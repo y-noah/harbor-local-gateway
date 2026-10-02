@@ -41,6 +41,61 @@ test('password sessions expire and are not shared with another server instance',
   auth.login('test-password',{setHeader:(_,v)=>cookie=v});const req={headers:{cookie}};assert.equal(auth.authenticated(req),true);
   assert.equal(createAdminAuth(config).authenticated(req),false);at=12*3600000;assert.equal(auth.authenticated(req),false);
 });
+
+test('missing or empty admin token cannot become a predictable bearer credential',async t=>{
+  for(const token of [undefined,null,'']){
+    const app=await setup(t,undefined,undefined,{config:{adminToken:token,codexBinary:'unused',reserveTokens:100}});
+    assert.equal((await app.call('/api/admin/state','GET',undefined,String(token))).status,401);
+  }
+});
+
+test('CSV neutralizes formulas after leading whitespace and control characters',async t=>{
+  const app=await setup(t);
+  for(const name of ['=1+1','\t=1+1','\r\n+1+1','\u0000@SUM(1)',' ordinary']){
+    const m=app.store.createMember(name,null,null);await app.chat(m.secret);
+  }
+  const r=await fetch(app.base+'/api/admin/export',{headers:{Authorization:'Bearer test-admin'}});
+  const csv=await r.text();
+  for(const name of ['=1+1','\t=1+1','\r\n+1+1','\u0000@SUM(1)'])assert.ok(csv.includes('"\''+name+'"'));
+  assert.ok(csv.includes('" ordinary"'));
+});
+
+test('same employee is limited during quota lookup, including sibling Keys',async t=>{
+  let release,started;const gate=new Promise(r=>release=r),entered=new Promise(r=>started=r);
+  const app=await setup(t,undefined,async()=>{started();await gate;return rates(0);});
+  const m=app.member(null),other=app.store.createKey(m.memberId);const first=app.chat(m.secret);
+  await entered;
+  try{
+    const r=await fetch(app.base+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+other.secret,'Content-Type':'application/json'},body:JSON.stringify({messages:[{role:'user',content:'duplicate'}]}),signal:AbortSignal.timeout(1000)});
+    assert.equal(r.status,429);assert.equal((await r.json()).error.type,'member_busy');
+  }finally{release();await first;}
+  assert.equal((await app.chat(m.secret)).status,200);
+});
+
+test('exhausted quota rejects before any upstream quota lookup and bad input releases admission',async t=>{
+  let reads=0;const app=await setup(t,undefined,async()=>{reads++;return rates(0);});
+  const m=app.member(0);assert.equal((await app.chat(m.secret)).status,429);assert.equal(reads,0);
+  const k=app.member(null);app.store.run('UPDATE keys SET quota=0 WHERE id=?',k.keyId);
+  assert.equal((await app.chat(k.secret)).status,429);assert.equal(reads,0);
+  app.store.run('UPDATE keys SET quota=NULL WHERE id=?',k.keyId);
+  assert.equal((await app.chat(k.secret,{messages:[]})).status,400);
+  assert.equal((await app.chat(k.secret)).status,200);
+});
+
+test('preparation admission is globally bounded while quota lookup stalls',{timeout:15000},async t=>{
+  let release;const gate=new Promise(r=>release=r);
+  const app=await setup(t,undefined,async()=>{await gate;return rates(0);});
+  let admissions=0;const allowance=app.store.allowance.bind(app.store);
+  app.store.allowance=(...args)=>{admissions++;return allowance(...args);};
+  const members=Array.from({length:17},()=>app.member(null)),calls=members.slice(0,16).map(m=>app.chat(m.secret));
+  try{
+    const deadline=Date.now()+5000;
+    while(admissions<16){assert.ok(Date.now()<deadline,'requests reach preparation');await new Promise(r=>setTimeout(r,5));}
+    const blocked=await app.chat(members[16].secret);assert.equal(blocked.status,429);assert.equal(admissions,16);
+  }finally{release();await Promise.all(calls);}
+  assert.equal((await app.chat(members[16].secret)).status,200);
+  assert.equal(app.store.get("SELECT COUNT(*) n FROM requests WHERE status IN ('queued','running')").n,0);
+});
 test('per-Key IP statistics exclude sibling Keys and reject cross-member lookup',async t=>{
   const app=await setup(t);const m=app.member(null),k=app.store.createKey(m.memberId,null,null),other=app.member(null);
   await app.chat(m.secret);await app.chat(m.secret);await app.chat(k.secret);

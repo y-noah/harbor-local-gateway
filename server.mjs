@@ -52,7 +52,7 @@ export function createGateway(options={}) {
   const executor=options.executor||runCodex, checker=options.checker||checkLogin,rateReader=options.rateReader||readRateLimits;
   const claudeBinary=config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe');
   const provider=a=>a.kind==='claude'?{binary:claudeBinary,run:options.claudeExecutor||runClaude,check:options.claudeChecker||checkClaudeLogin,env:claudeEnv,loginArgs:['auth','login']}:{binary:config.codexBinary,run:executor,check:checker,env:runnerEnv,loginArgs:['login']};
-  const busy=new Set(),queue=[],controllers=new Set(),logins=new Map(),tasks=new Set();let stopping=false;
+  const busy=new Set(),queue=[],controllers=new Set(),logins=new Map(),tasks=new Set(),admittedMembers=new Set();let stopping=false;
   const quotaReads=new Map(),authVersions=new Map();
   async function refreshQuota(account,force=false){
     if(account.kind==='claude'){store.run('UPDATE accounts SET quota_error=? WHERE id=?','Claude 官方 CLI 暂无已验证的额度查询；使用本地 Token 预算估算',account.id);return;}
@@ -111,7 +111,7 @@ export function createGateway(options={}) {
     const session={id:id(),member_id:member.id,account_id:chooseAccount(predicted,kind).id,upstream_id:null,state:'new',message_count:0,history_digest:'',created:now(),updated:now()};
     return {session,delta:messages,isNew:true};
   }
-  const authAdmin=req=>{if(!adminAuth.authenticated(req)&&!equals(req.headers.authorization,'Bearer '+config.adminToken))throw new AppError(401,'请先输入管理密码登录','admin_required');};
+  const authAdmin=req=>{const bearer=typeof config.adminToken==='string'&&config.adminToken.length>0&&equals(req.headers.authorization,'Bearer '+config.adminToken);if(!adminAuth.authenticated(req)&&!bearer)throw new AppError(401,'请先输入管理密码登录','admin_required');};
   const employee=req=>store.authenticate((req.headers.authorization||'').replace(/^Bearer /,''));
   function pump(){
     if(stopping)return;
@@ -235,7 +235,7 @@ export function createGateway(options={}) {
         }
         if(path==='/api/admin/export'&&method==='GET'){
           const rows=store.all('SELECT r.started,m.name,r.ip,r.status,r.input,r.output,r.cached,r.model FROM requests r LEFT JOIN members m ON m.id=r.member_id ORDER BY started DESC LIMIT 10000');
-          const cell=v=>'"'+String(v??'').replace(/^[=+@-]/,"'$&").replaceAll('"','""')+'"';
+          const cell=v=>{const text=String(v??'');return '"'+(/^[\s\x00-\x1f\x7f]*[=+@-]/.test(text)?"'":"")+text.replaceAll('"','""')+'"';};
           res.setHeader('Content-Type','text/csv; charset=utf-8');res.setHeader('Content-Disposition','attachment; filename="harbor-usage.csv"');return res.end('\ufeff'+['时间,员工,IP,状态,输入Token,输出Token,缓存Token,模型',...rows.map(r=>[new Date(r.started).toISOString(),r.name,r.ip,r.status,r.input,r.output,r.cached,r.model].map(cell).join(','))].join('\r\n'));
         }
         if(path==='/api/admin/backup'&&method==='POST'){
@@ -248,7 +248,13 @@ export function createGateway(options={}) {
         const m=employee(req);const reserved=store.get('SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE member_id=?',m.id).n;return json(res,200,{id:m.id,name:m.name,quota:m.quota,used:m.used,keyQuota:m.key_quota,keyUsed:m.key_used,reserved,expires:m.expires});
       }
       if(path==='/v1/chat/completions'&&method==='POST'){
-        const m=employee(req),b=await body(req);
+        const m=employee(req);
+        if(admittedMembers.has(m.id))throw new AppError(429,'该员工已有请求在处理，请稍后再试','member_busy');
+        if(stopping||admittedMembers.size>=16)throw new AppError(429,'请求准备队列已满，请稍后重试');
+        store.allowance(m,config.reserveTokens);
+        admittedMembers.add(m.id);
+        try{
+        const b=await body(req);
         if(!Array.isArray(b.messages)||!b.messages.length||b.messages.length>100||b.messages.some(v=>!v||!['system','user','assistant','developer'].includes(v.role)||typeof v.content!=='string'))throw new AppError(400,'仅支持 1–100 条纯文本 messages');
         if(b.tools||b.functions)throw new AppError(400,'此版本是纯文本网关，不支持工具调用');
         if(b.model!==undefined&&!['codex','claude'].includes(b.model))throw new AppError(400,'本地模型名为 codex 或 claude');
@@ -285,6 +291,7 @@ export function createGateway(options={}) {
             res.write('data: '+JSON.stringify({...common,object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:'stop'}],usage})+'\n\n');res.end('data: [DONE]\n\n');
           }else json(res,200,{...common,object:'chat.completion',choices:[{index:0,message:{role:'assistant',content:result.text},finish_reason:'stop'}],usage});
         }finally{controllers.delete(controller);}
+        }finally{admittedMembers.delete(m.id);}
         return;
       }
       throw new AppError(404,'接口不存在');

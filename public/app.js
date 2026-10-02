@@ -4,7 +4,7 @@ let admin=false,authEpoch=0,state=null,tab='overview',testKey='',chat=[],chatSes
 const labels={overview:'运行总览',members:'员工与密钥',accounts:'订阅账号池',sessions:'会话绑定',requests:'使用记录',playground:'请求测试',guide:'接入说明'};
 sessionStorage.removeItem('harbor-admin');if(location.hash)history.replaceState(null,'',location.pathname);
 let toastTimer;function toast(message){$('#toast').textContent=message;$('#toast').classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.add('hidden'),5000);}
-async function api(path,method='GET',data,credential=''){const epoch=authEpoch;const r=await fetch(path,{method,headers:{...(credential?{Authorization:'Bearer '+credential}:{}),...(data!==undefined?{'Content-Type':'application/json'}:{})},...(data!==undefined?{body:JSON.stringify(data)}:{})});const b=await r.json();if(!r.ok){if(r.status===401&&path.startsWith('/api/admin/')&&epoch===authEpoch){admin=false;authEpoch++;state=null;showLogin();}throw Error(b.error?.message||'请求失败');}return b;}
+async function api(path,method='GET',data,credential=''){const epoch=authEpoch;const r=await fetch(path,{method,headers:{...(credential?{Authorization:'Bearer '+credential}:{}),...(data!==undefined?{'Content-Type':'application/json'}:{})},...(data!==undefined?{body:JSON.stringify(data)}:{})});const b=await r.json();if(!r.ok){if(r.status===401&&path.startsWith('/api/admin/')&&epoch===authEpoch){admin=false;authEpoch++;state=null;showLogin();}throw Error(b.error?.message||'请求失败');}if(path.startsWith('/api/admin/')&&epoch!==authEpoch)throw Error('登录状态已变更，请重新操作');return b;}
 function badge(status){const map={ok:['完成',''],running:['处理中','warn'],queued:['排队中','warn'],failed:['失败','bad'],unknown:['待核对','warn'],interrupted:['待核对','warn'],cancelled:['已取消','off'],rejected:['已拒绝','off'],reconciled:['已核对',''],ready:['已连接',''],offline:['未登录','off'],degraded:['连接异常','warn'],login:['登录中','warn']};const [text,css]=map[status]||[status,'off'];return `<span class="badge ${css}">${esc(text)}</span>`;}
 function heading(eyebrow,title,sub,action=''){return `<div class="page-heading"><div><div class="eyebrow">${eyebrow}</div><h1>${title}</h1><p class="subtitle">${sub}</p></div>${action}</div>`;}
 function button(action,label,css='secondary',id=''){return `<button class="${css}" data-action="${action}" data-id="${esc(id)}">${label}</button>`;}
@@ -16,12 +16,13 @@ async function refresh(renderPage=true){
   try{const next=await api('/api/admin/state');if(!admin||epoch!==authEpoch)return;state=next;$('#connection').textContent='● 服务在线';if(renderPage)render();}
   catch(e){if(!admin||epoch!==authEpoch)return;$('#connection').textContent='连接异常';if(!state){showLogin();}toast(e.message);}
 }
-function showLogin(){if($('#modal').open)close();$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}
+function showLogin(){if($('#modal').open)close();testKey='';chat=[];chatSession='';chatOwner='';draft='';$('#modal-content').innerHTML='';$('#content').innerHTML='';$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}
 function showShell(){$('#login').classList.add('hidden');$('#shell').classList.remove('hidden');}
 function setTab(next){if(sending)return toast('请等待当前请求完成后再切换页面');if(!admin&&next!=='playground'){toast('请先进入管理后台');return;}tab=next;render();}
 function memberTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>员工</th><th>已用 / 总额度</th><th>来源 IP</th><th>最近使用</th><th>状态</th><th>管理</th></tr></thead><tbody>${rows.map(m=>`<tr><td><div class="member-cell"><span class="avatar">${esc(m.name.slice(0,1))}</span><strong>${esc(m.name)}</strong></div></td><td>${fmt(m.used)} <span class="muted">/ ${m.quota===null?'不限额':fmt(m.quota)}</span>${m.reserved?`<small>预占 ${fmt(m.reserved)}</small>`:''}</td><td>${button('ips',fmt(m.ips)+' 个 IP','table-button',m.id)}</td><td>${date(m.last_seen)}</td><td>${m.enabled?'<span class="badge">启用</span>':'<span class="badge off">已停用</span>'}</td><td>${button('member-detail','管理','table-button',m.id)}</td></tr>`).join('')}</tbody></table></div>`:empty('还没有员工。创建第一个 Key，开始使用。');}
 function requestTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>时间 / 员工</th><th>账号</th><th>输入 / 输出 Token</th><th>来源 IP</th><th>耗时</th><th>状态</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${date(r.started)}<small>${esc(r.member_name)}</small></td><td>${esc(r.account_name||'—')}</td><td>${fmt(r.input)} / ${fmt(r.output)}<small>其中缓存 ${fmt(r.cached)}</small></td><td class="mono">${esc(r.ip)}</td><td>${r.ended?((r.ended-r.started)/1000).toFixed(1)+'s':'—'}</td><td>${button('request-detail',badge(r.status),'table-button',r.id)}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无请求记录。测试一次请求后，数据会显示在这里。');}
 function render(){
+  if(!admin&&tab!=='playground'){showLogin();return;}
   showShell();document.querySelectorAll('[data-tab]').forEach(el=>el.classList.toggle('active',el.dataset.tab===tab));$('#crumb').textContent=labels[tab];
   if(!state&&tab!=='playground'){$('#content').innerHTML=empty('正在读取工作空间…');return;}
   let html='';
@@ -63,27 +64,30 @@ Content-Type: application/json
   if(tab==='requests'){$('#request-filter').onchange=e=>{requestFilter=e.target.value;render();};$('#status-filter').onchange=e=>{statusFilter=e.target.value;render();};}
 }
 function renderChat(){return chat.length?chat.map(m=>`<div class="message ${m.role==='user'?'user':''}"><span class="role">${m.role==='user'?'YOU':chatModel.toUpperCase()}</span>${esc(m.content)}</div>`).join(''):empty('从一个简单问题开始。');}
-function modal(html){$('#modal-content').innerHTML=html;$('#modal').showModal();}
-function close(){$('#modal').close();}
+function modal(html){if(!admin)return;$('#modal-content').innerHTML=html;$('#modal').showModal();}
+function close(){$('#modal').close();$('#modal-content').innerHTML='';}
+$('#modal').oncancel=e=>{e.preventDefault();close();};
 function formModal(title,sub,fields,onSubmit){modal(`<h2>${title}</h2><p class="hint">${sub}</p><form id="dialog-form">${fields}<div id="form-error" class="inline-error"></div><div class="dialog-actions"><button class="secondary" type="button" data-action="close">取消</button><button class="primary" type="submit">保存</button></div></form>`);$('#dialog-form').onsubmit=async e=>{e.preventDefault();const btn=e.target.querySelector('[type=submit]');btn.disabled=true;try{await onSubmit(new FormData(e.target));}catch(err){const output=$('#form-error');if(output)output.textContent=err.message;else toast(err.message);}finally{btn.disabled=false;}};}
 const expirationFields=`<label>有效期<select name="days"><option value="30">30 天</option><option value="7">7 天</option><option value="90">90 天</option><option value="0">永久</option></select></label>`;
 const expiresFrom=f=>Number(f.get('days'))?Date.now()+Number(f.get('days'))*86400000:null;
 function quotaValue(f){const v=f.get('quota');return v===''?null:Number(v);}
-function showSecret(secret){close();modal(`<h2>Key 已生成</h2><p class="hint">完整 Key 只显示这一次，请立即复制保存。平台仅保存其哈希。</p><div class="secret" id="new-secret"></div><div class="dialog-actions">${button('close','完成','secondary')}${button('use-secret','去请求测试','secondary')}${button('copy-secret','复制 Key','primary')}</div>`);$('#new-secret').textContent=secret;}
+function showSecret(secret){if(!admin)return;close();modal(`<h2>Key 已生成</h2><p class="hint">完整 Key 只显示这一次，请立即复制保存。平台仅保存其哈希。</p><div class="secret" id="new-secret"></div><div class="dialog-actions">${button('close','完成','secondary')}${button('use-secret','去请求测试','secondary')}${button('copy-secret','复制 Key','primary')}</div>`);$('#new-secret').textContent=secret;}
 function memberDetail(memberId){const m=state.members.find(x=>x.id===memberId),keys=state.keys.filter(k=>k.member_id===memberId);modal(`<h2>${esc(m.name)}</h2><p class="hint">已用 ${fmt(m.used)} / ${m.quota===null?'不限额':fmt(m.quota)} Token · 预占 ${fmt(m.reserved)}</p><div class="actions">${button('edit-member','修改额度 / 名称','secondary',m.id)}${button('new-key','新增 Key','secondary',m.id)}${button('toggle-member',m.enabled?'停用员工':'启用员工','text-button',m.id)}</div>${keys.map(k=>`<div class="mini-row"><div class="mono">${esc(k.prefix)}…<small>${k.expires?'到期 '+date(k.expires):'永久有效'} · ${!k.enabled?'已停用':!m.enabled?'员工已停用':k.expires&&k.expires<=Date.now()?'已过期':(k.quota!==null&&k.used>=k.quota)||(m.quota!==null&&m.used>=m.quota)?'额度用完':'可用'}<br>本 Key：${fmt(k.used)} / ${k.quota===null?'跟随员工额度':fmt(k.quota)+' Token'}</small></div><div>${button('key-ips',fmt(k.ips)+' 个 IP','table-button',k.id)}${button('renew-key','额度 / 续期','table-button',k.id)}${button('toggle-key',k.enabled?'停用':'启用','table-button',k.id)}</div></div>`).join('')}<p class="hint">员工总额度和 Key 独立额度同时生效。换 Key 不会清空员工历史用量。</p><div class="dialog-actions">${button('close','完成','primary')}</div>`);}
-async function checkKey(){testKey=$('#test-key').value.trim();try{const m=await api('/api/me','GET',undefined,testKey);$('#my-quota').textContent=`${m.name}：员工已用 ${fmt(m.used)} / ${m.quota===null?'不限额':fmt(m.quota)} Token；此 Key 已用 ${fmt(m.keyUsed)} / ${m.keyQuota===null?'跟随员工额度':fmt(m.keyQuota)}；预占 ${fmt(m.reserved)}`;}catch(e){toast(e.message);}}
+async function checkKey(){testKey=$('#test-key').value.trim();const key=testKey,epoch=authEpoch;try{const m=await api('/api/me','GET',undefined,key);if(epoch!==authEpoch||tab!=='playground'||$('#test-key')?.value.trim()!==key)return;$('#my-quota').textContent=`${m.name}：员工已用 ${fmt(m.used)} / ${m.quota===null?'不限额':fmt(m.quota)} Token；此 Key 已用 ${fmt(m.keyUsed)} / ${m.keyQuota===null?'跟随员工额度':fmt(m.keyQuota)}；预占 ${fmt(m.reserved)}`;}catch(e){if(epoch===authEpoch)toast(e.message);}}
 async function sendChat(e){
   e.preventDefault();testKey=$('#test-key').value.trim();const content=$('#prompt').value.trim();
   if(!testKey)return toast('请填写员工 Key');if(!content||sending)return;
-  draft=content;sending=true;render();let appended=false;
+  const epoch=authEpoch;draft=content;sending=true;render();let appended=false;
   try{
     const member=await api('/api/me','GET',undefined,testKey);
+    if(epoch!==authEpoch)return;
     if(chatOwner&&chatOwner!==member.id){chat=[];chatSession='';toast('已切换员工，自动新建会话');}
     chatOwner=member.id;chat.push({role:'user',content});appended=true;draft='';if(tab==='playground')render();
     const r=await api('/v1/chat/completions','POST',{model:chatModel,messages:chatSession?[chat.at(-1)]:chat,stream:false,...(chatSession?{session_id:chatSession}:{})},testKey);
+    if(epoch!==authEpoch)return;
     chatSession=r.session_id;chat.push({role:'assistant',content:r.choices[0].message.content});toast('完成 · '+fmt(r.usage.total_tokens)+' Token');
-  }catch(err){if(appended)chat.pop();draft=content;toast(err.message+'；输入已保留');}
-  finally{sending=false;if(admin)await refresh(false);if(tab==='playground')render();}
+  }catch(err){if(epoch===authEpoch){if(appended)chat.pop();draft=content;toast(err.message+'；输入已保留');}}
+  finally{sending=false;if(admin&&epoch===authEpoch)await refresh(false);if(tab==='playground'&&epoch===authEpoch)render();}
 }
 
 document.addEventListener('click',async e=>{
@@ -91,10 +95,10 @@ document.addEventListener('click',async e=>{
   const el=e.target.closest('[data-action]');if(!el)return;const action=el.dataset.action,identifier=el.dataset.id;
   try{
     if(action==='close')return close();if(action.startsWith('go-'))return setTab(action.slice(3));
-    if(action==='create-member')return formModal('创建员工 Key','额度属于员工；留空表示不限额。',`<label>员工名称<input name="name" placeholder="例如：张同事" maxlength="60" required></label><label>总额度（Token）<input name="quota" type="number" min="0" step="1" placeholder="留空：不限额" value="100000"></label>${expirationFields}`,async f=>{const r=await api('/api/admin/members','POST',{name:f.get('name'),quota:quotaValue(f),expires:expiresFrom(f)});await refresh();showSecret(r.secret);});
+    if(action==='create-member')return formModal('创建员工 Key','额度属于员工；留空表示不限额。',`<label>员工名称<input name="name" placeholder="例如：张同事" maxlength="60" required></label><label>总额度（Token）<input name="quota" type="number" min="0" step="1" placeholder="留空：不限额" value="100000"></label>${expirationFields}`,async f=>{const epoch=authEpoch;const r=await api('/api/admin/members','POST',{name:f.get('name'),quota:quotaValue(f),expires:expiresFrom(f)});await refresh();if(epoch===authEpoch)showSecret(r.secret);});
     if(action==='member-detail')return memberDetail(identifier);
     if(action==='edit-member'){const m=state.members.find(x=>x.id===identifier);close();return formModal('编辑员工','总额度包含历史已用量；增加总额度即可补充余额。',`<label>名称<input name="name" value="${esc(m.name)}" required maxlength="60"></label><label>总额度（Token）<input name="quota" type="number" min="0" step="1" value="${m.quota??''}" placeholder="留空：不限额"></label>`,async f=>{await api('/api/admin/members/'+identifier,'PATCH',{name:f.get('name'),quota:quotaValue(f)});close();await refresh();toast('已保存，历史用量保持不变');});}
-    if(action==='new-key'){close();return formModal('新增 Key','Key 独立额度与员工总额度同时生效；留空则跟随员工额度。',expirationFields+'<label>Key 总额度（Token）<input name="quota" type="number" min="0" step="1" placeholder="留空：跟随员工额度"></label>',async f=>{const r=await api('/api/admin/keys','POST',{memberId:identifier,expires:expiresFrom(f),quota:quotaValue(f)});await refresh();showSecret(r.secret);});}
+    if(action==='new-key'){close();return formModal('新增 Key','Key 独立额度与员工总额度同时生效；留空则跟随员工额度。',expirationFields+'<label>Key 总额度（Token）<input name="quota" type="number" min="0" step="1" placeholder="留空：跟随员工额度"></label>',async f=>{const epoch=authEpoch;const r=await api('/api/admin/keys','POST',{memberId:identifier,expires:expiresFrom(f),quota:quotaValue(f)});await refresh();if(epoch===authEpoch)showSecret(r.secret);});}
     if(action==='toggle-member'){const m=state.members.find(x=>x.id===identifier);await api('/api/admin/members/'+identifier,'PATCH',{enabled:!m.enabled});close();await refresh();return toast('员工状态已更新');}
     if(action==='toggle-key'){const k=state.keys.find(x=>x.id===identifier);await api('/api/admin/keys/'+identifier,'PATCH',{enabled:!k.enabled});await refresh();close();return memberDetail(k.member_id);}
     if(action==='renew-key'){const k=state.keys.find(x=>x.id===identifier);close();return formModal('Key 额度与有效期','提高总额度可追加余额，历史已用量保持不变。',`<label>Key 总额度（Token）<input name="quota" type="number" min="0" step="1" value="${k.quota??''}" placeholder="留空：跟随员工额度"></label><label>有效期<select name="days"><option value="keep">保持当前到期时间</option><option value="7">从现在起 7 天</option><option value="30">从现在起 30 天</option><option value="90">从现在起 90 天</option><option value="0">永久</option></select></label>`,async f=>{await api('/api/admin/keys/'+identifier,'PATCH',{quota:quotaValue(f),...(f.get('days')==='keep'?{}:{expires:expiresFrom(f)})});close();await refresh();toast('Key 已更新');});}
@@ -110,7 +114,7 @@ document.addEventListener('click',async e=>{
     if(action==='settle'){close();return formModal('核对异常请求','核实上游实际用量后填写需要补记的 Token。填 0 只释放预占；此操作会记入审计记录。','<label>补记 Token<input name="tokens" type="number" min="0" step="1" required></label>',async f=>{await api('/api/admin/requests/'+identifier+'/settle','POST',{tokens:Number(f.get('tokens'))});close();await refresh();toast('已补记用量并释放预占');});}
     if(action==='clear-chat'){if(sending)return toast('请等待当前请求完成');chat=[];chatSession='';render();return;}
     if(action==='backup'){const r=await api('/api/admin/backup','POST',{});return toast('备份已保存：'+r.file);}
-    if(action==='export'){const r=await fetch('/api/admin/export');if(!r.ok)throw Error('导出失败');const url=URL.createObjectURL(await r.blob()),a=document.createElement('a');a.href=url;a.download='Harbor-使用记录.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);return;}
+    if(action==='export'){const epoch=authEpoch,r=await fetch('/api/admin/export');if(!r.ok)throw Error('导出失败');const blob=await r.blob();if(!admin||epoch!==authEpoch)return;const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='Harbor-使用记录.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);return;}
   }catch(err){toast(err.message);}finally{el.disabled=false;}
 });
 $('#login-form').onsubmit=async e=>{e.preventDefault();const submit=e.submitter;submit.disabled=true;try{await api('/api/auth/login','POST',{password:$('#admin-input').value});authEpoch++;admin=true;$('#admin-input').value='';await refresh();}catch(err){toast(err.message);}finally{submit.disabled=false;}};

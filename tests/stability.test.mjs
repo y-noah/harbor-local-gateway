@@ -87,15 +87,15 @@ test('shutdown settles three running and two queued requests without stranded HT
   try{assert.equal(db.prepare("SELECT COUNT(*) n FROM requests WHERE status='unknown' AND reserved=100").get().n,3);assert.equal(db.prepare("SELECT COUNT(*) n FROM requests WHERE status='cancelled' AND reserved=0").get().n,2);assert.equal(db.prepare("SELECT COUNT(*) n FROM requests WHERE status IN ('queued','running')").get().n,0);}finally{db.close();}
 });
 
-test('a continuation waiting on quota reloads the session cursor after the preceding turn finishes',{timeout:30000},async t=>{
-  let holdQuota=false,quotaStarted=false,releaseQuota,releaseTurn,turn=0;const cursors=[];
-  const app=await fixture(t,{accounts:1,rateReader:async()=>{if(holdQuota){quotaStarted=true;await deadline(new Promise(r=>releaseQuota=r),'held quota');}return limits();},executor:async args=>{cursors.push({...args.previousUsage});turn++;if(turn===2)await deadline(new Promise(r=>releaseTurn=r),'held preceding turn');return result(args,'cursor-thread');}});
+test('overlapping continuation is rejected early and retry uses the settled session cursor',{timeout:30000},async t=>{
+  let releaseTurn,turn=0,quotaReads=0;const cursors=[];
+  const app=await fixture(t,{accounts:1,rateReader:async()=>{quotaReads++;return limits();},executor:async args=>{cursors.push({...args.previousUsage});turn++;if(turn===2)await deadline(new Promise(r=>releaseTurn=r),'held preceding turn');return result(args,'cursor-thread');}});
   const m=app.member(),first=await app.chat(m);assert.equal(first.status,200);
   const second=app.chat(m,first.body.session_id);await waitFor(()=>!!releaseTurn,'second turn running');
-  holdQuota=true;app.store.run('UPDATE accounts SET quota_json=NULL');
-  const third=app.chat(m,first.body.session_id);await waitFor(()=>quotaStarted,'third turn waiting for quota');
-  releaseTurn();assert.equal((await second).status,200);holdQuota=false;releaseQuota();
-  assert.equal((await third).status,200);assert.deepEqual(cursors.map(x=>x.input),[0,30,60]);
+  app.store.run('UPDATE accounts SET quota_json=NULL');const beforeReads=quotaReads;
+  try{const overlap=await app.chat(m,first.body.session_id);assert.equal(overlap.status,429);assert.equal(overlap.body.error.type,'member_busy');assert.equal(quotaReads,beforeReads);}finally{releaseTurn();}
+  assert.equal((await second).status,200);
+  assert.equal((await app.chat(m,first.body.session_id)).status,200);assert.deepEqual(cursors.map(x=>x.input),[0,30,60]);
   const s=app.store.get('SELECT * FROM sessions WHERE id=?',first.body.session_id);assert.equal(s.message_count,6);assert.equal(s.cum_input,90);assert.equal(s.cum_output,6);
   assert.equal(app.store.get('SELECT used FROM members WHERE id=?',m.memberId).used,96);
 });

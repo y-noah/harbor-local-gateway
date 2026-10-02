@@ -56,20 +56,23 @@ export class Store {
     if(row.expires!==null && row.expires<=now()) throw new AppError(403,'Key 已到期','key_expired');
     return row;
   }
-  reserve(member,ip,agent,reserveSize,model) {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+  allowance(member,reserveSize) {
       const m=this.get('SELECT * FROM members WHERE id=?',member.id);
       const key=this.get('SELECT * FROM keys WHERE id=?',member.key_id);
-      if(!key||!m.enabled||!key.enabled||(key.expires!==null&&key.expires<=now()))throw new AppError(403,'Key 或员工已停用或到期');
+      if(!m||!key||key.member_id!==m.id||!m.enabled||!key.enabled||(key.expires!==null&&key.expires<=now()))throw new AppError(403,'Key 或员工已停用或到期');
       const pending=this.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE member_id=? AND status IN ('queued','running','interrupted','unknown')",m.id).n;
       const keyPending=this.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE key_id=? AND status IN ('queued','running','interrupted','unknown')",key.id).n;
       if(this.get("SELECT id FROM requests WHERE member_id=? AND status IN ('queued','running')",m.id)) throw new AppError(429,'该员工已有请求在处理，请稍后再试','member_busy');
       if(m.quota!==null && m.used+pending>=m.quota) throw new AppError(429,'额度已用完或被待核对请求占用','quota_exceeded');
       if(key.quota!==null&&key.used+keyPending>=key.quota)throw new AppError(429,'此 Key 的独立额度已用完或被预占','key_quota_exceeded');
-      const reserved=Math.min(reserveSize,m.quota===null?Infinity:m.quota-m.used-pending,key.quota===null?Infinity:key.quota-key.used-keyPending);
+      return Math.min(reserveSize,m.quota===null?Infinity:m.quota-m.used-pending,key.quota===null?Infinity:key.quota-key.used-keyPending);
+  }
+  reserve(member,ip,agent,reserveSize,model) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const reserved=this.allowance(member,reserveSize);
       const requestId=id();
-      this.run("INSERT INTO requests(id,member_id,key_id,started,status,ip,agent,reserved,model) VALUES(?,?,?,?,'queued',?,?,?,?)",requestId,m.id,member.key_id,now(),ip,agent,reserved,model);
+      this.run("INSERT INTO requests(id,member_id,key_id,started,status,ip,agent,reserved,model) VALUES(?,?,?,?,'queued',?,?,?,?)",requestId,member.id,member.key_id,now(),ip,agent,reserved,model);
       this.db.exec('COMMIT'); return requestId;
     } catch(e) { this.db.exec('ROLLBACK'); throw e; }
   }
