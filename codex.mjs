@@ -10,8 +10,10 @@ export function runnerEnv(home) {
   return env;
 }
 const disabled=['shell_tool','unified_exec','apps','plugins','hooks','multi_agent','multi_agent_v2','browser_use','browser_use_external','computer_use','image_generation','view_image','sleep_tool','workspace_dependencies','code_mode_host','memories'];
+export const codexAuthArgs=()=>['-c','cli_auth_credentials_store="file"'];
 export function argsFor(workspace,model,sessionId) {
   const args=['exec','--ignore-user-config','--ignore-rules','--skip-git-repo-check','--sandbox','read-only','--json','--color','never','-C',workspace];
+  args.push(...codexAuthArgs());
   for(const feature of disabled)args.push('--disable',feature);
   args.push('--enable','skip_host_skill_discovery','-c','web_search="disabled"','-c','project_doc_max_bytes=0','-c','model_reasoning_effort="low"','-c','developer_instructions="You are a text-only assistant. Answer the supplied conversation. Do not access files, execute commands, call tools or delegate tasks."');
   if(model && model!=='codex')args.push('-m',model);
@@ -20,7 +22,7 @@ export function argsFor(workspace,model,sessionId) {
 }
 export function checkLogin(binary,home) {
   return new Promise(resolve=>{
-    const child=spawn(binary,['login','status'],{env:runnerEnv(home),windowsHide:true});
+    const child=spawn(binary,['login','status',...codexAuthArgs()],{env:runnerEnv(home),windowsHide:true});
     let out='';const timer=setTimeout(()=>child.kill(),10000);
     child.stdout.on('data',b=>out+=b);child.stderr.on('data',b=>out+=b);
     child.on('error',()=>{clearTimeout(timer);resolve(false);});

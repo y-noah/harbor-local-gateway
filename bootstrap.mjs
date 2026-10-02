@@ -18,7 +18,7 @@ if(!app.store.get('SELECT id FROM accounts LIMIT 1')){
   const ready=existsSync(join(home,'auth.json'))&&await checkLogin(app.config.codexBinary,home);
   app.store.run('INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,?)','local','本机 Codex',home,ready?'ready':'offline');
 }
-for(const account of app.store.all('SELECT id,home,kind FROM accounts')){
+for(const account of app.store.all('SELECT id,home,kind FROM accounts WHERE enabled=1')){
   const ready=account.kind==='claude'?await checkClaudeLogin(app.config.claudeBinary||join(app.runtime,'claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe'),account.home):await checkLogin(app.config.codexBinary,account.home);
   app.store.run('UPDATE accounts SET state=?,last_error=NULL WHERE id=?',ready?'ready':'offline',account.id);
   if(ready&&account.kind==='codex'){try{const q=normalizeLimits(await readRateLimits(app.config.codexBinary,account.home));if(q)app.store.run('UPDATE accounts SET quota_json=?,quota_error=NULL,since_check_tokens=0 WHERE id=?',JSON.stringify(q),account.id);}catch(e){app.store.run('UPDATE accounts SET quota_error=? WHERE id=?',e.message,account.id);}}

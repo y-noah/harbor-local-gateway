@@ -1,18 +1,35 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
-import { createGateway } from '../server.mjs';
+import { createGateway,recoverCodexBinary } from '../server.mjs';
 import { Store } from '../store.mjs';
 import {accountCapacity,normalizeLimits} from '../rates.mjs';
-import {usageDelta} from '../codex.mjs';
+import {usageDelta,argsFor,codexAuthArgs} from '../codex.mjs';
 import {parseClaudeResult,claudeArgs,claudeEnv} from '../claude.mjs';
 import {passwordHash,createAdminAuth} from '../auth.mjs';
 const scratch=resolve(fileURLToPath(new URL('../../../work/',import.meta.url)),'tests');mkdirSync(scratch,{recursive:true});
 function temp(){return mkdtempSync(join(scratch,'case-'));}
 function cleanup(dir){const target=resolve(dir);if(!target.startsWith(scratch+'\\')&&!target.startsWith(scratch+'/'))throw Error('Unsafe cleanup');rmSync(target,{recursive:true,force:true});}
+test('desktop CLI upgrade recovers a removed managed binary without replacing custom paths',()=>{
+  const dir=temp(),folder=join(dir,'bin'),latest=join(folder,'new-version','codex.exe'),old=join(folder,'old-version','codex.exe');
+  try{
+    mkdirSync(dirname(latest),{recursive:true});writeFileSync(latest,'fixture');
+    assert.equal(recoverCodexBinary(old,folder),latest);
+    assert.equal(recoverCodexBinary(latest,folder),latest);
+    const custom=join(dir,'custom','codex.exe');assert.equal(recoverCodexBinary(custom,folder),custom);
+    assert.equal(recoverCodexBinary('codex',folder),'codex');
+  }finally{cleanup(dir);}
+});
+test('Codex calls explicitly isolate the credential store for new and resumed sessions',()=>{
+  for(const session of [undefined,'upstream-session']){
+    const args=argsFor('isolated-workspace','codex',session);
+    assert.ok(args.includes('cli_auth_credentials_store="file"'));
+  }
+  assert.deepEqual(codexAuthArgs(),['-c','cli_auth_credentials_store="file"']);
+});
 async function setup(t,executor,rateReader,extra={}){
   const dir=temp(),app=createGateway({dataDir:join(dir,'data'),runtimeDir:join(dir,'runtime'),config:{adminToken:'test-admin',codexBinary:'unused',reserveTokens:100},checker:async()=>true,rateReader:rateReader||(async()=>({rateLimits:{primary:{usedPercent:0,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})),executor:executor||(async()=>({text:'你好',input:60,output:10,cached:20,usageKnown:true,threadId:'fake-thread'})),...extra});
   app.store.run("INSERT INTO accounts(id,name,home,state) VALUES('one','Test','unused','ready')");

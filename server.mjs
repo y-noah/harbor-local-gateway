@@ -3,12 +3,12 @@ import {homedir} from 'node:os';
 import {acquireInstance} from './instance.mjs';
 import {passwordHash,createAdminAuth} from './auth.mjs';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { Store, AppError, id, now, hash } from './store.mjs';
-import { runCodex, checkLogin, runnerEnv } from './codex.mjs';
+import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
 import {runClaude,checkClaudeLogin,claudeEnv} from './claude.mjs';
 
@@ -27,10 +27,18 @@ async function body(req){
   let size=0,chunks=[];for await(const chunk of req){size+=chunk.length;if(size>128*1024)throw new AppError(413,'请求超过 128 KB');chunks.push(chunk);}
   try{const value=JSON.parse(Buffer.concat(chunks).toString());if(!value||typeof value!=='object'||Array.isArray(value))throw Error();return value;}catch{throw new AppError(400,'请求必须是 JSON 对象');}
 }
-function discoverCodex(){
-  const folder=join(process.env.LOCALAPPDATA||join(homedir(),'AppData','Local'),'OpenAI','Codex','bin');
+const codexBinFolder=()=>join(process.env.LOCALAPPDATA||join(homedir(),'AppData','Local'),'OpenAI','Codex','bin');
+function discoverCodex(folder=codexBinFolder()){
   if(existsSync(folder))for(const sub of readdirSync(folder).reverse()){const p=join(folder,sub,'codex.exe');if(existsSync(p))return p;}
   return 'codex';
+}
+export function recoverCodexBinary(binary,folder=codexBinFolder()){
+  if(typeof binary!=='string'||existsSync(binary))return binary;
+  // Only repair removed desktop-managed versions; preserve custom CLI paths.
+  if(basename(binary).toLowerCase()==='codex.exe'&&resolve(dirname(dirname(binary))).toLowerCase()===resolve(folder).toLowerCase()){
+    const replacement=discoverCodex(folder);if(replacement!=='codex')return replacement;
+  }
+  return binary;
 }
 export function createGateway(options={}) {
   const data=resolve(options.dataDir||join(root,'data')),runtime=resolve(options.runtimeDir||join(root,'runtime'));
@@ -40,6 +48,10 @@ export function createGateway(options={}) {
   if(!config){
     if(existsSync(configPath))config=JSON.parse(readFileSync(configPath,'utf8'));
     else {config={port:43127,adminToken:randomBytes(32).toString('base64url'),codexBinary:discoverCodex(),reserveTokens:32000};writeFileSync(configPath,JSON.stringify(config,null,2));}
+  }
+  if(!options.config){
+    const binary=recoverCodexBinary(config.codexBinary);
+    if(binary!==config.codexBinary){config.codexBinary=binary;writeFileSync(configPath,JSON.stringify(config,null,2));}
   }
   if(!config.adminPasswordHash&&!options.config){
     const password='Hbr!'+randomBytes(24).toString('base64url');
@@ -51,7 +63,7 @@ export function createGateway(options={}) {
   const store=new Store(join(data,'gateway.sqlite'));
   const executor=options.executor||runCodex, checker=options.checker||checkLogin,rateReader=options.rateReader||readRateLimits;
   const claudeBinary=config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe');
-  const provider=a=>a.kind==='claude'?{binary:claudeBinary,run:options.claudeExecutor||runClaude,check:options.claudeChecker||checkClaudeLogin,env:claudeEnv,loginArgs:['auth','login']}:{binary:config.codexBinary,run:executor,check:checker,env:runnerEnv,loginArgs:['login']};
+  const provider=a=>a.kind==='claude'?{binary:claudeBinary,run:options.claudeExecutor||runClaude,check:options.claudeChecker||checkClaudeLogin,env:claudeEnv,loginArgs:['auth','login']}:{binary:config.codexBinary,run:executor,check:checker,env:runnerEnv,loginArgs:['login',...codexAuthArgs()]};
   const busy=new Set(),queue=[],controllers=new Set(),logins=new Map(),tasks=new Set(),admittedMembers=new Set();let stopping=false;
   const quotaReads=new Map(),authVersions=new Map();
   async function refreshQuota(account,force=false){

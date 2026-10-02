@@ -1,9 +1,9 @@
 import {spawn} from 'node:child_process';
 import {StringDecoder} from 'node:string_decoder';
-import {runnerEnv} from './codex.mjs';
+import {runnerEnv,codexAuthArgs} from './codex.mjs';
 export function readRateLimits(binary,home,{spawnProcess=spawn,timeoutMs=15000}={}){
   return new Promise((resolve,reject)=>{
-    const child=spawnProcess(binary,['app-server','--listen','stdio://','--disable','plugins','--disable','apps'],{env:runnerEnv(home),windowsHide:true});
+    const child=spawnProcess(binary,['app-server','--listen','stdio://','--disable','plugins','--disable','apps',...codexAuthArgs()],{env:runnerEnv(home),windowsHide:true});
     let buffer='',settled=false,size=0;const decoder=new StringDecoder('utf8');
     const finish=(err,value)=>{if(settled)return;settled=true;clearTimeout(timer);child.kill();err?reject(err):resolve(value);};
     const timer=setTimeout(()=>finish(Error('官方额度读取超时')),timeoutMs);
