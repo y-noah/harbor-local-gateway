@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Harbor · 本地 AI 网关</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<div id="login" class="login-wrap hidden"><form id="login-form" class="login-card"><div class="brand-mark">H</div><h1>欢迎来到 Harbor</h1><p class="muted">你的本地 AI 工作台</p><label>管理密码<input id="admin-input" name="password" type="password" autocomplete="current-password" required placeholder="输入管理密码，无需账号"></label><button class="primary">进入管理后台</button><p class="hint">初始密码见运行文件夹中的「管理密码.txt」。<br>员工使用 API Key，可直接进入请求测试。</p><button type="button" id="employee-entry" class="text-button">使用员工 Key 测试 →</button></form></div>
+<div id="shell" class="shell hidden">
+ <aside><div class="brand"><span class="brand-mark">H</span><div>Harbor<small>LOCAL AI GATEWAY</small></div></div><div class="nav-caption">工作空间</div><nav>
+ <button data-tab="overview" class="nav active"><span>◫</span>运行总览</button><button data-tab="members" class="nav"><span>♧</span>员工与密钥</button><button data-tab="accounts" class="nav"><span>▦</span>订阅账号池</button><button data-tab="sessions" class="nav"><span>↳</span>会话绑定</button><button data-tab="requests" class="nav"><span>≡</span>使用记录</button><button data-tab="playground" class="nav"><span>⌘</span>请求测试</button><button data-tab="guide" class="nav"><span>ⓘ</span>接入说明</button>
+ </nav><div class="aside-bottom"><span class="dot"></span> 仅本机访问<small>数据保存在这台电脑<br>Harbor v1.0 · 零运行依赖</small><button id="logout" class="text-button">退出后台</button></div></aside>
+ <main><header><div class="breadcrumb">工作空间 <span>/</span> <span id="crumb">运行总览</span></div><div class="header-right"><span id="connection" class="pill">正在连接</span><button id="refresh" class="icon-button" title="刷新">↻</button></div></header><div class="page"><div id="content"></div></div><footer>HARBOR / 本地订阅测试环境 <span>Token 为本地统计口径，不代表订阅剩余额度。</span></footer></main>
+</div>
+<dialog id="modal"><div id="modal-content"></div></dialog><div id="toast" class="toast hidden" role="status"></div><script type="module" src="/app.js"></script>
+</body></html>
