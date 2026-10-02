@@ -226,12 +226,12 @@ export function createGateway(options={}) {
             if(logins.has(account.id))return json(res,200,{ok:true,message:'登录流程已启动，请查看浏览器'});
             if(logins.size)throw new AppError(409,'另一个账号正在登录，请先完成该流程');
             const version=(authVersions.get(account.id)||0)+1;authVersions.set(account.id,version);
-            store.run("UPDATE accounts SET state='login',quota_json=NULL,quota_calibration=NULL,quota_error=NULL,since_check_tokens=0 WHERE id=?",account.id);
+            store.run("UPDATE accounts SET state='login',last_error=NULL,quota_json=NULL,quota_calibration=NULL,quota_error=NULL,since_check_tokens=0 WHERE id=?",account.id);
             store.run("UPDATE sessions SET state='uncertain' WHERE account_id=?",account.id);
             const upstream=provider(account),child=spawn(upstream.binary,upstream.loginArgs,{env:upstream.env(account.home),windowsHide:true,stdio:'ignore'});logins.set(account.id,child);
-            const timer=setTimeout(()=>child.kill(),180000);
-            let ended=false;const finish=async()=>{if(ended)return;ended=true;clearTimeout(timer);try{if(stopping)return;let ready=false;try{ready=await upstream.check(upstream.binary,account.home);}catch{}if(stopping||(authVersions.get(account.id)||0)!==version)return;store.run('UPDATE accounts SET state=? WHERE id=?',ready?'ready':'offline',account.id);}finally{logins.delete(account.id);if(!stopping)pump();}};
-            child.on('error',finish);child.on('close',finish);store.audit('account.login',account.id);return json(res,200,{ok:true,message:'已启动官方登录，请在本机浏览器完成'});
+            let timedOut=false;const timer=setTimeout(()=>{timedOut=true;child.kill();},600000);
+            let ended=false;const finish=async()=>{if(ended)return;ended=true;clearTimeout(timer);try{if(stopping)return;let ready=false;try{ready=await upstream.check(upstream.binary,account.home);}catch{}if(stopping||(authVersions.get(account.id)||0)!==version)return;store.run('UPDATE accounts SET state=?,last_error=? WHERE id=?',ready?'ready':'offline',ready?null:timedOut?'官方登录等待已超过 10 分钟，请重新点击官方登录并使用新打开的页面':'官方登录未完成，请重新点击官方登录',account.id);store.audit(ready?'account.login.success':'account.login.failed',account.id);}finally{logins.delete(account.id);if(!stopping)pump();}};
+            child.on('error',finish);child.on('close',finish);store.audit('account.login',account.id);return json(res,200,{ok:true,message:'已启动官方登录，请在 10 分钟内于本机浏览器完成；以账号显示已连接为准'});
           }
         }
         const settleMatch=path.match(/^\/api\/admin\/requests\/([a-f0-9-]+)\/settle$/);
