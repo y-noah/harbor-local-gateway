@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {tmpdir} from 'node:os';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
@@ -7,7 +8,7 @@ import {join,resolve} from 'node:path';
 import {runCodex} from '../codex.mjs';
 import {runClaude} from '../claude.mjs';
 import {readRateLimits} from '../rates.mjs';
-const scratch=fileURLToPath(new URL('../../../work/provider-tests/',import.meta.url));mkdirSync(scratch,{recursive:true});
+const scratch=join(tmpdir(),'harbor-provider-tests');mkdirSync(scratch,{recursive:true});
 const childFile=fileURLToPath(new URL('./provider-child.mjs',import.meta.url));
 function fixture(t,provider,scenario){
   const dir=mkdtempSync(join(scratch,'case-'));let child;

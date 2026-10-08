@@ -14,3 +14,4 @@ node_modules/
 auth.json
 settings.json
 work/
+__pycache__/

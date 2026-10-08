@@ -1,11 +1,12 @@
 import {test} from 'node:test';
+import {tmpdir} from 'node:os';
 import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {resolve,join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import {acquireInstance} from '../instance.mjs';
-const scratch=resolve(import.meta.dirname,'../../../work/instance-tests');mkdirSync(scratch,{recursive:true});
+const scratch=join(tmpdir(),'harbor-instance-tests');mkdirSync(scratch,{recursive:true});
 function temp(t){const dir=mkdtempSync(join(scratch,'lock-'));t.after(()=>{assert.ok(resolve(dir).startsWith(scratch));rmSync(dir,{recursive:true,force:true});});return dir;}
 test('second workspace instance fails before opening or recovering the store',async t=>{
   const dir=temp(t),first=await acquireInstance(dir);
