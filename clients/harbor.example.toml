@@ -1,0 +1,15 @@
+# Merge the top-level keys before the first table in your existing config.toml.
+# Select an available model from the authenticated /v1/models endpoint.
+model = "gpt-6.1-sol"
+model_provider = "harbor"
+web_search = "disabled"
+# Download /v1/codex/models first; set this to its absolute local path.
+# model_catalog_json = 'C:\Users\YOUR_USER\.codex\harbor-models.json'
+
+[model_providers.harbor]
+name = "Harbor"
+base_url = "http://127.0.0.1:43127/v1"
+wire_api = "responses"
+env_key = "HARBOR_API_KEY"
+requires_openai_auth = false
+supports_websockets = false

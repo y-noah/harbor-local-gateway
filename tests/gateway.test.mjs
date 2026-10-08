@@ -1,6 +1,7 @@
 import { test } from 'node:test';
+import {tmpdir} from 'node:os';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
@@ -10,7 +11,7 @@ import {accountCapacity,normalizeLimits} from '../rates.mjs';
 import {usageDelta,argsFor,codexAuthArgs} from '../codex.mjs';
 import {parseClaudeResult,claudeArgs,claudeEnv} from '../claude.mjs';
 import {passwordHash,createAdminAuth} from '../auth.mjs';
-const scratch=resolve(fileURLToPath(new URL('../../../work/',import.meta.url)),'tests');mkdirSync(scratch,{recursive:true});
+const scratch=join(tmpdir(),'harbor-gateway-tests');mkdirSync(scratch,{recursive:true});
 function temp(){return mkdtempSync(join(scratch,'case-'));}
 function cleanup(dir){const target=resolve(dir);if(!target.startsWith(scratch+'\\')&&!target.startsWith(scratch+'/'))throw Error('Unsafe cleanup');rmSync(target,{recursive:true,force:true});}
 test('desktop CLI upgrade recovers a removed managed binary without replacing custom paths',()=>{
@@ -31,7 +32,7 @@ test('Codex calls explicitly isolate the credential store for new and resumed se
   assert.deepEqual(codexAuthArgs(),['-c','cli_auth_credentials_store="file"']);
 });
 async function setup(t,executor,rateReader,extra={}){
-  const dir=temp(),app=createGateway({dataDir:join(dir,'data'),runtimeDir:join(dir,'runtime'),config:{adminToken:'test-admin',codexBinary:'unused',reserveTokens:100},checker:async()=>true,rateReader:rateReader||(async()=>({rateLimits:{primary:{usedPercent:0,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})),executor:executor||(async()=>({text:'你好',input:60,output:10,cached:20,usageKnown:true,threadId:'fake-thread'})),...extra});
+  const dir=temp(),app=createGateway({dataDir:join(dir,'data'),runtimeDir:join(dir,'runtime'),config:{adminToken:'test-admin',codexBinary:'unused',reserveTokens:100},checker:async()=>true,responsesTransport:{models:async()=>[]},loginStarter:()=>({challenge:Promise.resolve({type:'device',verificationUrl:'https://auth.openai.com/codex/device',userCode:'TEST-ONLY'}),completed:Promise.resolve({success:true}),cancel(){}}),rateReader:rateReader||(async()=>({rateLimits:{primary:{usedPercent:0,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})),executor:executor||(async()=>({text:'你好',input:60,output:10,cached:20,usageKnown:true,threadId:'fake-thread'})),...extra});
   app.store.run("INSERT INTO accounts(id,name,home,state) VALUES('one','Test','unused','ready')");
   await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+app.server.address().port;
   t.after(async()=>{await app.close();cleanup(dir);});
@@ -41,6 +42,19 @@ async function setup(t,executor,rateReader,extra={}){
   return {...app,base,call,member,chat};
 }
 test('admin protection, host and origin guards',async t=>{const {call,base}=await setup(t);assert.equal((await call('/api/admin/state','GET',undefined,'wrong')).status,401);assert.equal((await call('/api/admin/state','GET',undefined,'test-admin',{Origin:'https://evil.test'})).status,403);const status=await new Promise((resolve,reject)=>{http.get(base+'/health',{headers:{Host:'evil.test'}},r=>{r.resume();resolve(r.statusCode);}).on('error',reject);});assert.equal(status,403);assert.equal((await call('/api/admin/state')).status,200);});
+test('configured remote host keeps administration authenticated and rejects cross-site access',async t=>{
+  const app=await setup(t,undefined,undefined,{env:{HARBOR_LISTEN_HOST:'0.0.0.0',HARBOR_PUBLIC_ORIGINS:'http://gateway.test:43127'}});
+  const remote={Host:'gateway.test:43127',Origin:'http://gateway.test:43127'};
+  const request=(path,secret='',headers=remote)=>new Promise((resolve,reject)=>{
+    const req=http.get(app.base+path,{headers:{...headers,Authorization:'Bearer '+secret}},res=>{res.resume();resolve(res.statusCode);});
+    req.setTimeout(5000,()=>req.destroy(Error('Request timeout')));req.on('error',reject);
+  });
+  assert.equal(await request('/health'),200);
+  assert.equal(await request('/api/admin/state','wrong'),401);
+  assert.equal(await request('/api/admin/state','test-admin'),200);
+  assert.equal(await request('/api/admin/state','test-admin',{...remote,Origin:'http://evil.test'}),403);
+  assert.equal(await request('/health','',{...remote,Host:'evil.test'}),403);
+});
 test('password-only login sets private cookie, guards admin and invalidates logout',async t=>{
   const app=await setup(t,undefined,undefined,{config:{adminToken:'test-admin',adminPasswordHash:passwordHash('Test!Password-Only-42'),codexBinary:'unused',reserveTokens:100}});
   const post=async(password,extra={})=>fetch(app.base+'/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json',...extra},body:JSON.stringify({password})});
@@ -159,11 +173,67 @@ test('unknown upstream usage stays reserved until explicit reconciliation',async
 test('known failures release reservation',async t=>{const {member,chat,store}=await setup(t,async()=>{throw Object.assign(Error('spawn failed'),{usageKnown:true});});const m=member();await chat(m.secret);assert.equal(store.get('SELECT reserved FROM requests').reserved,0);assert.equal(store.get('SELECT status FROM requests').status,'failed');});
 test('restarting running requests preserves unknown reservation and marks interruption',()=>{const dir=temp(),db=join(dir,'s.sqlite');let s=new Store(db);const m=s.createMember('A',100,null);const request=s.reserve(s.authenticate(m.secret),'127.0.0.1','test',100,'codex');s.run("UPDATE requests SET status='running' WHERE id=?",request);s.close();s=new Store(db);assert.equal(s.get('SELECT status FROM requests').status,'interrupted');assert.equal(s.get('SELECT reserved FROM requests').reserved,100);assert.throws(()=>s.reserve(s.authenticate(m.secret),'ip','test',100,'codex'),/额度/);s.close();cleanup(dir);});
 test('invalid protocol rejected rather than pretending support',async t=>{const {member,chat}=await setup(t);const m=member();for(const extra of [{tools:[]},{max_tokens:10},{model:'unknown-model'},{messages:[{role:'user',content:[]}]},{stream:'yes'}])assert.equal((await chat(m.secret,extra)).status,400);});
-test('public responses never expose credential digests or home paths',async t=>{const {call,member}=await setup(t);const m=member();const r=await call('/api/admin/state');const text=JSON.stringify(r.body);assert.ok(!text.includes(m.secret));assert.ok(!text.includes('digest'));assert.ok(!text.includes('"home"'));});
+test('only authenticated admins can view complete employee Keys; hashes and encryption material stay private',async t=>{
+ const {call,member,store}=await setup(t);const m=member();const r=await call('/api/admin/state');
+ assert.equal(r.body.keys[0].full_key,m.secret);const text=JSON.stringify(r.body);
+ for(const field of ['digest','secret_cipher','"home"','encryptionKey'])assert.ok(!text.includes(field));
+ assert.equal((await call('/api/admin/state','GET',undefined,m.secret)).status,401);
+ assert.equal((await call('/api/admin/state','GET',undefined,'')).status,401);
+ assert.ok(!JSON.stringify((await call('/api/me','GET',undefined,m.secret)).body).includes(m.secret));
+ assert.ok(!JSON.stringify(store.all('SELECT * FROM audit')).includes(m.secret));
+});
 test('invalid administrative updates are rejected',async t=>{const {call,member}=await setup(t);const m=member();assert.equal((await call('/api/admin/members/'+m.memberId,'PATCH',{quota:-1})).status,400);assert.equal((await call('/api/admin/keys/'+m.keyId,'PATCH',{expires:'bad'})).status,400);assert.equal((await call('/api/admin/members','POST',{name:'',quota:null,expires:null})).status,400);});
+test('deleting a Key requires admin, revokes permanently and preserves historical accounting',async t=>{
+ const app=await setup(t),m=app.member(null),sibling=app.store.createKey(m.memberId),path='/api/admin/keys/'+m.keyId;
+ await app.chat(m.secret);const before=app.store.snapshot();
+ for(const secret of ['wrong',m.secret])assert.equal((await app.call(path,'DELETE',undefined,secret)).status,401);
+ assert.equal((await app.call(path,'DELETE')).status,200);assert.equal((await app.chat(m.secret)).status,401);
+ for(const method of ['DELETE','PATCH'])assert.equal((await app.call(path,method,method==='PATCH'?{enabled:true}:undefined)).status,404);
+ const after=app.store.snapshot();assert.deepEqual(after.totals,before.totals);assert.equal(after.members[0].used,before.members[0].used);assert.ok(!after.keys.some(k=>k.id===m.keyId));assert.ok(after.requests[0].key_removed_at);assert.equal(after.requests[0].key_prefix,m.secret.slice(0,11));
+ assert.equal(app.store.get('SELECT used FROM keys WHERE id=?',m.keyId).used,70);assert.equal(app.store.get("SELECT COUNT(*) n FROM audit WHERE action='key.remove' AND detail=?",m.keyId).n,1);
+ assert.equal((await app.chat(sibling.secret)).status,200);
+ // Simulate a legacy version re-enabling the row: the original digest stays revoked.
+ app.store.run('UPDATE keys SET enabled=1 WHERE id=?',m.keyId);assert.notEqual(app.store.get('SELECT digest FROM keys WHERE id=?',m.keyId).digest.length,64);
+ const restarted=new Store(app.store.get('PRAGMA database_list').file);try{assert.throws(()=>restarted.authenticate(m.secret),/Key 无效/);}finally{restarted.close();}
+});
+test('Key deletion waits for admitted and running requests before revocation',{timeout:5000},async t=>{
+ let quotaReady,releaseQuota,runReady,releaseRun;const quotaEntered=new Promise(r=>quotaReady=r),quotaGate=new Promise(r=>releaseQuota=r),runEntered=new Promise(r=>runReady=r),runGate=new Promise(r=>releaseRun=r);
+ const app=await setup(t,async()=>{runReady();await runGate;return {text:'ok',input:1,output:1,cached:0,threadId:'fixture'};},async()=>{quotaReady();await quotaGate;return rates(0);}),m=app.member(null),path='/api/admin/keys/'+m.keyId;
+ const pending=app.chat(m.secret);
+ try{await quotaEntered;assert.equal((await app.call(path,'DELETE')).status,409);releaseQuota();await runEntered;assert.equal((await app.call(path,'DELETE')).status,409);}
+ finally{releaseQuota();releaseRun();await pending;}
+ assert.equal((await app.call(path,'DELETE')).status,200);
+});
+test('deleting a Key retains unknown reservations and permits later audited settlement',async t=>{
+ const app=await setup(t),m=app.member(null),r=app.store.reserve(app.store.authenticate(m.secret),'fixture','fixture',100,'codex');
+ assert.equal((await app.call('/api/admin/keys/'+m.keyId,'DELETE')).status,409);
+ app.store.finish(r,{status:'unknown',usageKnown:false});
+ assert.equal((await app.call('/api/admin/keys/'+m.keyId,'DELETE')).status,200);assert.equal(app.store.snapshot().totals.reserved,100);
+ assert.equal((await app.call('/api/admin/requests/'+r+'/settle','POST',{tokens:12})).status,200);assert.equal(app.store.get('SELECT used FROM keys WHERE id=?',m.keyId).used,12);assert.equal(app.store.snapshot().totals.reserved,0);
+});
+test('removing an employee hides the row, revokes every Key and preserves history',async t=>{
+ const app=await setup(t),m=app.member(null),other=app.member(null),sibling=app.store.createKey(m.memberId),path='/api/admin/members/'+m.memberId;
+ await app.chat(m.secret);const known=app.store.authenticate(sibling.secret),r=app.store.reserve(known,'fixture','fixture',100,'codex');app.store.finish(r,{status:'unknown',usageKnown:false});const before=app.store.snapshot().totals;
+ for(const secret of ['wrong',m.secret])assert.equal((await app.call(path,'DELETE',undefined,secret)).status,401);
+ assert.equal((await app.call(path,'DELETE')).status,200);
+ const after=app.store.snapshot();assert.deepEqual(after.totals,before);assert.equal(after.members.length,1);assert.equal(after.members[0].id,other.memberId);assert.ok(!after.keys.some(k=>k.member_id===m.memberId));assert.equal(after.requests.length,2);assert.ok(after.requests.every(r=>r.member_name==='Test user'));assert.equal(after.sessions[0].state,'uncertain');
+ for(const key of [m,sibling])assert.equal((await app.call('/api/me','GET',undefined,key.secret)).status,401);
+ assert.equal((await app.call(path,'PATCH',{enabled:true})).status,404);assert.equal((await app.call(path,'DELETE')).status,404);assert.equal((await app.call('/api/admin/keys','POST',{memberId:m.memberId,expires:null})).status,404);assert.throws(()=>app.store.reserve(known,'fixture','fixture',100,'codex'),/停用/);
+ assert.equal(app.store.get("SELECT COUNT(*) n FROM keys WHERE member_id=? AND (enabled<>0 OR removed_at IS NULL OR digest NOT LIKE 'removed:%')",m.memberId).n,0);
+ assert.equal((await app.call('/api/admin/requests/'+r+'/settle','POST',{tokens:12})).status,200);assert.equal(app.store.get('SELECT used FROM members WHERE id=?',m.memberId).used,82);assert.equal((await app.chat(other.secret)).status,200);
+ const restarted=new Store(app.store.get('PRAGMA database_list').file);try{assert.equal(restarted.snapshot().members.length,1);assert.throws(()=>restarted.authenticate(m.secret),/Key 无效/);}finally{restarted.close();}
+});
+test('employee removal rejects preparing, running and queued work',{timeout:5000},async t=>{
+ let entered,release;const ready=new Promise(r=>entered=r),gate=new Promise(r=>release=r);
+ const app=await setup(t,undefined,async()=>{entered();await gate;return rates(0);}),m=app.member(null),path='/api/admin/members/'+m.memberId;const pending=app.chat(m.secret);
+ try{await ready;assert.equal((await app.call(path,'DELETE')).status,409);}finally{release();await pending;}
+ const r=app.store.reserve(app.store.authenticate(m.secret),'fixture','fixture',100,'codex');assert.equal((await app.call(path,'DELETE')).status,409);app.store.run("UPDATE requests SET status='running' WHERE id=?",r);assert.equal((await app.call(path,'DELETE')).status,409);app.store.finish(r,{status:'cancelled'});assert.equal((await app.call(path,'DELETE')).status,200);
+});
 test('SSE-compatible final response and authenticated model list',async t=>{const {base,member,call}=await setup(t);const m=member();const r=await fetch(base+'/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+m.secret,'Content-Type':'application/json'},body:JSON.stringify({messages:[{role:'user',content:'Hi'}],stream:true})});assert.equal(r.status,200);assert.match(r.headers.get('content-type'),/event-stream/);assert.match(await r.text(),/data: \[DONE\]/);assert.equal((await call('/v1/models','GET',undefined,m.secret)).body.data[0].id,'codex');});
 test('database backup and audit entries',async t=>{const {call,store}=await setup(t);const r=await call('/api/admin/backup','POST',{});assert.equal(r.status,200);assert.match(r.body.file,/^data\/backups\/gateway-/);assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='backup.create'").n,1);});
-const rates=used=>({rateLimits:{primary:{usedPercent:used,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}});
+// Keep the same upstream reset window throughout a test, including across seconds.
+const rateResetAt=Math.floor(Date.now()/1000)+18000;
+const rates=used=>({rateLimits:{primary:{usedPercent:used,windowDurationMins:300,resetsAt:rateResetAt}}});
 test('new sessions select largest remaining quota rather than first or least-used account',async t=>{const {member,chat,store}=await setup(t,undefined,async(_,home)=>rates(home==='second'?10:80));store.run("INSERT INTO accounts(id,name,home,state,last_used) VALUES('two','Full account','second','ready',9999999999999)");const r=await chat(member().secret);assert.equal(r.status,200);assert.equal(store.get('SELECT account_id FROM sessions WHERE id=?',r.body.session_id).account_id,'two');});
 test('session pins account and resumes exact upstream thread despite a fuller new account',async t=>{const seen=[];const {member,chat,store}=await setup(t,async args=>{seen.push({home:args.home,sessionId:args.sessionId,messages:args.messages});return {text:'reply',input:10,output:2,cached:0,threadId:args.sessionId||'upstream-pinned'};});const m=member();const first=await chat(m.secret);store.run("INSERT INTO accounts(id,name,home,state) VALUES('two','Other','second','ready')");const second=await chat(m.secret,{session_id:first.body.session_id});assert.equal(second.status,200);assert.equal(second.body.session_id,first.body.session_id);assert.equal(seen[1].home,'unused');assert.equal(seen[1].sessionId,'upstream-pinned');assert.equal(store.get('SELECT COUNT(*) n FROM sessions').n,1);});
 test('exhausted bound account pauses existing session while new session can use another account',async t=>{const {member,chat,store}=await setup(t);const m=member();const first=await chat(m.secret);store.run('UPDATE accounts SET quota_json=? WHERE id=?',JSON.stringify(normalizeLimits(rates(100))),'one');store.run("INSERT INTO accounts(id,name,home,state) VALUES('two','Other','second','ready')");const paused=await chat(m.secret,{session_id:first.body.session_id});assert.equal(paused.status,429);assert.equal(paused.body.error.type,'session_quota_exhausted');const next=await chat(m.secret);assert.equal(next.status,200);assert.equal(store.get('SELECT account_id FROM sessions WHERE id=?',next.body.session_id).account_id,'two');});
@@ -189,4 +259,93 @@ test('restarting queued requests releases quota and preserves an existing active
  assert.equal(s.get('SELECT status FROM requests').status,'cancelled');assert.equal(s.get('SELECT reserved FROM requests').reserved,0);assert.equal(s.get('SELECT state FROM sessions').state,'active');
  assert.doesNotThrow(()=>s.reserve(s.authenticate(m.secret),'ip','test',100,'codex'));
  }finally{s.close();cleanup(dir);}
+});
+
+function pendingLogin(){
+  let complete;const completed=new Promise(resolve=>complete=resolve);
+  return {challenge:Promise.resolve({type:'device',verificationUrl:'https://auth.openai.com/codex/device',userCode:'TEST-ONLY'}),completed,complete,cancel(){complete({success:false,message:'登录已取消'});}};
+}
+async function until(predicate){const end=Date.now()+2000;while(!predicate()){assert.ok(Date.now()<end,'condition timed out');await new Promise(setImmediate);}}
+test('device challenge is private, survives repeated clicks and can be cancelled then retried',async t=>{
+  const flows=[];const app=await setup(t,undefined,undefined,{loginStarter:()=>{const flow=pendingLogin();flows.push(flow);return flow;}});
+  const path='/api/admin/accounts/one/login';assert.equal((await app.call(path,'POST',{},'wrong')).status,401);
+  const start=await app.call(path,'POST',{});assert.equal(start.status,200);assert.equal(start.body.userCode,'TEST-ONLY');
+  assert.equal((await app.call(path,'POST',{})).body.userCode,'TEST-ONLY');assert.equal(flows.length,1);
+  assert.equal((await app.call(path)).body.userCode,'TEST-ONLY');assert.equal((await app.call(path,'GET',undefined,app.member().secret)).status,401);
+  assert.ok(!JSON.stringify((await app.call('/api/admin/state')).body).includes('TEST-ONLY'));
+  assert.equal((await app.call(path+'/cancel','POST',{})).status,200);assert.equal((await app.call(path)).body.state,'offline');assert.equal((await app.call(path)).body.userCode,undefined);
+  await app.call(path,'POST',{});assert.equal(flows.length,2);flows[1].complete({success:true});await until(()=>app.store.get('SELECT state FROM accounts WHERE id=?','one').state==='ready');
+});
+test('login startup errors return a failure and leave the account retryable',async t=>{
+  const app=await setup(t,undefined,undefined,{loginStarter:()=>({challenge:Promise.reject(Error('设备授权不可用')),completed:Promise.resolve({success:false,message:'设备授权不可用'}),cancel(){}})});
+  const r=await app.call('/api/admin/accounts/one/login','POST',{});assert.equal(r.status,502);assert.match(r.body.error.message,/不可用/);assert.equal(app.store.get('SELECT state FROM accounts').state,'offline');
+});
+test('removing an account hides it and keeps accounting, history, other accounts and directories',async t=>{
+  const app=await setup(t);const m=app.member(null),first=await app.chat(m.secret);const used=app.store.get('SELECT used FROM members').used;
+  const created=await app.call('/api/admin/accounts','POST',{name:'Second',kind:'codex'});const path='/api/admin/accounts/one';
+  assert.equal((await app.call(path,'DELETE',undefined,'wrong')).status,401);assert.equal((await app.call(path,'DELETE',undefined,m.secret)).status,401);
+  assert.equal((await app.call(path,'DELETE')).status,200);const a=app.store.get('SELECT * FROM accounts WHERE id=?','one');assert.equal(a.enabled,0);assert.equal(a.state,'removed');assert.ok(a.removed_at);
+  const state=app.store.snapshot();assert.deepEqual(state.accounts.map(x=>x.id),[created.body.id]);assert.equal(state.requests.length,1);assert.equal(state.sessions[0].account_name,'Test');assert.equal(app.store.get('SELECT used FROM members').used,used);
+  const home=app.store.get('SELECT home FROM accounts WHERE id=?',created.body.id).home;writeFileSync(join(home,'fixture-history.txt'),'test-only-history');await app.call('/api/admin/accounts/'+created.body.id,'DELETE');assert.ok(existsSync(join(home,'fixture-history.txt')));
+  assert.equal(app.store.get('SELECT state FROM sessions WHERE id=?',first.body.session_id).state,'uncertain');
+  for(const [suffix,method,b] of [['','PATCH',{enabled:true}],['/login','POST',{}],['/check','POST',{}],['/quota','POST',{}],['','DELETE',undefined]])assert.equal((await app.call(path+suffix,method,b)).status,404);
+  assert.equal((await app.chat(m.secret)).status,503);
+});
+test('removal rejects running and queued work before changing the account',async t=>{
+  let release;const app=await setup(t,()=>new Promise(resolve=>release=()=>resolve({text:'ok',input:1,output:1,cached:0})));const running=app.chat(app.member(null).secret);await until(()=>release);
+  const queued=app.chat(app.member(null).secret);await until(()=>app.store.get("SELECT COUNT(*) n FROM requests WHERE status='queued'").n===1);
+  assert.equal((await app.call('/api/admin/accounts/one','DELETE')).status,409);assert.equal(app.store.get('SELECT removed_at FROM accounts').removed_at,null);
+  release();await running;await until(()=>app.store.get("SELECT COUNT(*) n FROM requests WHERE status='running'").n===1);release();await queued;
+  assert.equal((await app.call('/api/admin/accounts/one','DELETE')).status,200);
+});
+test('removing a login and late authentication/quota responses cannot restore removed accounts',async t=>{
+  const flow=pendingLogin();let releaseCheck,releaseQuota;const app=await setup(t,undefined,async()=>new Promise(resolve=>releaseQuota=()=>resolve(rates(0))),{checker:()=>new Promise(resolve=>releaseCheck=resolve),loginStarter:()=>flow});
+  const check=app.call('/api/admin/accounts/one/check','POST',{});await until(()=>releaseCheck);
+  const quota=app.call('/api/admin/accounts/one/quota','POST',{});await until(()=>releaseQuota);
+  await app.call('/api/admin/accounts/one/login','POST',{});assert.equal((await app.call('/api/admin/accounts/one','DELETE')).status,200);
+  releaseCheck(true);releaseQuota();assert.equal((await check).status,409);await quota;await flow.completed;
+  const account=app.store.get('SELECT * FROM accounts');assert.equal(account.state,'removed');assert.equal(account.quota_json,null);assert.equal(app.store.snapshot().accounts.length,0);
+});
+test('restarting interrupts pending authorization without exposing an expired challenge',()=>{
+  const dir=temp(),db=join(dir,'s.sqlite');try{let s=new Store(db);s.run("INSERT INTO accounts(id,name,home,state) VALUES('login','Login','unused','login')");s.close();s=new Store(db);assert.equal(s.get('SELECT state FROM accounts').state,'offline');assert.match(s.get('SELECT last_error FROM accounts').last_error,/重启/);s.close();}finally{cleanup(dir);}
+});
+
+test('admin snapshots automatically refresh stale quotas, coalesce readers and throttle failures',async t=>{
+ let reads=0,release;const app=await setup(t,undefined,async()=>{reads++;await new Promise(r=>release=r);throw Error('Fixture unavailable');});
+ app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',JSON.stringify({...normalizeLimits(rates(25)),checked:Date.now()-600000}),'one');
+ const first=await app.call('/api/admin/state');assert.equal(first.status,200);assert.equal(reads,1);
+ await app.call('/api/admin/state');assert.equal(reads,1);release();await new Promise(setImmediate);
+ await app.call('/api/admin/state');assert.equal(reads,1);assert.equal(JSON.parse(app.store.get('SELECT quota_json FROM accounts').quota_json).remaining,75);
+ assert.match(app.store.get('SELECT quota_error FROM accounts').quota_error,/Fixture/);
+});
+test('successful official quota read recovers prior transient degraded status without a model request',async t=>{
+ const app=await setup(t);app.store.run("UPDATE accounts SET state='degraded',last_error='old transient' WHERE id='one'");
+ assert.equal((await app.call('/api/admin/accounts/one/quota','POST',{})).status,200);
+ assert.equal(app.store.get('SELECT state,last_error FROM accounts').state,'ready');assert.equal(app.store.get('SELECT last_error FROM accounts').last_error,null);
+});
+test('Key and employee removal erase encrypted secrets permanently',async t=>{
+ const app=await setup(t),m=app.member(),other=app.store.createKey(m.memberId);
+ await app.call('/api/admin/keys/'+m.keyId,'DELETE');assert.equal(app.store.get('SELECT secret_cipher FROM keys WHERE id=?',m.keyId).secret_cipher,null);
+ await app.call('/api/admin/members/'+m.memberId,'DELETE');assert.equal(app.store.get('SELECT secret_cipher FROM keys WHERE id=?',other.keyId).secret_cipher,null);
+});
+test('me, IP and export statistics share the same Beijing seven-day window',async t=>{
+ const app=await setup(t),m=app.member(null);await app.chat(m.secret);const w=app.store.snapshot().usageWindow;
+ const old=app.store.observe(app.store.authenticate(m.secret),'old-fixture-ip','fixture','codex');app.store.run("UPDATE requests SET started=?,ended=?,status='ok',input=9000 WHERE id=?",w.start-100,w.start-1,old);
+ const me=await app.call('/api/me','GET',undefined,m.secret);assert.equal(me.body.keyUsed,70);assert.equal(me.body.used,70);
+ const ips=await app.call('/api/admin/ips?member='+m.memberId);assert.equal(ips.body.length,1);assert.equal(ips.body[0].requests,1);
+ const exportResult=await fetch(app.base+'/api/admin/export',{headers:{Authorization:'Bearer test-admin'}});assert.ok(!(await exportResult.text()).includes('old-fixture-ip'));
+});
+
+test('idle maintenance refreshes enabled connected accounts and stops on shutdown',async t=>{
+ t.mock.timers.enable({apis:['Date','setInterval'],now:Date.now()});let reads=0;
+ const app=await setup(t,undefined,async()=>{reads++;return {rateLimits:{primary:{usedPercent:20,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}};});
+ app.store.run("INSERT INTO accounts(id,name,home,state,enabled) VALUES('disabled','Fixture','unused','ready',0),('offline','Fixture','unused','offline',1)");
+ assert.equal(reads,0);t.mock.timers.tick(30001);await new Promise(setImmediate);assert.equal(reads,1);
+ assert.equal(JSON.parse(app.store.get("SELECT quota_json FROM accounts WHERE id='one'").quota_json).remaining,80);
+ await app.close();t.mock.timers.tick(60000);await new Promise(setImmediate);assert.equal(reads,1);
+});
+test('gateway restart retains its encryption key and decrypted Key without raw storage',async t=>{
+ const app=await setup(t),m=app.member();await app.close();
+ const restarted=createGateway({dataDir:app.data,runtimeDir:app.runtime,config:app.config});
+ try{assert.equal(restarted.store.snapshot().keys[0].full_key,m.secret);assert.ok(!JSON.stringify(restarted.store.all('SELECT * FROM keys')).includes(m.secret));}finally{await restarted.close();}
 });

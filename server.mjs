@@ -5,12 +5,15 @@ import {passwordHash,createAdminAuth} from './auth.mjs';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { Store, AppError, id, now, hash } from './store.mjs';
+import { Store, AppError, id, now, hash, usageWindow } from './store.mjs';
 import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
 import {runClaude,checkClaudeLogin,claudeEnv} from './claude.mjs';
+import {networkConfig,acceptsRequest} from './network.mjs';
+import {startCodexLogin,startLocalLogin} from './account-login.mjs';
+import {readJsonBody,responseBodyBytes} from './request-body.mjs';
+import {createResponsesTransport,validateResponses} from './responses.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
 function integer(value,label,{nullable=false,min=0,max=1e12}={}) {
@@ -22,11 +25,7 @@ function expiry(value){return integer(value,'到期时间',{nullable:true,max:9e
 function bool(value){if(typeof value!=='boolean')throw new AppError(400,'状态无效');return value?1:0;}
 function equals(a,b){const x=Buffer.from(a||''),y=Buffer.from(b||'');return x.length===y.length&&timingSafeEqual(x,y);}
 const json=(res,status,body)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(body));};
-async function body(req){
-  if(!String(req.headers['content-type']||'').startsWith('application/json'))throw new AppError(415,'请使用 application/json');
-  let size=0,chunks=[];for await(const chunk of req){size+=chunk.length;if(size>128*1024)throw new AppError(413,'请求超过 128 KB');chunks.push(chunk);}
-  try{const value=JSON.parse(Buffer.concat(chunks).toString());if(!value||typeof value!=='object'||Array.isArray(value))throw Error();return value;}catch{throw new AppError(400,'请求必须是 JSON 对象');}
-}
+const body=req=>readJsonBody(req);
 const codexBinFolder=()=>join(process.env.LOCALAPPDATA||join(homedir(),'AppData','Local'),'OpenAI','Codex','bin');
 function discoverCodex(folder=codexBinFolder()){
   if(existsSync(folder))for(const sub of readdirSync(folder).reverse()){const p=join(folder,sub,'codex.exe');if(existsSync(p))return p;}
@@ -41,7 +40,8 @@ export function recoverCodexBinary(binary,folder=codexBinFolder()){
   return binary;
 }
 export function createGateway(options={}) {
-  const data=resolve(options.dataDir||join(root,'data')),runtime=resolve(options.runtimeDir||join(root,'runtime'));
+  const network=networkConfig(options.env||process.env);
+  const data=resolve(options.dataDir||process.env.HARBOR_DATA_DIR||join(root,'data')),runtime=resolve(options.runtimeDir||process.env.HARBOR_RUNTIME_DIR||join(root,'runtime'));
   mkdirSync(data,{recursive:true});mkdirSync(runtime,{recursive:true});
   const configPath=join(data,'settings.json');
   let config=options.config;
@@ -56,25 +56,34 @@ export function createGateway(options={}) {
   if(!config.adminPasswordHash&&!options.config){
     const password='Hbr!'+randomBytes(24).toString('base64url');
     config.adminPasswordHash=passwordHash(password);
-    writeFileSync(join(root,'管理密码.txt'),'Harbor 管理密码（请勿分享）\r\n\r\n'+password+'\r\n\r\n打开 http://127.0.0.1:'+config.port+'/ 输入密码，无需账号。\r\n可让浏览器密码管理器保存。此文件是本机找回副本，请勿公开。\r\n');
+    writeFileSync(join(process.env.HARBOR_DATA_DIR?data:root,'管理密码.txt'),'Harbor 管理密码（请勿分享）\r\n\r\n'+password+'\r\n\r\n打开 '+(network.origins[0]||'http://127.0.0.1:'+(network.port||config.port))+'/ 输入密码，无需账号。\r\n可让浏览器密码管理器保存。此文件是本机找回副本，请勿公开。\r\n',{mode:0o600});
     writeFileSync(configPath,JSON.stringify(config,null,2));
   }
   const adminAuth=createAdminAuth(config);
-  const store=new Store(join(data,'gateway.sqlite'));
+  const encryptionPath=join(data,'key-encryption.key');
+  if(!existsSync(encryptionPath))writeFileSync(encryptionPath,randomBytes(32),{mode:0o600,flag:'wx'});
+  const encryptionKey=readFileSync(encryptionPath);
+  if(encryptionKey.length!==32)throw Error('Key encryption key invalid');
+  const store=new Store(join(data,'gateway.sqlite'),{encryptionKey});
   const executor=options.executor||runCodex, checker=options.checker||checkLogin,rateReader=options.rateReader||readRateLimits;
+  const responses=options.responsesTransport||createResponsesTransport();
   const claudeBinary=config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe');
   const provider=a=>a.kind==='claude'?{binary:claudeBinary,run:options.claudeExecutor||runClaude,check:options.claudeChecker||checkClaudeLogin,env:claudeEnv,loginArgs:['auth','login']}:{binary:config.codexBinary,run:executor,check:checker,env:runnerEnv,loginArgs:['login',...codexAuthArgs()]};
-  const busy=new Set(),queue=[],controllers=new Set(),logins=new Map(),tasks=new Set(),admittedMembers=new Set();let stopping=false;
-  const quotaReads=new Map(),authVersions=new Map();
+  const busy=new Map(),responseMembers=new Map(),queue=[],controllers=new Set(),logins=new Map(),tasks=new Set(),admittedMembers=new Set();let stopping=false;
+  const quotaReads=new Map(),quotaAttempts=new Map(),authVersions=new Map();
+  const loginTasks=new Set();
   async function refreshQuota(account,force=false){
+    if(stopping||!account||account.removed_at!==null||!account.enabled||!['ready','degraded'].includes(account.state))return;
     if(account.kind==='claude'){store.run('UPDATE accounts SET quota_error=? WHERE id=?','Claude 官方 CLI 暂无已验证的额度查询；使用本地 Token 预算估算',account.id);return;}
     if(quotaReads.has(account.id))return quotaReads.get(account.id);
     let previous=null;try{previous=JSON.parse(account.quota_json);}catch{}
     if(!force&&previous&&previous.checked>now()-30000&&!previous.windows.some(w=>w.reset&&w.reset<=now()))return;
+    if(!force&&(quotaAttempts.get(account.id)||0)>now()-30000)return;
+    quotaAttempts.set(account.id,now());
     const beforeUsed=account.budget_used||0,authVersion=authVersions.get(account.id)||0;
     const pending=(async()=>{
       try{
-        const data=normalizeLimits(await rateReader(config.codexBinary,account.home));if(!data)throw Error('官方额度暂不可用，请设置本地预算后再测试');
+        const data=normalizeLimits(await rateReader(config.codexBinary,account.home));if(!data)throw Error('官方未返回可用额度窗口，稍后将自动重试');
         if(stopping||(authVersions.get(account.id)||0)!==authVersion)return;
         const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);let perPercent=current.tokens_per_percent;
         const windowId=data.windows.map(w=>w.reset).join(',');
@@ -85,10 +94,15 @@ export function createGateway(options={}) {
           if(spend>0)perPercent=Math.max(100,Math.min(1e7,spend/(baseline.remaining-data.remaining)));
           baseline={windowId,remaining:data.remaining,used:beforeUsed};
         }
-        store.run('UPDATE accounts SET quota_json=?,quota_error=NULL,since_check_tokens=?,tokens_per_percent=?,quota_calibration=? WHERE id=?',JSON.stringify(data),Math.max(0,current.budget_used-beforeUsed),perPercent,JSON.stringify(baseline),account.id);
+        store.run("UPDATE accounts SET state='ready',last_error=NULL,quota_json=?,quota_error=NULL,since_check_tokens=?,tokens_per_percent=?,quota_calibration=? WHERE id=?",JSON.stringify(data),Math.max(0,current.budget_used-beforeUsed),perPercent,JSON.stringify(baseline),account.id);
       }catch(e){if(!stopping&&(authVersions.get(account.id)||0)===authVersion)store.run('UPDATE accounts SET quota_error=? WHERE id=?',e.message,account.id);}
     })().finally(()=>quotaReads.delete(account.id));quotaReads.set(account.id,pending);return pending;
   }
+  function refreshQuotas(){
+    if(stopping)return;
+    for(const account of store.all("SELECT * FROM accounts WHERE enabled=1 AND removed_at IS NULL AND kind='codex' AND state IN ('ready','degraded')"))void refreshQuota(account);
+  }
+  const maintenance=setInterval(()=>{store.pruneUsage();refreshQuotas();},30000);maintenance.unref();
   function expectedTokens(messages){const avg=store.get("SELECT AVG(input+output) n FROM (SELECT input,output FROM requests WHERE status='ok' ORDER BY started DESC LIMIT 10)").n||10000;return Math.ceil(Math.max(10000,avg,JSON.stringify(messages).length/2+9000));}
   function capacity(account,predicted,exclude=''){
     const pending=store.get("SELECT COALESCE(SUM(predicted),0) n FROM requests WHERE account_id=? AND id<>? AND status IN ('queued','running','unknown','interrupted')",account.id,exclude).n;
@@ -103,6 +117,7 @@ export function createGateway(options={}) {
     if(sessionId){
       if(typeof sessionId!=='string'||sessionId.length>80)throw new AppError(400,'session_id 格式错误');
       let session=store.get('SELECT * FROM sessions WHERE id=? AND member_id=?',sessionId,member.id);if(!session)throw new AppError(404,'会话不存在或不属于该员工');
+      if(session.protocol!=='chat')throw new AppError(409,'会话协议不匹配','session_protocol_mismatch');
       if(session.state==='uncertain')throw new AppError(409,'此会话的上次调用状态不确定，请创建新会话','session_uncertain');
       const account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
       if(account.kind!==kind)throw new AppError(409,'会话已绑定另一种模型，请创建新会话','session_provider_mismatch');
@@ -125,13 +140,21 @@ export function createGateway(options={}) {
   }
   const authAdmin=req=>{const bearer=typeof config.adminToken==='string'&&config.adminToken.length>0&&equals(req.headers.authorization,'Bearer '+config.adminToken);if(!adminAuth.authenticated(req)&&!bearer)throw new AppError(401,'请先输入管理密码登录','admin_required');};
   const employee=req=>store.authenticate((req.headers.authorization||'').replace(/^Bearer /,''));
+  function startJob(job,account){
+    busy.set(account.id,(busy.get(account.id)||0)+1);
+    const task=execute(job,account);tasks.add(task);
+    void task.finally(()=>{tasks.delete(task);const left=busy.get(account.id)-1;if(left)busy.set(account.id,left);else busy.delete(account.id);pump();}).catch(e=>console.error('[worker]',e.message));
+  }
+  function responseAccount(){
+    const account=store.get("SELECT * FROM accounts WHERE kind='codex' AND enabled=1 AND removed_at IS NULL AND state IN ('ready','degraded') ORDER BY last_used,id LIMIT 1");
+    if(!account)throw new AppError(503,'没有已登录的可用账号','no_account');
+    return account;
+  }
   function pump(){
     if(stopping)return;
     while(queue.length){
       const index=queue.findIndex(job=>!busy.has(job.session.account_id));if(index===-1)return;
-      const [job]=queue.splice(index,1),account=store.get('SELECT * FROM accounts WHERE id=?',job.session.account_id);clearTimeout(job.queueTimer);busy.add(account.id);
-      const task=execute(job,account);tasks.add(task);
-      void task.finally(()=>{tasks.delete(task);busy.delete(account.id);pump();}).catch(e=>console.error('[worker]',e.message));
+      const [job]=queue.splice(index,1),account=store.get('SELECT * FROM accounts WHERE id=?',job.session.account_id);clearTimeout(job.queueTimer);startJob(job,account);
     }
   }
   async function execute(job,account){
@@ -139,16 +162,27 @@ export function createGateway(options={}) {
     if(controller.signal.aborted){store.finish(requestId,{status:'cancelled',error:'排队期间取消'});reject(new AppError(499,'请求已取消'));return;}
     try{
       const currentMember=store.authenticate(secret);
+      if(!job.responses){
       const held=store.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE member_id=? AND id<>?",currentMember.id,requestId).n;
       const heldKey=store.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE key_id=? AND id<>?",currentMember.key_id,requestId).n;
       if(currentMember.quota!==null&&currentMember.used+held>=currentMember.quota)throw new AppError(429,'排队期间员工额度已耗尽','quota_exceeded');
       if(currentMember.key_quota!==null&&currentMember.key_used+heldKey>=currentMember.key_quota)throw new AppError(429,'排队期间 Key 额度已耗尽','key_quota_exceeded');
+      }
     }catch(e){store.finish(requestId,{status:'rejected',error:e.message});reject(e);return;}
     const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
-    if(!current.enabled||!['ready','degraded'].includes(current.state)||!capacity(current,predicted,requestId).eligible){store.finish(requestId,{status:'rejected',error:'绑定账号不可用或预计额度不足'});reject(new AppError(429,'绑定账号不可用或预计额度不足；会话不会换号'));return;}
+    if(!current.enabled||current.removed_at||!['ready','degraded'].includes(current.state)){store.finish(requestId,{status:'rejected',error:'绑定账号不可用'});reject(new AppError(503,'绑定账号不可用','session_account_unavailable'));return;}
+    if(!job.responses&&!capacity(current,predicted,requestId).eligible){store.finish(requestId,{status:'rejected',error:'绑定账号预计额度不足'});reject(new AppError(429,'绑定账号预计额度不足；会话不会换号'));return;}
     store.run("UPDATE requests SET status='running',account_id=? WHERE id=?",account.id,requestId);
     store.run('UPDATE accounts SET last_used=? WHERE id=?',now(),account.id);
     try{
+      if(job.responses){
+        const result=await responses.run({binary:config.codexBinary,home:account.home,payload:job.responses,sessionId:session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,onEvent:job.onEvent});
+        store.finish(requestId,result,()=>{
+          store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
+          store.run("UPDATE sessions SET state='active',updated=? WHERE id=?",now(),session.id);
+        });
+        complete(result);void refreshQuota(store.get('SELECT * FROM accounts WHERE id=?',account.id));return;
+      }
       const upstream=provider(account);
       const result=await upstream.run({binary:upstream.binary,home:account.home,workspace:join(runtime,'jobs',session.id),messages,model,sessionId:session.upstream_id,previousUsage:{input:session.cum_input||0,output:session.cum_output||0,cached:session.cum_cached||0},signal:controller.signal});
       store.finish(requestId,result,()=>{
@@ -162,11 +196,17 @@ export function createGateway(options={}) {
     }catch(e){
       const known=e.usageKnown===true;
       store.finish(requestId,{input:e.input||0,output:e.output||0,cached:e.cached||0,status:known?'failed':'unknown',error:e.message,usageKnown:known},()=>{
+        if(job.responses){
+          if(e.code==='upstream_authentication')store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
+          store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',(e.input||0)+(e.output||0),(e.input||0)+(e.output||0),account.id);
+          if(!known)store.run("UPDATE sessions SET state='uncertain',updated=? WHERE id=?",now(),session.id);
+          return;
+        }
         store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
         store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',(e.input||0)+(e.output||0),(e.input||0)+(e.output||0),account.id);
         store.run("UPDATE sessions SET state='uncertain',upstream_id=COALESCE(?,upstream_id),updated=? WHERE id=?",e.threadId||null,now(),session.id);
       });
-      reject(new AppError(502,e.message,'upstream_error'));
+      reject(job.responses&&e.status?e:new AppError(502,e.message,'upstream_error'));
     }
   }
   async function handler(req,res){
@@ -174,8 +214,7 @@ export function createGateway(options={}) {
     res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     try{
       const host=req.headers.host||'';
-      if(!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host))throw new AppError(403,'本机服务不接受此 Host');
-      if(req.headers.origin && !['http://'+host].includes(req.headers.origin))throw new AppError(403,'不允许跨站请求');
+      if(!acceptsRequest(req.headers,network))throw new AppError(403,'不允许此 Host 或跨站请求');
       const url=new URL(req.url,'http://localhost'),path=url.pathname,method=req.method;
       if(method==='GET'&&['/','/app.js','/style.css'].includes(path)){
         const file=path==='/'?'index.html':path.slice(1);res.setHeader('Content-Type',file.endsWith('html')?'text/html; charset=utf-8':file.endsWith('js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8');return res.end(readFileSync(join(root,'public',file)));
@@ -189,19 +228,39 @@ export function createGateway(options={}) {
         if(path==='/api/admin/shutdown'&&method==='POST'){
           json(res,202,{ok:true});setTimeout(()=>void close().then(()=>options.onStopped?.()),50);return;
         }
-        if(path==='/api/admin/state'&&method==='GET')return json(res,200,{...store.snapshot(),queue:queue.length,busy:busy.size,endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});
+        if(path==='/api/admin/state'&&method==='GET'){refreshQuotas();return json(res,200,{...store.snapshot(),queue:queue.length,busy:[...busy.values()].reduce((a,b)=>a+b,0),preparing:[...responseMembers.values()].reduce((a,b)=>a+b,0),endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});}
         if(path==='/api/admin/members'&&method==='POST'){
           const b=await body(req);return json(res,201,store.createMember(name(b.name),integer(b.quota,'额度',{nullable:true}),expiry(b.expires)));
         }
         const memberMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
+        if(memberMatch&&method==='DELETE'){
+          const m=store.get('SELECT * FROM members WHERE id=? AND removed_at IS NULL',memberMatch[1]);if(!m)throw new AppError(404,'员工不存在或已移除');
+          if((admittedMembers.has(m.id)||responseMembers.has(m.id))||store.get("SELECT id FROM requests WHERE member_id=? AND status IN ('queued','running')",m.id))throw new AppError(409,'该员工仍有请求正在准备、排队或处理，请完成后再移除');
+          store.db.exec('BEGIN IMMEDIATE');try{
+            const at=now();store.run('UPDATE members SET enabled=0,removed_at=? WHERE id=?',at,m.id);
+            store.run("UPDATE keys SET enabled=0,secret_cipher=NULL,removed_at=COALESCE(removed_at,?),digest='removed:'||id WHERE member_id=?",at,m.id);
+            store.run("UPDATE sessions SET state='uncertain',updated=? WHERE member_id=?",at,m.id);
+            store.audit('member.remove',m.id);store.db.exec('COMMIT');
+          }catch(e){store.db.exec('ROLLBACK');throw e;}
+          return json(res,200,{ok:true});
+        }
         if(memberMatch&&method==='PATCH'){
-          const b=await body(req),m=store.get('SELECT * FROM members WHERE id=?',memberMatch[1]);if(!m)throw new AppError(404,'员工不存在');
+          const b=await body(req),m=store.get('SELECT * FROM members WHERE id=? AND removed_at IS NULL',memberMatch[1]);if(!m)throw new AppError(404,'员工不存在或已移除');
           store.run('UPDATE members SET name=?,quota=?,enabled=? WHERE id=?',b.name===undefined?m.name:name(b.name),b.quota===undefined?m.quota:integer(b.quota,'额度',{nullable:true}),b.enabled===undefined?m.enabled:bool(b.enabled),m.id);store.audit('member.update',m.id);return json(res,200,{ok:true});
         }
         if(path==='/api/admin/keys'&&method==='POST'){const b=await body(req);return json(res,201,store.createKey(b.memberId,expiry(b.expires),b.quota===undefined?null:integer(b.quota,'Key 额度',{nullable:true})));}
         const keyMatch=path.match(/^\/api\/admin\/keys\/([a-f0-9-]+)$/);
+        if(keyMatch&&method==='DELETE'){
+          const k=store.get('SELECT * FROM keys WHERE id=? AND removed_at IS NULL',keyMatch[1]);if(!k)throw new AppError(404,'Key 不存在或已删除');
+          if((admittedMembers.has(k.member_id)||responseMembers.has(k.member_id))||store.get("SELECT id FROM requests WHERE key_id=? AND status IN ('queued','running')",k.id))throw new AppError(409,'该员工仍有请求正在准备、排队或处理，请完成后再删除');
+          store.db.exec('BEGIN IMMEDIATE');try{
+            // Tombstone the digest so rollback cannot reactivate the original credential.
+            store.run('UPDATE keys SET enabled=0,secret_cipher=NULL,removed_at=?,digest=? WHERE id=?',now(),'removed:'+k.id,k.id);store.audit('key.remove',k.id);store.db.exec('COMMIT');
+          }catch(e){store.db.exec('ROLLBACK');throw e;}
+          return json(res,200,{ok:true});
+        }
         if(keyMatch&&method==='PATCH'){
-          const b=await body(req),k=store.get('SELECT * FROM keys WHERE id=?',keyMatch[1]);if(!k)throw new AppError(404,'Key 不存在');
+          const b=await body(req),k=store.get('SELECT * FROM keys WHERE id=? AND removed_at IS NULL',keyMatch[1]);if(!k)throw new AppError(404,'Key 不存在或已删除');
           store.run('UPDATE keys SET enabled=?,expires=?,quota=? WHERE id=?',b.enabled===undefined?k.enabled:bool(b.enabled),b.expires===undefined?k.expires:expiry(b.expires),b.quota===undefined?k.quota:integer(b.quota,'Key 额度',{nullable:true}),k.id);store.audit('key.update',k.id);return json(res,200,{ok:true});
         }
         if(path==='/api/admin/accounts'&&method==='POST'){
@@ -210,9 +269,26 @@ export function createGateway(options={}) {
           store.run("INSERT INTO accounts(id,name,home,kind,state) VALUES(?,?,?,?,'offline')",accountId,name(b.name),home,kind);store.audit('account.create',accountId);return json(res,201,{id:accountId});
         }
         if(path==='/api/admin/quotas/refresh'&&method==='POST'){await Promise.all(store.all('SELECT * FROM accounts WHERE enabled=1').map(a=>refreshQuota(a,true)));return json(res,200,{ok:true});}
-        const accountMatch=path.match(/^\/api\/admin\/accounts\/([a-zA-Z0-9-]+)(?:\/(check|login|quota))?$/);
+        const accountMatch=path.match(/^\/api\/admin\/accounts\/([a-zA-Z0-9-]+)(?:\/(check|login|quota|login\/cancel))?$/);
         if(accountMatch){
-          const account=store.get('SELECT * FROM accounts WHERE id=?',accountMatch[1]);if(!account)throw new AppError(404,'账号不存在');
+          const account=store.get('SELECT * FROM accounts WHERE id=? AND removed_at IS NULL',accountMatch[1]);if(!account)throw new AppError(404,'账号不存在或已移除');
+          if(method==='DELETE'&&!accountMatch[2]){
+            if(busy.has(account.id)||queue.some(job=>job.session.account_id===account.id))throw new AppError(409,'账号有请求正在处理或排队，请完成后再移除');
+            store.db.exec('BEGIN IMMEDIATE');try{
+              store.run("UPDATE accounts SET enabled=0,state='removed',removed_at=? WHERE id=?",now(),account.id);
+              store.run("UPDATE sessions SET state='uncertain' WHERE account_id=?",account.id);store.audit('account.remove',account.id);store.db.exec('COMMIT');
+            }catch(e){store.db.exec('ROLLBACK');throw e;}
+            authVersions.set(account.id,(authVersions.get(account.id)||0)+1);
+            logins.get(account.id)?.flow.cancel();logins.delete(account.id);pump();return json(res,200,{ok:true});
+          }
+          if(method==='GET'&&accountMatch[2]==='login'){
+            const pending=logins.get(account.id);
+            return json(res,200,{state:account.state,message:account.last_error||'',...(pending?.challenge?{...pending.challenge,expiresAt:pending.expiresAt}:{})});
+          }
+          if(method==='POST'&&accountMatch[2]==='login/cancel'){
+            const pending=logins.get(account.id);if(pending){authVersions.set(account.id,(authVersions.get(account.id)||0)+1);pending.flow.cancel();logins.delete(account.id);store.run("UPDATE accounts SET state='offline',last_error='登录已取消' WHERE id=?",account.id);store.audit('account.login.cancel',account.id);pump();}
+            return json(res,200,{ok:true});
+          }
           if(method==='PATCH'&&!accountMatch[2]){const b=await body(req);store.run('UPDATE accounts SET enabled=?,token_budget=?,tokens_per_percent=? WHERE id=?',b.enabled===undefined?account.enabled:bool(b.enabled),b.token_budget===undefined?account.token_budget:integer(b.token_budget,'本地预算',{nullable:true}),b.tokens_per_percent===undefined?account.tokens_per_percent:integer(b.tokens_per_percent,'容量换算',{min:100,max:1e7}),account.id);store.audit('account.update',account.id);pump();return json(res,200,{ok:true});}
           if(method==='POST'&&accountMatch[2]==='quota'){await refreshQuota(account,true);return json(res,200,{ok:true});}
           if(method==='POST'&&accountMatch[2]==='check'){
@@ -223,30 +299,39 @@ export function createGateway(options={}) {
           }
           if(method==='POST'&&accountMatch[2]==='login'){
             if(busy.has(account.id))throw new AppError(409,'账号正在使用，请稍后登录');
-            if(logins.has(account.id))return json(res,200,{ok:true,message:'登录流程已启动，请查看浏览器'});
+            if(logins.has(account.id)){const pending=logins.get(account.id);let challenge;try{challenge=await pending.flow.challenge;}catch(e){throw new AppError(502,e.message);}if(logins.get(account.id)!==pending)throw new AppError(409,'登录流程已结束，请重新登录');return json(res,200,{ok:true,...challenge,expiresAt:pending.expiresAt});}
             if(logins.size)throw new AppError(409,'另一个账号正在登录，请先完成该流程');
+            if(account.kind==='claude'&&!['127.0.0.1','::1'].includes(network.listenHost))throw new AppError(400,'服务器暂不支持 Claude 浏览器登录，请使用本机版完成授权');
             const version=(authVersions.get(account.id)||0)+1;authVersions.set(account.id,version);
             store.run("UPDATE accounts SET state='login',last_error=NULL,quota_json=NULL,quota_calibration=NULL,quota_error=NULL,since_check_tokens=0 WHERE id=?",account.id);
             store.run("UPDATE sessions SET state='uncertain' WHERE account_id=?",account.id);
-            const upstream=provider(account),child=spawn(upstream.binary,upstream.loginArgs,{env:upstream.env(account.home),windowsHide:true,stdio:'ignore'});logins.set(account.id,child);
-            let timedOut=false;const timer=setTimeout(()=>{timedOut=true;child.kill();},600000);
-            let ended=false;const finish=async()=>{if(ended)return;ended=true;clearTimeout(timer);try{if(stopping)return;let ready=false;try{ready=await upstream.check(upstream.binary,account.home);}catch{}if(stopping||(authVersions.get(account.id)||0)!==version)return;store.run('UPDATE accounts SET state=?,last_error=? WHERE id=?',ready?'ready':'offline',ready?null:timedOut?'官方登录等待已超过 10 分钟，请重新点击官方登录并使用新打开的页面':'官方登录未完成，请重新点击官方登录',account.id);store.audit(ready?'account.login.success':'account.login.failed',account.id);}finally{logins.delete(account.id);if(!stopping)pump();}};
-            child.on('error',finish);child.on('close',finish);store.audit('account.login',account.id);return json(res,200,{ok:true,message:'已启动官方登录，请在 10 分钟内于本机浏览器完成；以账号显示已连接为准'});
+            const upstream=provider(account),flow=options.loginStarter?options.loginStarter(account,upstream):account.kind==='codex'?startCodexLogin(upstream.binary,account.home):startLocalLogin(upstream.binary,upstream.loginArgs,upstream.env(account.home));
+            const pending={flow,expiresAt:now()+600000,challenge:null};logins.set(account.id,pending);
+            const task=flow.completed.then(async result=>{try{
+              if(stopping||(authVersions.get(account.id)||0)!==version)return;
+              let ready=false;if(result.success)try{ready=await upstream.check(upstream.binary,account.home);}catch{}
+              if(stopping||(authVersions.get(account.id)||0)!==version)return;
+              store.run('UPDATE accounts SET state=?,last_error=? WHERE id=?',ready?'ready':'offline',ready?null:result.message||'未检测到订阅登录，请重试',account.id);store.audit(ready?'account.login.success':'account.login.failed',account.id);
+            }finally{if(logins.get(account.id)===pending)logins.delete(account.id);if(!stopping)pump();}});
+            loginTasks.add(task);void task.finally(()=>loginTasks.delete(task)).catch(()=>{});store.audit('account.login',account.id);
+            try{pending.challenge=await flow.challenge;}catch(e){await task;throw new AppError(502,e.message);}
+            if(stopping||(authVersions.get(account.id)||0)!==version)throw new AppError(409,'账号登录已取消或账号已移除');
+            return json(res,200,{ok:true,...pending.challenge,expiresAt:pending.expiresAt});
           }
         }
         const settleMatch=path.match(/^\/api\/admin\/requests\/([a-f0-9-]+)\/settle$/);
         if(settleMatch&&method==='POST'){
           const b=await body(req),r=store.get('SELECT * FROM requests WHERE id=?',settleMatch[1]);if(!r||!['unknown','interrupted'].includes(r.status))throw new AppError(409,'该请求无需核对');
-          const actual=integer(b.tokens,'补记 Token');store.db.exec('BEGIN IMMEDIATE');try{store.run("UPDATE requests SET status='reconciled',reserved=0,input=input+?,error='管理员已核对并补记用量' WHERE id=?",actual,r.id);store.run('UPDATE members SET used=used+? WHERE id=?',actual,r.member_id);store.run('UPDATE keys SET used=used+? WHERE id=?',actual,r.key_id);if(r.account_id)store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',actual,actual,r.account_id);store.audit('request.settle',r.id+': '+actual);store.db.exec('COMMIT');}catch(e){store.db.exec('ROLLBACK');throw e;}
+          const actual=integer(b.tokens,'补记 Token');store.db.exec('BEGIN IMMEDIATE');try{store.run("UPDATE requests SET status='reconciled',usage_unknown=0,reserved=0,input=input+?,error='管理员已核对并补记用量' WHERE id=?",actual,r.id);store.run('UPDATE members SET used=used+? WHERE id=?',actual,r.member_id);store.run('UPDATE keys SET used=used+? WHERE id=?',actual,r.key_id);if(r.account_id)store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',actual,actual,r.account_id);store.audit('request.settle',r.id);store.prunedStart=null;store.pruneUsage();store.db.exec('COMMIT');}catch(e){store.db.exec('ROLLBACK');throw e;}
           return json(res,200,{ok:true});
         }
         if(path==='/api/admin/ips'&&method==='GET'){
           const member=url.searchParams.get('member')||'',key=url.searchParams.get('key');
           if(key&&!store.get('SELECT id FROM keys WHERE id=? AND member_id=?',key,member))throw new AppError(404,'Key 不属于该员工');
-          return json(res,200,store.all('SELECT ip,COUNT(*) requests,MIN(started) first_seen,MAX(started) last_seen,MAX(agent) agent FROM requests WHERE member_id=?'+(key?' AND key_id=?':'')+' GROUP BY ip ORDER BY last_seen DESC',...[member,...(key?[key]:[])]));
+          return json(res,200,store.all('SELECT ip,COUNT(*) requests,MIN(started) first_seen,MAX(started) last_seen,MAX(agent) agent FROM requests WHERE member_id=?'+(key?' AND key_id=?':'')+' AND COALESCE(ended,started)>=? AND COALESCE(ended,started)<? GROUP BY ip ORDER BY last_seen DESC',...[member,...(key?[key]:[]),usageWindow().start,usageWindow().end]));
         }
         if(path==='/api/admin/export'&&method==='GET'){
-          const rows=store.all('SELECT r.started,m.name,r.ip,r.status,r.input,r.output,r.cached,r.model FROM requests r LEFT JOIN members m ON m.id=r.member_id ORDER BY started DESC LIMIT 10000');
+          const rows=store.all('SELECT r.started,m.name,r.ip,r.status,r.input,r.output,r.cached,r.model FROM requests r LEFT JOIN members m ON m.id=r.member_id WHERE COALESCE(r.ended,r.started)>=? AND COALESCE(r.ended,r.started)<? ORDER BY started DESC LIMIT 10000',usageWindow().start,usageWindow().end);
           const cell=v=>{const text=String(v??'');return '"'+(/^[\s\x00-\x1f\x7f]*[=+@-]/.test(text)?"'":"")+text.replaceAll('"','""')+'"';};
           res.setHeader('Content-Type','text/csv; charset=utf-8');res.setHeader('Content-Disposition','attachment; filename="harbor-usage.csv"');return res.end('\ufeff'+['时间,员工,IP,状态,输入Token,输出Token,缓存Token,模型',...rows.map(r=>[new Date(r.started).toISOString(),r.name,r.ip,r.status,r.input,r.output,r.cached,r.model].map(cell).join(','))].join('\r\n'));
         }
@@ -255,9 +340,65 @@ export function createGateway(options={}) {
         }
         throw new AppError(404,'接口不存在');
       }
-      if(path==='/v1/models'&&method==='GET'){employee(req);return json(res,200,{object:'list',data:['codex','claude'].map(id=>({id,object:'model',owned_by:'local'}))});}
+      if((path==='/v1/models'||path==='/v1/codex/models')&&method==='GET'){
+        employee(req);
+        const account=store.get("SELECT * FROM accounts WHERE kind='codex' AND enabled=1 AND state IN ('ready','degraded') AND removed_at IS NULL ORDER BY last_used DESC LIMIT 1");
+        const models=account?await responses.models({binary:config.codexBinary,home:account.home}):[];
+        if(path==='/v1/codex/models')return json(res,200,{models});
+        return json(res,200,{object:'list',data:[...['codex','claude'].map(id=>({id,object:'model',owned_by:'local'})),...models.map(m=>({id:m.slug,object:'model',owned_by:'openai'}))],models});
+      }
       if(path==='/api/me'&&method==='GET'){
-        const m=employee(req);const reserved=store.get('SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE member_id=?',m.id).n;return json(res,200,{id:m.id,name:m.name,quota:m.quota,used:m.used,keyQuota:m.key_quota,keyUsed:m.key_used,reserved,expires:m.expires});
+        const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,used:store.usageFor('member_id',m.id).used,keyUsed:store.usageFor('key_id',m.key_id).used,unmetered:store.usageFor('key_id',m.key_id).unmetered,expires:m.expires,usageWindow:w});
+      }
+      if(path==='/v1/responses'&&method==='POST'){
+        const m=employee(req);
+        if(stopping)throw new AppError(503,'服务停止','service_stopping');
+        responseMembers.set(m.id,(responseMembers.get(m.id)||0)+1);
+        try{
+          const original=await readJsonBody(req,{maxBytes:responseBodyBytes,compressed:true}),payload=validateResponses(original);
+          if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开','client_cancelled');
+          const clientId=req.headers['thread-id']||req.headers['session-id']||req.headers.session_id||req.headers['x-codex-thread-id']||payload.prompt_cache_key;
+          if(clientId!==undefined&&(typeof clientId!=='string'||!clientId.length))throw new AppError(400,'客户端会话标识无效');
+          const clientKey=clientId?hash(clientId):null;
+          let session=clientKey?store.get("SELECT * FROM sessions WHERE member_id=? AND protocol='responses' AND client_key=?",m.id,clientKey):null;
+          if(session){
+            // Full-history calls may continue; previous unknown reservations remain held.
+            const account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
+            if(!account.enabled||account.removed_at||!['ready','degraded'].includes(account.state))throw new AppError(503,'会话绑定账号不可用，请新建客户端任务','session_account_unavailable');
+          }
+          if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开');
+          if(stopping)throw new AppError(503,'服务停止','service_stopping');
+          const secret=(req.headers.authorization||'').replace(/^Bearer /,'');store.authenticate(secret);
+          if(!session)session={id:id(),account_id:responseAccount().id};
+          const requestId=store.observe(m,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model);
+          if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,created,updated) VALUES(?,?,?,'responses',?,?,?)",session.id,m.id,session.account_id,clientKey,now(),now());
+          store.run('UPDATE requests SET session_id=?,account_id=? WHERE id=?',session.id,session.account_id,requestId);
+          // Scope all upstream cache/thread identifiers to the authenticated employee.
+          payload.prompt_cache_key=session.id;
+          const controller=new AbortController();controllers.add(controller);res.on('close',()=>{if(!res.writableEnded)controller.abort();});
+          const emit=async (event,signal=controller.signal)=>{
+            if(!original.stream)return;
+            if(res.destroyed)throw new AppError(499,'客户端已断开');
+            if(!res.headersSent)res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no','X-Harbor-Session':session.id});
+            if(!res.write('event: '+event.type+'\ndata: '+JSON.stringify(event)+'\n\n'))await new Promise((resolve,reject)=>{
+              const deadline=signal;
+              const cleanup=()=>{res.off('drain',drain);res.off('close',closed);deadline.removeEventListener('abort',aborted);};
+              const drain=()=>{cleanup();resolve();},closed=()=>{cleanup();reject(new AppError(499,'客户端已断开'));},aborted=()=>{cleanup();res.destroy();reject(new AppError(499,'事件发送已取消'));};
+              res.once('drain',drain);res.once('close',closed);deadline.addEventListener('abort',aborted,{once:true});if(deadline.aborted)aborted();
+            });
+          };
+          try{
+            const result=await new Promise((resolve,reject)=>{
+              const job={requestId,model:payload.model,resolve,reject,controller,secret,session,responses:payload,protocolHeaders:req.headers,onEvent:emit};
+              startJob(job,store.get('SELECT * FROM accounts WHERE id=?',session.account_id));
+            });
+            if(!res.destroyed){if(original.stream){await emit(result.terminal);res.end();}else json(res,200,result.response);}
+          }catch(e){
+            if(res.headersSent&&!res.destroyed){await emit({type:'error',error:{type:e.code||'upstream_error',message:e.status?e.message:'网关处理失败'}});res.end();}
+            else throw e;
+          }finally{controllers.delete(controller);}
+        }finally{const left=responseMembers.get(m.id)-1;if(left)responseMembers.set(m.id,left);else responseMembers.delete(m.id);}
+        return;
       }
       if(path==='/v1/chat/completions'&&method==='POST'){
         const m=employee(req);
@@ -308,17 +449,19 @@ export function createGateway(options={}) {
       }
       throw new AppError(404,'接口不存在');
     }catch(e){
+      if(e.status===429)console.warn('[gateway_rejection]',JSON.stringify({status:429,code:e.code||'rate_limit'}));
       if(!res.headersSent&&!res.destroyed)json(res,e.status||500,{error:{message:e.status?e.message:'服务内部错误，请查看本机日志',type:e.code||'server_error'}});
       if(!e.status)console.error('[server]',e.message);
     }
   }
-  const server=http.createServer(handler);server.requestTimeout=15000;server.headersTimeout=10000;
+  const server=http.createServer(handler);
   let closePromise;
-  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;for(const c of controllers)c.abort();for(const c of logins.values())c.kill();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks]);store.close();})();return closePromise;}
-  return {server,store,config,close,data,runtime};
+  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;clearInterval(maintenance);for(const c of controllers)c.abort();for(const c of logins.values())c.flow.cancel();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks,...loginTasks,...quotaReads.values()]);store.close();})();return closePromise;}
+  return {server,store,config,close,data,runtime,network};
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
-  const instance=await acquireInstance(join(root,'data'));
-  const app=createGateway({onStopped:()=>process.exit(0)});app.server.listen(app.config.port,'127.0.0.1',()=>console.log(`Harbor ready at http://127.0.0.1:${app.config.port}`));
+  process.umask(0o077);
+  const instance=await acquireInstance(resolve(process.env.HARBOR_DATA_DIR||join(root,'data')));
+  const app=createGateway({onStopped:()=>process.exit(0)});app.server.listen(app.network.port||app.config.port,app.network.listenHost,()=>console.log('Harbor ready'));
   for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>app.close().then(()=>process.exit(0)));
 }

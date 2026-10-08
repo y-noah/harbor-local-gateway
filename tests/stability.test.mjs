@@ -1,4 +1,5 @@
 import {test} from 'node:test';
+import {tmpdir} from 'node:os';
 import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {join,resolve,sep} from 'node:path';
@@ -7,7 +8,7 @@ import {setTimeout as sleep} from 'node:timers/promises';
 import {DatabaseSync} from 'node:sqlite';
 import {createGateway} from '../server.mjs';
 
-const scratch=resolve(fileURLToPath(new URL('../../../work/',import.meta.url)),'stability-tests');
+const scratch=join(tmpdir(),'harbor-stability-tests');
 mkdirSync(scratch,{recursive:true});
 const limits=()=>({rateLimits:{primary:{usedPercent:0,resetsAt:Math.floor(Date.now()/1000)+18000}}});
 async function waitFor(predicate,label,timeout=5000){
@@ -68,7 +69,11 @@ test('disconnecting five callers cancels queue, preserves only running uncertain
   const calls=people.map((m,i)=>app.chat(m,null,controllers[i].signal).catch(()=>null));
   await waitFor(()=>app.store.get("SELECT COUNT(*) n FROM requests WHERE status IN ('queued','running')").n===5,'five admitted requests');
   assert.equal(app.store.get("SELECT COUNT(*) n FROM requests WHERE status='running'").n,3);
-  controllers.forEach(c=>c.abort());await deadline(Promise.all(calls),'disconnect clients');
+  // Cancel queued callers first so no freed account can start them before their TCP close arrives.
+  const queuedMembers=new Set(app.store.all("SELECT member_id FROM requests WHERE status='queued'").map(r=>r.member_id));
+  people.forEach((person,i)=>{if(queuedMembers.has(person.memberId))controllers[i].abort();});
+  await waitFor(()=>app.store.get("SELECT COUNT(*) n FROM requests WHERE status='cancelled' AND reserved=0").n===2,'queued callers disconnected');
+  people.forEach((person,i)=>{if(!queuedMembers.has(person.memberId))controllers[i].abort();});await deadline(Promise.all(calls),'disconnect clients');
   await waitFor(()=>active===0&&app.store.get("SELECT COUNT(*) n FROM requests WHERE status IN ('queued','running')").n===0,'disconnect settlement');
   assert.equal(aborts,3);assert.equal(app.store.get("SELECT COUNT(*) n FROM requests WHERE status='cancelled' AND reserved=0").n,2);
   for(const row of app.store.all("SELECT * FROM requests WHERE status='unknown'")){assert.equal(row.reserved,100);assert.equal((await app.post('/api/admin/requests/'+row.id+'/settle',{tokens:0})).status,200);}
