@@ -93,10 +93,32 @@ base_url = ${esc(JSON.stringify(state.endpoint))}
 wire_api = "responses"
 env_key = "HARBOR_API_KEY"
 requires_openai_auth = false
-supports_websockets = false</pre><p>将员工 Key 放入客户端进程的 HARBOR_API_KEY 环境变量，然后完全退出并重启客户端。Windows 桌面应用必须能读取该变量；WSL需单独设置。不要把Key写进TOML或工程。</p><p>模型名使用 GET /v1/models 返回的实际名称；示例模型需在账号中可用。为让模型选择器显示最新模型，请带员工Key从 /v1/codex/models 下载目录，设置顶层 model_catalog_json 为文件的绝对路径并重启客户端；模型更新后重新下载。</p><p>文件读写和命令在客户端执行，93仅转发模型请求。使用 HTTP 完整历史续聊；同一个 Key、同一个订阅账号均支持多会话并行；只累计已获取用量，不预占、不按本地额度拦截。中断后可在原任务继续。</p></div>`);
+supports_websockets = false
+
+[features]
+memories = false
+
+[memories]
+generate_memories = false
+use_memories = false</pre><p>将员工 Key 放入客户端进程的 HARBOR_API_KEY 环境变量，然后完全退出并重启客户端。Windows 桌面应用必须能读取该变量；WSL需单独设置。不要把Key写进TOML或工程。</p><p>默认使用 gpt-6.1-sol，可在 Codex 中切换；模型名使用 GET /v1/models 返回的实际名称，推理强度按客户端选择转发。为让模型选择器显示最新模型，请带员工Key从 /v1/codex/models 下载目录，设置顶层 model_catalog_json 为文件的绝对路径并重启客户端；模型更新后重新下载。</p><p>网页版聊天和记忆不接入。文件读写和命令在客户端执行，平台只转发订阅请求。使用 HTTP 完整历史续聊；同一个 Key、同一个订阅账号均支持多会话并行；只累计已获取用量，不预占、不按本地额度拦截。中断后可在原任务继续。</p></div>`);
+  if(tab==='guide')html+=panel('image2 图片生成与编辑（测试接入）',imageGuide(state.endpoint));
   $('#content').innerHTML=html;document.querySelectorAll('[data-height]').forEach(el=>el.style.height=el.dataset.height+'px');document.querySelectorAll('[data-width]').forEach(el=>el.style.width=el.dataset.width+'%');
   if(tab==='playground'){$('#chat-form').onsubmit=sendChat;$('#check-key').onclick=checkKey;$('#test-key').oninput=e=>{testKey=e.target.value;$('#my-quota').textContent='';};$('#prompt').oninput=e=>draft=e.target.value;$('#chat-model').onchange=e=>{if(sending)return;chatModel=e.target.value;chat=[];chatSession='';chatOwner='';render();};$('#chat-log').scrollTop=$('#chat-log').scrollHeight;}
   if(tab==='requests'){$('#request-filter').onchange=e=>{requestFilter=e.target.value;render();};}
+}
+function imageGuide(endpoint){
+  const download=JSON.stringify(endpoint.replace(/\/$/,'')+'/codex/image-mcp.mjs');
+  const windows=`Invoke-WebRequest -UseBasicParsing ${download} -Headers @{Authorization="Bearer $env:HARBOR_API_KEY"} -OutFile "$env:USERPROFILE\\.codex\\harbor-image-mcp.mjs"`;
+  const linux=`curl --fail --silent --show-error -H "Authorization: Bearer $HARBOR_API_KEY" ${download} -o "$HOME/.codex/harbor-image-mcp.mjs"`;
+  const config=`[mcp_servers.harbor_image]
+command = "node"
+args = ['C:\\Users\\YOUR_USER\\.codex\\harbor-image-mcp.mjs', 'C:\\Work\\YOUR_WORKSPACE']
+env_vars = ["HARBOR_API_KEY"]
+tool_timeout_sec = 600
+
+[mcp_servers.harbor_image.env]
+HARBOR_BASE_URL = ${JSON.stringify(endpoint)}`;
+  return `<div class="panel-body"><p>原员工 Key 仍可使用，无需 OPENAI_API_KEY。每台客户端需单独安装图片 MCP；仅升级网关或新开聊天不会自动添加工具。</p><ol class="guide-list"><li>安装 Node.js 24，确认 node --version；在客户端进程中加载现有 HARBOR_API_KEY。</li><li>下载脚本到实际 CODEX_HOME（默认用户目录下的 .codex）；以下默认路径的父目录须已存在。</li></ol><label>Windows PowerShell</label><pre class="code">${esc(windows)}</pre><label>WSL / Linux</label><pre class="code">${esc(linux)}</pre><p>将下面配置合并到用户 config.toml，已有同名表时更新，不重复添加。把两个路径换成脚本和允许读写图片的工作区绝对路径；WSL 使用 Linux 路径。桌面应用找不到 node 时，填写 Node 24 可执行文件的绝对路径。</p><pre class="code">${esc(config)}</pre><p>完全退出并重启 Codex，再新建会话，确认 harbor_image 已连接、image_generate 工具可用。可以先运行 codex mcp list 检查注册；注册成功仍需实际调用验证。</p><p>生成：“用 Harbor 图片工具生成蓝色圆形，保存到 generated.png。”编辑：“把 generated.png 的圆形改成红色，保存到 edited.png。”输出路径必须在工作区内且文件尚不存在；检查图片可打开，并核对网关调用记录。</p><p>若仍提示“没有 image2 工具”或“缺少 OPENAI_API_KEY”，先检查是否加载了 harbor_image、Node 路径、工作区和环境变量；不要因此申请独立 API Key。超时或取消可能已消耗订阅额度，不自动重试。</p><p class="hint">这是自建 MCP 适配，功能实测不等于官方认可订阅转供。Linux 真实生图与改图已验收，Windows 原生图片流程尚未验收。远程使用应配置 HTTPS。移除上述 MCP 配置并重启即可停用；网页版聊天和记忆不接入。</p></div>`;
 }
 function renderChat(){return chat.length?chat.map(m=>`<div class="message ${m.role==='user'?'user':''}"><span class="role">${m.role==='user'?'YOU':chatModel.toUpperCase()}</span>${esc(m.content)}</div>`).join(''):empty('从一个简单问题开始。');}
 let loginPoll,loginAccount='',loginView=0;

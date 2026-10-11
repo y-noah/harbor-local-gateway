@@ -3,6 +3,7 @@ import {join} from 'node:path';
 import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {StringDecoder} from 'node:string_decoder';
+import {randomUUID} from 'node:crypto';
 import {runnerEnv,codexAuthArgs} from './codex.mjs';
 import {AppError} from './store.mjs';
 
@@ -62,6 +63,18 @@ export function validateResponses(value){
   if(value.store===true)throw new AppError(400,'网关仅支持 store=false','unsupported_storage');
   return {...value,instructions:value.instructions??'',store:false,stream:true};
 }
+// Only Codex inference/tool routes belong here, never account, chat or memory APIs.
+export const codexJsonRoutes=new Set(['/images/generations','/images/edits']);
+export function validateCodexJson(value,path){
+  if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
+  if(typeof value.model!=='string'||!value.model)throw new AppError(400,'请指定有效模型名称','invalid_model');
+  if(value.stream!==undefined&&value.stream!==false)throw new AppError(400,'此 Codex 工具接口使用 JSON 响应','unsupported_stream');
+  if(value.store===true||value.background===true||value.previous_response_id)throw new AppError(400,'订阅工具不支持保存响应或后台续传','unsupported_storage');
+  if(typeof value.prompt!=='string'||!value.prompt.trim())throw new AppError(400,'图片请求缺少 prompt','invalid_image_prompt');
+  if(path==='/images/edits'&&(!Array.isArray(value.images)||!value.images.length||value.images.some(image=>!image||typeof image.image_url!=='string'||!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(image.image_url)||Object.keys(image).some(k=>k!=='image_url'))))throw new AppError(400,'改图仅支持内联 PNG、JPEG 或 WebP 参考图','invalid_image_reference');
+  if(path==='/images/generations'&&value.images!==undefined)throw new AppError(400,'参考图请使用改图接口','invalid_image_reference');
+  return {...value};
+}
 function failure(status){
   if(status===401||status===403)return authError();
   if(status===429)return new AppError(429,'上游订阅限流或额度不足，请稍后重试','upstream_rate_limit');
@@ -79,10 +92,11 @@ export function responseUsage(response){
 }
 export function createResponsesTransport({fetchImpl=fetch,credentials=accountCredentials,version=installedVersion}={}){
   const catalogs=new Map();
-  async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={}}={}){
+  async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={},accept='text/event-stream'}={}){
     let auth;try{auth=await credentials(binary,home);}catch(error){throw Object.assign(error,{usageKnown:true});}
-    const headers={'Authorization':'Bearer '+auth.token,'ChatGPT-Account-ID':auth.accountId,'Accept':'text/event-stream','Content-Type':'application/json'};
+    const headers={'Authorization':'Bearer '+auth.token,'ChatGPT-Account-ID':auth.accountId,'Accept':accept,'Content-Type':'application/json'};
     if(sessionId){headers['session-id']=sessionId;headers['thread-id']=sessionId;}
+    if(path.startsWith('/images/'))headers['x-codex-image-turn-id']=randomUUID();
     for(const name of ['originator','openai-beta','x-codex-beta-features','x-openai-internal-codex-responses-lite']){
       const value=protocolHeaders[name];if(typeof value==='string'&&/^[\x20-\x7e]*$/.test(value))headers[name]=value;
     }
@@ -91,6 +105,22 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
     if(!result.ok){await result.body?.cancel().catch(()=>{});throw Object.assign(failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
+  }
+  async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders}){
+    if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
+    let usage=null;
+    try{
+      const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json'});
+      let response;try{response=await result.json();}catch{throw new AppError(502,'上游工具返回了无效 JSON','upstream_protocol');}
+      if(!response||typeof response!=='object'||Array.isArray(response))throw new AppError(502,'上游工具响应无效','upstream_protocol');
+      usage=responseUsage(response);
+      if(!Array.isArray(response.data)||!response.data.length||response.data.some(image=>typeof image?.b64_json!=='string'||!image.b64_json))throw new AppError(502,'上游图片响应缺少图片数据','upstream_protocol');
+      return {input:0,output:0,cached:0,...usage,usageKnown:!!usage,response};
+    }catch(error){
+      if(signal?.aborted)error=new AppError(499,'客户端已取消或服务停止','request_cancelled');
+      if(!(error instanceof AppError))error=new AppError(502,'上游工具连接中断','upstream_connection');
+      throw Object.assign(error,usage||{},{usageKnown:!!usage||error.usageKnown===true});
+    }
   }
   async function models({binary,home,signal,force=false}){
     const cached=catalogs.get(home);if(!force&&cached?.expires>Date.now())return cached.models;
@@ -136,5 +166,5 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
       throw Object.assign(error,knownUsage||{},{usageKnown:!!knownUsage||error.usageKnown===true||!dispatched});
     }finally{signal?.removeEventListener('abort',abort);}
   }
-  return {run,models};
+  return {run,runJson,models};
 }

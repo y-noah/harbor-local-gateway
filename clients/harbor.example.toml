@@ -1,5 +1,5 @@
 # Merge the top-level keys before the first table in your existing config.toml.
-# Select an available model from the authenticated /v1/models endpoint.
+# 默认使用 gpt-6.1-sol，可在 Codex 中切换为 /v1/models 返回的可用模型。
 model = "gpt-6.1-sol"
 model_provider = "harbor"
 web_search = "disabled"
@@ -13,3 +13,10 @@ wire_api = "responses"
 env_key = "HARBOR_API_KEY"
 requires_openai_auth = false
 supports_websockets = false
+
+[features]
+memories = false
+
+[memories]
+generate_memories = false
+use_memories = false
