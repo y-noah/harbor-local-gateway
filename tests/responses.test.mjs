@@ -27,6 +27,43 @@ async function setup(t,responder){
  return {...app,base,calls,member,send};
 }
 const until=async(fn)=>{const deadline=Date.now()+3000;while(!fn()){if(Date.now()>deadline)throw Error('condition timed out');await new Promise(r=>setTimeout(r,5));}};
+const imagePayload={model:'gpt-image-2',prompt:'a blue circle'};
+test('image MCP download is authenticated and does not call upstream',async t=>{
+ const app=await setup(t),m=app.member();
+ assert.equal((await fetch(app.base+'/v1/codex/image-mcp.mjs')).status,401);
+ const result=await fetch(app.base+'/v1/codex/image-mcp.mjs',{headers:{Authorization:'Bearer '+m.secret}});assert.equal(result.status,200);assert.match(await result.text(),/export async function createImageTool/);assert.equal(app.calls.length,0);
+});
+const postImage=(app,m,path='/images/generations',payload=imagePayload,extra={})=>fetch(app.base+'/v1'+path,{method:'POST',headers:{Authorization:'Bearer '+m.secret,'Content-Type':'application/json','thread-id':'shared-image-thread',...extra},body:JSON.stringify(payload)});
+test('images use subscription credentials, preserve payload and isolate employee sessions and usage',async t=>{
+ const app=await setup(t,()=>Response.json({created:1,data:[{b64_json:'Zm9v'}],usage:{input_tokens:20,output_tokens:30}})),a=app.member(),b=app.member();
+ for(const [m,path,payload] of [[a,'/images/generations',imagePayload],[a,'/images/edits',{...imagePayload,images:[{image_url:'data:image/png;base64,Zm9v'}]}],[b,'/images/generations',imagePayload]]){
+  const r=await postImage(app,m,path,payload,{'ChatGPT-Account-ID':'forged'});assert.equal(r.status,200);assert.equal((await r.json()).data[0].b64_json,'Zm9v');
+  const sent=app.calls.at(-1);assert.equal(sent.url,'https://chatgpt.com/backend-api/codex'+path);assert.equal(sent.options.headers.Authorization,'Bearer fixture-upstream-only');assert.equal(sent.options.headers['ChatGPT-Account-ID'],'fixture-account');assert.match(sent.options.headers['x-codex-image-turn-id'],/^[a-f0-9-]{36}$/);assert.deepEqual(JSON.parse(sent.options.body),payload);
+ }
+ assert.equal(app.calls[0].options.headers['thread-id'],app.calls[1].options.headers['thread-id']);assert.notEqual(app.calls[0].options.headers['thread-id'],app.calls[2].options.headers['thread-id']);
+ assert.equal(app.store.get('SELECT used FROM keys WHERE id=?',a.keyId).used,100);assert.equal(app.store.get('SELECT used FROM keys WHERE id=?',b.keyId).used,50);
+});
+test('images reject invalid auth and external/file references before upstream, excluded routes stay absent',async t=>{
+ const app=await setup(t),m=app.member();assert.equal((await postImage(app,{secret:'invalid'})).status,401);
+ for(const payload of [{...imagePayload,prompt:''},{...imagePayload,stream:true},{...imagePayload,stream:'yes'},{...imagePayload,store:true}])assert.equal((await postImage(app,m,'/images/generations',payload)).status,400);
+ for(const images of [[],[{file_id:'other-employee'}],[{image_url:'https://example.com/image.png'}],[{image_url:'data:image/png;base64,Zm9v',file_id:'other'}]])assert.equal((await postImage(app,m,'/images/edits',{...imagePayload,images})).status,400);
+ for(const path of ['/memories','/files','/audio/speech','/alpha/search','/responses/compact'])assert.equal((await postImage(app,m,path)).status,404);
+ app.store.run('UPDATE keys SET enabled=0 WHERE id=?',m.keyId);assert.equal((await postImage(app,m)).status,403);assert.equal(app.calls.length,0);
+});
+test('image failures are redacted, never retried, missing usage is unknown',async t=>{
+ let mode=0;const app=await setup(t,()=>mode===0?new Response('private upstream content',{status:429}):Response.json(mode===1?{data:[{b64_json:'Zm9v'}]}:{data:[]})),m=app.member();
+ const denied=await postImage(app,m);assert.equal(denied.status,429);assert.doesNotMatch(await denied.text(),/private upstream/);assert.equal(app.calls.length,1);
+ mode=1;assert.equal((await postImage(app,m)).status,200);assert.equal(app.store.get('SELECT unmetered FROM keys').unmetered,1);
+ mode=2;assert.equal((await postImage(app,m)).status,502);assert.equal(app.calls.length,3);
+});
+test('invalid image output retains upstream reported usage instead of counting it as free',async t=>{
+ const app=await setup(t,()=>Response.json({data:[],usage:{input_tokens:12,output_tokens:34}})),m=app.member();
+ assert.equal((await postImage(app,m)).status,502);assert.equal(app.store.get('SELECT used FROM keys').used,46);assert.equal(app.store.get('SELECT unmetered FROM keys').unmetered,0);
+});
+test('parallel image requests all reach upstream and service shutdown cancels them',async t=>{
+ let arrived=0;const app=await setup(t,(_,options)=>new Promise((resolve,reject)=>{arrived++;options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true});})),m=app.member();
+ const pending=Array.from({length:3},()=>postImage(app,m));await until(()=>arrived===3);const stopped=app.close();for(const p of pending)assert.equal((await p).status,499);await stopped;
+});
 test('Responses preserves function calls, replayed results, metadata and scoped account affinity',async t=>{
  const app=await setup(t),m=app.member(),headers={'thread-id':'client-thread','Authorization':'Bearer '+m.secret,'ChatGPT-Account-ID':'forged','x-openai-internal-codex-responses-lite':'true'};
  const tools=[{type:'function',name:'read_file',parameters:{type:'object',properties:{path:{type:'string'}}}}];

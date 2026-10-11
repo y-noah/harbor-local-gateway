@@ -13,7 +13,7 @@ import {runClaude,checkClaudeLogin,claudeEnv} from './claude.mjs';
 import {networkConfig,acceptsRequest} from './network.mjs';
 import {startCodexLogin,startLocalLogin} from './account-login.mjs';
 import {readJsonBody,responseBodyBytes} from './request-body.mjs';
-import {createResponsesTransport,validateResponses} from './responses.mjs';
+import {createResponsesTransport,validateResponses,validateCodexJson,codexJsonRoutes} from './responses.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
 function integer(value,label,{nullable=false,min=0,max=1e12}={}) {
@@ -176,7 +176,7 @@ export function createGateway(options={}) {
     store.run('UPDATE accounts SET last_used=? WHERE id=?',now(),account.id);
     try{
       if(job.responses){
-        const result=await responses.run({binary:config.codexBinary,home:account.home,payload:job.responses,sessionId:session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,onEvent:job.onEvent});
+        const result=await (job.jsonPath?responses.runJson:responses.run)({binary:config.codexBinary,home:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,onEvent:job.onEvent});
         store.finish(requestId,result,()=>{
           store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
           store.run("UPDATE sessions SET state='active',updated=? WHERE id=?",now(),session.id);
@@ -340,6 +340,11 @@ export function createGateway(options={}) {
         }
         throw new AppError(404,'接口不存在');
       }
+      if(path==='/v1/codex/image-mcp.mjs'&&method==='GET'){
+        employee(req);
+        const script=readFileSync(join(root,'clients','image-mcp.mjs'));
+        res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Content-Disposition':'attachment; filename="harbor-image-mcp.mjs"'});res.end(script);return;
+      }
       if((path==='/v1/models'||path==='/v1/codex/models')&&method==='GET'){
         employee(req);
         const account=store.get("SELECT * FROM accounts WHERE kind='codex' AND enabled=1 AND state IN ('ready','degraded') AND removed_at IS NULL ORDER BY last_used DESC LIMIT 1");
@@ -350,12 +355,13 @@ export function createGateway(options={}) {
       if(path==='/api/me'&&method==='GET'){
         const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,used:store.usageFor('member_id',m.id).used,keyUsed:store.usageFor('key_id',m.key_id).used,unmetered:store.usageFor('key_id',m.key_id).unmetered,expires:m.expires,usageWindow:w});
       }
-      if(path==='/v1/responses'&&method==='POST'){
+      if((path==='/v1/responses'||codexJsonRoutes.has(path.slice(3))&&path.startsWith('/v1/'))&&method==='POST'){
         const m=employee(req);
+        const jsonPath=path==='/v1/responses'?null:path.slice(3);
         if(stopping)throw new AppError(503,'服务停止','service_stopping');
         responseMembers.set(m.id,(responseMembers.get(m.id)||0)+1);
         try{
-          const original=await readJsonBody(req,{maxBytes:responseBodyBytes,compressed:true}),payload=validateResponses(original);
+          const original=await readJsonBody(req,{maxBytes:responseBodyBytes,compressed:true}),payload=jsonPath?validateCodexJson(original,jsonPath):validateResponses(original);
           if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开','client_cancelled');
           const clientId=req.headers['thread-id']||req.headers['session-id']||req.headers.session_id||req.headers['x-codex-thread-id']||payload.prompt_cache_key;
           if(clientId!==undefined&&(typeof clientId!=='string'||!clientId.length))throw new AppError(400,'客户端会话标识无效');
@@ -374,10 +380,10 @@ export function createGateway(options={}) {
           if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,created,updated) VALUES(?,?,?,'responses',?,?,?)",session.id,m.id,session.account_id,clientKey,now(),now());
           store.run('UPDATE requests SET session_id=?,account_id=? WHERE id=?',session.id,session.account_id,requestId);
           // Scope all upstream cache/thread identifiers to the authenticated employee.
-          payload.prompt_cache_key=session.id;
+          if(!jsonPath||payload.prompt_cache_key!==undefined)payload.prompt_cache_key=session.id;
           const controller=new AbortController();controllers.add(controller);res.on('close',()=>{if(!res.writableEnded)controller.abort();});
           const emit=async (event,signal=controller.signal)=>{
-            if(!original.stream)return;
+            if(jsonPath||!original.stream)return;
             if(res.destroyed)throw new AppError(499,'客户端已断开');
             if(!res.headersSent)res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no','X-Harbor-Session':session.id});
             if(!res.write('event: '+event.type+'\ndata: '+JSON.stringify(event)+'\n\n'))await new Promise((resolve,reject)=>{
@@ -389,7 +395,7 @@ export function createGateway(options={}) {
           };
           try{
             const result=await new Promise((resolve,reject)=>{
-              const job={requestId,model:payload.model,resolve,reject,controller,secret,session,responses:payload,protocolHeaders:req.headers,onEvent:emit};
+              const job={requestId,model:payload.model,resolve,reject,controller,secret,session,responses:payload,jsonPath,protocolHeaders:req.headers,onEvent:emit};
               startJob(job,store.get('SELECT * FROM accounts WHERE id=?',session.account_id));
             });
             if(!res.destroyed){if(original.stream){await emit(result.terminal);res.end();}else json(res,200,result.response);}

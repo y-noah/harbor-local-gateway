@@ -45,3 +45,13 @@ Harbor为Codex客户端提供API Key鉴权、独立订阅账号管理、HTTP Res
 本实现仍是无状态HTTP完整历史适配：要求JSON对象、非空model和布尔stream；发往订阅上游时使用`store=false`、`stream=true`，缺省instructions为空，客户端非流式请求在完成后返回JSON。显式store=true、background及previous_response_id模式未实现；WebSocket、独立`/v1/responses/compact`和正式Claude Messages协议也尚未支持。客户端通过现有Responses路径发来的压缩结果和参数保持原样。不得把这些范围外协议、旧Chat Completions的CLI桥接或仅模型列表可用，写成完整Codex/Claude兼容。
 
 发布前必须运行并通过上述行为测试。修改公共转发链路须运行`node --test tests/*.test.mjs`；新增代理、协议或客户端接入时补真实链路验证。测试只用独立临时数据库和模拟上游，不以大正文消耗真实订阅；不同客户端版本需要分别验证，不能以协议声明替代真实接入验收。禁止删除或放宽这些断言来接受回归。回滚旧版本可能恢复已取消的限制，应重新核对兼容约定。
+
+## image2 图片适配（测试接入）
+
+本轮仅新增生图与改图，通过本地 MCP 工具使用现有员工 Key，服务端固定转发 Codex 订阅图片接口，复用账号池、员工隔离、并发取消和用量统计。没有独立 OpenAI API Key 或付费备用入口，网页版聊天、记忆仍不接入。官方客户端原生生图的身份限制不通过修改客户端或伪造身份解除。
+
+安装与停用方法见 [客户端图片 MCP 配置](clients/README.md#安装图片-mcp)。新增鉴权接口为 `GET /v1/codex/image-mcp.mjs`、`POST /v1/images/generations` 与 `POST /v1/images/edits`；改图仅接受内联图片，不接受跨账号 file_id 或远程图片地址。已通过现有订阅的真实生图、参考图片编辑、文件保存及用量统计验收。
+
+本地检查：`node --test tests/*.test.mjs`；指定已安装官方 CLI 后运行 `HARBOR_CODEX_BINARY=/absolute/path/to/codex node --test tests/codex-client.test.mjs` 可验证真实客户端与模拟上游的完整 MCP 调用和文件保存。真实订阅生图、改图及客户端平台验证单独记录，不能由 Mock 替代。
+
+技术调用成功不代表官方认可订阅转供；远程访问应使用 HTTPS。客户端需单独配置 MCP 并完全重启，原员工 Key 可继续使用。
