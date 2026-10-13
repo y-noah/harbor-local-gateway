@@ -8,7 +8,8 @@ import {tmpdir} from 'node:os';
 export function instanceEndpoint(dataDir){
   const path=resolve(dataDir),canonical=process.platform==='win32'?path.toLowerCase():path;
   const digest=createHash('sha256').update(canonical).digest('hex').slice(0,32);
-  return process.platform==='win32'?`\\\\.\\pipe\\harbor-${digest}`:join(tmpdir(),`harbor-${digest}.sock`);
+  if(process.platform==='win32')return `\\\\.\\pipe\\harbor-${digest}`;
+  return process.platform==='linux'?`\0harbor-${digest}`:join(tmpdir(),`harbor-${digest}.sock`);
 }
 export async function acquireInstance(dataDir){
   const server=net.createServer(socket=>socket.destroy());

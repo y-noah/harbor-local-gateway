@@ -184,7 +184,12 @@ test('stale official quotas remain visible with their age instead of disappearin
  const html=page.run(`quotaCard({quota_json:JSON.stringify({remaining:42,checked:Date.now()-600000,windows:[{used:58,minutes:300,reset:Date.now()-1000}]})})`);
  assert.match(html,/42/);assert.match(html,/上次官方额度/);assert.match(html,/待刷新/);assert.match(html,/当前余量待确认/);
 });
-test('Responses session presentation uses forwarded thread identity instead of an uncreated CLI Session',async()=>{
- const page=await ui(()=>response(snapshot()));page.run(`admin=true;tab='sessions';state={sessions:[{id:'s',protocol:'responses',upstream_thread:'forwarded-fixture',request_count:2,state:'active'}]};render();`);
- assert.match(page.node('#content').innerHTML,/forwarded-fixture/);assert.match(page.node('#content').innerHTML,/Responses 转发线程/);assert.ok(!page.node('#content').innerHTML.includes('尚未创建'));
+test('session table exposes only routing metadata and hides normal binding status',async()=>{
+ const page=await ui(()=>response(snapshot()));page.run(`admin=true;tab='sessions';state={sessions:[{id:'s',title:'<img src=x onerror=alert(1)>',enabled:1,protocol:'responses',upstream_thread:'forwarded-fixture',request_count:2,state:'active'}]};render();`);
+ const html=page.node('#content').innerHTML;
+ assert.match(html,/<th>会话 ID \/ 员工<\/th><th>绑定账号<\/th><th>近7天请求数<\/th><th>最近活动<\/th><th>操作<\/th>/);
+ assert.ok(!html.includes('onerror'));assert.ok(!html.includes('会话名称'));assert.ok(!html.includes('forwarded-fixture'));assert.ok(!html.includes('已绑定'));assert.match(html,/管理会话/);
+ await page.click('session-actions','s');assert.ok(!page.node('#modal-content').innerHTML.includes('onerror'));assert.ok(!page.node('#modal-content').innerHTML.includes('修改会话名称'));assert.match(page.node('#modal-content').innerHTML,/修改绑定账号/);assert.match(page.node('#modal-content').innerHTML,/禁止该会话访问/);
+ page.run(`state.sessions[0].enabled=0;render();`);assert.match(page.node('#content').innerHTML,/已禁止访问/);
+ await page.click('session-actions','s');assert.match(page.node('#modal-content').innerHTML,/恢复该会话访问/);assert.ok(!page.node('#modal-content').innerHTML.includes('修改绑定账号'));
 });

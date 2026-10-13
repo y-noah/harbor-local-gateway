@@ -70,7 +70,7 @@ export function createGateway(options={}) {
   const claudeBinary=config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe');
   const provider=a=>a.kind==='claude'?{binary:claudeBinary,run:options.claudeExecutor||runClaude,check:options.claudeChecker||checkClaudeLogin,env:claudeEnv,loginArgs:['auth','login']}:{binary:config.codexBinary,run:executor,check:checker,env:runnerEnv,loginArgs:['login',...codexAuthArgs()]};
   const busy=new Map(),responseMembers=new Map(),queue=[],controllers=new Set(),logins=new Map(),tasks=new Set(),admittedMembers=new Set();let stopping=false;
-  const quotaReads=new Map(),quotaAttempts=new Map(),authVersions=new Map();
+  const quotaReads=new Map(),quotaAttempts=new Map(),authVersions=new Map(),responsePreparing=new Map();
   const loginTasks=new Set();
   async function refreshQuota(account,force=false){
     if(stopping||!account||account.removed_at!==null||!account.enabled||!['ready','degraded'].includes(account.state))return;
@@ -119,11 +119,13 @@ export function createGateway(options={}) {
       let session=store.get('SELECT * FROM sessions WHERE id=? AND member_id=?',sessionId,member.id);if(!session)throw new AppError(404,'会话不存在或不属于该员工');
       if(session.protocol!=='chat')throw new AppError(409,'会话协议不匹配','session_protocol_mismatch');
       if(session.state==='uncertain')throw new AppError(409,'此会话的上次调用状态不确定，请创建新会话','session_uncertain');
+      if(!session.enabled)throw new AppError(403,'该会话已被禁止访问','session_disabled');
       const account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
       if(account.kind!==kind)throw new AppError(409,'会话已绑定另一种模型，请创建新会话','session_provider_mismatch');
       if(!account.enabled||!['ready','degraded'].includes(account.state))throw new AppError(503,'会话绑定账号不可用；会话不会自动换号','session_account_unavailable');
       await refreshQuota(account);
       session=store.get('SELECT * FROM sessions WHERE id=? AND member_id=?',sessionId,member.id);
+      if(!session.enabled)throw new AppError(403,'该会话已被禁止访问','session_disabled');
       if(session.state==='uncertain')throw new AppError(409,'此会话的上次调用状态不确定，请创建新会话','session_uncertain');
       if(!capacity(store.get('SELECT * FROM accounts WHERE id=?',account.id),predicted).eligible)throw new AppError(429,'会话绑定账号预计额度不足；请等待恢复或创建新会话','session_quota_exhausted');
       let delta=messages;
@@ -169,6 +171,8 @@ export function createGateway(options={}) {
       if(currentMember.key_quota!==null&&currentMember.key_used+heldKey>=currentMember.key_quota)throw new AppError(429,'排队期间 Key 额度已耗尽','key_quota_exceeded');
       }
     }catch(e){store.finish(requestId,{status:'rejected',error:e.message});reject(e);return;}
+    const sessionState=store.get('SELECT enabled FROM sessions WHERE id=?',session.id);
+    if(sessionState&&!sessionState.enabled){store.finish(requestId,{status:'rejected',error:'该会话已被禁止访问'});reject(new AppError(403,'该会话已被禁止访问','session_disabled'));return;}
     const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
     if(!current.enabled||current.removed_at||!['ready','degraded'].includes(current.state)){store.finish(requestId,{status:'rejected',error:'绑定账号不可用'});reject(new AppError(503,'绑定账号不可用','session_account_unavailable'));return;}
     if(!job.responses&&!capacity(current,predicted,requestId).eligible){store.finish(requestId,{status:'rejected',error:'绑定账号预计额度不足'});reject(new AppError(429,'绑定账号预计额度不足；会话不会换号'));return;}
@@ -176,7 +180,7 @@ export function createGateway(options={}) {
     store.run('UPDATE accounts SET last_used=? WHERE id=?',now(),account.id);
     try{
       if(job.responses){
-        const result=await (job.jsonPath?responses.runJson:responses.run)({binary:config.codexBinary,home:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,onEvent:job.onEvent});
+        const result=await (job.jsonPath?responses.runJson:responses.run)({binary:config.codexBinary,home:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.upstream_thread||session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,collectOutput:job.collectOutput,onEvent:job.onEvent});
         store.finish(requestId,result,()=>{
           store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
           store.run("UPDATE sessions SET state='active',updated=? WHERE id=?",now(),session.id);
@@ -229,6 +233,35 @@ export function createGateway(options={}) {
           json(res,202,{ok:true});setTimeout(()=>void close().then(()=>options.onStopped?.()),50);return;
         }
         if(path==='/api/admin/state'&&method==='GET'){refreshQuotas();return json(res,200,{...store.snapshot(),queue:queue.length,busy:[...busy.values()].reduce((a,b)=>a+b,0),preparing:[...responseMembers.values()].reduce((a,b)=>a+b,0),endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});}
+        const sessionMatch=path.match(/^\/api\/admin\/sessions\/([a-zA-Z0-9-]+)$/);
+        if(sessionMatch&&method==='PATCH'){
+          const b=await body(req);
+          if(!b||typeof b!=='object'||Array.isArray(b)||Object.keys(b).some(k=>!['enabled','account_id','expected_route_version'].includes(k))||!['enabled','account_id'].some(k=>b[k]!==undefined))throw new AppError(400,'会话修改参数无效');
+          const session=store.get('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id WHERE s.id=?',sessionMatch[1]);
+          if(!session||session.member_removed)throw new AppError(404,'会话不存在');
+          const enabled=b.enabled===undefined?session.enabled:bool(b.enabled);
+          let accountId=session.account_id,upstreamThread=session.upstream_thread,version=session.route_version;
+          if(b.account_id!==undefined){
+            if(session.protocol!=='responses')throw new AppError(409,'旧 CLI Session 的上下文保存在原账号目录，暂不支持切换绑定账号','session_route_unsupported');
+            if(!session.enabled||!session.member_enabled)throw new AppError(409,'请先恢复会话及员工访问，再修改绑定账号','session_disabled');
+            if(typeof b.account_id!=='string'||!Number.isSafeInteger(b.expected_route_version)||b.expected_route_version<0)throw new AppError(400,'请选择有效账号并提供路由版本');
+            if(b.expected_route_version!==version)throw new AppError(409,'会话绑定已变化，请刷新后重试','session_route_conflict');
+            if(b.account_id!==accountId){
+              if(responsePreparing.has(session.member_id)||store.get("SELECT id FROM requests WHERE session_id=? AND status IN ('queued','running')",session.id))throw new AppError(409,'会话正在处理请求或员工有请求正在准备，请完成后再切换','session_busy');
+              const target=store.get("SELECT id FROM accounts WHERE id=? AND kind='codex' AND enabled=1 AND removed_at IS NULL AND state='ready'",b.account_id);
+              if(!target)throw new AppError(400,'目标账号必须是已启用且已连接的 Codex 账号','invalid_route_account');
+              accountId=target.id;upstreamThread=id();version++;
+            }
+          }else if(b.expected_route_version!==undefined)throw new AppError(400,'路由版本必须与目标账号一起提交');
+          store.db.exec('BEGIN IMMEDIATE');
+          try{
+            store.run('UPDATE sessions SET enabled=?,account_id=?,upstream_thread=?,route_version=? WHERE id=?',enabled,accountId,upstreamThread,version,session.id);
+            if(enabled!==session.enabled)store.audit(enabled?'session.enable':'session.disable',session.id);
+            if(accountId!==session.account_id)store.audit('session.route',JSON.stringify({sessionId:session.id,from:session.account_id,to:accountId,version}));
+            store.db.exec('COMMIT');
+          }catch(e){store.db.exec('ROLLBACK');throw e;}
+          return json(res,200,{ok:true,route_version:version});
+        }
         if(path==='/api/admin/members'&&method==='POST'){
           const b=await body(req);return json(res,201,store.createMember(name(b.name),integer(b.quota,'额度',{nullable:true}),expiry(b.expires)));
         }
@@ -361,13 +394,18 @@ export function createGateway(options={}) {
         if(stopping)throw new AppError(503,'服务停止','service_stopping');
         responseMembers.set(m.id,(responseMembers.get(m.id)||0)+1);
         try{
-          const original=await readJsonBody(req,{maxBytes:responseBodyBytes,compressed:true}),payload=jsonPath?validateCodexJson(original,jsonPath):validateResponses(original);
+          responsePreparing.set(m.id,(responsePreparing.get(m.id)||0)+1);
+          let original;
+          try{original=await readJsonBody(req,{maxBytes:responseBodyBytes,compressed:true});}
+          finally{const remaining=responsePreparing.get(m.id)-1;if(remaining)responsePreparing.set(m.id,remaining);else responsePreparing.delete(m.id);}
+          const payload=jsonPath?validateCodexJson(original,jsonPath):validateResponses(original);
           if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开','client_cancelled');
           const clientId=req.headers['thread-id']||req.headers['session-id']||req.headers.session_id||req.headers['x-codex-thread-id']||payload.prompt_cache_key;
           if(clientId!==undefined&&(typeof clientId!=='string'||!clientId.length))throw new AppError(400,'客户端会话标识无效');
           const clientKey=clientId?hash(clientId):null;
           let session=clientKey?store.get("SELECT * FROM sessions WHERE member_id=? AND protocol='responses' AND client_key=?",m.id,clientKey):null;
           if(session){
+            if(!session.enabled)throw new AppError(403,'该会话已被禁止访问','session_disabled');
             // Full-history calls may continue; previous unknown reservations remain held.
             const account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
             if(!account.enabled||account.removed_at||!['ready','degraded'].includes(account.state))throw new AppError(503,'会话绑定账号不可用，请新建客户端任务','session_account_unavailable');
@@ -380,7 +418,7 @@ export function createGateway(options={}) {
           if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,created,updated) VALUES(?,?,?,'responses',?,?,?)",session.id,m.id,session.account_id,clientKey,now(),now());
           store.run('UPDATE requests SET session_id=?,account_id=? WHERE id=?',session.id,session.account_id,requestId);
           // Scope all upstream cache/thread identifiers to the authenticated employee.
-          if(!jsonPath||payload.prompt_cache_key!==undefined)payload.prompt_cache_key=session.id;
+          if(!jsonPath||payload.prompt_cache_key!==undefined)payload.prompt_cache_key=session.upstream_thread||session.id;
           const controller=new AbortController();controllers.add(controller);res.on('close',()=>{if(!res.writableEnded)controller.abort();});
           const emit=async (event,signal=controller.signal)=>{
             if(jsonPath||!original.stream)return;
@@ -395,7 +433,7 @@ export function createGateway(options={}) {
           };
           try{
             const result=await new Promise((resolve,reject)=>{
-              const job={requestId,model:payload.model,resolve,reject,controller,secret,session,responses:payload,jsonPath,protocolHeaders:req.headers,onEvent:emit};
+              const job={requestId,model:payload.model,resolve,reject,controller,secret,session,responses:payload,jsonPath,protocolHeaders:req.headers,collectOutput:!original.stream,onEvent:emit};
               startJob(job,store.get('SELECT * FROM accounts WHERE id=?',session.account_id));
             });
             if(!res.destroyed){if(original.stream){await emit(result.terminal);res.end();}else json(res,200,result.response);}
@@ -468,6 +506,7 @@ export function createGateway(options={}) {
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
   process.umask(0o077);
   const instance=await acquireInstance(resolve(process.env.HARBOR_DATA_DIR||join(root,'data')));
-  const app=createGateway({onStopped:()=>process.exit(0)});app.server.listen(app.network.port||app.config.port,app.network.listenHost,()=>console.log('Harbor ready'));
-  for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>app.close().then(()=>process.exit(0)));
+  const stopped=()=>instance.release().then(()=>process.exit(0));
+  const app=createGateway({onStopped:stopped});app.server.listen(app.network.port||app.config.port,app.network.listenHost,()=>console.log('Harbor ready'));
+  for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>app.close().then(stopped));
 }

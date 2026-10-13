@@ -129,9 +129,10 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     if(!Array.isArray(value.models)||!value.models.length||value.models.some(m=>typeof m.slug!=='string'))throw new AppError(502,'模型目录响应无效','upstream_protocol');
     catalogs.set(home,{expires:Date.now()+60000,models:value.models});return value.models;
   }
-  async function run({binary,home,payload,sessionId,signal,protocolHeaders,onEvent=async()=>{}}){
+  async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,onEvent=async()=>{}}){
     const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
     let completed=null,knownUsage=null,dispatched=false;
+    const finishedItems=new Map();
     try{
       dispatched=true;const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal});
       // Some Codex subscription responses omit Content-Type; validate their SSE frames below.
@@ -151,6 +152,7 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
           knownUsage=responseUsage(event.response);throw new AppError(502,'上游响应失败或未完整结束','upstream_incomplete');
         }
         if(completed)throw new AppError(502,'上游结束后仍返回事件','upstream_protocol');
+        if(collectOutput&&event.type==='response.output_item.done'&&Number.isSafeInteger(event.output_index)&&event.output_index>=0&&event.item)finishedItems.set(event.output_index,event.item);
         await onEvent(event,controller.signal);
       };
       for await(const chunk of response.body){
@@ -159,7 +161,10 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
       }
       buffer+=decoder.decode();if(buffer.trim())await consume(buffer);
       if(!completed)throw new AppError(502,'上游连接提前结束，本次用量可能未计入累计','upstream_incomplete');
-      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,terminal:completed,response:completed.response};
+      // Keep streamed events intact; non-streaming clients also need items from done events.
+      const responseBody=(!completed.response?.output?.length&&finishedItems.size)
+        ?{...completed.response,output:[...finishedItems].sort(([a],[b])=>a-b).map(([,item])=>item)}:completed.response;
+      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,terminal:completed,response:responseBody};
     }catch(error){
       if(controller.signal.aborted)error=signal?.aborted?new AppError(499,'客户端已取消或服务停止','request_cancelled'):controller.signal.reason;
       if(!(error instanceof AppError))error=new AppError(502,'上游连接中断','upstream_connection');
