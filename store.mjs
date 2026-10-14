@@ -29,6 +29,9 @@ export class Store {
     const add=(table,column,definition)=>{if(!this.all('PRAGMA table_info('+table+')').some(c=>c.name===column))this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);};
     add('accounts','quota_json','TEXT');add('accounts','quota_error','TEXT');add('accounts','token_budget','INTEGER');add('accounts','budget_used','INTEGER NOT NULL DEFAULT 0');add('accounts','since_check_tokens','INTEGER NOT NULL DEFAULT 0');add('accounts','tokens_per_percent','REAL NOT NULL DEFAULT 10000');add('accounts','quota_calibration','TEXT');
     add('accounts','removed_at','INTEGER');
+    add('accounts','route_block','TEXT');add('accounts','route_epoch','INTEGER NOT NULL DEFAULT 0');add('accounts','route_blocked_at','INTEGER');
+    this.db.exec("CREATE TABLE IF NOT EXISTS gateway_settings(name TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS balance_runs(day TEXT PRIMARY KEY,started INTEGER NOT NULL,ended INTEGER,status TEXT NOT NULL,summary TEXT);");
+    this.run("UPDATE balance_runs SET status='interrupted',ended=? WHERE status='running'",now());
     add('members','removed_at','INTEGER');
     add('requests','tracking_only','INTEGER NOT NULL DEFAULT 0');
     const missingFlag=!this.all('PRAGMA table_info(requests)').some(c=>c.name==='usage_unknown');
@@ -40,6 +43,9 @@ export class Store {
     add('sessions','cum_input','INTEGER NOT NULL DEFAULT 0');add('sessions','cum_output','INTEGER NOT NULL DEFAULT 0');add('sessions','cum_cached','INTEGER NOT NULL DEFAULT 0');
     add('sessions','protocol',"TEXT NOT NULL DEFAULT 'chat'");add('sessions','client_key','TEXT');add('sessions','client_session_id','TEXT');
     add('sessions','title','TEXT');add('sessions','upstream_thread','TEXT');add('sessions','route_version','INTEGER NOT NULL DEFAULT 0');add('sessions','enabled','INTEGER NOT NULL DEFAULT 1');
+    const missingNightly=!this.all('PRAGMA table_info(sessions)').some(c=>c.name==='nightly_enabled');
+    add('sessions','nightly_enabled','INTEGER NOT NULL DEFAULT 1');
+    if(missingNightly)this.run('UPDATE sessions SET nightly_enabled=0 WHERE route_version>0');
     // Retain the legacy column for compatibility, but erase captured conversation text.
     this.run('UPDATE sessions SET title=NULL WHERE title IS NOT NULL');
     this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS session_client ON sessions(member_id,protocol,client_key) WHERE client_key IS NOT NULL');
@@ -155,8 +161,8 @@ export class Store {
       usageWindow:window,
       members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(m=>({...m,...scope('member_id',m.id)})),
       keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
-      accounts:this.all('SELECT id,name,kind,enabled,state,last_used,last_error,quota_json,quota_error,token_budget FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(a=>({...a,budget_used:scope('account_id',a.id).used})),
-      sessions:this.all('SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.upstream_thread,m.name member_name,a.name account_name FROM sessions s JOIN members m ON m.id=s.member_id JOIN accounts a ON a.id=s.account_id WHERE s.updated>=? AND s.updated<? ORDER BY updated DESC LIMIT 100',...range).map(s=>({...s,request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
+      accounts:this.all('SELECT id,name,kind,enabled,state,last_used,last_error,route_block,quota_json,quota_error,token_budget FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(a=>({...a,budget_used:scope('account_id',a.id).used})),
+      sessions:this.all('SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.upstream_thread,m.name member_name,a.name account_name FROM sessions s JOIN members m ON m.id=s.member_id JOIN accounts a ON a.id=s.account_id WHERE s.updated>=? AND s.updated<? ORDER BY updated DESC LIMIT 100',...range).map(s=>({...s,request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
       requests:this.all(`SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE ${where} ORDER BY started DESC LIMIT 200`,...range),
       totals:this.get(`SELECT COUNT(*) requests,COALESCE(SUM(input+output),0) tokens,COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0) success,COALESCE(SUM(reserved),0) reserved,COALESCE(SUM(usage_unknown),0) unmetered FROM requests WHERE ${where}`,...range),
       daily:this.all(`SELECT strftime('%Y-%m-%d',COALESCE(ended,started)/1000,'unixepoch','+8 hours') day,SUM(input+output) tokens,COUNT(*) requests FROM requests WHERE ${where} GROUP BY day ORDER BY day`,...range),

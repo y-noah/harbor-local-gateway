@@ -8,7 +8,21 @@ import {runnerEnv,codexAuthArgs} from './codex.mjs';
 import {AppError} from './store.mjs';
 
 const upstreamOrigin='https://chatgpt.com/backend-api/codex';
-const authError=()=>new AppError(503,'订阅凭据不可用，请检查账号登录','upstream_authentication');
+const authError=(confirmed=false)=>Object.assign(new AppError(503,'订阅凭据不可用，请检查账号登录','upstream_authentication'),confirmed?{routeFailure:'login_expired'}:{});
+const refreshError=()=>new AppError(503,'订阅凭据刷新暂未完成，请稍后重试','upstream_auth_refresh');
+export function structuredFailure(value){
+  const error=value?.error||value,code=error?.code||error?.type;
+  if(code==='usage_limit_reached')return Object.assign(new AppError(429,'上游订阅额度已耗尽','upstream_quota_exhausted'),{routeFailure:'quota_exhausted'});
+  if(['refresh_token_expired','refresh_token_revoked','refresh_token_reused','refresh_token_invalidated'].includes(code))return authError(true);
+  return null;
+}
+async function errorPayload(response){
+  if(!response.body)return null;
+  const reader=response.body.getReader(),chunks=[];let size=0;
+  let timer;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{void reader.cancel().catch(()=>{});resolve(null);},2000);});
+  try{return await Promise.race([timeout,(async()=>{while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>65536)return null;chunks.push(value);}try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{return null;}})()]);}
+  catch{return null;}finally{clearTimeout(timer);void reader.cancel().catch(()=>{});}
+}
 const versions=new Map();
 async function installedVersion(binary){
   if(!versions.has(binary)){
@@ -18,19 +32,19 @@ async function installedVersion(binary){
   }
   return versions.get(binary);
 }
-function refreshCredentials(binary,home){
+export function refreshCredentials(binary,home,{spawnProcess=spawn,timeoutMs=15000}={}){
   return new Promise((resolve,reject)=>{
-    const child=spawn(binary,['app-server','--listen','stdio://','--disable','plugins','--disable','apps',...codexAuthArgs()],{env:runnerEnv(home),windowsHide:true});
+    const child=spawnProcess(binary,['app-server','--listen','stdio://','--disable','plugins','--disable','apps',...codexAuthArgs()],{env:runnerEnv(home),windowsHide:true});
     let settled=false,buffer='',bytes=0;const decoder=new StringDecoder('utf8');
     const finish=error=>{if(settled)return;settled=true;clearTimeout(timer);child.kill();error?reject(error):resolve();};
-    const timer=setTimeout(()=>finish(authError()),15000);
+    const timer=setTimeout(()=>finish(refreshError()),timeoutMs);
     const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
-    child.on('error',()=>finish(authError()));child.on('close',()=>finish(authError()));child.stderr.on('data',()=>{});child.stdin.on('error',()=>{});
+    child.on('error',()=>finish(refreshError()));child.on('close',()=>finish(refreshError()));child.stderr.on('data',()=>{});child.stdin.on('error',()=>{});
     child.stdout.on('data',chunk=>{
-      if(settled)return;bytes+=chunk.length;if(bytes>1024*1024)return finish(authError());buffer+=decoder.write(chunk);
+      if(settled)return;bytes+=chunk.length;if(bytes>1024*1024)return finish(refreshError());buffer+=decoder.write(chunk);
       let at;while((at=buffer.indexOf('\n'))!==-1){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);let event;try{event=JSON.parse(line);}catch{continue;}
-        if(event.id===1){if(event.error)return finish(authError());send({method:'initialized',params:{}});send({method:'account/read',id:2,params:{refreshToken:true}});}
-        if(event.id===2)finish(event.error||event.result?.account?.type!=='chatgpt'?authError():null);
+        if(event.id===1){if(event.error)return finish(refreshError());send({method:'initialized',params:{}});send({method:'account/read',id:2,params:{refreshToken:true}});}
+        if(event.id===2)finish(event.error?(structuredFailure(event.error.data)||refreshError()):event.result?.account===null?authError(true):event.result?.account?.type!=='chatgpt'?refreshError():null);
       }
     });
     send({method:'initialize',id:1,params:{clientInfo:{name:'harbor_local_gateway',version:'1.0.0'}}});
@@ -76,7 +90,8 @@ export function validateCodexJson(value,path){
   return {...value};
 }
 function failure(status){
-  if(status===401||status===403)return authError();
+  if(status===401)return authError(true);
+  if(status===403)return new AppError(403,'上游拒绝访问，不能据此判定登录失效','upstream_forbidden');
   if(status===429)return new AppError(429,'上游订阅限流或额度不足，请稍后重试','upstream_rate_limit');
   if(status===400||status===422)return new AppError(400,'上游不接受当前模型参数或工具协议，请检查客户端配置','upstream_invalid_request');
   if(status===413)return new AppError(413,'官方服务拒绝了过大的请求体','upstream_payload_too_large');
@@ -103,7 +118,7 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     let result;
     try{result=await fetchImpl(upstreamOrigin+path,{method:payload?'POST':'GET',headers,body:payload?JSON.stringify(payload):undefined,signal,redirect:'error'});}
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
-    if(!result.ok){await result.body?.cancel().catch(()=>{});throw Object.assign(failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
+    if(!result.ok){const details=await errorPayload(result);const classified=[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
   }
   async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders}){
@@ -149,7 +164,7 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
           completed=event;return;
         }
         if(['response.failed','response.incomplete','error'].includes(event.type)){
-          knownUsage=responseUsage(event.response);throw new AppError(502,'上游响应失败或未完整结束','upstream_incomplete');
+          knownUsage=responseUsage(event.response);throw structuredFailure(event.response?.error||event.error||event)||new AppError(502,'上游响应失败或未完整结束','upstream_incomplete');
         }
         if(completed)throw new AppError(502,'上游结束后仍返回事件','upstream_protocol');
         if(collectOutput&&event.type==='response.output_item.done'&&Number.isSafeInteger(event.output_index)&&event.output_index>=0&&event.item)finishedItems.set(event.output_index,event.item);
