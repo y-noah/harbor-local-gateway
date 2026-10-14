@@ -21,3 +21,12 @@ test('invalid deployment configuration fails closed',()=>{
   for(const port of ['','0','65536','abc','1.5'])assert.throws(()=>networkConfig({HARBOR_PORT:port}));
   assert.equal(networkConfig({HARBOR_PORT:'43127'}).port,43127);
 });
+test('IPv6 loopback accepts exact local authority without trusting other origins',()=>{
+ const config=networkConfig({HARBOR_LISTEN_HOST:'::1'});
+ for(const host of ['[::1]','[::1]:43127']){
+  assert.equal(acceptsRequest({host},config),true);
+  assert.equal(acceptsRequest({host,origin:'http://'+host},config),true);
+  assert.equal(acceptsRequest({host,origin:'http://evil.test'},config),false);
+ }
+ for(const host of ['[::2]:43127','[::1].evil.test','::1:43127','[::1]:43127@evil.test'])assert.equal(acceptsRequest({host},config),false);
+});

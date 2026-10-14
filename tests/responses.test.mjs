@@ -261,3 +261,14 @@ test('upstream 413 remains distinguishable from authentication and network failu
  const app=await setup(t,()=>new Response('fixture-private-error',{status:413})),m=app.member();const r=await app.send(m);
  assert.equal(r.status,413);const b=await r.json();assert.equal(b.error.type,'upstream_payload_too_large');assert.ok(!JSON.stringify(b).includes('fixture-private-error'));
 });
+test('non-streaming output retains ordered done items when the terminal response omits them',async t=>{
+ const reasoning={type:'reasoning',id:'rs_fixture',summary:[],encrypted_content:'opaque-fixture'};
+ const message={type:'message',id:'msg_fixture',role:'assistant',status:'completed',content:[{type:'output_text',text:'Synthetic answer',annotations:[]}]};
+ const items=[reasoning,output,message],terminal=complete([]);
+ const events=[{type:'response.output_item.done',output_index:2,item:message},{type:'response.output_item.done',output_index:0,item:reasoning},{type:'response.output_item.done',output_index:1,item:output},terminal];
+ const app=await setup(t,()=>eventStream(events)),m=app.member();
+ const result=await app.send(m);assert.equal(result.status,200);const body=await result.json();assert.deepEqual(body.output,items);assert.deepEqual(body.usage,terminal.response.usage);
+ const streamed=await app.send(m,{stream:true});const wire=(await streamed.text()).split('\n').filter(line=>line.startsWith('data: ')).map(line=>JSON.parse(line.slice(6)));assert.deepEqual(wire,events);
+ const full=complete([message]);const {transport}=fixtureTransport(()=>eventStream([...events.slice(0,-1),full]));const normal=await transport.run({payload:{model,input:[],stream:true}});assert.deepEqual(normal.response,full.response);
+ const streamedOnly=fixtureTransport(()=>eventStream(events));const uncollected=await streamedOnly.transport.run({payload:{model,input:[],stream:true},collectOutput:false});assert.deepEqual(uncollected.response.output,[]);
+});

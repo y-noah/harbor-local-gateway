@@ -16,7 +16,7 @@ export function networkConfig(env=process.env) {
 
 export function acceptsRequest(headers,network) {
   const host=headers.host||'';
-  const local=/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host);
+  const local=/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(host);
   const origins=network.origins.filter(origin=>new URL(origin).host===host);
   if(!local&&!origins.length)return false;
   if(!headers.origin)return true;
