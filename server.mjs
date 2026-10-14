@@ -403,6 +403,8 @@ export function createGateway(options={}) {
           const clientId=req.headers['thread-id']||req.headers['session-id']||req.headers.session_id||req.headers['x-codex-thread-id']||payload.prompt_cache_key;
           if(clientId!==undefined&&(typeof clientId!=='string'||!clientId.length))throw new AppError(400,'客户端会话标识无效');
           const clientKey=clientId?hash(clientId):null;
+          // Display only a UUID-shaped client identifier; routing still uses the employee-scoped hash.
+          const clientSessionId=typeof clientId==='string'&&clientId.length===36&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientId)?clientId:null;
           let session=clientKey?store.get("SELECT * FROM sessions WHERE member_id=? AND protocol='responses' AND client_key=?",m.id,clientKey):null;
           if(session){
             if(!session.enabled)throw new AppError(403,'该会话已被禁止访问','session_disabled');
@@ -415,7 +417,8 @@ export function createGateway(options={}) {
           const secret=(req.headers.authorization||'').replace(/^Bearer /,'');store.authenticate(secret);
           if(!session)session={id:id(),account_id:responseAccount().id};
           const requestId=store.observe(m,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model);
-          if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,created,updated) VALUES(?,?,?,'responses',?,?,?)",session.id,m.id,session.account_id,clientKey,now(),now());
+          if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,client_session_id,created,updated) VALUES(?,?,?,'responses',?,?,?,?)",session.id,m.id,session.account_id,clientKey,clientSessionId,now(),now());
+          else if(clientSessionId)store.run('UPDATE sessions SET client_session_id=? WHERE id=? AND client_session_id IS NULL',clientSessionId,session.id);
           store.run('UPDATE requests SET session_id=?,account_id=? WHERE id=?',session.id,session.account_id,requestId);
           // Scope all upstream cache/thread identifiers to the authenticated employee.
           if(!jsonPath||payload.prompt_cache_key!==undefined)payload.prompt_cache_key=session.upstream_thread||session.id;

@@ -27,8 +27,9 @@ test('legacy titles are erased on reopen without changing routing or usage',()=>
   const m=store.createMember('Fixture',null,null);
   store.run("INSERT INTO accounts(id,name,home,state) VALUES('account-a','Fixture','unused','ready')");
   store.run("INSERT INTO sessions(id,member_id,account_id,title,protocol,state,enabled,route_version,upstream_thread,created,updated) VALUES('legacy',?,'account-a','private synthetic text','responses','active',0,2,'isolated-thread',?,?)",m.memberId,Date.now(),Date.now());
+  store.run('ALTER TABLE sessions DROP COLUMN client_session_id');
   const before=store.get("SELECT * FROM sessions WHERE id='legacy'");store.close();store=new Store(file);
-  assert.deepEqual({...store.get("SELECT * FROM sessions WHERE id='legacy'")},{...before,title:null});
+  assert.deepEqual({...store.get("SELECT * FROM sessions WHERE id='legacy'")},{...before,title:null,client_session_id:null});
   assert.ok(!('title' in store.snapshot().sessions[0]));
  }finally{store.close();rmSync(root,{recursive:true,force:true});}
 });
@@ -104,4 +105,39 @@ test('slow request preparation prevents routing until its binding has been resol
  assert.equal((await app.request('/api/admin/sessions/'+s.id,{account_id:'account-b',expected_route_version:0})).status,409);
  req.end(payload.slice(12));assert.equal(await pending,200);
  assert.equal((await app.request('/api/admin/sessions/'+s.id,{account_id:'account-b',expected_route_version:0})).status,200);
+});
+
+test('client Session is displayed unchanged, isolated by employee and stable after routing',async t=>{
+ const app=await setup(t),client='01234567-89ab-7cde-8fab-0123456789ab';
+ assert.equal((await app.send(client)).status,200);const first=app.session();
+ assert.equal(first.client_session_id,client);assert.notEqual(first.id,client);
+ assert.equal(app.calls.at(-1).sessionId,first.id);
+ assert.equal((await app.send(client,undefined,app.other)).status,200);
+ const other=app.store.get('SELECT * FROM sessions WHERE member_id=?',app.other.memberId);
+ assert.equal(other.client_session_id,client);assert.notEqual(other.id,first.id);
+ assert.equal((await app.request('/api/admin/sessions/'+first.id,{account_id:'account-b',expected_route_version:0})).status,200);
+ assert.equal((await app.send(client)).status,200);assert.equal(app.session().id,first.id);assert.equal(app.session().client_session_id,client);
+ assert.equal(app.session().account_id,'account-b');assert.equal(app.store.get('SELECT account_id FROM sessions WHERE id=?',other.id).account_id,other.account_id);
+ const state=await app.request('/api/admin/state',undefined,'fixture-admin','GET');
+ assert.equal(state.body.sessions.find(x=>x.id===first.id).client_session_id,client);
+ assert.equal((await app.request('/api/admin/sessions/'+first.id,{client_session_id:'forged'})).status,400);
+ assert.equal((await app.request('/api/admin/sessions/'+first.id,{enabled:false})).status,200);
+ assert.equal((await app.send(client)).status,403);
+});
+test('legacy hashed sessions backfill only the matching client UUID without replacing their binding',async t=>{
+ const app=await setup(t),client='ABCDEF01-2345-6789-ABCD-0123456789AB';await app.send(client);
+ const first=app.session();app.store.run('UPDATE sessions SET client_session_id=NULL WHERE id=?',first.id);
+ assert.equal(app.store.snapshot().sessions.find(x=>x.id===first.id).client_session_id,null);
+ await app.send(client);const next=app.session();
+ assert.equal(next.client_session_id,client);assert.equal(next.id,first.id);assert.equal(next.account_id,first.account_id);assert.equal(next.route_version,first.route_version);
+ assert.equal(app.store.get('SELECT COUNT(*) n FROM sessions WHERE member_id=?',app.member.memberId).n,1);
+});
+test('missing and non-UUID client identifiers never become display metadata',async t=>{
+ const app=await setup(t);
+ for(const client of ['synthetic-secret-not-a-session','<img src=x onerror=alert(1)>','01234567-89ab-7cde-8fab-0123456789ab-extra'])assert.equal((await app.send(client)).status,200);
+ assert.equal((await app.request('/v1/responses',{model:'fixture-model',input:[],stream:false},app.member.secret,'POST')).status,200);
+ assert.equal((await app.request('/v1/responses',{model:'fixture-model',input:[],stream:false,prompt_cache_key:'01234567-89ab-7cde-8fab-0123456789ab\n'},app.member.secret,'POST')).status,200);
+ assert.equal(app.store.all('SELECT client_session_id FROM sessions').every(x=>x.client_session_id===null),true);
+ const state=await app.request('/api/admin/state',undefined,'fixture-admin','GET');
+ assert.ok(!JSON.stringify(state.body.sessions).includes('synthetic-secret'));assert.ok(!JSON.stringify(state.body.sessions).includes('onerror'));
 });
