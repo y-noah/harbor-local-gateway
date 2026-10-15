@@ -110,7 +110,7 @@ export function createGateway(options={}) {
           baseline={windowId,remaining:data.remaining,used:beforeUsed};
         }
         store.run("UPDATE accounts SET state='ready',last_error=NULL,quota_json=?,quota_error=NULL,since_check_tokens=?,tokens_per_percent=?,quota_calibration=? WHERE id=?",JSON.stringify(data),Math.max(0,current.budget_used-beforeUsed),perPercent,JSON.stringify(baseline),account.id);
-        if(balancer.settings().failover&&data.limitReached)balancer.block(account,'quota_exhausted');
+        if(balancer.settings().failover&&(data.limitReached||data.remaining<=0))balancer.block(account,'quota_exhausted');
         else balancer.recover(account,data);
         return data;
       }catch(e){if(!stopping&&(authVersions.get(account.id)||0)===authVersion)store.run('UPDATE accounts SET quota_error=? WHERE id=?',e.message,account.id);}
@@ -166,9 +166,7 @@ export function createGateway(options={}) {
     void task.finally(()=>{tasks.delete(task);const left=busy.get(account.id)-1;if(left)busy.set(account.id,left);else busy.delete(account.id);pump();}).catch(e=>console.error('[worker]',e.message));
   }
   function responseAccount(){
-    const account=store.get("SELECT * FROM accounts WHERE kind='codex' AND enabled=1 AND removed_at IS NULL AND state IN ('ready','degraded') AND route_block IS NULL ORDER BY last_used,id LIMIT 1");
-    if(!account)throw new AppError(503,'没有已登录的可用账号','no_account');
-    return account;
+    return balancer.selectAccount();
   }
   function pump(){
     if(stopping)return;
@@ -253,6 +251,7 @@ export function createGateway(options={}) {
         }
         if(path==='/api/admin/state'&&method==='GET'){refreshQuotas();return json(res,200,{...store.snapshot(),balancing:balancer.status(),queue:queue.length,busy:[...busy.values()].reduce((a,b)=>a+b,0),preparing:[...responseMembers.values()].reduce((a,b)=>a+b,0),endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});}
         if(path==='/api/admin/balancing'&&method==='PATCH')return json(res,200,balancer.saveSettings(await body(req)));
+        if(path==='/api/admin/balancing/weights'&&method==='PATCH')return json(res,200,balancer.saveWeights(await body(req)));
         if(path==='/api/admin/balancing/preview'&&method==='POST')return json(res,200,await balancer.preview());
         const sessionMatch=path.match(/^\/api\/admin\/sessions\/([a-zA-Z0-9-]+)$/);
         if(sessionMatch&&method==='PATCH'){
@@ -439,11 +438,13 @@ export function createGateway(options={}) {
           if(stopping)throw new AppError(503,'服务停止','service_stopping');
           const secret=(req.headers.authorization||'').replace(/^Bearer /,'');store.authenticate(secret);
           if(session)session=balancer.route(session);
-          if(!session)session={id:id(),account_id:responseAccount().id};
-          const requestId=store.observe(m,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model);
-          if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,client_session_id,created,updated) VALUES(?,?,?,'responses',?,?,?,?)",session.id,m.id,session.account_id,clientKey,clientSessionId,now(),now());
-          else if(clientSessionId)store.run('UPDATE sessions SET client_session_id=? WHERE id=? AND client_session_id IS NULL',clientSessionId,session.id);
-          store.run('UPDATE requests SET session_id=?,account_id=? WHERE id=?',session.id,session.account_id,requestId);
+          const requestId=balancer.atomic(()=>{
+            if(!session)session={id:id(),account_id:responseAccount().id};
+            const requestId=store.observe(m,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model);
+            if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,client_session_id,created,updated) VALUES(?,?,?,'responses',?,?,?,?)",session.id,m.id,session.account_id,clientKey,clientSessionId,now(),now());
+            else if(clientSessionId)store.run('UPDATE sessions SET client_session_id=? WHERE id=? AND client_session_id IS NULL',clientSessionId,session.id);
+            store.run('UPDATE requests SET session_id=?,account_id=? WHERE id=?',session.id,session.account_id,requestId);return requestId;
+          });
           // Scope all upstream cache/thread identifiers to the authenticated employee.
           if(!jsonPath||payload.prompt_cache_key!==undefined)payload.prompt_cache_key=session.upstream_thread||session.id;
           const controller=new AbortController();controllers.add(controller);res.on('close',()=>{if(!res.writableEnded)controller.abort();});

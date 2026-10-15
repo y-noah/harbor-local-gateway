@@ -199,3 +199,16 @@ test('missing client Session is explicit and never falls back to internal routin
  assert.equal(page.run("sessionDisplayId({id:'internal',upstream_thread:'upstream',protocol:'responses'})"),'未获取');
  assert.equal(page.run("sessionDisplayId({id:'internal',upstream_id:'upstream',protocol:'chat'})"),'旧 CLI 会话');
 });
+
+test('positive automatic weights are never displayed as zero or one hundred after rounding',async()=>{
+ const page=await ui(()=>response(snapshot()));
+ assert.equal(page.run('weightPercent(0.000001)'),'低于0.01%');assert.equal(page.run('weightPercent(99.999999)'),'高于99.99%');
+ assert.equal(page.run('weightPercent(0)'),'0%');assert.equal(page.run('weightPercent(100)'),'100%');
+});
+test('temporary weight editor uses server version and offers explicit automatic restore',async()=>{
+ const calls=[],data={...snapshot(),accounts:[{id:'a',name:'Account A',kind:'codex',enabled:1,state:'ready'},{id:'b',name:'Account B',kind:'codex',enabled:1,state:'ready'}],balancing:{settings:{weighted:true},weights:{mode:'manual',configuration:{mode:'manual',weights:{a:100,b:0},expires:1800000000000,version:7},accounts:[{id:'a',automatic:68.965,effective:100},{id:'b',automatic:31.035,effective:0}]}}};
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?data:{ok:true});});
+ page.run('admin=true;state='+JSON.stringify(data)+';');await page.click('routing-weights');
+ const html=page.node('#modal-content').innerHTML;assert.match(html,/value="100"/);assert.match(html,/value="0"/);assert.match(html,/每天北京时间02:00恢复自动/);assert.match(html,/即使其权重为0%/);
+ await page.click('routing-auto');const saved=calls.find(([p])=>p==='/api/admin/balancing/weights');assert.deepEqual(JSON.parse(saved[1].body),{mode:'auto',expected_version:7});
+});

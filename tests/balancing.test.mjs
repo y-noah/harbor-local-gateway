@@ -8,7 +8,7 @@ import {PassThrough} from 'node:stream';
 import {Store} from '../store.mjs';
 import {createGateway} from '../server.mjs';
 import {createResponsesTransport,structuredFailure,refreshCredentials} from '../responses.mjs';
-import {balanceSettings,nightlyWindow,planBalance,createBalancer} from '../balancing.mjs';
+import {balanceSettings,nightlyWindow,planBalance,createBalancer,automaticWeights,nextWeightReset} from '../balancing.mjs';
 
 const at=Date.parse('2026-10-14T02:00:15+08:00'),hour=3600000;
 const account=(id,remaining=50)=>({id,kind:'codex',enabled:1,removed_at:null,state:'ready',route_block:null,route_epoch:0,quota_json:JSON.stringify({plan:'same-plan',checked:at,remaining,windows:[{used:100-remaining,minutes:300,reset:at+hour}],limitReached:false})});
@@ -22,7 +22,7 @@ test('nightly calendar is Beijing 02:00 with exact 16-hour window and one-minute
  assert.equal(nightlyWindow(w.end-1).due,false);assert.equal(nightlyWindow(w.end+60000).due,false);
 });
 test('settings reject unsafe types and unexpected client options',()=>{
- assert.deepEqual(balanceSettings(),{failover:false,nightly:false,quietMinutes:30});
+ assert.deepEqual(balanceSettings(),{failover:false,nightly:false,quietMinutes:30,weighted:false});
  for(const value of [null,[],2,{failover:'true'},{nightly:1},{quietMinutes:0},{quietMinutes:961},{quietMinutes:1.1},{account_id:'forged'}])assert.throws(()=>balanceSettings(value));
 });
 test('fixed long task consumes its account share while movable sessions move toward spare quota',()=>{
@@ -54,7 +54,7 @@ test('stale, reset, incomparable and blocked accounts never receive nightly tran
  }
 });
 
-async function gateway(t,{rateReader=async()=>{throw Error('unavailable');}}={}){
+async function gateway(t,{rateReader=async()=>{throw Error('unavailable');},clock}={}){
  const root=mkdtempSync(join(tmpdir(),'harbor-balancing-'));let mode='ok',release,arrivals=0;const calls=[];
  const transport=createResponsesTransport({version:async()=>'0.0.0',credentials:async(_binary,home)=>({token:'fixture-upstream',accountId:home}),fetchImpl:async(url,options)=>{
   calls.push({home:options.headers['ChatGPT-Account-ID'],body:JSON.parse(options.body)});arrivals++;
@@ -68,7 +68,7 @@ async function gateway(t,{rateReader=async()=>{throw Error('unavailable');}}={})
   const output=mode==='partial'?[{type:'response.output_text.delta',delta:'fixture'},{type:'response.failed',response:{error:{type:'usage_limit_reached'}}}]:[{type:'response.completed',response:{status:'completed',output:[],usage:{input_tokens:5,output_tokens:5}}}];
   return new Response(output.map(x=>'data: '+JSON.stringify(x)+'\n\n').join(''),{headers:{'Content-Type':'text/event-stream'}});
  }});
- const app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'fixture-admin',codexBinary:'unused',reserveTokens:100},rateReader,responsesTransport:transport});
+ const app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'fixture-admin',codexBinary:'unused',reserveTokens:100},rateReader,responsesTransport:transport,...(clock?{clock}:{})});
  for(const a of ['a','b'])app.store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
  app.balancer.saveSettings({failover:true});
  const member=app.store.createMember('Fixture',null,null);await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+app.server.address().port;
@@ -203,4 +203,86 @@ for(const enabled of [true,false])test('pre-fault preview cannot supply recovery
   pending[1](positive());assert.equal((await refresh).status,200);
   assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null,'only fresh post-fault evidence can recover');
  }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([preview,refresh].filter(Boolean));}
+});
+
+const timedAccount=(id,remaining,hours,checked=at)=>({...account(id,remaining),quota_json:JSON.stringify({plan:'same-plan',checked,remaining,windows:[{used:100-remaining,minutes:10080,reset:checked+hours*hour}],limitReached:false})});
+test('24-hour budgets keep positive balances positive and do not amplify a nearly expired tail',()=>{
+ for(const [remaining,hours,expected] of [[30,24,68.9655172414],[30,12,68.9655172414],[5,1,27.0270270270],[1,1,6.8965517241],[0,1,0]]){
+  const result=automaticWeights([timedAccount('a',remaining,hours),timedAccount('b',90,160)],at);
+  assert.equal(result.reason,null);assert.ok(Math.abs(result.weights.get('a')-expected)<1e-8);
+  if(remaining>0){assert.ok(result.weights.get('a')>0&&result.weights.get('a')<100);assert.ok(result.weights.get('b')>0&&result.weights.get('b')<100);}
+ }
+ assert.ok(automaticWeights([timedAccount('a',0.000001,0.001),timedAccount('b',90,160)],at).weights.get('a')>0);
+ const a=timedAccount('a',30,24),b=timedAccount('b',90,160);
+ assert.equal(automaticWeights([a,{...b,quota_json:null}],at).reason,'quota_unavailable');
+ assert.equal(automaticWeights([a,timedAccount('b',90,0)],at).reason,'quota_unavailable');
+ const multi=JSON.parse(b.quota_json);multi.windows.push({...multi.windows[0],minutes:300});
+ assert.equal(automaticWeights([a,{...b,quota_json:JSON.stringify(multi)}],at).reason,'incomparable_quota');
+});
+test('new sessions use atomic smooth weights and duplicate client sessions are not allocated again',async t=>{
+ const checked=Date.now(),app=await gateway(t,{clock:()=>checked});
+ for(const a of [timedAccount('a',30,24,checked),timedAccount('b',90,160,checked)])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+ app.balancer.saveSettings({weighted:true});
+ const replies=await Promise.all(Array.from({length:100},(_,i)=>app.send('weighted-'+i)));assert.ok(replies.every(r=>r.status===200));
+ const counts=app.store.all('SELECT account_id,COUNT(*) n FROM sessions GROUP BY account_id');assert.deepEqual(Object.fromEntries(counts.map(r=>[r.account_id,r.n])),{a:69,b:31});
+ const before=app.store.get("SELECT value FROM gateway_settings WHERE name='routing_schedule'").value;
+ await Promise.all(Array.from({length:8},()=>app.send('weighted-0')));
+ assert.equal(app.store.get("SELECT value FROM gateway_settings WHERE name='routing_schedule'").value,before);
+ assert.equal(app.store.get('SELECT COUNT(*) n FROM sessions').n,100);
+ const admin=await fetch(app.base+'/api/admin/state',{headers:{Authorization:'Bearer fixture-admin'}});const state=await admin.json();assert.equal(state.balancing.weights.mode,'auto');
+ assert.ok(Math.abs(state.balancing.weights.accounts[0].automatic-68.9655172414)<1e-8);
+});
+test('manual 100/0 keeps zero-weight fallback and official zero overrides the preference without replay',async t=>{
+ const app=await gateway(t);const checked=Date.now();
+ for(const a of [timedAccount('a',30,24,checked),timedAccount('b',90,160,checked)])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+ app.balancer.saveSettings({weighted:true});
+ const patch=(body,key='fixture-admin')=>fetch(app.base+'/api/admin/balancing/weights',{method:'PATCH',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify(body)});
+ assert.equal((await patch({mode:'manual',weights:{a:100,b:0},expected_version:0},app.member.secret)).status,401);
+ for(const weights of [{a:101,b:-1},{a:50,b:49},{a:0,b:0},{forged:100},{a:'100'},{a:99.999,b:0.001}])assert.equal((await patch({mode:'manual',weights,expected_version:0})).status,400);
+ assert.equal((await patch({mode:'manual',weights:{a:100,b:0},expected_version:0})).status,200);
+ assert.equal((await patch({mode:'auto',expected_version:0})).status,409);
+ await app.send();assert.equal(app.calls.at(-1).home,'a');
+ app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24,Date.now()).quota_json,'a');
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');assert.equal(app.calls.length,2);
+ assert.equal(app.balancer.status().weights.mode,'failover');assert.equal(app.balancer.status().weights.configuration.weights.a,100);
+ assert.equal((await app.send('new-after-zero')).status,200);assert.equal(app.calls.at(-1).home,'b');
+ assert.equal((await patch({mode:'auto',expected_version:1})).status,200);
+});
+test('manual settings expire at the next Beijing 02:00 even with nightly disabled, restart or missed trigger',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'harbor-weight-expiry-'));let store,clock=Date.parse('2026-10-15T23:00:00+08:00');
+ try{
+  store=new Store(join(root,'db.sqlite'));for(const a of ['a','b'])store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
+  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});
+  let b=create();b.saveSettings({weighted:true});b.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+  const expires=Date.parse('2026-10-16T02:00:00+08:00');assert.equal(b.status().weights.configuration.expires,expires);assert.equal(nextWeightReset(expires),expires+24*hour);
+  store.db.close();store=new Store(join(root,'db.sqlite'));b=create();assert.equal(b.status().weights.mode,'manual');
+  clock=expires+3*hour;assert.equal(b.status().weights.configuration.mode,'auto','deadline is enforced before maintenance');
+  await b.tick();assert.equal(b.status().weights.configuration.mode,'auto');assert.equal(b.status().weights.configuration.version,2);assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0);
+  const before=store.get("SELECT value FROM gateway_settings WHERE name='routing_schedule'");
+  assert.throws(()=>b.atomic(()=>{b.selectAccount();throw Error('rollback');}));assert.deepEqual(store.get("SELECT value FROM gateway_settings WHERE name='routing_schedule'"),before);
+ }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
+});
+test('nightly uses the same hourly weights and accepts quota recovered by its own refresh',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'harbor-weight-night-'));let store;
+ try{
+  store=new Store(join(root,'db.sqlite'));const m=store.createMember('Fixture',null,null);
+  for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
+  for(let i=0;i<10;i++){store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'b','responses',?,?)",'night-'+i,m.memberId,at-2*hour,at-hour);store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,ip,model,input) VALUES(?,?,?,'b',?,?,'ok','fixture','fixture',10)",'r'+i,m.memberId,'night-'+i,at-2*hour,at-hour);}
+  const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async a=>{const q=JSON.parse(a.quota_json);b.recover(a,q);return q;}});
+  b.saveSettings({weighted:true,nightly:true,failover:true});b.block(store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+  await b.tick();const result=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
+  assert.equal(store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);
+  assert.ok(Math.abs(result.summaries[0].target.a-68.9655172414)<1e-8);assert.equal(store.get("SELECT COUNT(*) n FROM sessions WHERE account_id='a'").n,7);
+ }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
+});
+test('weighted switch preserves the old balancing settings contract across disable and restart',()=>{
+ const root=mkdtempSync(join(tmpdir(),'harbor-weight-rollback-'));let store;
+ try{
+  store=new Store(join(root,'db.sqlite'));const create=()=>createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async()=>null});
+  let b=create();b.saveSettings({weighted:true,failover:true,nightly:true});
+  assert.deepEqual(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),{failover:true,nightly:true,quietMinutes:30});
+  b.saveSettings({weighted:false});assert.deepEqual(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),{failover:true,nightly:true,quietMinutes:30});
+  store.db.close();store=new Store(join(root,'db.sqlite'));b=create();assert.equal(b.settings().weighted,false);assert.equal(b.settings().nightly,true);
+  store.run("UPDATE gateway_settings SET value=? WHERE name='balancing'",JSON.stringify({failover:true,nightly:true,quietMinutes:30,weighted:true}));b=create();assert.ok(!Object.hasOwn(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),'weighted'));assert.equal(b.settings().weighted,false,'existing independent setting wins over transitional data');
+ }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
 });
