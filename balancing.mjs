@@ -244,7 +244,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     const exhausted=snapshot.limitReached||snapshot.remaining<=0;if(exhausted&&account.route_block!=='login_expired')return;
     return atomic(()=>{
       const result=store.run('UPDATE accounts SET route_block=?,route_epoch=route_epoch+1,route_blocked_at=? WHERE id=? AND route_epoch=? AND route_block IS NOT NULL',exhausted?'quota_exhausted':null,exhausted?clock():null,account.id,account.route_epoch);
-      if(result.changes){store.audit('account.route_recover',account.id);if(settings().weighted)syncWeights(undefined,clock(),'recovery');}
+      if(result.changes){store.audit('account.route_recover',account.id);syncWeights(undefined,clock(),'recovery');}
       return result.changes>0;
     });
   }

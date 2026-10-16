@@ -594,3 +594,19 @@ test('initial authentication recovery with incomparable windows does not retain 
  const quota=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(quota.status,200);
  assert.equal(app.balancer.status().weights.mode,'fallback');assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
 });
+for(const manual of [false,true])test('recovery while weighted is disabled refreshes cached allocation before reenable, manual '+manual,async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:50,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',50,24,Date.now()).quota_json,'a');
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').automatic,0);
+ if(manual)app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ const configuration=app.store.get("SELECT value FROM gateway_settings WHERE name='routing_weights'")?.value;
+ app.balancer.saveSettings({weighted:false});
+ const recovered=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(recovered.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);assert.equal(app.balancer.settings().weighted,false);
+ assert.equal((await app.send()).status,200);assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0,'legacy recovery does not migrate');
+ app.balancer.saveSettings({weighted:true});
+ const restarted=createBalancer({store:app.store,preparing:new Set(),refreshQuota:async()=>null});
+ assert.equal(restarted.status().weights.accounts.find(a=>a.id==='a').automatic,100);
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.length,2);assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0);
+ assert.equal(app.store.get("SELECT value FROM gateway_settings WHERE name='routing_weights'")?.value,configuration,'automatic cache refresh preserves manual values, version and expiry');
+});
