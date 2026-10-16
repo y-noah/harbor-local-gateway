@@ -85,6 +85,14 @@ test('tolerance and smaller-combination search stay isolated between comparable 
  assert.equal(p.summaries.length,2);assert.equal(p.moves.length,1);assert.equal(p.moves[0].from,'a');assert.equal(p.moves[0].to,'b');
  assert.deepEqual(p.summaries[1].after,{c:52,d:48});
 });
+test('large nightly groups preserve a valid plan without overflowing the search stack',()=>{
+ const count=30000,accounts=['a','b','c','d'].map(id=>account(id));
+ const sessions=Array.from({length:count},(_,i)=>session('s'+String(i).padStart(8,'0'),i<count*0.7?'a':'c'));
+ const p=plan(accounts,sessions,sessions.map(s=>request(s.id,1)),{weighted:true}),g=p.summaries[0];
+ assert.ok(p.moves.length>0);assert.equal(new Set(p.moves.map(m=>m.session_id)).size,p.moves.length);
+ const replay={...g.before};for(const m of p.moves){replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
+ assert.deepEqual(replay,g.after);for(const a of accounts)assert.ok(Math.abs(g.after[a.id]-g.target[a.id])/count<=0.02);
+});
 test('quiet, manual exclusion, preparing and disabled sessions remain fixed and count as load',()=>{
  const sessions=[session('quiet','a'),session('manual','a',{nightly_enabled:0}),session('disabled','a',{enabled:0}),session('ready','a')];
  const rows=sessions.map(s=>request(s.id,20,s.id==='quiet'?{ended:at-1,started:nightlyWindow(at).end-1000}:{}));

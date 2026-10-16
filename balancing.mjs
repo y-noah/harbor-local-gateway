@@ -47,28 +47,34 @@ function minimizeTransfers(pool,movable,before,target,total,proposed){
   for(const m of proposed){proposedLoads.set(m.from,proposedLoads.get(m.from)-m.weight);proposedLoads.set(m.to,proposedLoads.get(m.to)+m.weight);}
   const limit=withinTolerance(proposedLoads,target,total)?proposed.length-1:movable.length;
   let budget=nightlySearchBudget;
-  const selected=[];
-  function search(start,left){
-    if(budget--<=0)return null;
-    if(!left)return withinTolerance(loads,target,total)?[...selected]:null;
-    if(movable.length-start<left)return null;
-    const capacity=movable.slice(start,start+left).reduce((sum,s)=>sum+s.weight,0);
-    if(pool.some(a=>Math.abs(loads.get(a.id)-target.get(a.id))>capacity+slack))return null;
-    for(let i=start;i<=movable.length-left&&budget>0;i++){
-      const s=movable[i],from=loads.get(s.account_id);
-      for(const a of pool){
-        if(a.id===s.account_id||target.get(a.id)<=0||budget<=0)continue;
-        const to=loads.get(a.id);
-        loads.set(s.account_id,from-s.weight);loads.set(a.id,to+s.weight);
+  const selected=[],prefix=[0];for(const s of movable)prefix.push(prefix.at(-1)+s.weight);
+  function search(count){
+    const stack=[{start:0,left:count}];
+    const leave=()=>{const frame=stack.pop();if(frame.restore){const r=frame.restore;loads.set(r.from,r.fromLoad);loads.set(r.to,r.toLoad);selected.pop();}};
+    try{
+      while(stack.length&&budget>0){
+        const frame=stack.at(-1);
+        if(frame.index===undefined){
+          budget--;
+          if(!frame.left){if(withinTolerance(loads,target,total))return [...selected];leave();continue;}
+          if(movable.length-frame.start<frame.left){leave();continue;}
+          const capacity=prefix[frame.start+frame.left]-prefix[frame.start];
+          if(pool.some(a=>Math.abs(loads.get(a.id)-target.get(a.id))>capacity+slack)){leave();continue;}
+          frame.index=frame.start;frame.destination=0;
+        }
+        if(frame.index>movable.length-frame.left){leave();continue;}
+        const index=frame.index,s=movable[index],a=pool[frame.destination++];
+        if(frame.destination===pool.length){frame.index++;frame.destination=0;}
+        if(a.id===s.account_id||target.get(a.id)<=0)continue;
+        const fromLoad=loads.get(s.account_id),toLoad=loads.get(a.id);
+        loads.set(s.account_id,fromLoad-s.weight);loads.set(a.id,toLoad+s.weight);
         selected.push({session_id:s.id,from:s.account_id,to:a.id,version:s.route_version,weight:s.weight});
-        const found=search(i+1,left-1);
-        selected.pop();loads.set(s.account_id,from);loads.set(a.id,to);
-        if(found)return found;
+        stack.push({start:index+1,left:frame.left-1,restore:{from:s.account_id,to:a.id,fromLoad,toLoad}});
       }
-    }
-    return null;
+      return null;
+    }finally{while(stack.length)leave();}
   }
-  for(let count=1;count<=limit&&budget>0;count++){const found=search(0,count);if(found)return found;}
+  for(let count=1;count<=limit&&budget>0;count++){const found=search(count);if(found)return found;}
   return proposed;
 }
 
