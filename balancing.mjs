@@ -249,12 +249,26 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     running=(async()=>{
       try{
         const result=await plan(at),applied=[];
-        for(const item of result.moves){
+        for(const group of result.summaries){
           if(stopping()||!settings().nightly)break;
-          const session=store.get('SELECT * FROM sessions WHERE id=?',item.session_id),target=store.get('SELECT * FROM accounts WHERE id=?',item.to),source=store.get('SELECT * FROM accounts WHERE id=?',item.from);
-          const latest=store.get('SELECT MAX(MAX(started,COALESCE(ended,started))) last FROM requests WHERE session_id=?',item.session_id)?.last;
-          if(!session?.nightly_enabled||session.route_version!==item.version||session.account_id!==item.from||latest>clock()-settings().quietMinutes*minute||!quotaSnapshot(target,clock())||!quotaSnapshot(source,clock())||source.route_block)continue;
-          try{move(session,item.to,'nightly');applied.push(item.session_id);}catch(e){if(!(e instanceof AppError))throw e;result.skipped.push({session_id:item.session_id,reason:e.code});}
+          const ids=new Set(group.accounts),items=result.moves.filter(item=>ids.has(item.from));
+          if(!items.length)continue;
+          // Smaller combinations can require both directions; never publish only half a group.
+          try{
+            const committed=atomic(()=>{
+              const moved=[];
+              for(const item of items){
+                if(stopping()||!settings().nightly)throw new AppError(409,'夜间计划条件已变化','nightly_plan_changed');
+                const session=store.get('SELECT * FROM sessions WHERE id=?',item.session_id),target=store.get('SELECT * FROM accounts WHERE id=?',item.to),source=store.get('SELECT * FROM accounts WHERE id=?',item.from);
+                const latest=store.get('SELECT MAX(MAX(started,COALESCE(ended,started))) last FROM requests WHERE session_id=?',item.session_id)?.last,targetQuota=quotaSnapshot(target,clock());
+                if(!session?.nightly_enabled||session.route_version!==item.version||session.account_id!==item.from||latest>clock()-settings().quietMinutes*minute||!targetQuota||targetQuota.limitReached||targetQuota.remaining<=0||!quotaSnapshot(source,clock())||source.route_block)throw new AppError(409,'夜间计划条件已变化','nightly_plan_changed');
+                move(session,item.to,'nightly');moved.push(item.session_id);
+              }
+              const committedAt=clock();if(group.accounts.some(account=>!quotaSnapshot(store.get('SELECT * FROM accounts WHERE id=?',account),committedAt)))throw new AppError(409,'夜间计划额度已变化','nightly_plan_changed');
+              return moved;
+            });
+            for(const session of committed)applied.push(session);
+          }catch(e){if(!(e instanceof AppError))throw e;for(const item of items)result.skipped.push({session_id:item.session_id,reason:e.code});}
         }
         store.run("UPDATE balance_runs SET ended=?,status='completed',summary=? WHERE day=?",clock(),JSON.stringify({...result,applied}),window.key);
       }catch{store.run("UPDATE balance_runs SET ended=?,status='failed',summary=? WHERE day=?",clock(),JSON.stringify({reason:'planning_failed'}),window.key);}

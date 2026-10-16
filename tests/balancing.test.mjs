@@ -206,6 +206,60 @@ test('preview computes the complete minimal plan and the nightly batch applies e
   await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,3);
  }finally{store.close();}
 });
+for(const expires of [false,true])test('a complete nightly combination is committed together, quota expires '+expires,async()=>{
+ const store=new Store(':memory:');let clock=at;
+ try{
+  const member=store.createMember('Fixture',null,null),rows=[['fixed-a','a',30,0],['move-a','a',30,1],['fixed-b','b',20,0],['move-b','b',20,1]];
+  for(const a of [account('a'),account('b')]){
+   const q=JSON.parse(a.quota_json);q.windows[0].reset=at+1000;
+   store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,JSON.stringify(q));
+  }
+  for(const [sid,aid,weight,nightly] of rows){
+   store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated,nightly_enabled) VALUES(?,?,?,'responses',?,?,?)",sid,member.memberId,aid,at-2*hour,at-hour,nightly);
+   store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,model,ip) VALUES(?,?,?,?,?,?,'ok',?,'fixture','fixture')",'r-'+sid,member.memberId,sid,aid,at-2*hour,at-hour,weight);
+  }
+  const read=async a=>JSON.parse(a.quota_json),b=createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:read,readQuota:read});
+  b.saveSettings({nightly:true,weighted:true});const before=store.all('SELECT id,account_id,route_version,upstream_thread FROM sessions ORDER BY id');
+  const preview=await b.preview();assert.equal(preview.moves.length,2);assert.deepEqual(preview.summaries[0].after,{a:50,b:50});
+  const audit=store.audit.bind(store);store.audit=(action,detail)=>{audit(action,detail);if(expires&&action==='session.route')clock=at+1000;};
+  await b.tick();const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
+  assert.equal(store.get('SELECT status FROM balance_runs').status,'completed');
+  if(expires){
+   assert.deepEqual(store.all('SELECT id,account_id,route_version,upstream_thread FROM sessions ORDER BY id'),before);
+   assert.equal(saved.applied.length,0);assert.equal(saved.skipped.filter(s=>s.reason==='nightly_plan_changed').length,2);
+   assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,0);
+  }else{
+   assert.equal(saved.applied.length,2);assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
+   assert.equal(store.get("SELECT route_version FROM sessions WHERE id='move-a'").route_version,1);
+   assert.equal(store.get("SELECT route_version FROM sessions WHERE id='move-b'").route_version,1);
+  }
+  await b.tick();assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,1);
+ }finally{store.close();}
+});
+test('a group becoming busy rolls back its whole combination without cancelling an independent group',async()=>{
+ const store=new Store(':memory:'),preparing=new Set();
+ try{
+  const members=[store.createMember('Fixture one',null,null),store.createMember('Fixture two',null,null)];
+  for(const [index,ids] of [['a','b'],['c','d']].entries()){
+   for(const aid of ids){const a=account(aid),q=JSON.parse(a.quota_json);q.plan='plan-'+index;store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",aid,aid,aid,JSON.stringify(q));}
+   for(const [suffix,aid,weight,nightly] of [['fixed-a',ids[0],30,0],['move-a',ids[0],30,1],['fixed-b',ids[1],20,0],['move-b',ids[1],20,1]]){
+    const sid=index+'-'+suffix;
+    store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated,nightly_enabled) VALUES(?,?,?,'responses',?,?,?)",sid,members[index].memberId,aid,at-2*hour,at-hour,nightly);
+    store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,model,ip) VALUES(?,?,?,?,?,?,'ok',?,'fixture','fixture')",'r-'+sid,members[index].memberId,sid,aid,at-2*hour,at-hour,weight);
+   }
+  }
+  const b=createBalancer({store,preparing,clock:()=>at,refreshQuota:async a=>JSON.parse(a.quota_json)});b.saveSettings({nightly:true,weighted:true});
+  const before=store.all("SELECT id,account_id,route_version,upstream_thread FROM sessions WHERE id LIKE '0-%' ORDER BY id"),audit=store.audit.bind(store);
+  store.audit=(action,detail)=>{audit(action,detail);if(action==='session.route'&&JSON.parse(detail).session.startsWith('0-'))preparing.add(members[0].memberId);};
+  await b.tick();const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
+  assert.equal(saved.moves.length,4);assert.equal(saved.applied.length,2);assert.ok(saved.applied.every(s=>s.startsWith('1-')));
+  assert.deepEqual(store.all("SELECT id,account_id,route_version,upstream_thread FROM sessions WHERE id LIKE '0-%' ORDER BY id"),before);
+  assert.equal(saved.skipped.filter(s=>s.reason==='session_busy').length,2);
+  assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
+  assert.equal(store.get("SELECT route_version FROM sessions WHERE id='1-move-a'").route_version,1);
+  assert.equal(store.get("SELECT route_version FROM sessions WHERE id='1-move-b'").route_version,1);
+ }finally{store.close();}
+});
 test('structured classifier uses codes, never message substring or ambiguous errors',()=>{
  assert.equal(structuredFailure({error:{type:'usage_limit_reached'}}).routeFailure,'quota_exhausted');
  assert.equal(structuredFailure({code:'refresh_token_expired'}).routeFailure,'login_expired');
