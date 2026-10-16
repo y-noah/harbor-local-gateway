@@ -90,7 +90,8 @@ export function createGateway(options={}) {
   async function refreshQuota(account,force=false){
     if(stopping||!account||account.removed_at!==null||!account.enabled||!['ready','degraded'].includes(account.state))return;
     if(account.kind==='claude'){store.run('UPDATE accounts SET quota_error=? WHERE id=?','Claude 官方 CLI 暂无已验证的额度查询；使用本地 Token 预算估算',account.id);return;}
-    if(quotaReads.has(account.id))return quotaReads.get(account.id);
+    const quotaKey=account.id+':'+(authVersions.get(account.id)||0)+':'+account.route_epoch;
+    if(quotaReads.has(quotaKey))return quotaReads.get(quotaKey);
     let previous=null;try{previous=JSON.parse(account.quota_json);}catch{}
     if(!force&&previous&&previous.checked>now()-30000&&!previous.windows.some(w=>w.reset&&w.reset<=now()))return;
     if(!force&&(quotaAttempts.get(account.id)||0)>now()-30000)return;
@@ -100,7 +101,8 @@ export function createGateway(options={}) {
       try{
         const data=await readQuota(account);
         if(stopping||(authVersions.get(account.id)||0)!==authVersion)return;
-        const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);let perPercent=current.tokens_per_percent;
+        const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);if(current.route_epoch!==account.route_epoch)return;
+        let perPercent=current.tokens_per_percent;
         const windowId=data.windows.map(w=>w.reset).join(',');
         let baseline=null;try{baseline=JSON.parse(current.quota_calibration);}catch{}
         if(!baseline||baseline.windowId!==windowId||data.remaining>baseline.remaining){baseline={windowId,remaining:data.remaining,used:beforeUsed};}
@@ -110,11 +112,12 @@ export function createGateway(options={}) {
           baseline={windowId,remaining:data.remaining,used:beforeUsed};
         }
         store.run("UPDATE accounts SET state='ready',last_error=NULL,quota_json=?,quota_error=NULL,since_check_tokens=?,tokens_per_percent=?,quota_calibration=? WHERE id=?",JSON.stringify(data),Math.max(0,current.budget_used-beforeUsed),perPercent,JSON.stringify(baseline),account.id);
-        if(balancer.settings().failover&&(data.limitReached||data.remaining<=0))balancer.block(account,'quota_exhausted');
-        else balancer.recover(account,data);
+        balancer.recover(account,data);
+        if(data.limitReached||data.remaining<=0)balancer.block(store.get('SELECT * FROM accounts WHERE id=?',account.id),'quota_exhausted');
+        if(balancer.settings().weighted)balancer.syncWeights();
         return data;
-      }catch(e){if(!stopping&&(authVersions.get(account.id)||0)===authVersion)store.run('UPDATE accounts SET quota_error=? WHERE id=?',e.message,account.id);}
-    })().finally(()=>quotaReads.delete(account.id));quotaReads.set(account.id,pending);return pending;
+      }catch(e){if(!stopping&&(authVersions.get(account.id)||0)===authVersion&&store.get('SELECT route_epoch FROM accounts WHERE id=?',account.id)?.route_epoch===account.route_epoch)store.run('UPDATE accounts SET quota_error=? WHERE id=?',e.message,account.id);}
+    })().finally(()=>quotaReads.delete(quotaKey));quotaReads.set(quotaKey,pending);return pending;
   }
   function refreshQuotas(){
     if(stopping)return;
@@ -190,7 +193,7 @@ export function createGateway(options={}) {
     const sessionState=store.get('SELECT enabled FROM sessions WHERE id=?',session.id);
     if(sessionState&&!sessionState.enabled){store.finish(requestId,{status:'rejected',error:'该会话已被禁止访问'});reject(new AppError(403,'该会话已被禁止访问','session_disabled'));return;}
     const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
-    if(!current.enabled||current.removed_at||!['ready','degraded'].includes(current.state)||(job.responses&&current.route_block)){store.finish(requestId,{status:'rejected',error:'绑定账号不可用'});reject(new AppError(503,'绑定账号不可用','session_account_unavailable'));return;}
+    if(!current.enabled||current.removed_at||!['ready','degraded'].includes(current.state)||(job.responses&&current.route_block&&current.route_block!=='quota_exhausted')){store.finish(requestId,{status:'rejected',error:'绑定账号不可用'});reject(new AppError(503,'绑定账号不可用','session_account_unavailable'));return;}
     if(!job.responses&&!capacity(current,predicted,requestId).eligible){store.finish(requestId,{status:'rejected',error:'绑定账号预计额度不足'});reject(new AppError(429,'绑定账号预计额度不足；会话不会换号'));return;}
     store.run("UPDATE requests SET status='running',account_id=? WHERE id=?",account.id,requestId);
     store.run('UPDATE accounts SET last_used=? WHERE id=?',now(),account.id);
@@ -217,7 +220,7 @@ export function createGateway(options={}) {
       const known=e.usageKnown===true;
       store.finish(requestId,{input:e.input||0,output:e.output||0,cached:e.cached||0,status:known?'failed':'unknown',error:e.message,usageKnown:known},()=>{
         if(job.responses){
-          if(balancer.settings().failover)balancer.block(account,e.routeFailure);
+          if(e.routeFailure==='quota_exhausted'?balancer.settings().weighted:balancer.settings().failover)balancer.block(account,e.routeFailure);
           if(e.code==='upstream_authentication')store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
           store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',(e.input||0)+(e.output||0),(e.input||0)+(e.output||0),account.id);
           if(!known)store.run("UPDATE sessions SET state='uncertain',updated=? WHERE id=?",now(),session.id);

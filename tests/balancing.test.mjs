@@ -133,7 +133,7 @@ async function gateway(t,{rateReader=async()=>{throw Error('unavailable');},cloc
  }});
  const app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'fixture-admin',codexBinary:'unused',reserveTokens:100},rateReader,responsesTransport:transport,...(clock?{clock}:{})});
  for(const a of ['a','b'])app.store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
- app.balancer.saveSettings({failover:true});
+ app.balancer.saveSettings({failover:true,weighted:true});
  const member=app.store.createMember('Fixture',null,null);await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+app.server.address().port;
  t.after(async()=>{release?.();await app.close();rmSync(root,{recursive:true,force:true});});
  const send=(thread='01234567-89ab-7cde-8fab-0123456789ab',extra={})=>fetch(base+'/v1/responses',{method:'POST',headers:{Authorization:'Bearer '+member.secret,'Content-Type':'application/json','thread-id':thread},body:JSON.stringify({model:'fixture-model',input:[{role:'user',content:'synthetic'}],stream:false,...extra})});
@@ -172,7 +172,7 @@ test('admin-only controls, switch-off behavior and manual nightly exclusion',asy
  assert.equal((await patch('/api/admin/balancing',null)).status,400);
  assert.equal((await patch('/api/admin/sessions/'+s.id,{account_id:'b',expected_route_version:0})).status,200);assert.equal(app.store.get('SELECT nightly_enabled FROM sessions').nightly_enabled,0);
  assert.equal((await patch('/api/admin/sessions/'+s.id,{nightly_enabled:true})).status,200);
- app.balancer.saveSettings({failover:false});app.mode('quota');await app.send();assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='b'").route_block,null);
+ app.balancer.saveSettings({failover:false});app.mode('quota');await app.send();assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='b'").route_block,'quota_exhausted','exhaustion updates automatic weights independently of the login failover switch');
 });
 
 test('scheduler persists one daily execution, versioned moves and restart idempotence',async()=>{
@@ -369,7 +369,7 @@ test('new sessions use atomic smooth weights and duplicate client sessions are n
  const admin=await fetch(app.base+'/api/admin/state',{headers:{Authorization:'Bearer fixture-admin'}});const state=await admin.json();assert.equal(state.balancing.weights.mode,'auto');
  assert.ok(Math.abs(state.balancing.weights.accounts[0].automatic-68.9655172414)<1e-8);
 });
-test('manual 100/0 keeps zero-weight fallback and official zero overrides the preference without replay',async t=>{
+test('manual 100/0 validates the admin contract and official zero does not override its preference',async t=>{
  const app=await gateway(t);const checked=Date.now();
  for(const a of [timedAccount('a',30,24,checked),timedAccount('b',90,160,checked)])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
  app.balancer.saveSettings({weighted:true});
@@ -380,10 +380,11 @@ test('manual 100/0 keeps zero-weight fallback and official zero overrides the pr
  assert.equal((await patch({mode:'auto',expected_version:0})).status,409);
  await app.send();assert.equal(app.calls.at(-1).home,'a');
  app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24,Date.now()).quota_json,'a');
- assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');assert.equal(app.calls.length,2);
- assert.equal(app.balancer.status().weights.mode,'failover');assert.equal(app.balancer.status().weights.configuration.weights.a,100);
- assert.equal((await app.send('new-after-zero')).status,200);assert.equal(app.calls.at(-1).home,'b');
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'a');assert.equal(app.calls.length,2);
+ assert.equal(app.balancer.status().weights.mode,'manual');assert.equal(app.balancer.status().weights.configuration.weights.a,100);
+ assert.equal((await app.send('new-after-zero')).status,200);assert.equal(app.calls.at(-1).home,'a');
  assert.equal((await patch({mode:'auto',expected_version:1})).status,200);
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');
 });
 test('manual settings expire at the next Beijing 02:00 even with nightly disabled, restart or missed trigger',async()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-expiry-'));let store,clock=Date.parse('2026-10-15T23:00:00+08:00');
@@ -422,4 +423,96 @@ test('weighted switch preserves the old balancing settings contract across disab
   store.db.close();store=new Store(join(root,'db.sqlite'));b=create();assert.equal(b.settings().weighted,false);assert.equal(b.settings().nightly,true);
   store.run("UPDATE gateway_settings SET value=? WHERE name='balancing'",JSON.stringify({failover:true,nightly:true,quietMinutes:30,weighted:true}));b=create();assert.ok(!Object.hasOwn(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),'weighted'));assert.equal(b.settings().weighted,false,'existing independent setting wins over transitional data');
  }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test('automatic weights change only at initialization, quota transitions or the Beijing daily reset',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'harbor-weight-auto-restart-'));let store=new Store(join(root,'db.sqlite')),clock=at;
+ try{
+  for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
+  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});let b=create();b.saveSettings({weighted:true});
+  const original=b.status().weights.accounts.map(a=>a.automatic);assert.ok(Math.abs(original[0]-68.9655172414)<1e-8);
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',10,24).quota_json,'a');
+  assert.deepEqual(b.status().weights.accounts.map(a=>a.automatic),original,'positive quota changes do not rewrite saved weights');
+  store.close();store=new Store(join(root,'db.sqlite'));b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.automatic),original,'reopening the database retains weights');
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24).quota_json,'a');
+  assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),[0,100]);
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',60,24).quota_json,'a');
+  assert.ok(b.status().weights.accounts[0].effective>original[0],'official recovery recomputes automatic shares');
+  clock+=24*hour;
+  for(const a of [timedAccount('a',10,24,clock),timedAccount('b',90,160,clock)])store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+  await b.tick();assert.ok(Math.abs(b.status().weights.accounts[0].effective-42.5531914894)<1e-8);
+  assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0,'weight reset is independent of nightly migrations');
+ }finally{store.close();rmSync(root,{recursive:true,force:true});}
+});
+test('manual positive weights permit an exhausted subscription and strict zero never becomes fallback',async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({weighted:true});
+ for(const a of [timedAccount('a',0,24,Date.now()),timedAccount('b',80,160,Date.now())])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'a');
+ app.mode('quota');assert.ok((await app.send()).status>=400);assert.equal(app.calls.length,2);
+ app.mode('ok');assert.equal((await app.send()).status,200);assert.equal((await app.send('credit-new')).status,200);
+ assert.ok(app.calls.every(c=>c.home==='a'),'manual credit usage survives repeated exhaustion evidence');
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal((await app.send()).status,503);assert.equal(app.calls.length,4,'zero-weight b cannot take over an unavailable positive account');
+});
+test('all confirmed exhausted accounts reject automatic routing until a manual positive allocation',async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({weighted:true,failover:false});
+ for(const a of [timedAccount('a',0,24,Date.now()),timedAccount('b',0,160,Date.now())])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+ assert.equal((await app.send()).status,503);assert.equal(app.calls.length,0);
+ app.balancer.saveWeights({mode:'manual',weights:{a:0,b:100},expected_version:0});
+ assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'b');
+});
+test('positive changes retain an existing binding while zero reroutes once even with login failover disabled',async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({failover:false});
+ await app.send();const first=app.store.get('SELECT * FROM sessions');assert.equal(first.account_id,'a');
+ app.balancer.saveWeights({mode:'manual',weights:{a:40,b:60},expected_version:0});
+ await app.send();assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0);
+ app.balancer.saveWeights({mode:'manual',weights:{a:0,b:100},expected_version:1});
+ await app.send();const moved=app.store.get('SELECT * FROM sessions');assert.equal(moved.id,first.id);assert.equal(moved.client_session_id,first.client_session_id);
+ assert.equal(moved.account_id,'b');assert.equal(moved.route_version,1);assert.notEqual(moved.upstream_thread,first.upstream_thread);
+ await app.send();assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,1);
+ assert.deepEqual(app.calls.map(c=>c.home),['a','a','b','b']);
+});
+test('stale exhausted snapshots stay at zero across restart and a failed daily refresh completes on fresh evidence',async()=>{
+ const store=new Store(':memory:');let clock=at;
+ try{
+  for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
+  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});let b=create();b.saveSettings({weighted:true});
+  const original=b.status().weights.accounts.map(a=>a.effective),saved=store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value;
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',10,24).quota_json,'a');b.status();
+  assert.equal(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value,saved,'normal refresh is not a write event');
+  clock+=24*hour;b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),original);
+  assert.equal(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value).pending,true);
+  for(const a of [timedAccount('a',10,24,clock),timedAccount('b',90,160,clock)])store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+  assert.ok(Math.abs(b.status().weights.accounts[0].effective-42.5531914894)<1e-8,'the pending daily calculation finishes although both quotas stayed positive');
+  assert.equal(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value).pending,false);
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24,clock).quota_json,'a');b.status();clock+=600000;b=create();
+  assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),[0,100],'a stale zero cannot silently become eligible');
+ }finally{store.close();}
+});
+test('overlapping old quota refresh cannot undo exhaustion or join the new account generation',async t=>{
+ const pending=[],positive=()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:20,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}});
+ const app=await gateway(t,{rateReader:async(_binary,home)=>home==='a'?new Promise(resolve=>pending.push(resolve)):positive()});
+ const refresh=()=>fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});let old,current;
+ try{
+  old=refresh();await until(()=>pending.length===1);
+  app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+  current=refresh();await until(()=>pending.length===2);
+  pending[0](positive());assert.equal((await old).status,200);
+  assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+  assert.equal(app.store.get("SELECT quota_json FROM accounts WHERE id='a'").quota_json,null);
+  pending[1](positive());assert.equal((await current).status,200);
+  assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);
+  assert.equal(app.store.get("SELECT route_epoch FROM accounts WHERE id='a'").route_epoch,2);
+ }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([old,current].filter(Boolean));}
+});
+test('official authentication recovery with zero subscription quota permits explicit manual credit usage',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal((await app.send()).status,503);assert.equal(app.calls.length,0);
+ const refreshed=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(refreshed.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+ assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
 });
