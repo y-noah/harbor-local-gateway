@@ -112,7 +112,7 @@ export function createGateway(options={}) {
           baseline={windowId,remaining:data.remaining,used:beforeUsed};
         }
         store.run("UPDATE accounts SET state='ready',last_error=NULL,quota_json=?,quota_error=NULL,since_check_tokens=?,tokens_per_percent=?,quota_calibration=? WHERE id=?",JSON.stringify(data),Math.max(0,current.budget_used-beforeUsed),perPercent,JSON.stringify(baseline),account.id);
-        balancer.recover(account,data);
+        if(balancer.recover(account,data)&&account.route_block==='login_expired')authVersions.set(account.id,authVersion+1);
         if(data.limitReached||data.remaining<=0)balancer.block(store.get('SELECT * FROM accounts WHERE id=?',account.id),'quota_exhausted',{quotaRefresh:true});
         if(balancer.settings().weighted)balancer.syncWeights();
         return data;
@@ -180,6 +180,7 @@ export function createGateway(options={}) {
   }
   async function execute(job,account){
     const {requestId,messages,model,resolve:complete,reject,controller,secret,session,predicted}=job;
+    const authVersion=authVersions.get(account.id)||0;
     if(controller.signal.aborted){store.finish(requestId,{status:'cancelled',error:'排队期间取消'});reject(new AppError(499,'请求已取消'));return;}
     try{
       const currentMember=store.authenticate(secret);
@@ -220,8 +221,9 @@ export function createGateway(options={}) {
       const known=e.usageKnown===true;
       store.finish(requestId,{input:e.input||0,output:e.output||0,cached:e.cached||0,status:known?'failed':'unknown',error:e.message,usageKnown:known},()=>{
         if(job.responses){
-          if(e.routeFailure==='login_expired'||e.routeFailure==='quota_exhausted'&&balancer.settings().weighted)balancer.block(account,e.routeFailure);
-          if(e.code==='upstream_authentication')store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
+          const failureAccount=e.routeFailure==='login_expired'?((authVersions.get(account.id)||0)===authVersion?store.get('SELECT * FROM accounts WHERE id=?',account.id):null):account;
+          if(failureAccount)balancer.block(failureAccount,e.routeFailure);
+          if(e.code==='upstream_authentication'&&failureAccount)store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
           store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',(e.input||0)+(e.output||0),(e.input||0)+(e.output||0),account.id);
           if(!known)store.run("UPDATE sessions SET state='uncertain',updated=? WHERE id=?",now(),session.id);
           return;

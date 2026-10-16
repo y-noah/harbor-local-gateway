@@ -171,7 +171,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     let saved=previous;
     if(force||changed||previous?.pending&&!calculated.reason){
       // A failed refresh cannot erase the last known allocation or resurrect an exhausted account.
-      const retain=calculated.reason&&previous&&Object.values(previous.weights).every(Number.isFinite);
+      const retain=calculated.reason&&previous&&Object.values(previous.weights).every(Number.isFinite)&&Object.values(previous.weights).some(weight=>weight>0);
       const weights=retain?Object.fromEntries(accounts.map(a=>[a.id,states[a.id]===0?0:previous.weights[a.id]??0])):Object.fromEntries(calculated.weights);
       saved={cycle,states,weights,reason:calculated.reason,pending:!!calculated.reason};
       atomic(()=>{writeSetting('routing_auto',saved);store.audit('balancing.weights.auto',JSON.stringify({cycle,reason:force||(!previous?'initialize':previous.cycle!==cycle?'nightly':'quota'),weights}));});
@@ -244,7 +244,8 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     const exhausted=snapshot.limitReached||snapshot.remaining<=0;if(exhausted&&account.route_block!=='login_expired')return;
     return atomic(()=>{
       const result=store.run('UPDATE accounts SET route_block=?,route_epoch=route_epoch+1,route_blocked_at=? WHERE id=? AND route_epoch=? AND route_block IS NOT NULL',exhausted?'quota_exhausted':null,exhausted?clock():null,account.id,account.route_epoch);
-      if(result.changes){store.audit('account.route_recover',account.id);if(settings().weighted)syncWeights();}
+      if(result.changes){store.audit('account.route_recover',account.id);if(settings().weighted)syncWeights(undefined,clock(),'recovery');}
+      return result.changes>0;
     });
   }
   function route(session){

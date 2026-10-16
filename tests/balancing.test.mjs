@@ -540,3 +540,57 @@ test('a new exhaustion failure during manual credit usage invalidates an older p
   app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'a');
  }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([refresh].filter(Boolean));}
 });
+test('a newer soft quota observation cannot hide a login failure returned by an in-flight manual request',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.balancer.saveSettings({failover:false});app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ app.mode('hold');const pending=app.send();await until(()=>app.arrivals()===1);
+ const quota=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(quota.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+ app.mode('auth');app.release();assert.ok((await pending).status>=400);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'login_expired');
+ app.mode('ok');assert.equal((await app.send()).status,503);assert.equal(app.calls.length,1,'the failed request is not replayed and later requests stay blocked');
+});
+test('an old authentication failure cannot replace newly confirmed authentication recovery',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ app.mode('hold');const pending=app.send();await until(()=>app.arrivals()===1);
+ app.mode('auth');assert.ok((await app.send('another-auth-request')).status>=400);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'login_expired');
+ const recovered=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(recovered.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+ app.release();assert.ok((await pending).status>=400);
+ const current=app.store.get("SELECT * FROM accounts WHERE id='a'");assert.equal(current.route_block,'quota_exhausted');assert.equal(current.state,'ready');assert.equal(current.last_error,null);
+ app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.length,3);
+});
+test('official login recovery restores automatic allocation initialized while the account was blocked',async t=>{
+ let remaining=50;
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100-remaining,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',50,24,Date.now()).quota_json,'a');
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').effective,0);
+ const refresh=()=>fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});
+ assert.equal((await refresh()).status,200);assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);
+ assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').effective,100);
+ assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
+ const saved=app.store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value;remaining=40;assert.equal((await refresh()).status,200);
+ assert.equal(app.store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value,saved,'later ordinary positive refreshes still do not rewrite weights');
+});
+test('legacy routing records exhaustion without switching and rejects its old quota query before weighted is enabled',async t=>{
+ const pending=[],positive=()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:50,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}});
+ const app=await gateway(t,{rateReader:async()=>new Promise(resolve=>pending.push(resolve))});app.balancer.saveSettings({weighted:false});app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");let refresh;
+ try{
+  refresh=fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});await until(()=>pending.length===1);
+  app.mode('quota');assert.ok((await app.send()).status>=400);assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+  app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0);
+  pending[0](positive());assert.equal((await refresh).status,200);assert.equal(app.store.get("SELECT quota_json FROM accounts WHERE id='a'").quota_json,null);
+  app.balancer.saveSettings({weighted:true});assert.equal((await app.send()).status,503);assert.equal(app.calls.length,2);
+  app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});assert.equal((await app.send()).status,200);assert.equal(app.calls.length,3);
+ }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([refresh].filter(Boolean));}
+});
+test('initial authentication recovery with incomparable windows does not retain an unusable all-zero allocation',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:50,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000},secondary:{usedPercent:20,windowDurationMins:10080,resetsAt:Math.floor(Date.now()/1000)+86400}}})});
+ app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').effective,0);
+ const quota=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(quota.status,200);
+ assert.equal(app.balancer.status().weights.mode,'fallback');assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
+});
