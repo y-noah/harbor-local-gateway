@@ -1,6 +1,6 @@
 import {AppError,id} from './store.mjs';
 
-const minute=60000,day=24*60*minute;
+const minute=60000,day=24*60*minute,nightlyTolerance=0.02,nightlySearchBudget=100000;
 export const balanceDefaults=Object.freeze({failover:false,nightly:false,quietMinutes:30,weighted:false});
 export function balanceSettings(value={}){
   if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!Object.hasOwn(balanceDefaults,k)))throw new AppError(400,'负载均衡设置无效');
@@ -17,12 +17,12 @@ export function quotaSnapshot(account,at){
   let q;try{q=JSON.parse(account.quota_json);}catch{return null;}
   if(!q||!Number.isFinite(q.checked)||q.checked>at||at-q.checked>5*minute||!q.plan||!Array.isArray(q.windows)||!q.windows.length)return null;
   if(q.windows.some(w=>!Number.isFinite(w.used)||w.used<0||w.used>100||!Number.isFinite(w.minutes)||w.minutes<=0||!Number.isFinite(w.reset)||w.reset<=at))return null;
-  return {...q,remaining:Math.min(...q.windows.map(w=>100-w.used)),group:JSON.stringify([q.plan,q.windows.map(w=>w.minutes).sort((a,b)=>a-b)])};
+  return {...q,remaining:q.limitReached||account.route_block==='quota_exhausted'?0:Math.min(...q.windows.map(w=>100-w.used)),group:JSON.stringify([q.plan,q.windows.map(w=>w.minutes).sort((a,b)=>a-b)])};
 }
-const available=a=>a.enabled&&!a.removed_at&&a.kind==='codex'&&['ready','degraded'].includes(a.state)&&!a.route_block;
+const available=a=>a.enabled&&!a.removed_at&&a.kind==='codex'&&['ready','degraded'].includes(a.state)&&(!a.route_block||a.route_block==='quota_exhausted');
 export function automaticWeights(accounts,at){
   const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)]));
-  const eligible=accounts.filter(a=>available(a)&&!(snapshots.get(a.id)?.limitReached||snapshots.get(a.id)?.remaining===0));
+  const eligible=accounts.filter(a=>available(a)&&a.route_block!=='quota_exhausted'&&!(snapshots.get(a.id)?.limitReached||snapshots.get(a.id)?.remaining===0));
   let reason=null;
   if(eligible.some(a=>!snapshots.get(a.id)))reason='quota_unavailable';
   else if(new Set(eligible.map(a=>snapshots.get(a.id).group)).size>1||eligible.some(a=>snapshots.get(a.id).windows.length!==1))reason='incomparable_quota';
@@ -32,10 +32,55 @@ export function automaticWeights(accounts,at){
 }
 export function nextWeightReset(at){const end=nightlyWindow(at).end;return end>at?end:end+day;}
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
+const withinTolerance=(loads,target,total)=>[...target].every(([account,weight])=>Math.abs(loads.get(account)-weight)<=total*(nightlyTolerance+Number.EPSILON));
+
+// Prefer fewer transfers without an unbounded combinatorial search on the request thread.
+function minimizeTransfers(pool,movable,before,target,total,proposed){
+  const loads=new Map(Object.entries(before)),slack=total*(nightlyTolerance+Number.EPSILON);
+  if(withinTolerance(loads,target,total))return [];
+  const movableTotal=movable.reduce((sum,s)=>sum+s.weight,0);
+  if(pool.some(a=>{
+    const fixed=before[a.id]-movable.filter(s=>s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0);
+    return fixed>target.get(a.id)+slack||fixed+movableTotal<target.get(a.id)-slack;
+  }))return proposed;
+  const proposedLoads=new Map(loads);
+  for(const m of proposed){proposedLoads.set(m.from,proposedLoads.get(m.from)-m.weight);proposedLoads.set(m.to,proposedLoads.get(m.to)+m.weight);}
+  const limit=withinTolerance(proposedLoads,target,total)?proposed.length-1:movable.length;
+  let budget=nightlySearchBudget;
+  const selected=[],prefix=[0];for(const s of movable)prefix.push(prefix.at(-1)+s.weight);
+  function search(count){
+    const stack=[{start:0,left:count}];
+    const leave=()=>{const frame=stack.pop();if(frame.restore){const r=frame.restore;loads.set(r.from,r.fromLoad);loads.set(r.to,r.toLoad);selected.pop();}};
+    try{
+      while(stack.length&&budget>0){
+        const frame=stack.at(-1);
+        if(frame.index===undefined){
+          budget--;
+          if(!frame.left){if(withinTolerance(loads,target,total))return [...selected];leave();continue;}
+          if(movable.length-frame.start<frame.left){leave();continue;}
+          const capacity=prefix[frame.start+frame.left]-prefix[frame.start];
+          if(pool.some(a=>Math.abs(loads.get(a.id)-target.get(a.id))>capacity+slack)){leave();continue;}
+          frame.index=frame.start;frame.destination=0;
+        }
+        if(frame.index>movable.length-frame.left){leave();continue;}
+        const index=frame.index,s=movable[index],a=pool[frame.destination++];
+        if(frame.destination===pool.length){frame.index++;frame.destination=0;}
+        if(a.id===s.account_id||target.get(a.id)<=0)continue;
+        const fromLoad=loads.get(s.account_id),toLoad=loads.get(a.id);
+        loads.set(s.account_id,fromLoad-s.weight);loads.set(a.id,toLoad+s.weight);
+        selected.push({session_id:s.id,from:s.account_id,to:a.id,version:s.route_version,weight:s.weight});
+        stack.push({start:index+1,left:frame.left-1,restore:{from:s.account_id,to:a.id,fromLoad,toLoad}});
+      }
+      return null;
+    }finally{while(stack.length)leave();}
+  }
+  for(let count=1;count<=limit&&budget>0;count++){const found=search(count);if(found)return found;}
+  return proposed;
+}
 
 // Workload is a relative estimate, never a quota admission check.
 export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false}){
-  const window=nightlyWindow(at),eligible=accounts.filter(a=>a.enabled&&!a.removed_at&&a.kind==='codex'&&['ready','degraded'].includes(a.state)&&!a.route_block);
+  const window=nightlyWindow(at),eligible=accounts.filter(available);
   const snapshots=new Map(eligible.map(a=>[a.id,quotaSnapshot(a,at)]));
   const active=new Map(),bySession=new Map(),latest=new Map();
   for(const r of requests){
@@ -69,7 +114,7 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     if(fixed)skipped.push({session_id:s.id,reason:unknown?'unknown_workload':running?'busy':'protected'});
   }
   const moves=[],groups=new Map();
-  for(const a of eligible){const q=snapshots.get(a.id);if(!q||q.limitReached){skipped.push({account_id:a.id,reason:'quota_unavailable'});continue;}if(!groups.has(q.group))groups.set(q.group,[]);groups.get(q.group).push(a);}
+  for(const a of eligible){const q=snapshots.get(a.id);if(!q){skipped.push({account_id:a.id,reason:'quota_unavailable'});continue;}if(!groups.has(q.group))groups.set(q.group,[]);groups.get(q.group).push(a);}
   const summaries=[];
   for(const pool of groups.values()){
     if(pool.length<2){skipped.push({reason:'incomparable_quota',accounts:pool.map(a=>a.id)});continue;}
@@ -83,9 +128,10 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     const shares=new Map(pool.map(a=>[a.id,weighted?calculated.weights.get(a.id)/100:snapshots.get(a.id).remaining/remaining]));
     const loads=new Map(pool.map(a=>[a.id,0])),target=new Map(pool.map(a=>[a.id,total*shares.get(a.id)]));
     for(const s of work)loads.set(s.account_id,loads.get(s.account_id)+s.weight);
-    const before=Object.fromEntries(loads);
+    const before=Object.fromEntries(loads),groupMoves=[];
     const movable=work.filter(s=>!s.fixed).sort((a,b)=>b.weight-a.weight||a.id.localeCompare(b.id));
     for(const s of movable){
+      if(withinTolerance(loads,target,total))break;
       const origin=s.account_id,from=loads.get(origin)-target.get(origin);
       let best=null,benefit=0;
       for(const a of pool){
@@ -94,11 +140,15 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
         const improvement=Math.abs(from)+Math.abs(to)-Math.abs(from-s.weight)-Math.abs(to+s.weight);
         if(improvement-benefit>Number.EPSILON*total){benefit=improvement;best=a.id;}
       }
-      if(best){loads.set(origin,loads.get(origin)-s.weight);loads.set(best,loads.get(best)+s.weight);moves.push({session_id:s.id,from:origin,to:best,version:s.route_version,weight:s.weight});}
+      if(best){loads.set(origin,loads.get(origin)-s.weight);loads.set(best,loads.get(best)+s.weight);groupMoves.push({session_id:s.id,from:origin,to:best,version:s.route_version,weight:s.weight});}
     }
-    // Remove transfers whose cancellation preserves or improves the final deviation.
+    // Cancel any transfer that is unnecessary for tolerance, or improves an infeasible plan.
     const deviation=()=>pool.reduce((sum,a)=>sum+Math.abs(loads.get(a.id)-target.get(a.id)),0);
-    for(let i=moves.length-1;i>=0;i--){const m=moves[i];if(!ids.has(m.from))continue;const beforeDeviation=deviation();loads.set(m.from,loads.get(m.from)+m.weight);loads.set(m.to,loads.get(m.to)-m.weight);if(deviation()<=beforeDeviation+Number.EPSILON*total)moves.splice(i,1);else{loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}}
+    for(let i=groupMoves.length-1;i>=0;i--){const m=groupMoves[i],balanced=withinTolerance(loads,target,total),beforeDeviation=deviation();loads.set(m.from,loads.get(m.from)+m.weight);loads.set(m.to,loads.get(m.to)-m.weight);if(balanced?withinTolerance(loads,target,total):deviation()<=beforeDeviation+Number.EPSILON*total)groupMoves.splice(i,1);else{loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}}
+    const selected=minimizeTransfers(pool,movable,before,target,total,groupMoves);
+    for(const a of pool)loads.set(a.id,before[a.id]);
+    for(const m of selected){loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}
+    for(const m of selected)moves.push(m);
     summaries.push({accounts:pool.map(a=>a.id),weights:Object.fromEntries(shares),before,after:Object.fromEntries(loads),target:Object.fromEntries(target),fixed:work.filter(s=>s.fixed).map(s=>s.id),fixedLoad:Object.fromEntries(pool.map(a=>[a.id,work.filter(s=>s.fixed&&s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0)]))});
   }
   return {window,moves,skipped,summaries};
@@ -112,6 +162,22 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   const writeSetting=(name,value)=>store.run('INSERT INTO gateway_settings(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',name,JSON.stringify(value));
   const manual=()=>readSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:0});
   const atomic=fn=>{if(store.db.isTransaction)return fn();store.db.exec('BEGIN IMMEDIATE');try{const result=fn();store.db.exec('COMMIT');return result;}catch(e){store.db.exec('ROLLBACK');throw e;}};
+  function syncWeights(accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL"),at=clock(),force=false){
+    const previous=readSetting('routing_auto',null),cycle=nextWeightReset(at)-day;
+    const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)]));
+    const states=Object.fromEntries(accounts.map(a=>[a.id,a.route_block==='quota_exhausted'?0:snapshots.get(a.id)?snapshots.get(a.id).remaining>0?1:0:previous?.states[a.id]??null]));
+    const changed=!previous||previous.cycle!==cycle||accounts.some(a=>states[a.id]!==null&&states[a.id]!==previous.states[a.id]);
+    const calculated=force||changed||previous?.pending?automaticWeights(accounts.map(a=>states[a.id]===0?{...a,route_block:'quota_exhausted'}:a),at):null;
+    let saved=previous;
+    if(force||changed||previous?.pending&&!calculated.reason){
+      // A failed refresh cannot erase the last known allocation or resurrect an exhausted account.
+      const retain=calculated.reason&&previous&&Object.values(previous.weights).every(Number.isFinite)&&Object.values(previous.weights).some(weight=>weight>0);
+      const weights=retain?Object.fromEntries(accounts.map(a=>[a.id,states[a.id]===0?0:previous.weights[a.id]??0])):Object.fromEntries(calculated.weights);
+      saved={cycle,states,weights,reason:calculated.reason,pending:!!calculated.reason};
+      atomic(()=>{writeSetting('routing_auto',saved);store.audit('balancing.weights.auto',JSON.stringify({cycle,reason:force||(!previous?'initialize':previous.cycle!==cycle?'nightly':'quota'),weights}));});
+    }
+    return {eligible:accounts.filter(a=>available(a)&&states[a.id]!==0),snapshots,reason:saved.reason,weights:new Map(accounts.map(a=>[a.id,!available(a)||states[a.id]===0?0:Object.hasOwn(saved.weights,a.id)?saved.weights[a.id]:0]))};
+  }
   const previousSettings=readSetting('balancing',{});
   if(Object.hasOwn(previousSettings,'weighted'))atomic(()=>{const {weighted,...legacy}=previousSettings;if(!store.get("SELECT name FROM gateway_settings WHERE name='routing_strategy'"))writeSetting('routing_strategy',{weighted});writeSetting('balancing',legacy);});
   function saveWeights(value){
@@ -125,18 +191,16 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
         if(!weights||typeof weights!=='object'||Array.isArray(weights)||!Object.keys(weights).length||Object.entries(weights).some(([key,v])=>!ids.has(key)||!Number.isFinite(v)||v<0||v>100||Math.abs(v*100-Math.round(v*100))>1e-8)||Math.abs(Object.values(weights).reduce((n,v)=>n+v,0)-100)>1e-8)throw new AppError(400,'请填写有效账号权重，最多两位小数且总和必须为100%');
       }else if(value.weights!==undefined)throw new AppError(400,'自动模式无需填写权重');
       const next={mode:value.mode,weights,expires:value.mode==='manual'?nextWeightReset(clock()):null,version:current.version+1};
-      writeSetting('routing_weights',next);store.audit('balancing.weights',JSON.stringify(next));return next;
+      writeSetting('routing_weights',next);if(value.mode==='auto')syncWeights(undefined,clock(),'manual');store.audit('balancing.weights',JSON.stringify(next));return next;
     });
   }
   function distribution(accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL")){
-    const at=clock(),system=automaticWeights(accounts,at),configured=manual(),active=configured.mode==='manual'&&configured.expires>at;
-    let mode=settings().weighted?(system.reason?'fallback':'auto'):'legacy',weights=new Map(system.weights);
-    if(settings().weighted&&active){
-      const sum=system.eligible.reduce((n,a)=>n+(configured.weights[a.id]||0),0);
-      if(sum>0){mode='manual';weights=new Map(accounts.map(a=>[a.id,system.eligible.includes(a)?(configured.weights[a.id]||0)/sum*100:0]));}
-      else mode=system.reason?'fallback':'failover';
-    }
-    return {mode,reason:system.reason,eligible:mode==='legacy'?accounts.filter(available):system.eligible,weights,system,configuration:{...configured,...(!active?{mode:'auto',expires:null}:{})},accounts:accounts.map(a=>({id:a.id,automatic:system.weights.get(a.id),effective:['legacy','fallback'].includes(mode)?null:weights.get(a.id),configured:active?configured.weights[a.id]??0:null}))};
+    const at=clock(),weighted=settings().weighted,system=weighted?syncWeights(accounts,at):automaticWeights(accounts,at),configured=manual(),active=configured.mode==='manual'&&configured.expires>at;
+    const mode=!weighted?'legacy':active?'manual':system.eligible.some(a=>system.weights.get(a.id)===null)?'fallback':'auto';
+    const eligible=mode==='legacy'||mode==='manual'?accounts.filter(available):system.eligible;
+    const desired=a=>mode==='manual'?configured.weights[a.id]||0:system.weights.get(a.id)||0,sum=eligible.reduce((n,a)=>n+desired(a),0);
+    const weights=new Map(accounts.map(a=>[a.id,eligible.includes(a)&&sum>0?desired(a)/sum*100:0]));
+    return {mode,reason:system.reason,eligible,weights,system,configuration:{...configured,...(!active?{mode:'auto',expires:null}:{})},accounts:accounts.map(a=>({id:a.id,automatic:system.weights.get(a.id),effective:['legacy','fallback'].includes(mode)?null:weights.get(a.id),configured:active?configured.weights[a.id]??0:null}))};
   }
   function selectAccount(){
     const state=distribution(),pool=state.eligible;
@@ -147,7 +211,8 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     const mean=Object.values(credits).reduce((n,v)=>n+v,0)/pool.length;
     for(const a of pool)credits[a.id]=credits[a.id]-mean+state.weights.get(a.id)/100;
     const candidates=pool.filter(a=>state.weights.get(a.id)>0).sort((a,b)=>credits[b.id]-credits[a.id]||a.id.localeCompare(b.id));
-    const selected=candidates[0];credits[selected.id]-=1;writeSetting('routing_schedule',{signature,credits});return selected;
+    const selected=candidates[0];if(!selected)throw new AppError(503,'没有生效权重大于0的可用账号，请调整权重或等待额度恢复','no_account');
+    credits[selected.id]-=1;writeSetting('routing_schedule',{signature,credits});return selected;
   }
   const busy=s=>preparing.has(s.member_id)||!!store.get("SELECT id FROM requests WHERE session_id=? AND status IN ('queued','running')",s.id);
   function move(session,target,reason){
@@ -155,7 +220,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     if(!current||!current.enabled||!current.member_enabled||current.member_removed!==null||current.protocol!=='responses')throw new AppError(409,'会话当前不可迁移','session_disabled');
     if(current.route_version!==session.route_version)throw new AppError(409,'会话绑定已变化','session_route_conflict');
     if(busy(current))throw new AppError(409,'会话仍有请求处理中，暂不能切换','session_busy');
-    const account=store.get("SELECT * FROM accounts WHERE id=? AND enabled=1 AND removed_at IS NULL AND kind='codex' AND state IN ('ready','degraded') AND route_block IS NULL",target);
+    const account=store.get("SELECT * FROM accounts WHERE id=? AND enabled=1 AND removed_at IS NULL AND kind='codex' AND state IN ('ready','degraded') AND (route_block IS NULL OR route_block='quota_exhausted')",target);
     if(!account)throw new AppError(503,'没有可用的目标账号','no_account');
     if(current.account_id===target)return current;
     return atomic(()=>{
@@ -163,53 +228,81 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
       store.audit('session.route',JSON.stringify({session:current.id,from:current.account_id,to:target,reason}));return store.get('SELECT * FROM sessions WHERE id=?',current.id);
     });
   }
-  function block(account,reason){
+  function block(account,reason,{quotaRefresh=false}={}){
     if(!['quota_exhausted','login_expired'].includes(reason))return;
-    const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
-    if(!current||current.route_epoch!==account.route_epoch)return;
-    store.run('UPDATE accounts SET route_block=?,route_epoch=route_epoch+1,route_blocked_at=? WHERE id=?',reason,clock(),account.id);
-    store.audit('account.route_block',JSON.stringify({account:account.id,reason}));
+    return atomic(()=>{
+      const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
+      if(!current||current.route_epoch!==account.route_epoch)return;
+      if(quotaRefresh&&current.route_block===reason||reason==='quota_exhausted'&&current.route_block==='login_expired')return;
+      store.run('UPDATE accounts SET route_block=?,route_epoch=route_epoch+1,route_blocked_at=? WHERE id=?',reason,clock(),account.id);
+      store.audit('account.route_block',JSON.stringify({account:account.id,reason}));
+      if(settings().weighted)syncWeights();
+    });
   }
   function recover(account,snapshot){
-    if(!account.route_block||!snapshot||snapshot.limitReached||snapshot.remaining<=0||snapshot.windows.some(w=>w.reset&&w.reset<=clock()))return;
-    const result=store.run('UPDATE accounts SET route_block=NULL,route_epoch=route_epoch+1,route_blocked_at=NULL WHERE id=? AND route_epoch=? AND route_block IS NOT NULL',account.id,account.route_epoch);
-    if(result.changes)store.audit('account.route_recover',account.id);
+    if(!account.route_block||!snapshot||!snapshot.windows?.length||snapshot.windows.some(w=>!w.reset||w.reset<=clock()))return;
+    const exhausted=snapshot.limitReached||snapshot.remaining<=0;if(exhausted&&account.route_block!=='login_expired')return;
+    return atomic(()=>{
+      const result=store.run('UPDATE accounts SET route_block=?,route_epoch=route_epoch+1,route_blocked_at=? WHERE id=? AND route_epoch=? AND route_block IS NOT NULL',exhausted?'quota_exhausted':null,exhausted?clock():null,account.id,account.route_epoch);
+      if(result.changes){store.audit('account.route_recover',account.id);syncWeights(undefined,clock(),'recovery');}
+      return result.changes>0;
+    });
   }
   function route(session){
-    let account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
-    const snapshot=quotaSnapshot(account,clock());
-    if(!account?.route_block&&settings().weighted&&settings().failover&&snapshot&&(snapshot.limitReached||snapshot.remaining===0)){block(account,'quota_exhausted');account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);}
-    if(!account?.route_block)return session;
-    if(!settings().failover)throw new AppError(503,'绑定账号已阻断，自动切换未开启','session_account_blocked');
-    return atomic(()=>move(session,selectAccount().id,account.route_block));
+    const account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
+    const blocked=account?.route_block&&account.route_block!=='quota_exhausted';
+    if(blocked&&!settings().failover)throw new AppError(503,'绑定账号已阻断，自动切换未开启','session_account_blocked');
+    if(!blocked){
+      if(!settings().weighted)return session;
+      const state=distribution();if(state.mode==='fallback'?state.eligible.some(a=>a.id===account.id):state.weights.get(account.id)>0)return session;
+    }
+    return atomic(()=>move(session,selectAccount().id,blocked?account.route_block:'weight_zero'));
   }
   async function plan(at,preview=false){
     const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND enabled=1 AND removed_at IS NULL");
     const refreshed=await Promise.all(accounts.map(a=>Promise.resolve().then(()=>preview?readQuota(a):refreshQuota(a,true)).catch(()=>null)));
     const freshById=new Map(accounts.map((a,index)=>{const current=store.get('SELECT quota_json,route_epoch FROM accounts WHERE id=?',a.id);return [a.id,{snapshot:refreshed[index],epoch:!preview&&refreshed[index]&&current.quota_json===JSON.stringify(refreshed[index])?current.route_epoch:a.route_epoch}];}));
     if(stopping())throw new AppError(503,'服务正在停止');
-    return planBalance({accounts:store.all('SELECT * FROM accounts').map(a=>({...a,quota_json:freshById.get(a.id)?.epoch===a.route_epoch&&freshById.get(a.id)?.snapshot?JSON.stringify(freshById.get(a.id).snapshot):null})),sessions:store.all('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id'),requests:store.all("SELECT * FROM requests WHERE COALESCE(ended,started)>=? OR status IN ('queued','running')",nightlyWindow(at).start),at:clock(),quietMinutes:settings().quietMinutes,weighted:settings().weighted,preparing});
+    const planningAccounts=store.all('SELECT * FROM accounts').map(a=>({...a,quota_json:freshById.get(a.id)?.epoch===a.route_epoch&&freshById.get(a.id)?.snapshot?JSON.stringify(freshById.get(a.id).snapshot):null}));
+    if(!preview&&settings().weighted)syncWeights(planningAccounts,clock(),'nightly');
+    return planBalance({accounts:planningAccounts,sessions:store.all('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id'),requests:store.all("SELECT * FROM requests WHERE COALESCE(ended,started)>=? OR status IN ('queued','running')",nightlyWindow(at).start),at:clock(),quietMinutes:settings().quietMinutes,weighted:settings().weighted,preparing});
   }
   async function tick(){
     const at=clock(),window=nightlyWindow(at);
+    if(stopping())return;
     const configured=manual();if(configured.mode==='manual'&&configured.expires<=at){writeSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:configured.version+1});store.audit('balancing.weights.expired',String(configured.expires));}
+    if(settings().weighted&&(!settings().nightly||!window.due))syncWeights();
     if(stopping()||running||!settings().nightly||!window.due)return;
     const claim=store.run("INSERT OR IGNORE INTO balance_runs(day,started,status) VALUES(?,?,'running')",window.key,at);
     if(!claim.changes)return;
     running=(async()=>{
       try{
         const result=await plan(at),applied=[];
-        for(const item of result.moves){
+        for(const group of result.summaries){
           if(stopping()||!settings().nightly)break;
-          const session=store.get('SELECT * FROM sessions WHERE id=?',item.session_id),target=store.get('SELECT * FROM accounts WHERE id=?',item.to),source=store.get('SELECT * FROM accounts WHERE id=?',item.from);
-          const latest=store.get('SELECT MAX(MAX(started,COALESCE(ended,started))) last FROM requests WHERE session_id=?',item.session_id)?.last;
-          if(!session?.nightly_enabled||session.route_version!==item.version||session.account_id!==item.from||latest>clock()-settings().quietMinutes*minute||!quotaSnapshot(target,clock())||!quotaSnapshot(source,clock())||source.route_block)continue;
-          try{move(session,item.to,'nightly');applied.push(item.session_id);}catch(e){if(!(e instanceof AppError))throw e;result.skipped.push({session_id:item.session_id,reason:e.code});}
+          const ids=new Set(group.accounts),items=result.moves.filter(item=>ids.has(item.from));
+          if(!items.length)continue;
+          // Smaller combinations can require both directions; never publish only half a group.
+          try{
+            const committed=atomic(()=>{
+              const moved=[];
+              for(const item of items){
+                if(stopping()||!settings().nightly)throw new AppError(409,'夜间计划条件已变化','nightly_plan_changed');
+                const session=store.get('SELECT * FROM sessions WHERE id=?',item.session_id),target=store.get('SELECT * FROM accounts WHERE id=?',item.to),source=store.get('SELECT * FROM accounts WHERE id=?',item.from);
+                const latest=store.get('SELECT MAX(MAX(started,COALESCE(ended,started))) last FROM requests WHERE session_id=?',item.session_id)?.last,targetQuota=quotaSnapshot(target,clock());
+                if(!session?.nightly_enabled||session.route_version!==item.version||session.account_id!==item.from||latest>clock()-settings().quietMinutes*minute||!targetQuota||targetQuota.limitReached||targetQuota.remaining<=0||!quotaSnapshot(source,clock())||source.route_block&&source.route_block!=='quota_exhausted')throw new AppError(409,'夜间计划条件已变化','nightly_plan_changed');
+                move(session,item.to,'nightly');moved.push(item.session_id);
+              }
+              const committedAt=clock();if(group.accounts.some(account=>!quotaSnapshot(store.get('SELECT * FROM accounts WHERE id=?',account),committedAt)))throw new AppError(409,'夜间计划额度已变化','nightly_plan_changed');
+              return moved;
+            });
+            for(const session of committed)applied.push(session);
+          }catch(e){if(!(e instanceof AppError))throw e;for(const item of items)result.skipped.push({session_id:item.session_id,reason:e.code});}
         }
         store.run("UPDATE balance_runs SET ended=?,status='completed',summary=? WHERE day=?",clock(),JSON.stringify({...result,applied}),window.key);
       }catch{store.run("UPDATE balance_runs SET ended=?,status='failed',summary=? WHERE day=?",clock(),JSON.stringify({reason:'planning_failed'}),window.key);}
     })().finally(()=>{running=null;});
     return running;
   }
-  return {settings,saveSettings,saveWeights,selectAccount,atomic,distribution,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs ORDER BY day DESC LIMIT 1')||null};}};
+  return {settings,saveSettings,saveWeights,selectAccount,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs ORDER BY day DESC LIMIT 1')||null};}};
 }

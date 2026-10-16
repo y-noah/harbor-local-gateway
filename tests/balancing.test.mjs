@@ -37,6 +37,69 @@ test('balanced allocations do not churn and indivisible oversized sessions are n
  assert.equal(plan([account('a'),account('b')],[session('a1','a'),session('b1','b')],[request('a1',100),request('b1',100)]).moves.length,0);
  assert.equal(plan([account('a'),account('b')],[session('large','a')],[request('large',100)]).moves.length,0);
 });
+for(const weighted of [false,true])test('nightly accepts up to two percentage points without churn, weighted '+weighted,()=>{
+ for(const tail of [1.5,2,2.0001]){
+  const p=plan([account('a'),account('b')],[session('large','a'),session('tail','a'),session('other','b')],[request('large',50),request('tail',tail),request('other',50-tail)],{weighted});
+  assert.equal(p.moves.length,tail<=2?0:1);
+  if(tail>2)assert.equal(p.moves[0].session_id,'tail');
+ }
+});
+test('nightly stops after reaching tolerance instead of migrating a tail for exact balance',()=>{
+ const weights=[40,40,15,4,1],sessions=weights.map((_,i)=>session('work-'+i,'b'));
+ const p=plan([account('a',60),account('b',40)],sessions,weights.map((w,i)=>request('work-'+i,w)),{weighted:true});
+ assert.equal(p.moves.length,3);assert.equal(p.summaries[0].after.a,59);assert.equal(p.summaries[0].after.b,41);
+ assert.equal(new Set(p.moves.map(m=>m.session_id)).size,3);assert.ok(p.moves.every(m=>m.from==='b'&&m.to==='a'));
+});
+test('one fitting session is preferred over a larger greedy transfer that misses tolerance',()=>{
+ const sessions=[session('large','a'),session('small-1','a'),session('small-2','a'),session('other','b')];
+ const p=plan([account('a'),account('b')],sessions,[request('large',30),request('small-1',20),request('small-2',20),request('other',30)]);
+ assert.equal(p.moves.length,1);assert.equal(p.moves[0].weight,20);assert.deepEqual(p.summaries[0].after,{a:50,b:50});
+});
+test('nightly finds a smaller feasible combination when the largest session overshoots',()=>{
+ const weights=[60,40,30,20,50],sessions=weights.map((_,i)=>session('work-'+i,i===4?'b':'a'));
+ const p=plan([account('a'),account('b')],sessions,weights.map((w,i)=>request('work-'+i,w)),{weighted:true});
+ assert.equal(p.moves.length,2);assert.deepEqual(p.moves.map(m=>m.weight).sort((a,b)=>a-b),[20,30]);
+ assert.deepEqual(p.summaries[0].after,{a:100,b:100});
+});
+test('two-point tolerance is checked per account rather than averaged across the group',()=>{
+ const sessions=[session('large','a'),session('small','a'),session('b-work','b'),session('c-work','c')];
+ const p=plan([account('a'),account('b'),account('c')],sessions,[request('large',33),request('small',3),request('b-work',32),request('c-work',32)],{weighted:true});
+ assert.equal(p.moves.length,1);assert.equal(p.moves[0].session_id,'small');
+ const g=p.summaries[0];for(const a of ['a','b','c'])assert.ok(Math.abs(g.after[a]-g.target[a])<=2);
+});
+test('fewer-transfer combinations never allocate sessions to an exhausted zero-weight account',()=>{
+ const weights=[60,40,30,20,50,1],sessions=weights.map((_,i)=>session('work-'+i,i<4?'a':i===4?'b':'empty'));
+ const p=plan([account('a'),account('b'),account('empty',0)],sessions,weights.map((w,i)=>request('work-'+i,w)),{weighted:true});
+ assert.equal(p.moves.length,2);assert.ok(p.moves.every(m=>m.to!=='empty'));
+ const g=p.summaries[0],total=weights.reduce((sum,w)=>sum+w,0);for(const a of ['a','b','empty'])assert.ok(Math.abs(g.after[a]-g.target[a])/total<=0.02);
+});
+test('minimizing transfers keeps protected sessions fixed even when tolerance is unattainable',()=>{
+ const p=plan([account('a'),account('b')],[session('protected','a',{nightly_enabled:0}),session('movable','a')],[request('protected',80),request('movable',20)],{weighted:true});
+ assert.deepEqual(p.moves.map(m=>m.session_id),['movable']);assert.deepEqual(p.summaries[0].after,{a:80,b:20});
+ assert.deepEqual(p.summaries[0].fixed,['protected']);assert.equal(p.summaries[0].fixedLoad.a,80);
+});
+test('tolerance and smaller-combination search stay isolated between comparable account groups',()=>{
+ const c=account('c'),d=account('d');for(const a of [c,d]){const q=JSON.parse(a.quota_json);q.plan='other-plan';a.quota_json=JSON.stringify(q);}
+ const sessions=[session('a-large','a'),session('a-small-1','a'),session('a-small-2','a'),session('b-work','b'),session('c-work','c'),session('d-work','d')];
+ const p=plan([account('a'),account('b'),c,d],sessions,[request('a-large',30),request('a-small-1',20),request('a-small-2',20),request('b-work',30),request('c-work',52),request('d-work',48)],{weighted:true});
+ assert.equal(p.summaries.length,2);assert.equal(p.moves.length,1);assert.equal(p.moves[0].from,'a');assert.equal(p.moves[0].to,'b');
+ assert.deepEqual(p.summaries[1].after,{c:52,d:48});
+});
+test('large nightly groups preserve a valid plan without overflowing the search stack',()=>{
+ const count=30000,accounts=['a','b','c','d'].map(id=>account(id));
+ const sessions=Array.from({length:count},(_,i)=>session('s'+String(i).padStart(8,'0'),i<count*0.7?'a':'c'));
+ const p=plan(accounts,sessions,sessions.map(s=>request(s.id,1)),{weighted:true}),g=p.summaries[0];
+ assert.ok(p.moves.length>0);assert.equal(new Set(p.moves.map(m=>m.session_id)).size,p.moves.length);
+ const replay={...g.before};for(const m of p.moves){replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
+ assert.deepEqual(replay,g.after);for(const a of accounts)assert.ok(Math.abs(g.after[a.id]-g.target[a.id])/count<=0.02);
+});
+test('large fallback plans are appended without expanding moves into function arguments',()=>{
+ const count=140000,sessions=Array.from({length:count},(_,i)=>session('s'+String(i).padStart(8,'0'),'b'));
+ const p=plan([account('a',99),account('b',1)],sessions,sessions.map(s=>request(s.id,1)),{weighted:true}),g=p.summaries[0];
+ assert.ok(p.moves.length>100000);assert.equal(new Set(p.moves.map(m=>m.session_id)).size,p.moves.length);
+ const replay={...g.before};for(const m of p.moves){assert.equal(m.from,'b');assert.equal(m.to,'a');replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
+ assert.deepEqual(replay,g.after);for(const a of ['a','b'])assert.ok(Math.abs(g.after[a]-g.target[a])/count<=0.02);
+});
 test('quiet, manual exclusion, preparing and disabled sessions remain fixed and count as load',()=>{
  const sessions=[session('quiet','a'),session('manual','a',{nightly_enabled:0}),session('disabled','a',{enabled:0}),session('ready','a')];
  const rows=sessions.map(s=>request(s.id,20,s.id==='quiet'?{ended:at-1,started:nightlyWindow(at).end-1000}:{}));
@@ -70,7 +133,7 @@ async function gateway(t,{rateReader=async()=>{throw Error('unavailable');},cloc
  }});
  const app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'fixture-admin',codexBinary:'unused',reserveTokens:100},rateReader,responsesTransport:transport,...(clock?{clock}:{})});
  for(const a of ['a','b'])app.store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
- app.balancer.saveSettings({failover:true});
+ app.balancer.saveSettings({failover:true,weighted:true});
  const member=app.store.createMember('Fixture',null,null);await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+app.server.address().port;
  t.after(async()=>{release?.();await app.close();rmSync(root,{recursive:true,force:true});});
  const send=(thread='01234567-89ab-7cde-8fab-0123456789ab',extra={})=>fetch(base+'/v1/responses',{method:'POST',headers:{Authorization:'Bearer '+member.secret,'Content-Type':'application/json','thread-id':thread},body:JSON.stringify({model:'fixture-model',input:[{role:'user',content:'synthetic'}],stream:false,...extra})});
@@ -109,7 +172,7 @@ test('admin-only controls, switch-off behavior and manual nightly exclusion',asy
  assert.equal((await patch('/api/admin/balancing',null)).status,400);
  assert.equal((await patch('/api/admin/sessions/'+s.id,{account_id:'b',expected_route_version:0})).status,200);assert.equal(app.store.get('SELECT nightly_enabled FROM sessions').nightly_enabled,0);
  assert.equal((await patch('/api/admin/sessions/'+s.id,{nightly_enabled:true})).status,200);
- app.balancer.saveSettings({failover:false});app.mode('quota');await app.send();assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='b'").route_block,null);
+ app.balancer.saveSettings({failover:false});app.mode('quota');await app.send();assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='b'").route_block,'quota_exhausted','exhaustion updates automatic weights independently of the login failover switch');
 });
 
 test('scheduler persists one daily execution, versioned moves and restart idempotence',async()=>{
@@ -121,6 +184,80 @@ test('scheduler persists one daily execution, versioned moves and restart idempo
   await Promise.all([b.tick(),b.tick()]);assert.equal(refreshes,2);assert.ok(store.get("SELECT COUNT(*) n FROM sessions WHERE account_id='b'").n>0);assert.equal(store.get('SELECT status FROM balance_runs').status,'completed');
   const routes=store.all('SELECT id,account_id,route_version FROM sessions');await create().tick();assert.equal(refreshes,2);assert.deepEqual(store.all('SELECT id,account_id,route_version FROM sessions'),routes);
   clock+=24*hour+60000;await create().tick();assert.equal(refreshes,2,'missed window never catches up in daytime');
+ }finally{store.close();}
+});
+test('preview computes the complete minimal plan and the nightly batch applies each session only once',async()=>{
+ const store=new Store(':memory:');
+ try{
+  const member=store.createMember('Fixture',null,null),weights=[40,40,15,4,1];
+  for(const a of [account('a',60),account('b',40)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
+  for(const [i,w] of weights.entries()){
+   store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'b','responses',?,?)",'s'+i,member.memberId,at-2*hour,at-hour);
+   store.run("INSERT INTO requests(id,member_id,account_id,session_id,started,ended,status,input,model,ip) VALUES(?,?,'b',?,?,?,'ok',?,'fixture','fixture')",'r'+i,member.memberId,'s'+i,at-2*hour,at-hour,w);
+  }
+  const read=async a=>JSON.parse(a.quota_json),b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:read,readQuota:read});
+  b.saveSettings({nightly:true,weighted:true});const before=store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),auditCount=store.get('SELECT COUNT(*) n FROM audit').n;
+  const preview=await b.preview();assert.equal(preview.moves.length,3);
+  assert.deepEqual(store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),before);assert.equal(store.get('SELECT COUNT(*) n FROM audit').n,auditCount);
+  await b.tick();const run=store.get('SELECT * FROM balance_runs'),saved=JSON.parse(run.summary);
+  assert.equal(run.status,'completed');assert.deepEqual(saved.moves,preview.moves);assert.equal(saved.applied.length,3);
+  assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,3);
+  assert.equal(store.get('SELECT MAX(route_version) n FROM sessions').n,1);
+  await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,3);
+ }finally{store.close();}
+});
+for(const expires of [false,true])test('a complete nightly combination is committed together, quota expires '+expires,async()=>{
+ const store=new Store(':memory:');let clock=at;
+ try{
+  const member=store.createMember('Fixture',null,null),rows=[['fixed-a','a',30,0],['move-a','a',30,1],['fixed-b','b',20,0],['move-b','b',20,1]];
+  for(const a of [account('a'),account('b')]){
+   const q=JSON.parse(a.quota_json);q.windows[0].reset=at+1000;
+   store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,JSON.stringify(q));
+  }
+  for(const [sid,aid,weight,nightly] of rows){
+   store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated,nightly_enabled) VALUES(?,?,?,'responses',?,?,?)",sid,member.memberId,aid,at-2*hour,at-hour,nightly);
+   store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,model,ip) VALUES(?,?,?,?,?,?,'ok',?,'fixture','fixture')",'r-'+sid,member.memberId,sid,aid,at-2*hour,at-hour,weight);
+  }
+  const read=async a=>JSON.parse(a.quota_json),b=createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:read,readQuota:read});
+  b.saveSettings({nightly:true,weighted:true});const before=store.all('SELECT id,account_id,route_version,upstream_thread FROM sessions ORDER BY id');
+  const preview=await b.preview();assert.equal(preview.moves.length,2);assert.deepEqual(preview.summaries[0].after,{a:50,b:50});
+  const audit=store.audit.bind(store);store.audit=(action,detail)=>{audit(action,detail);if(expires&&action==='session.route')clock=at+1000;};
+  await b.tick();const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
+  assert.equal(store.get('SELECT status FROM balance_runs').status,'completed');
+  if(expires){
+   assert.deepEqual(store.all('SELECT id,account_id,route_version,upstream_thread FROM sessions ORDER BY id'),before);
+   assert.equal(saved.applied.length,0);assert.equal(saved.skipped.filter(s=>s.reason==='nightly_plan_changed').length,2);
+   assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,0);
+  }else{
+   assert.equal(saved.applied.length,2);assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
+   assert.equal(store.get("SELECT route_version FROM sessions WHERE id='move-a'").route_version,1);
+   assert.equal(store.get("SELECT route_version FROM sessions WHERE id='move-b'").route_version,1);
+  }
+  await b.tick();assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,1);
+ }finally{store.close();}
+});
+test('a group becoming busy rolls back its whole combination without cancelling an independent group',async()=>{
+ const store=new Store(':memory:'),preparing=new Set();
+ try{
+  const members=[store.createMember('Fixture one',null,null),store.createMember('Fixture two',null,null)];
+  for(const [index,ids] of [['a','b'],['c','d']].entries()){
+   for(const aid of ids){const a=account(aid),q=JSON.parse(a.quota_json);q.plan='plan-'+index;store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",aid,aid,aid,JSON.stringify(q));}
+   for(const [suffix,aid,weight,nightly] of [['fixed-a',ids[0],30,0],['move-a',ids[0],30,1],['fixed-b',ids[1],20,0],['move-b',ids[1],20,1]]){
+    const sid=index+'-'+suffix;
+    store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated,nightly_enabled) VALUES(?,?,?,'responses',?,?,?)",sid,members[index].memberId,aid,at-2*hour,at-hour,nightly);
+    store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,model,ip) VALUES(?,?,?,?,?,?,'ok',?,'fixture','fixture')",'r-'+sid,members[index].memberId,sid,aid,at-2*hour,at-hour,weight);
+   }
+  }
+  const b=createBalancer({store,preparing,clock:()=>at,refreshQuota:async a=>JSON.parse(a.quota_json)});b.saveSettings({nightly:true,weighted:true});
+  const before=store.all("SELECT id,account_id,route_version,upstream_thread FROM sessions WHERE id LIKE '0-%' ORDER BY id"),audit=store.audit.bind(store);
+  store.audit=(action,detail)=>{audit(action,detail);if(action==='session.route'&&JSON.parse(detail).session.startsWith('0-'))preparing.add(members[0].memberId);};
+  await b.tick();const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
+  assert.equal(saved.moves.length,4);assert.equal(saved.applied.length,2);assert.ok(saved.applied.every(s=>s.startsWith('1-')));
+  assert.deepEqual(store.all("SELECT id,account_id,route_version,upstream_thread FROM sessions WHERE id LIKE '0-%' ORDER BY id"),before);
+  assert.equal(saved.skipped.filter(s=>s.reason==='session_busy').length,2);
+  assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
+  assert.equal(store.get("SELECT route_version FROM sessions WHERE id='1-move-a'").route_version,1);
+  assert.equal(store.get("SELECT route_version FROM sessions WHERE id='1-move-b'").route_version,1);
  }finally{store.close();}
 });
 test('structured classifier uses codes, never message substring or ambiguous errors',()=>{
@@ -232,7 +369,7 @@ test('new sessions use atomic smooth weights and duplicate client sessions are n
  const admin=await fetch(app.base+'/api/admin/state',{headers:{Authorization:'Bearer fixture-admin'}});const state=await admin.json();assert.equal(state.balancing.weights.mode,'auto');
  assert.ok(Math.abs(state.balancing.weights.accounts[0].automatic-68.9655172414)<1e-8);
 });
-test('manual 100/0 keeps zero-weight fallback and official zero overrides the preference without replay',async t=>{
+test('manual 100/0 validates the admin contract and official zero does not override its preference',async t=>{
  const app=await gateway(t);const checked=Date.now();
  for(const a of [timedAccount('a',30,24,checked),timedAccount('b',90,160,checked)])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
  app.balancer.saveSettings({weighted:true});
@@ -243,10 +380,11 @@ test('manual 100/0 keeps zero-weight fallback and official zero overrides the pr
  assert.equal((await patch({mode:'auto',expected_version:0})).status,409);
  await app.send();assert.equal(app.calls.at(-1).home,'a');
  app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24,Date.now()).quota_json,'a');
- assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');assert.equal(app.calls.length,2);
- assert.equal(app.balancer.status().weights.mode,'failover');assert.equal(app.balancer.status().weights.configuration.weights.a,100);
- assert.equal((await app.send('new-after-zero')).status,200);assert.equal(app.calls.at(-1).home,'b');
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'a');assert.equal(app.calls.length,2);
+ assert.equal(app.balancer.status().weights.mode,'manual');assert.equal(app.balancer.status().weights.configuration.weights.a,100);
+ assert.equal((await app.send('new-after-zero')).status,200);assert.equal(app.calls.at(-1).home,'a');
  assert.equal((await patch({mode:'auto',expected_version:1})).status,200);
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');
 });
 test('manual settings expire at the next Beijing 02:00 even with nightly disabled, restart or missed trigger',async()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-expiry-'));let store,clock=Date.parse('2026-10-15T23:00:00+08:00');
@@ -285,4 +423,190 @@ test('weighted switch preserves the old balancing settings contract across disab
   store.db.close();store=new Store(join(root,'db.sqlite'));b=create();assert.equal(b.settings().weighted,false);assert.equal(b.settings().nightly,true);
   store.run("UPDATE gateway_settings SET value=? WHERE name='balancing'",JSON.stringify({failover:true,nightly:true,quietMinutes:30,weighted:true}));b=create();assert.ok(!Object.hasOwn(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),'weighted'));assert.equal(b.settings().weighted,false,'existing independent setting wins over transitional data');
  }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test('automatic weights change only at initialization, quota transitions or the Beijing daily reset',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'harbor-weight-auto-restart-'));let store=new Store(join(root,'db.sqlite')),clock=at;
+ try{
+  for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
+  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});let b=create();b.saveSettings({weighted:true});
+  const original=b.status().weights.accounts.map(a=>a.automatic);assert.ok(Math.abs(original[0]-68.9655172414)<1e-8);
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',10,24).quota_json,'a');
+  assert.deepEqual(b.status().weights.accounts.map(a=>a.automatic),original,'positive quota changes do not rewrite saved weights');
+  store.close();store=new Store(join(root,'db.sqlite'));b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.automatic),original,'reopening the database retains weights');
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24).quota_json,'a');
+  assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),[0,100]);
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',60,24).quota_json,'a');
+  assert.ok(b.status().weights.accounts[0].effective>original[0],'official recovery recomputes automatic shares');
+  clock+=24*hour;
+  for(const a of [timedAccount('a',10,24,clock),timedAccount('b',90,160,clock)])store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+  await b.tick();assert.ok(Math.abs(b.status().weights.accounts[0].effective-42.5531914894)<1e-8);
+  assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0,'weight reset is independent of nightly migrations');
+ }finally{store.close();rmSync(root,{recursive:true,force:true});}
+});
+test('manual positive weights permit an exhausted subscription and strict zero never becomes fallback',async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({weighted:true});
+ for(const a of [timedAccount('a',0,24,Date.now()),timedAccount('b',80,160,Date.now())])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'a');
+ app.mode('quota');assert.ok((await app.send()).status>=400);assert.equal(app.calls.length,2);
+ app.mode('ok');assert.equal((await app.send()).status,200);assert.equal((await app.send('credit-new')).status,200);
+ assert.ok(app.calls.every(c=>c.home==='a'),'manual credit usage survives repeated exhaustion evidence');
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal((await app.send()).status,503);assert.equal(app.calls.length,4,'zero-weight b cannot take over an unavailable positive account');
+});
+test('all confirmed exhausted accounts reject automatic routing until a manual positive allocation',async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({weighted:true,failover:false});
+ for(const a of [timedAccount('a',0,24,Date.now()),timedAccount('b',0,160,Date.now())])app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+ assert.equal((await app.send()).status,503);assert.equal(app.calls.length,0);
+ app.balancer.saveWeights({mode:'manual',weights:{a:0,b:100},expected_version:0});
+ assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'b');
+});
+test('positive changes retain an existing binding while zero reroutes once even with login failover disabled',async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({failover:false});
+ await app.send();const first=app.store.get('SELECT * FROM sessions');assert.equal(first.account_id,'a');
+ app.balancer.saveWeights({mode:'manual',weights:{a:40,b:60},expected_version:0});
+ await app.send();assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0);
+ app.balancer.saveWeights({mode:'manual',weights:{a:0,b:100},expected_version:1});
+ await app.send();const moved=app.store.get('SELECT * FROM sessions');assert.equal(moved.id,first.id);assert.equal(moved.client_session_id,first.client_session_id);
+ assert.equal(moved.account_id,'b');assert.equal(moved.route_version,1);assert.notEqual(moved.upstream_thread,first.upstream_thread);
+ await app.send();assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,1);
+ assert.deepEqual(app.calls.map(c=>c.home),['a','a','b','b']);
+});
+test('stale exhausted snapshots stay at zero across restart and a failed daily refresh completes on fresh evidence',async()=>{
+ const store=new Store(':memory:');let clock=at;
+ try{
+  for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
+  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});let b=create();b.saveSettings({weighted:true});
+  const original=b.status().weights.accounts.map(a=>a.effective),saved=store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value;
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',10,24).quota_json,'a');b.status();
+  assert.equal(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value,saved,'normal refresh is not a write event');
+  clock+=24*hour;b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),original);
+  assert.equal(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value).pending,true);
+  for(const a of [timedAccount('a',10,24,clock),timedAccount('b',90,160,clock)])store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
+  assert.ok(Math.abs(b.status().weights.accounts[0].effective-42.5531914894)<1e-8,'the pending daily calculation finishes although both quotas stayed positive');
+  assert.equal(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value).pending,false);
+  store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24,clock).quota_json,'a');b.status();clock+=600000;b=create();
+  assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),[0,100],'a stale zero cannot silently become eligible');
+ }finally{store.close();}
+});
+test('overlapping old quota refresh cannot undo exhaustion or join the new account generation',async t=>{
+ const pending=[],positive=()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:20,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}});
+ const app=await gateway(t,{rateReader:async(_binary,home)=>home==='a'?new Promise(resolve=>pending.push(resolve)):positive()});
+ const refresh=()=>fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});let old,current;
+ try{
+  old=refresh();await until(()=>pending.length===1);
+  app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+  current=refresh();await until(()=>pending.length===2);
+  pending[0](positive());assert.equal((await old).status,200);
+  assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+  assert.equal(app.store.get("SELECT quota_json FROM accounts WHERE id='a'").quota_json,null);
+  pending[1](positive());assert.equal((await current).status,200);
+  assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);
+  assert.equal(app.store.get("SELECT route_epoch FROM accounts WHERE id='a'").route_epoch,2);
+ }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([old,current].filter(Boolean));}
+});
+test('official authentication recovery with zero subscription quota permits explicit manual credit usage',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal((await app.send()).status,503);assert.equal(app.calls.length,0);
+ const refreshed=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(refreshed.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+ assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
+});
+for(const failover of [false,true])test('confirmed login loss remains unavailable to manual weights, login switching '+failover,async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({failover});
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ await app.send();app.mode('auth');assert.ok((await app.send()).status>=400);app.mode('ok');
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'login_expired');
+ assert.equal((await app.send()).status,503);assert.equal((await app.send('after-login-loss')).status,503);assert.equal(app.calls.length,2);
+ app.balancer.saveWeights({mode:'manual',weights:{a:0,b:100},expected_version:1});
+ assert.equal((await app.send()).status,failover?200:503);
+ assert.equal((await app.send('positive-b')).status,200);assert.equal(app.calls.at(-1).home,'b');
+});
+test('a new exhaustion failure during manual credit usage invalidates an older positive quota query',async t=>{
+ const pending=[],positive=()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:20,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}});
+ const app=await gateway(t,{rateReader:async(_binary,home)=>home==='a'?new Promise(resolve=>pending.push(resolve)):positive()});
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});let refresh;
+ try{
+  refresh=fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});await until(()=>pending.length===1);
+  app.mode('quota');assert.ok((await app.send()).status>=400);
+  assert.equal(app.store.get("SELECT route_epoch FROM accounts WHERE id='a'").route_epoch,2);
+  pending[0](positive());assert.equal((await refresh).status,200);
+  const a=app.store.get("SELECT * FROM accounts WHERE id='a'");assert.equal(a.route_block,'quota_exhausted');assert.equal(a.quota_json,null);
+  app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'a');
+ }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([refresh].filter(Boolean));}
+});
+test('a newer soft quota observation cannot hide a login failure returned by an in-flight manual request',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.balancer.saveSettings({failover:false});app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ app.mode('hold');const pending=app.send();await until(()=>app.arrivals()===1);
+ const quota=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(quota.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+ app.mode('auth');app.release();assert.ok((await pending).status>=400);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'login_expired');
+ app.mode('ok');assert.equal((await app.send()).status,503);assert.equal(app.calls.length,1,'the failed request is not replayed and later requests stay blocked');
+});
+test('an old authentication failure cannot replace newly confirmed authentication recovery',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ app.mode('hold');const pending=app.send();await until(()=>app.arrivals()===1);
+ app.mode('auth');assert.ok((await app.send('another-auth-request')).status>=400);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'login_expired');
+ const recovered=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(recovered.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+ app.release();assert.ok((await pending).status>=400);
+ const current=app.store.get("SELECT * FROM accounts WHERE id='a'");assert.equal(current.route_block,'quota_exhausted');assert.equal(current.state,'ready');assert.equal(current.last_error,null);
+ app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.length,3);
+});
+test('official login recovery restores automatic allocation initialized while the account was blocked',async t=>{
+ let remaining=50;
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:100-remaining,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',50,24,Date.now()).quota_json,'a');
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').effective,0);
+ const refresh=()=>fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});
+ assert.equal((await refresh()).status,200);assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);
+ assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').effective,100);
+ assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
+ const saved=app.store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value;remaining=40;assert.equal((await refresh()).status,200);
+ assert.equal(app.store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value,saved,'later ordinary positive refreshes still do not rewrite weights');
+});
+test('legacy routing records exhaustion without switching and rejects its old quota query before weighted is enabled',async t=>{
+ const pending=[],positive=()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:50,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}});
+ const app=await gateway(t,{rateReader:async()=>new Promise(resolve=>pending.push(resolve))});app.balancer.saveSettings({weighted:false});app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");let refresh;
+ try{
+  refresh=fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});await until(()=>pending.length===1);
+  app.mode('quota');assert.ok((await app.send()).status>=400);assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
+  app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0);
+  pending[0](positive());assert.equal((await refresh).status,200);assert.equal(app.store.get("SELECT quota_json FROM accounts WHERE id='a'").quota_json,null);
+  app.balancer.saveSettings({weighted:true});assert.equal((await app.send()).status,503);assert.equal(app.calls.length,2);
+  app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});assert.equal((await app.send()).status,200);assert.equal(app.calls.length,3);
+ }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([refresh].filter(Boolean));}
+});
+test('initial authentication recovery with incomparable windows does not retain an unusable all-zero allocation',async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:50,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000},secondary:{usedPercent:20,windowDurationMins:10080,resetsAt:Math.floor(Date.now()/1000)+86400}}})});
+ app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');
+ assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').effective,0);
+ const quota=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(quota.status,200);
+ assert.equal(app.balancer.status().weights.mode,'fallback');assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
+});
+for(const manual of [false,true])test('recovery while weighted is disabled refreshes cached allocation before reenable, manual '+manual,async t=>{
+ const app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:50,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}})});
+ app.store.run("UPDATE accounts SET enabled=0 WHERE id='b'");app.store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',50,24,Date.now()).quota_json,'a');
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'login_expired');assert.equal(app.balancer.status().weights.accounts.find(a=>a.id==='a').automatic,0);
+ if(manual)app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ const configuration=app.store.get("SELECT value FROM gateway_settings WHERE name='routing_weights'")?.value;
+ app.balancer.saveSettings({weighted:false});
+ const recovered=await fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});assert.equal(recovered.status,200);
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);assert.equal(app.balancer.settings().weighted,false);
+ assert.equal((await app.send()).status,200);assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0,'legacy recovery does not migrate');
+ app.balancer.saveSettings({weighted:true});
+ const restarted=createBalancer({store:app.store,preparing:new Set(),refreshQuota:async()=>null});
+ assert.equal(restarted.status().weights.accounts.find(a=>a.id==='a').automatic,100);
+ assert.equal((await app.send()).status,200);assert.equal(app.calls.length,2);assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,0);
+ assert.equal(app.store.get("SELECT value FROM gateway_settings WHERE name='routing_weights'")?.value,configuration,'automatic cache refresh preserves manual values, version and expiry');
 });
