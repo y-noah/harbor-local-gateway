@@ -1,6 +1,6 @@
 import {AppError,id} from './store.mjs';
 
-const minute=60000,day=24*60*minute;
+const minute=60000,day=24*60*minute,nightlyTolerance=0.02,nightlySearchBudget=100000;
 export const balanceDefaults=Object.freeze({failover:false,nightly:false,quietMinutes:30,weighted:false});
 export function balanceSettings(value={}){
   if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!Object.hasOwn(balanceDefaults,k)))throw new AppError(400,'负载均衡设置无效');
@@ -32,6 +32,45 @@ export function automaticWeights(accounts,at){
 }
 export function nextWeightReset(at){const end=nightlyWindow(at).end;return end>at?end:end+day;}
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
+const withinTolerance=(loads,target,total)=>[...target].every(([account,weight])=>Math.abs(loads.get(account)-weight)<=total*(nightlyTolerance+Number.EPSILON));
+
+// Prefer fewer transfers without an unbounded combinatorial search on the request thread.
+function minimizeTransfers(pool,movable,before,target,total,proposed){
+  const loads=new Map(Object.entries(before)),slack=total*(nightlyTolerance+Number.EPSILON);
+  if(withinTolerance(loads,target,total))return [];
+  const movableTotal=movable.reduce((sum,s)=>sum+s.weight,0);
+  if(pool.some(a=>{
+    const fixed=before[a.id]-movable.filter(s=>s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0);
+    return fixed>target.get(a.id)+slack||fixed+movableTotal<target.get(a.id)-slack;
+  }))return proposed;
+  const proposedLoads=new Map(loads);
+  for(const m of proposed){proposedLoads.set(m.from,proposedLoads.get(m.from)-m.weight);proposedLoads.set(m.to,proposedLoads.get(m.to)+m.weight);}
+  const limit=withinTolerance(proposedLoads,target,total)?proposed.length-1:movable.length;
+  let budget=nightlySearchBudget;
+  const selected=[];
+  function search(start,left){
+    if(budget--<=0)return null;
+    if(!left)return withinTolerance(loads,target,total)?[...selected]:null;
+    if(movable.length-start<left)return null;
+    const capacity=movable.slice(start,start+left).reduce((sum,s)=>sum+s.weight,0);
+    if(pool.some(a=>Math.abs(loads.get(a.id)-target.get(a.id))>capacity+slack))return null;
+    for(let i=start;i<=movable.length-left&&budget>0;i++){
+      const s=movable[i],from=loads.get(s.account_id);
+      for(const a of pool){
+        if(a.id===s.account_id||target.get(a.id)<=0||budget<=0)continue;
+        const to=loads.get(a.id);
+        loads.set(s.account_id,from-s.weight);loads.set(a.id,to+s.weight);
+        selected.push({session_id:s.id,from:s.account_id,to:a.id,version:s.route_version,weight:s.weight});
+        const found=search(i+1,left-1);
+        selected.pop();loads.set(s.account_id,from);loads.set(a.id,to);
+        if(found)return found;
+      }
+    }
+    return null;
+  }
+  for(let count=1;count<=limit&&budget>0;count++){const found=search(0,count);if(found)return found;}
+  return proposed;
+}
 
 // Workload is a relative estimate, never a quota admission check.
 export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false}){
@@ -83,9 +122,10 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     const shares=new Map(pool.map(a=>[a.id,weighted?calculated.weights.get(a.id)/100:snapshots.get(a.id).remaining/remaining]));
     const loads=new Map(pool.map(a=>[a.id,0])),target=new Map(pool.map(a=>[a.id,total*shares.get(a.id)]));
     for(const s of work)loads.set(s.account_id,loads.get(s.account_id)+s.weight);
-    const before=Object.fromEntries(loads);
+    const before=Object.fromEntries(loads),groupMoves=[];
     const movable=work.filter(s=>!s.fixed).sort((a,b)=>b.weight-a.weight||a.id.localeCompare(b.id));
     for(const s of movable){
+      if(withinTolerance(loads,target,total))break;
       const origin=s.account_id,from=loads.get(origin)-target.get(origin);
       let best=null,benefit=0;
       for(const a of pool){
@@ -94,11 +134,15 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
         const improvement=Math.abs(from)+Math.abs(to)-Math.abs(from-s.weight)-Math.abs(to+s.weight);
         if(improvement-benefit>Number.EPSILON*total){benefit=improvement;best=a.id;}
       }
-      if(best){loads.set(origin,loads.get(origin)-s.weight);loads.set(best,loads.get(best)+s.weight);moves.push({session_id:s.id,from:origin,to:best,version:s.route_version,weight:s.weight});}
+      if(best){loads.set(origin,loads.get(origin)-s.weight);loads.set(best,loads.get(best)+s.weight);groupMoves.push({session_id:s.id,from:origin,to:best,version:s.route_version,weight:s.weight});}
     }
-    // Remove transfers whose cancellation preserves or improves the final deviation.
+    // Cancel any transfer that is unnecessary for tolerance, or improves an infeasible plan.
     const deviation=()=>pool.reduce((sum,a)=>sum+Math.abs(loads.get(a.id)-target.get(a.id)),0);
-    for(let i=moves.length-1;i>=0;i--){const m=moves[i];if(!ids.has(m.from))continue;const beforeDeviation=deviation();loads.set(m.from,loads.get(m.from)+m.weight);loads.set(m.to,loads.get(m.to)-m.weight);if(deviation()<=beforeDeviation+Number.EPSILON*total)moves.splice(i,1);else{loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}}
+    for(let i=groupMoves.length-1;i>=0;i--){const m=groupMoves[i],balanced=withinTolerance(loads,target,total),beforeDeviation=deviation();loads.set(m.from,loads.get(m.from)+m.weight);loads.set(m.to,loads.get(m.to)-m.weight);if(balanced?withinTolerance(loads,target,total):deviation()<=beforeDeviation+Number.EPSILON*total)groupMoves.splice(i,1);else{loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}}
+    const selected=minimizeTransfers(pool,movable,before,target,total,groupMoves);
+    for(const a of pool)loads.set(a.id,before[a.id]);
+    for(const m of selected){loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}
+    moves.push(...selected);
     summaries.push({accounts:pool.map(a=>a.id),weights:Object.fromEntries(shares),before,after:Object.fromEntries(loads),target:Object.fromEntries(target),fixed:work.filter(s=>s.fixed).map(s=>s.id),fixedLoad:Object.fromEntries(pool.map(a=>[a.id,work.filter(s=>s.fixed&&s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0)]))});
   }
   return {window,moves,skipped,summaries};
