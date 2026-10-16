@@ -148,7 +148,7 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     const selected=minimizeTransfers(pool,movable,before,target,total,groupMoves);
     for(const a of pool)loads.set(a.id,before[a.id]);
     for(const m of selected){loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}
-    moves.push(...selected);
+    for(const m of selected)moves.push(m);
     summaries.push({accounts:pool.map(a=>a.id),weights:Object.fromEntries(shares),before,after:Object.fromEntries(loads),target:Object.fromEntries(target),fixed:work.filter(s=>s.fixed).map(s=>s.id),fixedLoad:Object.fromEntries(pool.map(a=>[a.id,work.filter(s=>s.fixed&&s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0)]))});
   }
   return {window,moves,skipped,summaries};

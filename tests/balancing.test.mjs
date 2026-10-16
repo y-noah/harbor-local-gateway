@@ -93,6 +93,13 @@ test('large nightly groups preserve a valid plan without overflowing the search 
  const replay={...g.before};for(const m of p.moves){replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
  assert.deepEqual(replay,g.after);for(const a of accounts)assert.ok(Math.abs(g.after[a.id]-g.target[a.id])/count<=0.02);
 });
+test('large fallback plans are appended without expanding moves into function arguments',()=>{
+ const count=140000,sessions=Array.from({length:count},(_,i)=>session('s'+String(i).padStart(8,'0'),'b'));
+ const p=plan([account('a',99),account('b',1)],sessions,sessions.map(s=>request(s.id,1)),{weighted:true}),g=p.summaries[0];
+ assert.ok(p.moves.length>100000);assert.equal(new Set(p.moves.map(m=>m.session_id)).size,p.moves.length);
+ const replay={...g.before};for(const m of p.moves){assert.equal(m.from,'b');assert.equal(m.to,'a');replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
+ assert.deepEqual(replay,g.after);for(const a of ['a','b'])assert.ok(Math.abs(g.after[a]-g.target[a])/count<=0.02);
+});
 test('quiet, manual exclusion, preparing and disabled sessions remain fixed and count as load',()=>{
  const sessions=[session('quiet','a'),session('manual','a',{nightly_enabled:0}),session('disabled','a',{enabled:0}),session('ready','a')];
  const rows=sessions.map(s=>request(s.id,20,s.id==='quiet'?{ended:at-1,started:nightlyWindow(at).end-1000}:{}));
