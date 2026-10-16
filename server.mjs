@@ -113,7 +113,7 @@ export function createGateway(options={}) {
         }
         store.run("UPDATE accounts SET state='ready',last_error=NULL,quota_json=?,quota_error=NULL,since_check_tokens=?,tokens_per_percent=?,quota_calibration=? WHERE id=?",JSON.stringify(data),Math.max(0,current.budget_used-beforeUsed),perPercent,JSON.stringify(baseline),account.id);
         balancer.recover(account,data);
-        if(data.limitReached||data.remaining<=0)balancer.block(store.get('SELECT * FROM accounts WHERE id=?',account.id),'quota_exhausted');
+        if(data.limitReached||data.remaining<=0)balancer.block(store.get('SELECT * FROM accounts WHERE id=?',account.id),'quota_exhausted',{quotaRefresh:true});
         if(balancer.settings().weighted)balancer.syncWeights();
         return data;
       }catch(e){if(!stopping&&(authVersions.get(account.id)||0)===authVersion&&store.get('SELECT route_epoch FROM accounts WHERE id=?',account.id)?.route_epoch===account.route_epoch)store.run('UPDATE accounts SET quota_error=? WHERE id=?',e.message,account.id);}
@@ -220,7 +220,7 @@ export function createGateway(options={}) {
       const known=e.usageKnown===true;
       store.finish(requestId,{input:e.input||0,output:e.output||0,cached:e.cached||0,status:known?'failed':'unknown',error:e.message,usageKnown:known},()=>{
         if(job.responses){
-          if(e.routeFailure==='quota_exhausted'?balancer.settings().weighted:balancer.settings().failover)balancer.block(account,e.routeFailure);
+          if(e.routeFailure==='login_expired'||e.routeFailure==='quota_exhausted'&&balancer.settings().weighted)balancer.block(account,e.routeFailure);
           if(e.code==='upstream_authentication')store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
           store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',(e.input||0)+(e.output||0),(e.input||0)+(e.output||0),account.id);
           if(!known)store.run("UPDATE sessions SET state='uncertain',updated=? WHERE id=?",now(),session.id);

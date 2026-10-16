@@ -228,12 +228,12 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
       store.audit('session.route',JSON.stringify({session:current.id,from:current.account_id,to:target,reason}));return store.get('SELECT * FROM sessions WHERE id=?',current.id);
     });
   }
-  function block(account,reason){
+  function block(account,reason,{quotaRefresh=false}={}){
     if(!['quota_exhausted','login_expired'].includes(reason))return;
     return atomic(()=>{
       const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
       if(!current||current.route_epoch!==account.route_epoch)return;
-      if(current.route_block===reason||reason==='quota_exhausted'&&current.route_block==='login_expired')return;
+      if(quotaRefresh&&current.route_block===reason||reason==='quota_exhausted'&&current.route_block==='login_expired')return;
       store.run('UPDATE accounts SET route_block=?,route_epoch=route_epoch+1,route_blocked_at=? WHERE id=?',reason,clock(),account.id);
       store.audit('account.route_block',JSON.stringify({account:account.id,reason}));
       if(settings().weighted)syncWeights();

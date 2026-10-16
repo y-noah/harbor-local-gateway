@@ -516,3 +516,27 @@ test('official authentication recovery with zero subscription quota permits expl
  assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'quota_exhausted');
  assert.equal((await app.send()).status,200);assert.equal(app.calls[0].home,'a');
 });
+for(const failover of [false,true])test('confirmed login loss remains unavailable to manual weights, login switching '+failover,async t=>{
+ const app=await gateway(t);app.balancer.saveSettings({failover});
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ await app.send();app.mode('auth');assert.ok((await app.send()).status>=400);app.mode('ok');
+ assert.equal(app.store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,'login_expired');
+ assert.equal((await app.send()).status,503);assert.equal((await app.send('after-login-loss')).status,503);assert.equal(app.calls.length,2);
+ app.balancer.saveWeights({mode:'manual',weights:{a:0,b:100},expected_version:1});
+ assert.equal((await app.send()).status,failover?200:503);
+ assert.equal((await app.send('positive-b')).status,200);assert.equal(app.calls.at(-1).home,'b');
+});
+test('a new exhaustion failure during manual credit usage invalidates an older positive quota query',async t=>{
+ const pending=[],positive=()=>({rateLimits:{planType:'same-plan',primary:{usedPercent:20,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}}});
+ const app=await gateway(t,{rateReader:async(_binary,home)=>home==='a'?new Promise(resolve=>pending.push(resolve)):positive()});
+ app.balancer.block(app.store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+ app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});let refresh;
+ try{
+  refresh=fetch(app.base+'/api/admin/accounts/a/quota',{method:'POST',headers:{Authorization:'Bearer fixture-admin'}});await until(()=>pending.length===1);
+  app.mode('quota');assert.ok((await app.send()).status>=400);
+  assert.equal(app.store.get("SELECT route_epoch FROM accounts WHERE id='a'").route_epoch,2);
+  pending[0](positive());assert.equal((await refresh).status,200);
+  const a=app.store.get("SELECT * FROM accounts WHERE id='a'");assert.equal(a.route_block,'quota_exhausted');assert.equal(a.quota_json,null);
+  app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'a');
+ }finally{for(const resolve of pending)resolve(positive());await Promise.allSettled([refresh].filter(Boolean));}
+});
