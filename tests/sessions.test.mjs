@@ -141,3 +141,21 @@ test('missing and non-UUID client identifiers never become display metadata',asy
  const state=await app.request('/api/admin/state',undefined,'fixture-admin','GET');
  assert.ok(!JSON.stringify(state.body.sessions).includes('synthetic-secret'));assert.ok(!JSON.stringify(state.body.sessions).includes('onerror'));
 });
+
+test('admin session pages cover more than 100 records with stable ties, valid boundaries and unchanged details',async t=>{
+ const app=await setup(t),at=Date.now(),start=Math.floor((at+8*3600000)/86400000)*86400000-8*3600000-6*86400000;
+ for(let i=0;i<130;i++)app.store.run("INSERT INTO sessions(id,member_id,account_id,protocol,state,created,updated) VALUES(?,?,'account-a','responses','active',?,?)",'page-'+String(i).padStart(3,'0'),app.member.memberId,at-1000,at);
+ for(const [sid,updated] of [['expired',start-1],['future',start+7*86400000]])app.store.run("INSERT INTO sessions(id,member_id,account_id,created,updated) VALUES(?,?,'account-a',?,?)",sid,app.member.memberId,at-1000,updated);
+ const observed=app.store.observe(app.store.authenticate(app.member.secret),'synthetic','fixture','fixture');app.store.run("UPDATE requests SET session_id='page-000',started=?,ended=?,status='ok',input=5,output=2 WHERE id=?",at-500,at,observed);
+ const read=query=>app.request('/api/admin/state'+query,undefined,'fixture-admin','GET');
+ const first=(await read('')).body;assert.deepEqual(first.sessionsPagination,{page:1,pageSize:25,total:130,totalPages:6});assert.equal(first.sessions.length,25);
+ const ids=[];for(let page=1;page<=6;page++){const result=await read('?session_page='+page);assert.equal(result.status,200);ids.push(...result.body.sessions.map(s=>s.id));}
+ assert.deepEqual(ids,Array.from({length:130},(_,i)=>'page-'+String(129-i).padStart(3,'0')));assert.equal(new Set(ids).size,130);
+ const tail=(await read('?session_page=999')).body;assert.equal(tail.sessionsPagination.page,6);assert.equal(tail.sessions.length,5);assert.equal(tail.sessions.at(-1).id,'page-000');assert.equal(tail.sessions.at(-1).request_count,1);assert.equal(tail.sessions.at(-1).account_id,'account-a');
+ const large=(await read('?session_page=2&session_page_size=100')).body;assert.deepEqual(large.sessionsPagination,{page:2,pageSize:100,total:130,totalPages:2});assert.equal(large.sessions.length,30);
+ assert.equal((await app.request('/api/admin/state?session_page=2',undefined,app.member.secret,'GET')).status,401);
+ for(const query of ['?session_page=0','?session_page=-1','?session_page=1.5','?session_page=1e2','?session_page=abc','?session_page=01','?session_page=','?session_page=9007199254740992','?session_page_size=0','?session_page_size=101','?session_page_size=2.5','?session_page=1&session_page=2','?session_page_size=25&session_page_size=50'])assert.equal((await read(query)).status,400,query);
+ app.store.run("UPDATE sessions SET updated=? WHERE id>='page-104' AND id<='page-129'",start-1);
+ const reduced=(await read('?session_page=6')).body;assert.deepEqual(reduced.sessionsPagination,{page:5,pageSize:25,total:104,totalPages:5});assert.equal(reduced.sessions.length,4);
+ app.store.run('UPDATE sessions SET updated=?',start-1);const empty=(await read('?session_page=999')).body;assert.deepEqual(empty.sessionsPagination,{page:1,pageSize:25,total:0,totalPages:1});assert.deepEqual(empty.sessions,[]);
+});
