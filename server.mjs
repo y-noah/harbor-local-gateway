@@ -254,10 +254,21 @@ export function createGateway(options={}) {
         if(path==='/api/admin/shutdown'&&method==='POST'){
           json(res,202,{ok:true});setTimeout(()=>void close().then(()=>options.onStopped?.()),50);return;
         }
-        if(path==='/api/admin/state'&&method==='GET'){refreshQuotas();return json(res,200,{...store.snapshot(),balancing:balancer.status(),queue:queue.length,busy:[...busy.values()].reduce((a,b)=>a+b,0),preparing:[...responseMembers.values()].reduce((a,b)=>a+b,0),endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});}
+        if(path==='/api/admin/state'&&method==='GET'){
+          const pagination={};
+          for(const [name,field] of [['session_page','sessionPage'],['session_page_size','sessionPageSize']]){
+            const values=url.searchParams.getAll(name);
+            if(values.length>1||values.length&&(!/^[1-9]\d*$/.test(values[0])||!Number.isSafeInteger(Number(values[0]))))throw new AppError(400,'会话分页参数无效');
+            if(values.length)pagination[field]=Number(values[0]);
+          }
+          if(pagination.sessionPageSize>100)throw new AppError(400,'每页最多100个会话');
+          refreshQuotas();return json(res,200,{...store.snapshot(now(),pagination),balancing:balancer.status(),queue:queue.length,busy:[...busy.values()].reduce((a,b)=>a+b,0),preparing:[...responseMembers.values()].reduce((a,b)=>a+b,0),endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});}
         if(path==='/api/admin/balancing'&&method==='PATCH')return json(res,200,balancer.saveSettings(await body(req)));
         if(path==='/api/admin/balancing/weights'&&method==='PATCH')return json(res,200,balancer.saveWeights(await body(req)));
-        if(path==='/api/admin/balancing/preview'&&method==='POST')return json(res,200,await balancer.preview());
+        if(path==='/api/admin/balancing/preview'&&method==='POST'){
+          const result=await balancer.preview();
+          return json(res,200,{...result,moves:result.moves.map(move=>({...move,protocol:'responses',client_session_id:null,...store.get('SELECT protocol,client_session_id FROM sessions WHERE id=?',move.session_id)}))});
+        }
         const sessionMatch=path.match(/^\/api\/admin\/sessions\/([a-zA-Z0-9-]+)$/);
         if(sessionMatch&&method==='PATCH'){
           const b=await body(req);

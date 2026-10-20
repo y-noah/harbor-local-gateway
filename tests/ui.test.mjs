@@ -190,7 +190,7 @@ test('session table exposes only routing metadata and hides normal binding statu
  assert.match(html,/<th>Codex Session \/ 员工<\/th><th>绑定账号<\/th><th>近7天请求数<\/th><th>最近活动<\/th><th>操作<\/th>/);
  assert.match(html,/<td class="mono">01234567-89ab-7cde-8fab-0123456789ab<small>/);assert.ok(!html.includes('onerror'));assert.ok(!html.includes('会话名称'));assert.ok(!html.includes('forwarded-fixture'));assert.ok(!html.includes('已绑定'));assert.match(html,/管理会话/);
  await page.click('session-actions','s');assert.match(page.node('#modal-content').innerHTML,/<p class="mono muted">01234567-89ab-7cde-8fab-0123456789ab<\/p>/);assert.ok(!page.node('#modal-content').innerHTML.includes('onerror'));assert.ok(!page.node('#modal-content').innerHTML.includes('修改会话名称'));assert.match(page.node('#modal-content').innerHTML,/修改绑定账号/);assert.match(page.node('#modal-content').innerHTML,/禁止该会话访问/);
- page.run(`state.sessions[0].enabled=0;render();`);assert.match(page.node('#content').innerHTML,/已禁止访问/);
+ page.run(`state.sessions[0].enabled=0;render();`);assert.doesNotMatch(page.node('#content').innerHTML,/已禁止访问/);await page.click('session-actions','s');assert.match(page.node('#modal-content').innerHTML,/已禁止访问/);
  await page.click('session-actions','s');assert.match(page.node('#modal-content').innerHTML,/恢复该会话访问/);assert.ok(!page.node('#modal-content').innerHTML.includes('修改绑定账号'));
 });
 
@@ -226,5 +226,47 @@ test('uncertain Responses warning appears only in session management, with tempo
  page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[{id:'session',protocol:'responses',enabled:1,state:'uncertain',nightly_enabled:0,nightly_expires:Date.now()+1000,member_name:'Fixture',account_name:'Fixture account'}]};tab='sessions';render();`);
  assert.doesNotMatch(page.node('#content').innerHTML,/可继续 · 用量可能漏计/);await page.click('session-actions','session');
  assert.match(page.node('#modal-content').innerHTML,/可继续 · 用量可能漏计/);assert.match(page.node('#modal-content').innerHTML,/临时固定至/);assert.match(page.node('#modal-content').innerHTML,/02:00/);assert.match(page.node('#modal-content').innerHTML,/恢复自动调整/);
- page.run("state.sessions[0].enabled=0;render();");assert.match(page.node('#content').innerHTML,/已禁止访问/);
+ page.run("state.sessions[0].enabled=0;render();");assert.doesNotMatch(page.node('#content').innerHTML,/已禁止访问/);await page.click('session-actions','session');assert.match(page.node('#modal-content').innerHTML,/已禁止访问/);
+});
+
+test('every session action cell contains only the management button, including disabled and legacy sessions',async()=>{
+ const page=await ui(()=>response(snapshot())),sessions=[['active','responses',1],['uncertain','responses',1],['uncertain','chat',1],['active','responses',0],['new','responses',1]].map(([state,protocol,enabled],i)=>({id:'s'+i,state,protocol,enabled,member_name:'Fixture',account_name:'Fixture'}));
+ page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:${JSON.stringify(sessions)}};tab='sessions';render();`);
+ const cells=[...page.node('#content').innerHTML.matchAll(/<td>((?:(?!<\/td>).)*)<\/td><\/tr>/g)].map(m=>m[1]);assert.equal(cells.length,5);
+ for(const cell of cells)assert.match(cell,/^<button[^>]*data-action="session-actions"[^>]*>管理会话<\/button>$/);
+ assert.doesNotMatch(page.node('#content').innerHTML,/最多100个/);
+});
+test('session pagination preserves pages on refresh and rejects late results from an earlier page',async()=>{
+ const base={...snapshot(),sessions:[],sessionsPagination:{page:1,pageSize:25,total:130,totalPages:6}},pending=[],paths=[];
+ const page=await ui(path=>{paths.push(path);return new Promise(resolve=>pending.push(resolve));});
+ page.run(`admin=true;state=${JSON.stringify(base)};tab='sessions';render();`);
+ const older=page.run('refresh()'),next=page.click('sessions-page','2');assert.match(paths.at(-1),/session_page=2/);assert.equal(page.run('sessionsLoading'),true);
+ const size=paths.length;await page.click('sessions-page','3');assert.equal(paths.length,size,'paging is disabled during load');
+ pending[1](response({...base,sessionsPagination:{...base.sessionsPagination,page:2}}));await next;pending[0](response(base));await older;
+ assert.equal(page.run('state.sessionsPagination.page'),2);assert.equal(page.run('sessionsPage'),2);assert.equal(page.run('sessionsLoading'),false);
+ const refreshed=page.run('refresh()');assert.match(paths.at(-1),/session_page=2/);pending[2](response({...base,sessionsPagination:{...base.sessionsPagination,page:2}}));await refreshed;
+ const changed=page.node('#session-page-size').onchange({target:{value:'100'}});assert.match(paths.at(-1),/session_page=1&session_page_size=100/);pending[3](response({...base,sessionsPagination:{page:1,pageSize:100,total:130,totalPages:2}}));await changed;
+ assert.equal(page.run('sessionsPageSize'),100);assert.equal(page.run('sessionsPage'),1);
+});
+test('failed page changes retain the last confirmed page and unlock pagination',async()=>{
+ const page=await ui(()=>response({error:{message:'synthetic network failure'}},503));
+ page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[],sessionsPagination:{page:2,pageSize:25,total:130,totalPages:6}};sessionsPage=2;tab='sessions';render();`);
+ await page.click('sessions-page','3');assert.equal(page.run('sessionsPage'),2);assert.equal(page.run('state.sessionsPagination.page'),2);assert.equal(page.run('sessionsLoading'),false);assert.match(page.node('#toast').textContent,/synthetic network failure/);
+});
+
+test('pending pagination disables old row management and in-flight refresh preserves an open session dialog',async()=>{
+ const pending=[],calls=[],s={id:'old-session',enabled:1,protocol:'responses',state:'active',member_name:'Fixture',account_name:'Fixture',nightly_enabled:1},base={...snapshot(),sessions:[s],sessionsPagination:{page:1,pageSize:25,total:50,totalPages:2}};
+ const page=await ui((path,options)=>{calls.push([path,options]);if(path.startsWith('/api/admin/state'))return new Promise(resolve=>pending.push(resolve));return response({ok:true});});
+ page.run(`admin=true;state=${JSON.stringify(base)};tab='sessions';render();`);
+ const next=page.click('sessions-page','2');assert.match(page.node('#content').innerHTML,/data-action="session-actions" data-id="old-session" disabled/);await page.click('session-actions','old-session');assert.equal(page.node('#modal').open,false);
+ pending[0](response({...base,sessions:[{...s,id:'new-session'}],sessionsPagination:{...base.sessionsPagination,page:2}}));await next;assert.equal(page.run('sessionsLoading'),false);
+ await page.click('session-actions','new-session');const refresh=page.run('refresh()');pending[1](response({...base,sessions:[],sessionsPagination:{...base.sessionsPagination,page:1}}));await refresh;
+ assert.equal(page.run('state.sessions[0].id'),'new-session');assert.equal(page.run('sessionsPage'),2);assert.match(page.node('#modal-content').innerHTML,/禁止该会话访问/);
+ await page.click('toggle-session','new-session');assert.match(page.node('#modal-content').innerHTML,/禁止该会话访问？/);await page.click('close');
+ const afterClose=page.run('refresh()');pending[2](response({...base,sessions:[],sessionsPagination:{...base.sessionsPagination,page:1}}));await afterClose;assert.equal(page.run('sessionsPage'),1);
+});
+test('balancing preview renders identifiers supplied by the preview even outside the current page',async()=>{
+ const client='00000000-0000-4000-8000-000000000777';
+ const page=await ui(()=>response({window:{end:Date.now()},summaries:[],skipped:[],moves:[{session_id:'not-on-page',from:'a',to:'b',protocol:'responses',client_session_id:client},{session_id:'missing',from:'a',to:'b',protocol:'responses',client_session_id:null}]}));
+ page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[]};`);await page.click('balancing-preview');assert.match(page.node('#modal-content').innerHTML,new RegExp(client));assert.match(page.node('#modal-content').innerHTML,/未获取/);
 });

@@ -2,3 +2,5 @@
 .quota{padding:16px 0;border-top:1px solid #edf1e9;margin-top:16px}.quota-number{font-size:35px;font-weight:600;margin:9px 0}.quota-number small{font-size:16px;margin-left:3px}.quota-track{height:5px;background:#edf2e9;border-radius:4px;margin:13px 0}.quota-track span{display:block;height:100%;background:#76a287;border-radius:4px}.quota-row{display:flex;justify-content:space-between;font-size:11px;color:#7a897c;margin-top:14px}.quota>small{display:block;font-size:10px;margin-top:6px}.quota-row strong{font-weight:500;color:#536f5a}
 
 .key-cell{min-width:22rem;max-width:34rem;white-space:normal}.key-value{overflow-wrap:anywhere;user-select:all}.clipboard-fallback{position:fixed;left:-9999px;top:0}
+
+.session-pager{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;padding:16px 22px;border-top:1px solid var(--line)}.session-pager label{display:flex;align-items:center;gap:8px;margin:0;font-size:12px;font-weight:400;white-space:nowrap}.session-pager select{width:auto;margin:0;padding:8px}.session-pager .actions{gap:6px}

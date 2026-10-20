@@ -161,17 +161,22 @@ export class Store {
       this.db.exec('COMMIT');
     } catch(e) {this.db.exec('ROLLBACK');throw e;}
   }
-  snapshot(at=now()) {
+  snapshot(at=now(),{sessionPage=1,sessionPageSize=25}={}) {
+    if(!Number.isSafeInteger(sessionPage)||sessionPage<1||!Number.isSafeInteger(sessionPageSize)||sessionPageSize<1||sessionPageSize>100)throw new AppError(400,'会话分页参数无效');
     const window=this.pruneUsage(at),where='COALESCE(ended,started)>=? AND COALESCE(ended,started)<?',range=[window.start,window.end];
+    const sessionFrom='FROM sessions s JOIN members m ON m.id=s.member_id JOIN accounts a ON a.id=s.account_id WHERE s.updated>=? AND s.updated<?';
+    const sessionTotal=this.get(`SELECT COUNT(*) total ${sessionFrom}`,...range).total;
+    const sessionPages=Math.max(1,Math.ceil(sessionTotal/sessionPageSize)),page=Math.min(sessionPage,sessionPages);
     const recentUsageWindow={start:at-12*3600000,end:at,hours:12};
     const scope=(column,value)=>this.get(`SELECT COALESCE(SUM(input+output),0) used,COALESCE(SUM(CASE WHEN COALESCE(ended,started)>=? AND COALESCE(ended,started)<? THEN input+output ELSE 0 END),0) used_12h,COALESCE(SUM(usage_unknown),0) unmetered,COUNT(DISTINCT ip) ips,MAX(started) last_seen,COALESCE(SUM(reserved),0) reserved FROM requests WHERE ${column}=? AND ${where}`,recentUsageWindow.start,recentUsageWindow.end,value,...range);
     return {
       usageWindow:window,
       recentUsageWindow,
+      sessionsPagination:{page,pageSize:sessionPageSize,total:sessionTotal,totalPages:sessionPages},
       members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(m=>({...m,...scope('member_id',m.id)})),
       keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
       accounts:this.all('SELECT id,name,kind,enabled,state,last_used,last_error,route_block,quota_json,quota_error,token_budget FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(a=>({...a,budget_used:scope('account_id',a.id).used})),
-      sessions:this.all('SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name FROM sessions s JOIN members m ON m.id=s.member_id JOIN accounts a ON a.id=s.account_id WHERE s.updated>=? AND s.updated<? ORDER BY updated DESC LIMIT 100',...range).map(s=>({...s,nightly_enabled:Number(participatesNightly(s,at)),request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
+      sessions:this.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${sessionFrom} ORDER BY s.updated DESC,s.id DESC LIMIT ? OFFSET ?`,...range,sessionPageSize,(page-1)*sessionPageSize).map(s=>({...s,nightly_enabled:Number(participatesNightly(s,at)),request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
       requests:this.all(`SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE ${where} ORDER BY started DESC LIMIT 200`,...range),
       totals:this.get(`SELECT COUNT(*) requests,COALESCE(SUM(input+output),0) tokens,COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0) success,COALESCE(SUM(reserved),0) reserved,COALESCE(SUM(usage_unknown),0) unmetered FROM requests WHERE ${where}`,...range),
       daily:this.all(`SELECT strftime('%Y-%m-%d',COALESCE(ended,started)/1000,'unixepoch','+8 hours') day,SUM(input+output) tokens,COUNT(*) requests FROM requests WHERE ${where} GROUP BY day ORDER BY day`,...range),
