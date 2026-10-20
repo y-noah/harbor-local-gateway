@@ -253,3 +253,20 @@ test('failed page changes retain the last confirmed page and unlock pagination',
  page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[],sessionsPagination:{page:2,pageSize:25,total:130,totalPages:6}};sessionsPage=2;tab='sessions';render();`);
  await page.click('sessions-page','3');assert.equal(page.run('sessionsPage'),2);assert.equal(page.run('state.sessionsPagination.page'),2);assert.equal(page.run('sessionsLoading'),false);assert.match(page.node('#toast').textContent,/synthetic network failure/);
 });
+
+test('pending pagination disables old row management and in-flight refresh preserves an open session dialog',async()=>{
+ const pending=[],calls=[],s={id:'old-session',enabled:1,protocol:'responses',state:'active',member_name:'Fixture',account_name:'Fixture',nightly_enabled:1},base={...snapshot(),sessions:[s],sessionsPagination:{page:1,pageSize:25,total:50,totalPages:2}};
+ const page=await ui((path,options)=>{calls.push([path,options]);if(path.startsWith('/api/admin/state'))return new Promise(resolve=>pending.push(resolve));return response({ok:true});});
+ page.run(`admin=true;state=${JSON.stringify(base)};tab='sessions';render();`);
+ const next=page.click('sessions-page','2');assert.match(page.node('#content').innerHTML,/data-action="session-actions" data-id="old-session" disabled/);await page.click('session-actions','old-session');assert.equal(page.node('#modal').open,false);
+ pending[0](response({...base,sessions:[{...s,id:'new-session'}],sessionsPagination:{...base.sessionsPagination,page:2}}));await next;assert.equal(page.run('sessionsLoading'),false);
+ await page.click('session-actions','new-session');const refresh=page.run('refresh()');pending[1](response({...base,sessions:[],sessionsPagination:{...base.sessionsPagination,page:1}}));await refresh;
+ assert.equal(page.run('state.sessions[0].id'),'new-session');assert.equal(page.run('sessionsPage'),2);assert.match(page.node('#modal-content').innerHTML,/禁止该会话访问/);
+ await page.click('toggle-session','new-session');assert.match(page.node('#modal-content').innerHTML,/禁止该会话访问？/);await page.click('close');
+ const afterClose=page.run('refresh()');pending[2](response({...base,sessions:[],sessionsPagination:{...base.sessionsPagination,page:1}}));await afterClose;assert.equal(page.run('sessionsPage'),1);
+});
+test('balancing preview renders identifiers supplied by the preview even outside the current page',async()=>{
+ const client='00000000-0000-4000-8000-000000000777';
+ const page=await ui(()=>response({window:{end:Date.now()},summaries:[],skipped:[],moves:[{session_id:'not-on-page',from:'a',to:'b',protocol:'responses',client_session_id:client},{session_id:'missing',from:'a',to:'b',protocol:'responses',client_session_id:null}]}));
+ page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[]};`);await page.click('balancing-preview');assert.match(page.node('#modal-content').innerHTML,new RegExp(client));assert.match(page.node('#modal-content').innerHTML,/未获取/);
+});

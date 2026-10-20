@@ -265,7 +265,10 @@ export function createGateway(options={}) {
           refreshQuotas();return json(res,200,{...store.snapshot(now(),pagination),balancing:balancer.status(),queue:queue.length,busy:[...busy.values()].reduce((a,b)=>a+b,0),preparing:[...responseMembers.values()].reduce((a,b)=>a+b,0),endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});}
         if(path==='/api/admin/balancing'&&method==='PATCH')return json(res,200,balancer.saveSettings(await body(req)));
         if(path==='/api/admin/balancing/weights'&&method==='PATCH')return json(res,200,balancer.saveWeights(await body(req)));
-        if(path==='/api/admin/balancing/preview'&&method==='POST')return json(res,200,await balancer.preview());
+        if(path==='/api/admin/balancing/preview'&&method==='POST'){
+          const result=await balancer.preview();
+          return json(res,200,{...result,moves:result.moves.map(move=>({...move,protocol:'responses',client_session_id:null,...store.get('SELECT protocol,client_session_id FROM sessions WHERE id=?',move.session_id)}))});
+        }
         const sessionMatch=path.match(/^\/api\/admin\/sessions\/([a-zA-Z0-9-]+)$/);
         if(sessionMatch&&method==='PATCH'){
           const b=await body(req);

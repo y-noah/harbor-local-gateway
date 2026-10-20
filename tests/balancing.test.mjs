@@ -668,3 +668,18 @@ test('nightly rechecks a manual hold created while quota refresh was in progress
   const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);assert.equal(saved.applied.length,0);assert.equal(store.get('SELECT MAX(route_version) n FROM sessions').n,0);
  }finally{store.close();}
 });
+
+test('admin preview returns client metadata for planned moves outside the selected session page without writes',async t=>{
+ const time=Date.now(),end=nightlyWindow(time).end,app=await gateway(t,{rateReader:async()=>({rateLimits:{planType:'fixture-plan',primary:{usedPercent:50,windowDurationMins:10080,resetsAt:Math.floor(time/1000)+86400}}})});
+ for(let i=0;i<4;i++){
+  const sid='preview-'+i,client='00000000-0000-4000-8000-'+String(i).padStart(12,'0');
+  app.store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_session_id,created,updated) VALUES(?,?,'a','responses',?,?,?)",sid,app.member.memberId,client,end-15*hour,end-14*hour);
+  app.store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,ip,model) VALUES(?,?,?,'a',?,?,'ok',20,'fixture','fixture')",'preview-r'+i,app.member.memberId,sid,end-15*hour,end-14*hour);
+ }
+ const headers={Authorization:'Bearer fixture-admin','Content-Type':'application/json'};
+ const selected=await (await fetch(app.base+'/api/admin/state?session_page_size=1',{headers})).json();const current=new Set(selected.sessions.map(s=>s.id)),before=app.store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),audits=app.store.get('SELECT COUNT(*) n FROM audit').n;
+ const response=await fetch(app.base+'/api/admin/balancing/preview',{method:'POST',headers,body:'{}'});assert.equal(response.status,200);const result=await response.json();assert.equal(result.moves.length,2);assert.ok(result.moves.some(m=>!current.has(m.session_id)));
+ for(const move of result.moves){assert.equal(move.protocol,'responses');assert.equal(move.client_session_id,app.store.get('SELECT client_session_id FROM sessions WHERE id=?',move.session_id).client_session_id);assert.ok(!('title' in move));}
+ assert.deepEqual(app.store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),before);assert.equal(app.store.get('SELECT COUNT(*) n FROM audit').n,audits);
+ const denied=await fetch(app.base+'/api/admin/balancing/preview',{method:'POST',headers:{Authorization:'Bearer '+app.member.secret,'Content-Type':'application/json'},body:'{}'});assert.equal(denied.status,401);
+});
