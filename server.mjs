@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { Store, AppError, id, now, hash, usageWindow } from './store.mjs';
+import { Store, AppError, id, now, hash, usageWindow, nextDailyReset } from './store.mjs';
 import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
 import {createBalancer} from './balancing.mjs';
@@ -266,6 +266,7 @@ export function createGateway(options={}) {
           if(!session||session.member_removed)throw new AppError(404,'会话不存在');
           const enabled=b.enabled===undefined?session.enabled:bool(b.enabled);
           const nightly=b.nightly_enabled===undefined?(b.account_id!==undefined?0:session.nightly_enabled):bool(b.nightly_enabled);
+          const nightlyExpires=nightly?null:(b.account_id!==undefined||b.nightly_enabled!==undefined?nextDailyReset((options.clock||Date.now)()):session.nightly_expires);
           let accountId=session.account_id,upstreamThread=session.upstream_thread,version=session.route_version;
           if(b.account_id!==undefined){
             if(session.protocol!=='responses')throw new AppError(409,'旧 CLI Session 的上下文保存在原账号目录，暂不支持切换绑定账号','session_route_unsupported');
@@ -281,8 +282,8 @@ export function createGateway(options={}) {
           }else if(b.expected_route_version!==undefined)throw new AppError(400,'路由版本必须与目标账号一起提交');
           store.db.exec('BEGIN IMMEDIATE');
           try{
-            store.run('UPDATE sessions SET enabled=?,account_id=?,upstream_thread=?,route_version=?,nightly_enabled=? WHERE id=?',enabled,accountId,upstreamThread,version,nightly,session.id);
-            if(nightly!==session.nightly_enabled)store.audit('session.nightly',JSON.stringify({session:session.id,enabled:!!nightly}));
+            store.run('UPDATE sessions SET enabled=?,account_id=?,upstream_thread=?,route_version=?,nightly_enabled=?,nightly_expires=? WHERE id=?',enabled,accountId,upstreamThread,version,nightly,nightlyExpires,session.id);
+            if(nightly!==session.nightly_enabled||nightlyExpires!==session.nightly_expires)store.audit('session.nightly',JSON.stringify({session:session.id,enabled:!!nightly,expires:nightlyExpires}));
             if(enabled!==session.enabled)store.audit(enabled?'session.enable':'session.disable',session.id);
             if(accountId!==session.account_id)store.audit('session.route',JSON.stringify({sessionId:session.id,from:session.account_id,to:accountId,version}));
             store.db.exec('COMMIT');
