@@ -4,6 +4,12 @@ export const hash = value => createHash('sha256').update(value).digest('hex');
 export const token = () => 'hg_' + randomBytes(30).toString('base64url');
 export const id = () => randomUUID();
 export const now = () => Date.now();
+export function nextDailyReset(at) {
+  const day=86400000,offset=8*3600000;
+  const end=Math.floor((at+offset)/day)*day-offset+2*3600000;
+  return end>at?end:end+day;
+}
+export const participatesNightly=(s,at)=>!!s.nightly_enabled||(Number.isFinite(s.nightly_expires)&&s.nightly_expires<=at);
 export class AppError extends Error {
   constructor(status, message, code = 'invalid_request') { super(message); this.status = status; this.code = code; }
 }
@@ -45,6 +51,7 @@ export class Store {
     add('sessions','title','TEXT');add('sessions','upstream_thread','TEXT');add('sessions','route_version','INTEGER NOT NULL DEFAULT 0');add('sessions','enabled','INTEGER NOT NULL DEFAULT 1');
     const missingNightly=!this.all('PRAGMA table_info(sessions)').some(c=>c.name==='nightly_enabled');
     add('sessions','nightly_enabled','INTEGER NOT NULL DEFAULT 1');
+    add('sessions','nightly_expires','INTEGER');
     if(missingNightly)this.run('UPDATE sessions SET nightly_enabled=0 WHERE route_version>0');
     // Retain the legacy column for compatibility, but erase captured conversation text.
     this.run('UPDATE sessions SET title=NULL WHERE title IS NOT NULL');
@@ -156,13 +163,15 @@ export class Store {
   }
   snapshot(at=now()) {
     const window=this.pruneUsage(at),where='COALESCE(ended,started)>=? AND COALESCE(ended,started)<?',range=[window.start,window.end];
-    const scope=(column,value)=>this.get(`SELECT COALESCE(SUM(input+output),0) used,COALESCE(SUM(usage_unknown),0) unmetered,COUNT(DISTINCT ip) ips,MAX(started) last_seen,COALESCE(SUM(reserved),0) reserved FROM requests WHERE ${column}=? AND ${where}`,value,...range);
+    const recentUsageWindow={start:at-12*3600000,end:at,hours:12};
+    const scope=(column,value)=>this.get(`SELECT COALESCE(SUM(input+output),0) used,COALESCE(SUM(CASE WHEN COALESCE(ended,started)>=? AND COALESCE(ended,started)<? THEN input+output ELSE 0 END),0) used_12h,COALESCE(SUM(usage_unknown),0) unmetered,COUNT(DISTINCT ip) ips,MAX(started) last_seen,COALESCE(SUM(reserved),0) reserved FROM requests WHERE ${column}=? AND ${where}`,recentUsageWindow.start,recentUsageWindow.end,value,...range);
     return {
       usageWindow:window,
+      recentUsageWindow,
       members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(m=>({...m,...scope('member_id',m.id)})),
       keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
       accounts:this.all('SELECT id,name,kind,enabled,state,last_used,last_error,route_block,quota_json,quota_error,token_budget FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(a=>({...a,budget_used:scope('account_id',a.id).used})),
-      sessions:this.all('SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.upstream_thread,m.name member_name,a.name account_name FROM sessions s JOIN members m ON m.id=s.member_id JOIN accounts a ON a.id=s.account_id WHERE s.updated>=? AND s.updated<? ORDER BY updated DESC LIMIT 100',...range).map(s=>({...s,request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
+      sessions:this.all('SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name FROM sessions s JOIN members m ON m.id=s.member_id JOIN accounts a ON a.id=s.account_id WHERE s.updated>=? AND s.updated<? ORDER BY updated DESC LIMIT 100',...range).map(s=>({...s,nightly_enabled:Number(participatesNightly(s,at)),request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
       requests:this.all(`SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE ${where} ORDER BY started DESC LIMIT 200`,...range),
       totals:this.get(`SELECT COUNT(*) requests,COALESCE(SUM(input+output),0) tokens,COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0) success,COALESCE(SUM(reserved),0) reserved,COALESCE(SUM(usage_unknown),0) unmetered FROM requests WHERE ${where}`,...range),
       daily:this.all(`SELECT strftime('%Y-%m-%d',COALESCE(ended,started)/1000,'unixepoch','+8 hours') day,SUM(input+output) tokens,COUNT(*) requests FROM requests WHERE ${where} GROUP BY day ORDER BY day`,...range),

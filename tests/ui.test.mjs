@@ -212,3 +212,19 @@ test('temporary weight editor uses server version and offers explicit automatic 
  const html=page.node('#modal-content').innerHTML;assert.match(html,/value="100"/);assert.match(html,/value="0"/);assert.match(html,/每天北京时间02:00恢复自动/);assert.match(html,/0权重不参与兜底/);assert.match(html,/订阅额度为0也可设置正权重/);
  await page.click('routing-auto');const saved=calls.find(([p])=>p==='/api/admin/balancing/weights');assert.deepEqual(JSON.parse(saved[1].body),{mode:'auto',expected_version:7});
 });
+
+test('recent usage renders both windows and exposes accessible estimate help',async()=>{
+ const page=await ui(()=>response(snapshot()));
+ page.run(`admin=true;state={...${JSON.stringify(snapshot())},keys:[{id:'key',member_id:'member',prefix:'hg_fixture',used:200000000,used_12h:30000000,unmetered:12,enabled:1}],members:[{id:'member',name:'Fixture',enabled:1}],sessions:[]};tab='overview';render();`);
+ assert.match(page.node('#content').innerHTML,/最近用量/);assert.match(page.node('#content').innerHTML,/aria-label="最近用量说明"/);
+ assert.match(page.node('#content').innerHTML,/近12小时 Token（亿）/);assert.match(page.node('#content').innerHTML,/0\.30/);assert.doesNotMatch(page.node('#content').innerHTML,/近7天未计量请求/);
+ await page.click('usage-help');assert.match(page.node('#modal-content').innerHTML,/可能漏计/);assert.match(page.node('#modal-content').innerHTML,/不等于官方订阅额度/);
+ page.run("tab='requests';render();");assert.match(page.node('#content').innerHTML,/最近用量/);
+});
+test('uncertain Responses warning appears only in session management, with temporary deadline',async()=>{
+ const page=await ui(()=>response(snapshot()));
+ page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[{id:'session',protocol:'responses',enabled:1,state:'uncertain',nightly_enabled:0,nightly_expires:Date.now()+1000,member_name:'Fixture',account_name:'Fixture account'}]};tab='sessions';render();`);
+ assert.doesNotMatch(page.node('#content').innerHTML,/可继续 · 用量可能漏计/);await page.click('session-actions','session');
+ assert.match(page.node('#modal-content').innerHTML,/可继续 · 用量可能漏计/);assert.match(page.node('#modal-content').innerHTML,/临时固定至/);assert.match(page.node('#modal-content').innerHTML,/02:00/);assert.match(page.node('#modal-content').innerHTML,/恢复自动调整/);
+ page.run("state.sessions[0].enabled=0;render();");assert.match(page.node('#content').innerHTML,/已禁止访问/);
+});

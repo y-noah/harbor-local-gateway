@@ -1,4 +1,4 @@
-import {AppError,id} from './store.mjs';
+import {AppError,id,nextDailyReset,participatesNightly} from './store.mjs';
 
 const minute=60000,day=24*60*minute,nightlyTolerance=0.02,nightlySearchBudget=100000;
 export const balanceDefaults=Object.freeze({failover:false,nightly:false,quietMinutes:30,weighted:false});
@@ -30,7 +30,7 @@ export function automaticWeights(accounts,at){
   const total=[...scores.values()].reduce((n,v)=>n+v,0);
   return {eligible,snapshots,reason,weights:new Map(accounts.map(a=>[a.id,eligible.includes(a)?reason?null:scores.get(a.id)/total*100:0]))};
 }
-export function nextWeightReset(at){const end=nightlyWindow(at).end;return end>at?end:end+day;}
+export const nextWeightReset=nextDailyReset;
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
 const withinTolerance=(loads,target,total)=>[...target].every(([account,weight])=>Math.abs(loads.get(account)-weight)<=total*(nightlyTolerance+Number.EPSILON));
 
@@ -45,10 +45,20 @@ function minimizeTransfers(pool,movable,before,target,total,proposed){
   }))return proposed;
   const proposedLoads=new Map(loads);
   for(const m of proposed){proposedLoads.set(m.from,proposedLoads.get(m.from)-m.weight);proposedLoads.set(m.to,proposedLoads.get(m.to)+m.weight);}
-  const limit=withinTolerance(proposedLoads,target,total)?proposed.length-1:movable.length;
+  const proposedValid=withinTolerance(proposedLoads,target,total);
+  const limit=proposedValid?proposed.length:movable.length;
+  const rank=new Map(movable.map((s,i)=>[s.id,i]));
+  const preferred=(candidate,previous)=>{
+    if(!previous)return true;
+    const destinations=new Map(previous.map(m=>[m.session_id,m.to])),next=new Map(candidate.map(m=>[m.session_id,m.to]));
+    const changed=[...new Set([...destinations.keys(),...next.keys()])].sort((a,b)=>rank.get(a)-rank.get(b));
+    for(const sid of changed){const s=movable[rank.get(sid)],difference=target.get(next.get(sid)||s.account_id)-target.get(destinations.get(sid)||s.account_id);if(Math.abs(difference)>Number.EPSILON*total)return difference>0;}
+    return false;
+  };
   let budget=nightlySearchBudget;
   const selected=[],prefix=[0];for(const s of movable)prefix.push(prefix.at(-1)+s.weight);
   function search(count){
+    let best=proposedValid&&count===proposed.length?proposed:null;
     const stack=[{start:0,left:count}];
     const leave=()=>{const frame=stack.pop();if(frame.restore){const r=frame.restore;loads.set(r.from,r.fromLoad);loads.set(r.to,r.toLoad);selected.pop();}};
     try{
@@ -56,7 +66,7 @@ function minimizeTransfers(pool,movable,before,target,total,proposed){
         const frame=stack.at(-1);
         if(frame.index===undefined){
           budget--;
-          if(!frame.left){if(withinTolerance(loads,target,total))return [...selected];leave();continue;}
+          if(!frame.left){if(withinTolerance(loads,target,total)&&preferred(selected,best))best=[...selected];leave();continue;}
           if(movable.length-frame.start<frame.left){leave();continue;}
           const capacity=prefix[frame.start+frame.left]-prefix[frame.start];
           if(pool.some(a=>Math.abs(loads.get(a.id)-target.get(a.id))>capacity+slack)){leave();continue;}
@@ -71,7 +81,7 @@ function minimizeTransfers(pool,movable,before,target,total,proposed){
         selected.push({session_id:s.id,from:s.account_id,to:a.id,version:s.route_version,weight:s.weight});
         stack.push({start:index+1,left:frame.left-1,restore:{from:s.account_id,to:a.id,fromLoad,toLoad}});
       }
-      return null;
+      return best;
     }finally{while(stack.length)leave();}
   }
   for(let count=1;count<=limit&&budget>0;count++){const found=search(count);if(found)return found;}
@@ -108,7 +118,7 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     if(weight===0&&!unknown){skipped.push({session_id:s.id,reason:'no_measured_work'});continue;}
     const running=rows.some(r=>['queued','running'].includes(r.status));
     const last=latest.get(s.id);
-    const fixed=running||rows.some(r=>r.started>=window.end)||preparing.has(s.member_id)||at-last<quietMinutes*minute||!s.nightly_enabled||!s.enabled||!s.member_enabled||s.member_removed!==null||s.protocol!=='responses'||unknown;
+    const fixed=running||rows.some(r=>r.started>=window.end)||preparing.has(s.member_id)||at-last<quietMinutes*minute||!participatesNightly(s,at)||!s.enabled||!s.member_enabled||s.member_removed!==null||s.protocol!=='responses'||unknown;
     if(unknown)uncertainAccounts.add(s.account_id);
     active.set(s.id,{...s,weight,fixed,unknown});
     if(fixed)skipped.push({session_id:s.id,reason:unknown?'unknown_workload':running?'busy':'protected'});
@@ -179,6 +189,16 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     return {eligible:accounts.filter(a=>available(a)&&states[a.id]!==0),snapshots,reason:saved.reason,weights:new Map(accounts.map(a=>[a.id,!available(a)||states[a.id]===0?0:Object.hasOwn(saved.weights,a.id)?saved.weights[a.id]:0]))};
   }
   const previousSettings=readSetting('balancing',{});
+  // Older manual routes had no deadline. Recover only human actions, not automatic moves.
+  const legacy=store.all('SELECT id,created FROM sessions WHERE nightly_enabled=0 AND nightly_expires IS NULL');
+  if(legacy.length)atomic(()=>{
+    const actions=new Map();
+    for(const row of store.all("SELECT at,action,detail FROM audit WHERE action IN ('session.route','session.nightly') ORDER BY at")){
+      let detail;try{detail=JSON.parse(row.detail);}catch{continue;}
+      if(row.action==='session.route'&&!detail.reason||row.action==='session.nightly'&&detail.enabled===false){const sid=detail.session||detail.sessionId;actions.set(sid,Math.max(actions.get(sid)||0,row.at));}
+    }
+    for(const s of legacy){const expires=nextDailyReset(actions.get(s.id)??s.created);store.run('UPDATE sessions SET nightly_expires=? WHERE id=?',expires,s.id);store.audit('session.nightly.deadline',JSON.stringify({session:s.id,expires}));}
+  });
   if(Object.hasOwn(previousSettings,'weighted'))atomic(()=>{const {weighted,...legacy}=previousSettings;if(!store.get("SELECT name FROM gateway_settings WHERE name='routing_strategy'"))writeSetting('routing_strategy',{weighted});writeSetting('balancing',legacy);});
   function saveWeights(value){
     if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!['mode','weights','expected_version'].includes(k))||!['auto','manual'].includes(value.mode)||!Number.isSafeInteger(value.expected_version))throw new AppError(400,'权重设置无效');
@@ -270,6 +290,12 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   async function tick(){
     const at=clock(),window=nightlyWindow(at);
     if(stopping())return;
+    atomic(()=>{
+      for(const s of store.all('SELECT id,nightly_expires FROM sessions WHERE nightly_enabled=0 AND nightly_expires<=?',at)){
+        store.run('UPDATE sessions SET nightly_enabled=1,nightly_expires=NULL WHERE id=?',s.id);
+        store.audit('session.nightly.expired',JSON.stringify({session:s.id,expires:s.nightly_expires}));
+      }
+    });
     const configured=manual();if(configured.mode==='manual'&&configured.expires<=at){writeSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:configured.version+1});store.audit('balancing.weights.expired',String(configured.expires));}
     if(settings().weighted&&(!settings().nightly||!window.due))syncWeights();
     if(stopping()||running||!settings().nightly||!window.due)return;
@@ -290,7 +316,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
                 if(stopping()||!settings().nightly)throw new AppError(409,'夜间计划条件已变化','nightly_plan_changed');
                 const session=store.get('SELECT * FROM sessions WHERE id=?',item.session_id),target=store.get('SELECT * FROM accounts WHERE id=?',item.to),source=store.get('SELECT * FROM accounts WHERE id=?',item.from);
                 const latest=store.get('SELECT MAX(MAX(started,COALESCE(ended,started))) last FROM requests WHERE session_id=?',item.session_id)?.last,targetQuota=quotaSnapshot(target,clock());
-                if(!session?.nightly_enabled||session.route_version!==item.version||session.account_id!==item.from||latest>clock()-settings().quietMinutes*minute||!targetQuota||targetQuota.limitReached||targetQuota.remaining<=0||!quotaSnapshot(source,clock())||source.route_block&&source.route_block!=='quota_exhausted')throw new AppError(409,'夜间计划条件已变化','nightly_plan_changed');
+                if(!session||!participatesNightly(session,clock())||session.route_version!==item.version||session.account_id!==item.from||latest>clock()-settings().quietMinutes*minute||!targetQuota||targetQuota.limitReached||targetQuota.remaining<=0||!quotaSnapshot(source,clock())||source.route_block&&source.route_block!=='quota_exhausted')throw new AppError(409,'夜间计划条件已变化','nightly_plan_changed');
                 move(session,item.to,'nightly');moved.push(item.session_id);
               }
               const committedAt=clock();if(group.accounts.some(account=>!quotaSnapshot(store.get('SELECT * FROM accounts WHERE id=?',account),committedAt)))throw new AppError(409,'夜间计划额度已变化','nightly_plan_changed');

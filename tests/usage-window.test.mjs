@@ -13,6 +13,16 @@ test('seven Beijing calendar days cross midnight and Monday without weekly reset
  assert.equal(w.start,Date.parse('2026-10-05T00:00:00+08:00'));assert.equal(w.end,Date.parse('2026-10-12T00:00:00+08:00'));
  assert.equal(usageWindow(w.end).start,w.start+86400000);assert.equal(usageWindow(w.end-1).start,w.start);
 });
+test('rolling twelve hours use completion boundaries across midnight and isolate keys',t=>{
+ const {store:s}=fixture(t),a=s.createMember('Fixture A',null,null),b=s.createMember('Fixture B',null,null),at=Date.parse('2026-10-20T08:30:00+08:00'),start=at-12*3600000;
+ s.run("INSERT INTO accounts(id,name,home,state) VALUES('account','Fixture','unused','ready')");
+ record(s,a,start-1,100);record(s,a,start,10);record(s,a,at-1,20,'unknown',1);record(s,a,at,200);record(s,b,at-1,30);
+ const result=s.snapshot(at);
+ assert.deepEqual(result.recentUsageWindow,{start,end:at,hours:12});
+ assert.equal(result.keys.find(k=>k.id===a.keyId).used_12h,34);assert.equal(result.members.find(m=>m.id===a.memberId).used_12h,34);
+ assert.equal(result.keys.find(k=>k.id===b.keyId).used_12h,32);assert.equal(result.keys.find(k=>k.id===a.keyId).used,338);
+ assert.equal(s.snapshot(at+1).keys.find(k=>k.id===a.keyId).used_12h,224);
+});
 test('all aggregate scopes use the same seven days and physically remove expired token statistics',t=>{
  const f=fixture(t),s=f.store,m=s.createMember('Fixture',null,null),at=Date.now(),w=usageWindow(at);
  s.run("INSERT INTO accounts(id,name,home,state) VALUES('account','Fixture','unused','ready')");
