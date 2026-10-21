@@ -44,11 +44,11 @@ for(const weighted of [false,true])test('nightly accepts up to five percentage p
   if(tail>5){assert.ok(p.moves.some(m=>m.session_id==='large'));assert.ok(p.summaries[0].planning.withinTolerance);}
  }
 });
-test('nightly stops after reaching tolerance instead of migrating a tail for exact balance',()=>{
+test('nightly moves extra sessions to correct the low-budget excess within tolerance',()=>{
  const weights=[40,40,15,4,1],sessions=weights.map((_,i)=>session('work-'+i,'b'));
  const p=plan([account('a',60),account('b',40)],sessions,weights.map((w,i)=>request('work-'+i,w)),{weighted:true});
- assert.equal(p.moves.length,2);assert.equal(p.summaries[0].after.a,55);assert.equal(p.summaries[0].after.b,45);
- assert.equal(new Set(p.moves.map(m=>m.session_id)).size,2);assert.ok(p.moves.every(m=>m.from==='b'&&m.to==='a'));
+ assert.equal(p.moves.length,4);assert.equal(p.summaries[0].after.a,60);assert.equal(p.summaries[0].after.b,40);
+ assert.equal(new Set(p.moves.map(m=>m.session_id)).size,4);assert.ok(p.moves.every(m=>m.from==='b'&&m.to==='a'));
 });
 test('heavy priority requires a complete swap even when one light session fits',()=>{
  const sessions=[session('large','a'),session('small-1','a'),session('small-2','a'),session('other','b')];
@@ -103,7 +103,7 @@ test('large fallback plans are appended without expanding moves into function ar
  const p=plan([account('a',99),account('b',1)],sessions,sessions.map(s=>request(s.id,1)),{weighted:true}),g=p.summaries[0];
  assert.ok(p.moves.length>100000);assert.equal(new Set(p.moves.map(m=>m.session_id)).size,p.moves.length);
  const replay={...g.before};for(const m of p.moves){assert.equal(m.from,'b');assert.equal(m.to,'a');replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
- assert.deepEqual(replay,g.after);assert.ok(g.planning.withinTolerance);
+ assert.deepEqual(replay,g.after);assert.ok(g.planning.withinTolerance);assert.ok(g.after.b<=g.target.b+count*Number.EPSILON*16);assert.ok(g.planning.directionComplete);
 });
 test('quiet, manual exclusion, preparing and disabled sessions remain fixed and count as load',()=>{
  const sessions=[session('quiet','a'),session('manual','a',{nightly_enabled:0}),session('disabled','a',{enabled:0}),session('ready','a')];
@@ -191,7 +191,7 @@ test('scheduler persists one daily execution, versioned moves and restart idempo
   clock+=24*hour+60000;await create().tick();assert.equal(refreshes,2,'missed window never catches up in daytime');
  }finally{store.close();}
 });
-test('preview computes the complete minimal plan and the nightly batch applies each session only once',async()=>{
+test('preview computes the complete direction-first plan and the nightly batch applies each session only once',async()=>{
  const store=new Store(':memory:');
  try{
   const member=store.createMember('Fixture',null,null),weights=[40,40,15,4,1];
@@ -202,13 +202,13 @@ test('preview computes the complete minimal plan and the nightly batch applies e
   }
   const read=async a=>JSON.parse(a.quota_json),b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:read,readQuota:read});
   b.saveSettings({nightly:true,weighted:true});const before=store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),auditCount=store.get('SELECT COUNT(*) n FROM audit').n;
-  const preview=await b.preview();assert.equal(preview.moves.length,2);
+  const preview=await b.preview();assert.equal(preview.moves.length,4);
   assert.deepEqual(store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),before);assert.equal(store.get('SELECT COUNT(*) n FROM audit').n,auditCount);
   await b.tick();const run=store.get('SELECT * FROM balance_runs'),saved=JSON.parse(run.summary);
-  assert.equal(run.status,'completed');assert.deepEqual(saved.moves,preview.moves);assert.equal(saved.applied.length,2);
-  assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
+  assert.equal(run.status,'completed');assert.deepEqual(saved.moves,preview.moves);assert.equal(saved.applied.length,4);
+  assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,4);
   assert.equal(store.get('SELECT MAX(route_version) n FROM sessions').n,1);
-  await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
+  await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,4);
  }finally{store.close();}
 });
 for(const expires of [false,true])test('a complete nightly combination is committed together, quota expires '+expires,async()=>{
