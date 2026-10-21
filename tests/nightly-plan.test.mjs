@@ -64,38 +64,66 @@ test('search exhaustion is distinct from infeasibility and cannot silently selec
 });
 
 // Independent exhaustive assignment oracle: no planner pruning, greedy phase, or move-count search.
-test('small multi-account plans match exhaustive heavy-priority and migration-count decisions',()=>{
+test('small multi-account plans match exhaustive heavy-direction-count decisions',()=>{
   let seed=9173;const random=n=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed%n;};
   for(let trial=0;trial<90;trial++){
     const count=2+random(3),size=3+random(5),budgets=Array.from({length:count},()=>1+random(5)),sum=budgets.reduce((a,b)=>a+b,0),shares=budgets.map(x=>x/sum),rows=Array.from({length:size},()=>[random(count),1+random(35)]);
     const {input,result,loads}=fixture(shares,rows),{pool,movable,before,target,total}=input,tolerance=total*.05,initialExcess=Object.entries(before).reduce((n,[a,w])=>n+Math.max(0,w-target.get(a)),0);
-    if(initialExcess<=tolerance+1e-8){assert.equal(result.moves.length,0);continue;}
+    const levels=[...new Set(budgets)].sort((a,b)=>a-b).slice(0,-1);
+    const direction=amounts=>levels.map(level=>amounts.reduce((n,v,i)=>n+(budgets[i]===level?Math.max(0,v-total*shares[i]):0),0));
+    const compare=(a,b)=>{for(let i=0;i<a.length;i++)if(Math.abs(a[i]-b[i])>1e-8)return a[i]-b[i];return 0;};
+    const initialDirection=direction(pool.map(a=>before[a.id])),correction=initialExcess<=tolerance+1e-8;
+    if(correction&&initialDirection.every(x=>x<1e-8)){assert.equal(result.moves.length,0);continue;}
     const feasible=[],destinations=[];
     function enumerate(index){
       if(index===size){
         const amounts=pool.map(()=>0);for(let i=0;i<size;i++)amounts[destinations[i]]+=rows[i][1];
         const excess=amounts.reduce((n,v,i)=>n+Math.max(0,v-total*shares[i]),0);
-        if(excess<=tolerance+1e-8)feasible.push({moved:new Set(rows.flatMap(([a],i)=>a===destinations[i]?[]:['s'+i])),amounts});
+        if(excess<=tolerance+1e-8&&(!correction||compare(direction(amounts),initialDirection)<0))feasible.push({moved:new Set(rows.flatMap(([a],i)=>a===destinations[i]?[]:['s'+i])),amounts});
         return;
       }
       for(let a=0;a<count;a++){destinations[index]=a;enumerate(index+1);}
     }
     enumerate(0);
-    if(!feasible.length){assert.equal(result.planning.reason,'infeasible',`trial ${trial}`);continue;}
+    if(!feasible.length){assert.equal(result.planning.reason,correction?'direction_unavailable':'infeasible',`trial ${trial}`);continue;}
     let candidates=feasible,covered=0;const required=[],released=Array(count).fill(0);
     for(const s of movable){
-      if(covered>=initialExcess-tolerance-1e-8)break;
-      const a=Number(s.account_id),surplus=Math.max(0,before[a]-target.get(String(a))),old=Math.min(surplus,released[a]);
+      if(covered>=(correction?initialDirection.reduce((a,b)=>a+b,0):initialExcess-tolerance)-1e-8)break;
+      const a=Number(s.account_id),surplus=correction&&budgets[a]===Math.max(...budgets)?0:Math.max(0,before[a]-target.get(String(a))),old=Math.min(surplus,released[a]);
       if(old>=surplus-1e-8)continue;
       const next=candidates.filter(p=>p.moved.has(s.id));if(!next.length)continue;
       candidates=next;required.push(s.id);released[a]+=s.weight;covered+=Math.min(surplus,released[a])-old;
     }
     assert.deepEqual(result.planning.prioritySessions,required,`priority trial ${trial}`);
-    const minimum=Math.min(...candidates.map(p=>p.moved.size));assert.equal(result.moves.length,minimum,`count trial ${trial}`);
     assert.ok(result.planning.withinTolerance,`tolerance trial ${trial}`);
-    const levels=[...new Set(budgets)].sort((a,b)=>a-b).slice(0,-1);
-    const score=amounts=>[...levels.map(level=>amounts.reduce((n,v,i)=>n+(budgets[i]===level?Math.max(0,v-total*shares[i]):0),0)),amounts.reduce((n,v,i)=>n+Math.max(0,v-total*shares[i]),0)];
-    const compare=(a,b)=>{for(let i=0;i<a.length;i++)if(Math.abs(a[i]-b[i])>1e-8)return a[i]-b[i];return 0;};
-    const best=candidates.filter(p=>p.moved.size===minimum).map(p=>score(p.amounts)).sort(compare)[0];assert.equal(compare(score(pool.map(a=>loads.get(a.id))),best),0,`bias trial ${trial}`);
+    assert.ok(result.planning.optimizationComplete,`complete trial ${trial}`);
+    const score=p=>[...direction(p.amounts),p.moved.size,p.amounts.reduce((n,v,i)=>n+Math.max(0,v-total*shares[i]),0)];
+    const best=candidates.map(score).sort(compare)[0];
+    assert.equal(compare(score({amounts:pool.map(a=>loads.get(a.id)),moved:new Set(result.moves.map(m=>m.session_id))}),best),0,`direction/count trial ${trial}`);
   }
+});
+
+test('direction wins over fewer transfers',()=>{
+  const {result,loads}=fixture([.6,.4],[[1,40],[1,40],[1,15],[1,4],[1,1]]);
+  assert.equal(result.moves.length,4);assert.deepEqual([...loads.values()],[60,40]);assert.ok(result.planning.prioritySessions.includes('s0'));
+});
+test('inside tolerance corrects the low-budget side with heavy priority, including reverse compensation',()=>{
+  const {result,loads}=fixture([.6,.4],[[0,35],[0,21],[1,30],[1,10],[1,4]]);
+  assert.equal(result.planning.beforeDeviation,4);assert.deepEqual(result.planning.prioritySessions,['s2']);
+  assert.equal(result.moves.length,2);assert.deepEqual([...loads.values()],[65,35]);assert.equal(result.planning.afterDeviation,5);
+  // A third move can get closer to target (61/39); equivalent direction keeps two.
+  assert.equal(fixture([.6,.4],[[0,64],[1,36]]).result.moves.length,0);
+});
+test('unavailable correction is explicit and protected load can still allow a partial improvement',()=>{
+  const blocked=fixture([.6,.4],[[0,56],[1,44]]);
+  assert.equal(blocked.result.moves.length,0);assert.equal(blocked.result.planning.reason,'direction_unavailable');
+  const partial=fixture([.6,.4],[[1,1]],{fixed:{0:56,1:43}});
+  assert.equal(partial.result.moves.length,1);assert.deepEqual([...partial.loads.values()],[57,43]);
+  assert.equal(partial.result.planning.directionComplete,true);
+});
+test('budget-limited optimization retains a direction-correct witness and reports the unproven minimum',()=>{
+  const {result,loads}=fixture([.6,.4],[[1,20],[1,20],[1,20],[1,20],[1,20]],{searchBudget:0});
+  assert.equal(result.planning.priorityComplete,true);assert.equal(result.planning.directionComplete,true);
+  assert.equal(result.planning.optimizationComplete,false);assert.equal(result.planning.searchLimited,true);
+  assert.equal(result.moves.length,3);assert.deepEqual([...loads.values()],[60,40]);
 });
