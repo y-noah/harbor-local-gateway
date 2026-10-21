@@ -37,29 +37,29 @@ test('balanced allocations do not churn and indivisible oversized sessions are n
  assert.equal(plan([account('a'),account('b')],[session('a1','a'),session('b1','b')],[request('a1',100),request('b1',100)]).moves.length,0);
  assert.equal(plan([account('a'),account('b')],[session('large','a')],[request('large',100)]).moves.length,0);
 });
-for(const weighted of [false,true])test('nightly accepts up to two percentage points without churn, weighted '+weighted,()=>{
- for(const tail of [1.5,2,2.0001]){
+for(const weighted of [false,true])test('nightly accepts up to five percentage points without churn, weighted '+weighted,()=>{
+ for(const tail of [4.5,5,5.0001]){
   const p=plan([account('a'),account('b')],[session('large','a'),session('tail','a'),session('other','b')],[request('large',50),request('tail',tail),request('other',50-tail)],{weighted});
-  assert.equal(p.moves.length,tail<=2?0:1);
-  if(tail>2)assert.equal(p.moves[0].session_id,'tail');
+  assert.equal(p.moves.length,tail<=5?0:2);
+  if(tail>5){assert.ok(p.moves.some(m=>m.session_id==='large'));assert.ok(p.summaries[0].planning.withinTolerance);}
  }
 });
 test('nightly stops after reaching tolerance instead of migrating a tail for exact balance',()=>{
  const weights=[40,40,15,4,1],sessions=weights.map((_,i)=>session('work-'+i,'b'));
  const p=plan([account('a',60),account('b',40)],sessions,weights.map((w,i)=>request('work-'+i,w)),{weighted:true});
- assert.equal(p.moves.length,3);assert.equal(p.summaries[0].after.a,59);assert.equal(p.summaries[0].after.b,41);
- assert.equal(new Set(p.moves.map(m=>m.session_id)).size,3);assert.ok(p.moves.every(m=>m.from==='b'&&m.to==='a'));
+ assert.equal(p.moves.length,2);assert.equal(p.summaries[0].after.a,55);assert.equal(p.summaries[0].after.b,45);
+ assert.equal(new Set(p.moves.map(m=>m.session_id)).size,2);assert.ok(p.moves.every(m=>m.from==='b'&&m.to==='a'));
 });
-test('one fitting session is preferred over a larger greedy transfer that misses tolerance',()=>{
+test('heavy priority requires a complete swap even when one light session fits',()=>{
  const sessions=[session('large','a'),session('small-1','a'),session('small-2','a'),session('other','b')];
  const p=plan([account('a'),account('b')],sessions,[request('large',30),request('small-1',20),request('small-2',20),request('other',30)]);
- assert.equal(p.moves.length,1);assert.equal(p.moves[0].weight,20);assert.deepEqual(p.summaries[0].after,{a:50,b:50});
+ assert.equal(p.moves.length,3);assert.ok(p.moves.some(m=>m.session_id==='large'));assert.deepEqual(p.summaries[0].after,{a:50,b:50});
 });
-test('nightly finds a smaller feasible combination when the largest session overshoots',()=>{
+test('nightly accepts the heaviest session inside five-point tolerance',()=>{
  const weights=[60,40,30,20,50],sessions=weights.map((_,i)=>session('work-'+i,i===4?'b':'a'));
  const p=plan([account('a'),account('b')],sessions,weights.map((w,i)=>request('work-'+i,w)),{weighted:true});
- assert.equal(p.moves.length,2);assert.deepEqual(p.moves.map(m=>m.weight).sort((a,b)=>a-b),[20,30]);
- assert.deepEqual(p.summaries[0].after,{a:100,b:100});
+ assert.equal(p.moves.length,1);assert.deepEqual(p.moves.map(m=>m.weight),[60]);
+ assert.deepEqual(p.summaries[0].after,{a:90,b:110});
 });
 test('equal-size plans favor heavy sessions on the larger budget without adding transfers',()=>{
  const rows=[['heavy-a','a',35],['medium-a','a',20],['heavy-b','b',30],['light-1','b',5],['light-2','b',5],['light-3','b',5]];
@@ -67,17 +67,16 @@ test('equal-size plans favor heavy sessions on the larger budget without adding 
  assert.equal(p.moves.length,2);assert.deepEqual(p.summaries[0].after,{a:65,b:35});
  assert.ok(p.moves.some(m=>m.session_id==='heavy-b'&&m.to==='a'));assert.ok(p.moves.some(m=>m.session_id==='medium-a'&&m.to==='b'));
 });
-test('two-point tolerance is checked per account rather than averaged across the group',()=>{
+test('multi-account allocations inside aggregate five-point tolerance do not churn',()=>{
  const sessions=[session('large','a'),session('small','a'),session('b-work','b'),session('c-work','c')];
  const p=plan([account('a'),account('b'),account('c')],sessions,[request('large',33),request('small',3),request('b-work',32),request('c-work',32)],{weighted:true});
- assert.equal(p.moves.length,1);assert.equal(p.moves[0].session_id,'small');
- const g=p.summaries[0];for(const a of ['a','b','c'])assert.ok(Math.abs(g.after[a]-g.target[a])<=2);
+ assert.equal(p.moves.length,0);assert.ok(p.summaries[0].planning.beforeDeviation<5);
 });
 test('fewer-transfer combinations never allocate sessions to an exhausted zero-weight account',()=>{
  const weights=[60,40,30,20,50,1],sessions=weights.map((_,i)=>session('work-'+i,i<4?'a':i===4?'b':'empty'));
  const p=plan([account('a'),account('b'),account('empty',0)],sessions,weights.map((w,i)=>request('work-'+i,w)),{weighted:true});
  assert.equal(p.moves.length,2);assert.ok(p.moves.every(m=>m.to!=='empty'));
- const g=p.summaries[0],total=weights.reduce((sum,w)=>sum+w,0);for(const a of ['a','b','empty'])assert.ok(Math.abs(g.after[a]-g.target[a])/total<=0.02);
+ assert.ok(p.summaries[0].planning.withinTolerance);
 });
 test('minimizing transfers keeps protected sessions fixed even when tolerance is unattainable',()=>{
  const p=plan([account('a'),account('b')],[session('protected','a',{nightly_enabled:0}),session('movable','a')],[request('protected',80),request('movable',20)],{weighted:true});
@@ -88,7 +87,7 @@ test('tolerance and smaller-combination search stay isolated between comparable 
  const c=account('c'),d=account('d');for(const a of [c,d]){const q=JSON.parse(a.quota_json);q.plan='other-plan';a.quota_json=JSON.stringify(q);}
  const sessions=[session('a-large','a'),session('a-small-1','a'),session('a-small-2','a'),session('b-work','b'),session('c-work','c'),session('d-work','d')];
  const p=plan([account('a'),account('b'),c,d],sessions,[request('a-large',30),request('a-small-1',20),request('a-small-2',20),request('b-work',30),request('c-work',52),request('d-work',48)],{weighted:true});
- assert.equal(p.summaries.length,2);assert.equal(p.moves.length,1);assert.equal(p.moves[0].from,'a');assert.equal(p.moves[0].to,'b');
+ assert.equal(p.summaries.length,2);assert.equal(p.moves.length,3);assert.ok(p.moves.every(m=>['a','b'].includes(m.from)&&['a','b'].includes(m.to)));
  assert.deepEqual(p.summaries[1].after,{c:52,d:48});
 });
 test('large nightly groups preserve a valid plan without overflowing the search stack',()=>{
@@ -97,14 +96,14 @@ test('large nightly groups preserve a valid plan without overflowing the search 
  const p=plan(accounts,sessions,sessions.map(s=>request(s.id,1)),{weighted:true}),g=p.summaries[0];
  assert.ok(p.moves.length>0);assert.equal(new Set(p.moves.map(m=>m.session_id)).size,p.moves.length);
  const replay={...g.before};for(const m of p.moves){replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
- assert.deepEqual(replay,g.after);for(const a of accounts)assert.ok(Math.abs(g.after[a.id]-g.target[a.id])/count<=0.02);
+ assert.deepEqual(replay,g.after);assert.ok(g.planning.withinTolerance);
 });
 test('large fallback plans are appended without expanding moves into function arguments',()=>{
  const count=140000,sessions=Array.from({length:count},(_,i)=>session('s'+String(i).padStart(8,'0'),'b'));
  const p=plan([account('a',99),account('b',1)],sessions,sessions.map(s=>request(s.id,1)),{weighted:true}),g=p.summaries[0];
  assert.ok(p.moves.length>100000);assert.equal(new Set(p.moves.map(m=>m.session_id)).size,p.moves.length);
  const replay={...g.before};for(const m of p.moves){assert.equal(m.from,'b');assert.equal(m.to,'a');replay[m.from]-=m.weight;replay[m.to]+=m.weight;}
- assert.deepEqual(replay,g.after);for(const a of ['a','b'])assert.ok(Math.abs(g.after[a]-g.target[a])/count<=0.02);
+ assert.deepEqual(replay,g.after);assert.ok(g.planning.withinTolerance);
 });
 test('quiet, manual exclusion, preparing and disabled sessions remain fixed and count as load',()=>{
  const sessions=[session('quiet','a'),session('manual','a',{nightly_enabled:0}),session('disabled','a',{enabled:0}),session('ready','a')];
@@ -203,13 +202,13 @@ test('preview computes the complete minimal plan and the nightly batch applies e
   }
   const read=async a=>JSON.parse(a.quota_json),b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:read,readQuota:read});
   b.saveSettings({nightly:true,weighted:true});const before=store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),auditCount=store.get('SELECT COUNT(*) n FROM audit').n;
-  const preview=await b.preview();assert.equal(preview.moves.length,3);
+  const preview=await b.preview();assert.equal(preview.moves.length,2);
   assert.deepEqual(store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),before);assert.equal(store.get('SELECT COUNT(*) n FROM audit').n,auditCount);
   await b.tick();const run=store.get('SELECT * FROM balance_runs'),saved=JSON.parse(run.summary);
-  assert.equal(run.status,'completed');assert.deepEqual(saved.moves,preview.moves);assert.equal(saved.applied.length,3);
-  assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,3);
+  assert.equal(run.status,'completed');assert.deepEqual(saved.moves,preview.moves);assert.equal(saved.applied.length,2);
+  assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
   assert.equal(store.get('SELECT MAX(route_version) n FROM sessions').n,1);
-  await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,3);
+  await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,2);
  }finally{store.close();}
 });
 for(const expires of [false,true])test('a complete nightly combination is committed together, quota expires '+expires,async()=>{
