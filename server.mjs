@@ -15,6 +15,7 @@ import {networkConfig,acceptsRequest} from './network.mjs';
 import {startCodexLogin,startLocalLogin} from './account-login.mjs';
 import {readJsonBody,responseBodyBytes} from './request-body.mjs';
 import {createResponsesTransport,validateResponses,validateCodexJson,codexJsonRoutes} from './responses.mjs';
+import {historyReader,historyQuery,requestObservation} from './observability.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
 function integer(value,label,{nullable=false,min=0,max=1e12}={}) {
@@ -200,7 +201,7 @@ export function createGateway(options={}) {
     store.run('UPDATE accounts SET last_used=? WHERE id=?',now(),account.id);
     try{
       if(job.responses){
-        const result=await (job.jsonPath?responses.runJson:responses.run)({binary:config.codexBinary,home:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.upstream_thread||session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,collectOutput:job.collectOutput,onEvent:job.onEvent});
+        const result=await (job.jsonPath?responses.runJson:responses.run)({binary:config.codexBinary,home:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.upstream_thread||session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,collectOutput:job.collectOutput,onEvent:job.onEvent,onPhase:phase=>store.phase(requestId,phase)});
         store.finish(requestId,result,()=>{
           store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
           store.run("UPDATE sessions SET state='active',updated=? WHERE id=?",now(),session.id);
@@ -208,6 +209,7 @@ export function createGateway(options={}) {
         complete(result);void refreshQuota(store.get('SELECT * FROM accounts WHERE id=?',account.id));return;
       }
       const upstream=provider(account);
+      store.phase(requestId,'cli');
       const result=await upstream.run({binary:upstream.binary,home:account.home,workspace:join(runtime,'jobs',session.id),messages,model,sessionId:session.upstream_id,previousUsage:{input:session.cum_input||0,output:session.cum_output||0,cached:session.cum_cached||0},signal:controller.signal});
       store.finish(requestId,result,()=>{
         store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
@@ -251,6 +253,12 @@ export function createGateway(options={}) {
       if(path==='/api/auth/session'&&method==='GET')return json(res,200,{authenticated:adminAuth.authenticated(req)});
       if(path.startsWith('/api/admin/')){
         authAdmin(req);
+        if(path==='/api/admin/balancing/explanation'&&method==='GET')return json(res,200,balancer.explain());
+        if(path==='/api/admin/history'&&method==='GET')return json(res,200,historyReader(store).list(historyQuery(url.searchParams)));
+        const batch=path.match(/^\/api\/admin\/history\/nightly\/(\d{4}-\d{2}-\d{2})$/);
+        if(batch&&method==='GET')return json(res,200,historyReader(store).nightly(batch[1]));
+        const observation=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]+)$/);
+        if(observation&&method==='GET')return json(res,200,requestObservation(store,observation[1]));
         if(path==='/api/admin/shutdown'&&method==='POST'){
           json(res,202,{ok:true});setTimeout(()=>void close().then(()=>options.onStopped?.()),50);return;
         }

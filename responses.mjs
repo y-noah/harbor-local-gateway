@@ -107,7 +107,8 @@ export function responseUsage(response){
 }
 export function createResponsesTransport({fetchImpl=fetch,credentials=accountCredentials,version=installedVersion}={}){
   const catalogs=new Map();
-  async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={},accept='text/event-stream'}={}){
+  async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={},accept='text/event-stream',onPhase=()=>{}}={}){
+    onPhase('credentials');
     let auth;try{auth=await credentials(binary,home);}catch(error){throw Object.assign(error,{usageKnown:true});}
     const headers={'Authorization':'Bearer '+auth.token,'ChatGPT-Account-ID':auth.accountId,'Accept':accept,'Content-Type':'application/json'};
     if(sessionId){headers['session-id']=sessionId;headers['thread-id']=sessionId;}
@@ -116,16 +117,18 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
       const value=protocolHeaders[name];if(typeof value==='string'&&/^[\x20-\x7e]*$/.test(value))headers[name]=value;
     }
     let result;
+    onPhase('upstream');
     try{result=await fetchImpl(upstreamOrigin+path,{method:payload?'POST':'GET',headers,body:payload?JSON.stringify(payload):undefined,signal,redirect:'error'});}
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
     if(!result.ok){const details=await errorPayload(result);const classified=[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
   }
-  async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders}){
+  async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,onPhase=()=>{}}){
     if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
     let usage=null;
     try{
-      const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json'});
+      const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json',onPhase});
+      onPhase('streaming');
       let response;try{response=await result.json();}catch{throw new AppError(502,'上游工具返回了无效 JSON','upstream_protocol');}
       if(!response||typeof response!=='object'||Array.isArray(response))throw new AppError(502,'上游工具响应无效','upstream_protocol');
       usage=responseUsage(response);
@@ -144,12 +147,12 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     if(!Array.isArray(value.models)||!value.models.length||value.models.some(m=>typeof m.slug!=='string'))throw new AppError(502,'模型目录响应无效','upstream_protocol');
     catalogs.set(home,{expires:Date.now()+60000,models:value.models});return value.models;
   }
-  async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,onEvent=async()=>{}}){
+  async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,onEvent=async()=>{},onPhase=()=>{}}){
     const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
     let completed=null,knownUsage=null,dispatched=false;
     const finishedItems=new Map();
     try{
-      dispatched=true;const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal});
+      dispatched=true;const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal,onPhase});
       // Some Codex subscription responses omit Content-Type; validate their SSE frames below.
       const contentType=response.headers.get('content-type');
       if(contentType&&!contentType.includes('text/event-stream')){await response.body?.cancel();throw new AppError(502,'上游未返回 Responses 事件流','upstream_protocol');}
@@ -170,7 +173,9 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
         if(collectOutput&&event.type==='response.output_item.done'&&Number.isSafeInteger(event.output_index)&&event.output_index>=0&&event.item)finishedItems.set(event.output_index,event.item);
         await onEvent(event,controller.signal);
       };
+      let receiving=false;
       for await(const chunk of response.body){
+        if(!receiving){receiving=true;onPhase('streaming');}
         buffer=(buffer+decoder.decode(chunk,{stream:true})).replaceAll('\r\n','\n');
         let at;while((at=buffer.indexOf('\n\n'))!==-1){await consume(buffer.slice(0,at));buffer=buffer.slice(at+2);}
       }
