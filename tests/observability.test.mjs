@@ -67,6 +67,30 @@ test('routing explanation uses frozen calculation facts and never advances the a
   const saved=JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value);delete saved.basis;
   store.run("UPDATE gateway_settings SET value=? WHERE name='routing_auto'",JSON.stringify(saved));assert.equal(b.explain().basis,null,'old weights must not gain invented historical evidence');
 });
+
+test('nightly client UUID filter includes all employee-scoped sessions while internal IDs remain exact',t=>{
+  const {store,at}=fixture(t),other=store.createMember('另一个测试员工',null,null),client='11111111-1111-4111-8111-111111111111';
+  store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_session_id,created,updated) VALUES('session-two',?,'b','responses',?,?,?)",other.memberId,client,at,at);
+  for(const [day,sid] of [['2026-10-25','session-one'],['2026-10-26','session-two']])store.run("INSERT INTO balance_runs VALUES(?, ?,?,'completed',?)",day,at,at+1,JSON.stringify({moves:[{session_id:sid}],applied:[]}));
+  const reader=historyReader(store);assert.equal(reader.list(query({kind:'nightly',session:client})).pagination.total,2);
+  for(const sid of ['session-one','session-two'])assert.equal(reader.list(query({kind:'nightly',session:sid})).pagination.total,1);
+});
+test('account history includes manual restore and removed previous weights but not unrelated accounts',t=>{
+  const {store}=fixture(t);store.run('DELETE FROM audit');
+  store.audit('balancing.weights',JSON.stringify({mode:'auto',weights:{},previous:{mode:'manual',weights:{a:100},expires:1}}));
+  const reader=historyReader(store);assert.equal(reader.list(query({account:'a'})).pagination.total,1);assert.equal(reader.list(query({account:'b'})).pagination.total,0);
+  store.audit('balancing.weights.auto',JSON.stringify({weights:{a:100},previous:{b:100},reason:'recovery'}));assert.equal(reader.list(query({account:'b'})).pagination.total,1);
+});
+test('nightly DTO retains each skipped group and explains individual heavy-session exclusion',t=>{
+  const {store,at}=fixture(t);
+  store.run("INSERT INTO balance_runs VALUES('2026-10-27',?,?,'completed',?)",at,at+1,JSON.stringify({skipped:[{accounts:['a','b','synthetic-private-marker'],reason:'incomparable_quota'},{accounts:['c'],reason:'unknown_fixed_load'}],summaries:[{accounts:['a','b'],planning:{prioritySessions:['session-one'],heavySkipped:[{session_id:'session-one',reason:'cannot_fit',secret:'synthetic-private-marker'}]}}]}));
+  const data=historyReader(store).nightly('2026-10-27');assert.deepEqual(data.skipped.map(x=>x.accounts),[['a','b'],['c']]);
+  assert.equal(data.summaries[0].planning.heavySkipped[0].reason,'cannot_fit');assert.equal(data.summaries[0].planning.prioritySessions[0].client_session_id,'11111111-1111-4111-8111-111111111111');assert.ok(!JSON.stringify(data).includes('synthetic-private-marker'));
+});
+test('request settlement audit remains associated with its request account after session moves',t=>{
+  const {store,member}=fixture(t),r=store.observe(store.authenticate(member.secret),'local','fixture','model');store.run("UPDATE requests SET account_id='a',session_id='session-one' WHERE id=?",r);store.finish(r,{});store.audit('request.settle',r);
+  const reader=historyReader(store),data=reader.list(query({account:'a',action:'request.settle'}));assert.equal(data.rows.length,1);assert.equal(data.rows[0].detail.request,r);assert.equal(data.rows[0].clientSession,'11111111-1111-4111-8111-111111111111');assert.equal(reader.list(query({account:'c',action:'request.settle'})).pagination.total,0);
+});
 test('phase transitions persist bounded metadata and late callbacks cannot reopen a finished request',t=>{
   const {store,member}=fixture(t),r=store.observe(store.authenticate(member.secret),'127.0.0.1','fixture','model');
   store.run("UPDATE requests SET status='running' WHERE id=?",r);store.phase(r,'credentials');store.phase(r,'upstream');store.phase(r,'streaming');store.phase(r,'streaming');

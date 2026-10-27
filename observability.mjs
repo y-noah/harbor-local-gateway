@@ -2,7 +2,7 @@ import {AppError,requestPhases} from './store.mjs';
 
 const parse=value=>{try{return JSON.parse(value);}catch{return null;}};
 const number=value=>Number.isFinite(value)?value:null;
-const reasonCodes=new Set(['manual','nightly','quota','initialize','recovery','weight_zero','quota_exhausted','login_expired','unknown_workload','busy','protected','no_measured_work','quota_unavailable','incomparable_quota','unknown_fixed_load','session_disabled','session_busy','nightly_plan_changed','planning_failed','balanced','within_tolerance','direction_unavailable','infeasible','search_limited','priority_unresolved']);
+const reasonCodes=new Set(['manual','nightly','quota','initialize','recovery','weight_zero','quota_exhausted','login_expired','unknown_workload','busy','protected','no_measured_work','quota_unavailable','incomparable_quota','unknown_fixed_load','session_disabled','session_busy','nightly_plan_changed','planning_failed','balanced','within_tolerance','direction_unavailable','infeasible','search_limited','priority_unresolved','cannot_fit']);
 const reason=value=>reasonCodes.has(value)?value:null;
 
 // Only structured routing metadata crosses the history boundary. Never return raw audit text.
@@ -34,6 +34,7 @@ export function historyReader(store){
     if(row.action.startsWith('session.'))return {session:row.session_id||null,enabled:typeof d.enabled==='boolean'?d.enabled:null,expires:number(d.expires)};
     if(row.action==='balancing.settings')return {weighted:typeof d.weighted==='boolean'?d.weighted:null,nightly:typeof d.nightly==='boolean'?d.nightly:null,failover:typeof d.failover==='boolean'?d.failover:null,quietMinutes:number(d.quietMinutes)};
     if(row.action.startsWith('key.')){const k=store.get('SELECT prefix,member_id FROM keys WHERE id=?',row.detail);return k?{prefix:k.prefix,member:store.get('SELECT name FROM members WHERE id=?',k.member_id)?.name??null}:{};}
+    if(row.action==='request.settle'){const r=store.get('SELECT id,account_id,member_id FROM requests WHERE id=?',row.detail);return r?{request:r.id,account:known.has(r.account_id)?r.account_id:null,member:store.get('SELECT name FROM members WHERE id=?',r.member_id)?.name??null}:{};}
     if(row.action.startsWith('member.')&&row.action!=='member.create')return {member:store.get('SELECT name FROM members WHERE id=?',row.detail)?.name??null};
     return {};
   }
@@ -46,12 +47,12 @@ export function historyReader(store){
     let join='';
     if(isNight){
       if(account){clauses.push("EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(a.summary) THEN a.summary ELSE '{}' END) WHERE value=?)");args.push(account);}
-      if(session){const sid=store.get('SELECT id FROM sessions WHERE id=? OR client_session_id=?',session,session)?.id||session;clauses.push("EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(a.summary) THEN a.summary ELSE '{}' END) WHERE value=?)");args.push(sid);}
+      if(session){clauses.push("EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(a.summary) THEN a.summary ELSE '{}' END) WHERE value=? OR value IN (SELECT id FROM sessions WHERE client_session_id=?))");args.push(session,session);}
     }else{
       const detail="CASE WHEN json_valid(a.detail) THEN a.detail ELSE '{}' END";
-      join=` LEFT JOIN sessions s ON s.id=COALESCE(json_extract(${detail},'$.session'),json_extract(${detail},'$.sessionId'),CASE WHEN a.action IN ('session.enable','session.disable') THEN a.detail END)`;
+      join=` LEFT JOIN requests r ON a.action='request.settle' AND r.id=a.detail LEFT JOIN sessions s ON s.id=COALESCE(json_extract(${detail},'$.session'),json_extract(${detail},'$.sessionId'),CASE WHEN a.action IN ('session.enable','session.disable') THEN a.detail END,r.session_id)`;
       if(session){clauses.push('(s.id=? OR s.client_session_id=?)');args.push(session,session);}
-      if(account){clauses.push(`(json_extract(${detail},'$.from')=? OR json_extract(${detail},'$.to')=? OR json_extract(${detail},'$.account')=? OR (a.action<>'session.route' AND s.account_id=?) OR (a.action LIKE 'account.%' AND a.detail=?) OR EXISTS(SELECT 1 FROM json_each(${detail},'$.weights') WHERE key=?))`);args.push(account,account,account,account,account,account);}
+      if(account){clauses.push(`(json_extract(${detail},'$.from')=? OR json_extract(${detail},'$.to')=? OR json_extract(${detail},'$.account')=? OR (a.action NOT IN ('session.route','request.settle') AND s.account_id=?) OR r.account_id=? OR (a.action LIKE 'account.%' AND a.detail=?) OR EXISTS(SELECT 1 FROM json_each(${detail},'$.weights') WHERE key=?) OR EXISTS(SELECT 1 FROM json_each(${detail},'$.previous') WHERE key=?) OR EXISTS(SELECT 1 FROM json_each(${detail},'$.previous.weights') WHERE key=?))`);args.push(account,account,account,account,account,account,account,account,account);}
     }
     const where=clauses.length?' WHERE '+clauses.join(' AND '):'',from=` FROM ${table} a${join}${where}`;
     const total=store.get('SELECT COUNT(*) total'+from,...args).total,totalPages=Math.max(1,Math.ceil(total/pageSize)),page=Math.min(query.page,totalPages);
@@ -67,8 +68,8 @@ export function historyReader(store){
     const sessionInfo=id=>{const s=store.get('SELECT id,client_session_id,member_id FROM sessions WHERE id=?',id);return {session_id:s?.id??null,client_session_id:s?.client_session_id??null,member:s?store.get('SELECT name FROM members WHERE id=?',s.member_id)?.name??null:null};};
     return {day:row.day,status:row.status,started:row.started,ended:row.ended,accounts:accounts(),window:raw.window?{start:number(raw.window.start),end:number(raw.window.end)}:null,reason:reason(raw.reason),
       moves:(Array.isArray(raw.moves)?raw.moves:[]).map(m=>({...sessionInfo(m.session_id),from:known.has(m.from)?m.from:null,to:known.has(m.to)?m.to:null,weight:number(m.weight),applied:Array.isArray(raw.applied)?raw.applied.includes(m.session_id):null})),
-      skipped:(Array.isArray(raw.skipped)?raw.skipped:[]).map(m=>({...(m.session_id?sessionInfo(m.session_id):{}),account:known.has(m.account_id)?m.account_id:null,reason:reason(m.reason)})),
-      summaries:(Array.isArray(raw.summaries)?raw.summaries:[]).map(g=>({accounts:(g.accounts||[]).filter(id=>known.has(id)),weights:nums(g.weights),before:nums(g.before),after:nums(g.after),target:nums(g.target),fixedLoad:nums(g.fixedLoad),planning:g.planning?{reason:reason(g.planning.reason),strategy:g.planning.strategy==='heavy-bias-first-v2'?'heavy-bias-first-v2':null,beforeDeviation:number(g.planning.beforeDeviation),afterDeviation:number(g.planning.afterDeviation),tolerance:number(g.planning.tolerance),optimizationComplete:g.planning.optimizationComplete===true,directionComplete:g.planning.directionComplete===true,prioritySessions:Array.isArray(g.planning.prioritySessions)?g.planning.prioritySessions.map(()=>null):[],heavySkipped:Array.isArray(g.planning.heavySkipped)?g.planning.heavySkipped.map(()=>null):[]}:null}))};
+      skipped:(Array.isArray(raw.skipped)?raw.skipped:[]).map(m=>({...(m.session_id?sessionInfo(m.session_id):{}),account:known.has(m.account_id)?m.account_id:null,accounts:(Array.isArray(m.accounts)?m.accounts:[]).filter(id=>known.has(id)),reason:reason(m.reason)})),
+      summaries:(Array.isArray(raw.summaries)?raw.summaries:[]).map(g=>({accounts:(g.accounts||[]).filter(id=>known.has(id)),weights:nums(g.weights),before:nums(g.before),after:nums(g.after),target:nums(g.target),fixedLoad:nums(g.fixedLoad),planning:g.planning?{reason:reason(g.planning.reason),strategy:g.planning.strategy==='heavy-bias-first-v2'?'heavy-bias-first-v2':null,beforeDeviation:number(g.planning.beforeDeviation),afterDeviation:number(g.planning.afterDeviation),tolerance:number(g.planning.tolerance),optimizationComplete:g.planning.optimizationComplete===true,directionComplete:g.planning.directionComplete===true,prioritySessions:Array.isArray(g.planning.prioritySessions)?g.planning.prioritySessions.map(sessionInfo):[],heavySkipped:Array.isArray(g.planning.heavySkipped)?g.planning.heavySkipped.map(m=>({...sessionInfo(m.session_id),reason:reason(m.reason)})):[]}:null}))};
   }
   return {list,nightly};
 }

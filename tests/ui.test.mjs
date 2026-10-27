@@ -47,6 +47,12 @@ test('closing a request phase dialog prevents late polling results from restorin
  assert.equal(page.node('#modal').open,false);assert.equal(page.node('#modal-content').innerHTML,'');assert.equal(page.run('requestDetailId'),'');
 });
 
+test('nightly history names skipped account groups and preserves heavy-session exclusion reasons',async()=>{
+ const page=await ui(()=>response({ok:true}));
+ const result={day:'2026-10-27',status:'completed',accounts:[{id:'a',name:'测试组A'},{id:'b',name:'测试组B'},{id:'c',name:'测试组C'}],moves:[],skipped:[{accounts:['a','b'],reason:'incomparable_quota'},{accounts:['c'],reason:'unknown_fixed_load'}],summaries:[{accounts:[],planning:{reason:'infeasible',prioritySessions:[{session_id:'heavy-one'}],heavySkipped:[{session_id:'heavy-two',reason:'cannot_fit'}]}}]};
+ const html=page.run('nightlyHistory('+JSON.stringify(result)+')');assert.match(html,/测试组A \/ 测试组B/);assert.match(html,/测试组C/);assert.match(html,/额度窗口或套餐不可比较/);assert.match(html,/固定会话的历史负载不足以估计/);assert.match(html,/heavy-one/);assert.match(html,/heavy-two/);assert.match(html,/会话负载无法放入其他账号的容差范围/);
+});
+
 test('logout clears history cache and a pending history page cannot restore private data',async()=>{
  let release;const page=await ui(path=>path.startsWith('/api/admin/history')?new Promise(r=>release=()=>r(response({accounts:[],rows:[{id:'private-history'}],pagination:{page:1,pageSize:25,total:1,totalPages:1}}))):response({ok:true}));
  page.run('admin=true;state='+JSON.stringify({...snapshot(),keys:[]})+";tab='requests';");
