@@ -29,7 +29,12 @@ export function automaticWeights(accounts,at){
   else if(new Set(eligible.map(a=>snapshots.get(a.id).group)).size>1||eligible.some(a=>snapshots.get(a.id).windows.length!==1))reason='incomparable_quota';
   const scores=new Map(eligible.map(a=>{const q=snapshots.get(a.id);return [a.id,reason?0:q.remaining/Math.max((q.windows[0].reset-at)/3600000,24)];}));
   const total=[...scores.values()].reduce((n,v)=>n+v,0);
-  return {eligible,snapshots,reason,weights:new Map(accounts.map(a=>[a.id,eligible.includes(a)?reason?null:scores.get(a.id)/total*100:0]))};
+  const weights=new Map(accounts.map(a=>[a.id,eligible.includes(a)?reason?null:scores.get(a.id)/total*100:0]));
+  const basis={at,formula:'remaining / max(hours_to_reset, 24)',accounts:accounts.map(a=>{
+    const q=snapshots.get(a.id),hours=q?.windows.length===1?(q.windows[0].reset-at)/3600000:null;
+    return {id:a.id,remaining:q?.remaining??null,checked:q?.checked??null,reset:hours!==null?q.windows[0].reset:null,hours,denominator:hours!==null?Math.max(hours,24):null,score:reason?null:scores.get(a.id)??0,weight:weights.get(a.id)};
+  })};
+  return {eligible,snapshots,reason,weights,basis};
 }
 export const nextWeightReset=nextDailyReset;
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
@@ -113,10 +118,11 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
       // A failed refresh cannot erase the last known allocation or resurrect an exhausted account.
       const retain=calculated.reason&&previous&&Object.values(previous.weights).every(Number.isFinite)&&Object.values(previous.weights).some(weight=>weight>0);
       const weights=retain?Object.fromEntries(accounts.map(a=>[a.id,states[a.id]===0?0:previous.weights[a.id]??0])):Object.fromEntries(calculated.weights);
-      saved={cycle,states,weights,reason:calculated.reason,pending:!!calculated.reason};
-      atomic(()=>{writeSetting('routing_auto',saved);store.audit('balancing.weights.auto',JSON.stringify({cycle,reason:force||(!previous?'initialize':previous.cycle!==cycle?'nightly':'quota'),weights}));});
+      const trigger=force||(!previous?'initialize':previous.cycle!==cycle?'nightly':'quota');
+      saved={cycle,states,weights,reason:calculated.reason,pending:!!calculated.reason,basis:retain?previous.basis??null:calculated.basis,updated:at,trigger};
+      atomic(()=>{writeSetting('routing_auto',saved);store.audit('balancing.weights.auto',JSON.stringify({cycle,reason:trigger,weights,previous:previous?.weights??null,basis:saved.basis,retained:!!retain}));});
     }
-    return {eligible:accounts.filter(a=>available(a)&&states[a.id]!==0),snapshots,reason:saved.reason,weights:new Map(accounts.map(a=>[a.id,!available(a)||states[a.id]===0?0:Object.hasOwn(saved.weights,a.id)?saved.weights[a.id]:0]))};
+    return {eligible:accounts.filter(a=>available(a)&&states[a.id]!==0),snapshots,reason:saved.reason,basis:saved.basis??null,updated:saved.updated??null,trigger:saved.trigger??null,weights:new Map(accounts.map(a=>[a.id,!available(a)||states[a.id]===0?0:Object.hasOwn(saved.weights,a.id)?saved.weights[a.id]:0]))};
   }
   const previousSettings=readSetting('balancing',{});
   // Older manual routes had no deadline. Recover only human actions, not automatic moves.
@@ -141,7 +147,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
         if(!weights||typeof weights!=='object'||Array.isArray(weights)||!Object.keys(weights).length||Object.entries(weights).some(([key,v])=>!ids.has(key)||!Number.isFinite(v)||v<0||v>100||Math.abs(v*100-Math.round(v*100))>1e-8)||Math.abs(Object.values(weights).reduce((n,v)=>n+v,0)-100)>1e-8)throw new AppError(400,'请填写有效账号权重，最多两位小数且总和必须为100%');
       }else if(value.weights!==undefined)throw new AppError(400,'自动模式无需填写权重');
       const next={mode:value.mode,weights,expires:value.mode==='manual'?nextWeightReset(clock()):null,version:current.version+1};
-      writeSetting('routing_weights',next);if(value.mode==='auto')syncWeights(undefined,clock(),'manual');store.audit('balancing.weights',JSON.stringify(next));return next;
+      writeSetting('routing_weights',next);if(value.mode==='auto')syncWeights(undefined,clock(),'manual');store.audit('balancing.weights',JSON.stringify({...next,previous:current}));return next;
     });
   }
   function distribution(accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL")){
@@ -152,17 +158,30 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     const weights=new Map(accounts.map(a=>[a.id,eligible.includes(a)&&sum>0?desired(a)/sum*100:0]));
     return {mode,reason:system.reason,eligible,weights,system,configuration:{...configured,...(!active?{mode:'auto',expires:null}:{})},accounts:accounts.map(a=>({id:a.id,automatic:system.weights.get(a.id),effective:['legacy','fallback'].includes(mode)?null:weights.get(a.id),configured:active?configured.weights[a.id]??0:null}))};
   }
-  function selectAccount(){
-    const state=distribution(),pool=state.eligible;
-    if(!pool.length)throw new AppError(503,'所有账号均不可用，请等待额度恢复或重新登录','no_account');
-    if(['legacy','fallback'].includes(state.mode))return [...pool].sort((a,b)=>a.last_used-b.last_used||a.id.localeCompare(b.id))[0];
+  function allocation(state){
+    const pool=state.eligible;
+    if(['legacy','fallback'].includes(state.mode))return {selected:[...pool].sort((a,b)=>a.last_used-b.last_used||a.id.localeCompare(b.id))[0]};
     const signature=JSON.stringify([state.mode,state.mode==='manual'?state.configuration.version:0,pool.map(a=>a.id).sort()]),previous=readSetting('routing_schedule',{});
     const credits=Object.fromEntries(pool.map(a=>[a.id,previous.signature===signature?previous.credits?.[a.id]||0:0]));
     const mean=Object.values(credits).reduce((n,v)=>n+v,0)/pool.length;
     for(const a of pool)credits[a.id]=credits[a.id]-mean+state.weights.get(a.id)/100;
     const candidates=pool.filter(a=>state.weights.get(a.id)>0).sort((a,b)=>credits[b.id]-credits[a.id]||a.id.localeCompare(b.id));
-    const selected=candidates[0];if(!selected)throw new AppError(503,'没有生效权重大于0的可用账号，请调整权重或等待额度恢复','no_account');
-    credits[selected.id]-=1;writeSetting('routing_schedule',{signature,credits});return selected;
+    const selected=candidates[0];
+    if(selected)credits[selected.id]-=1;
+    return {selected,schedule:{signature,credits}};
+  }
+  function selectAccount(){
+    const state=distribution();
+    if(!state.eligible.length)throw new AppError(503,'所有账号均不可用，请等待额度恢复或重新登录','no_account');
+    const result=allocation(state);
+    if(!result.selected)throw new AppError(503,'没有生效权重大于0的可用账号，请调整权重或等待额度恢复','no_account');
+    if(result.schedule)writeSetting('routing_schedule',result.schedule);
+    return result.selected;
+  }
+  function explain(){
+    const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL"),state=distribution(accounts),next=allocation(state).selected;
+    return {at:clock(),mode:state.mode,reason:state.reason,configuration:state.configuration,basis:state.system.basis??null,updated:state.system.updated??null,trigger:state.system.trigger??null,nextAccount:next?.id??null,
+      accounts:accounts.map(a=>({...state.accounts.find(x=>x.id===a.id),name:a.name,reason:!a.enabled?'disabled':a.route_block==='login_expired'?'login_expired':!available(a)?'not_ready':!state.eligible.some(x=>x.id===a.id)?'quota_exhausted':!['legacy','fallback'].includes(state.mode)&&!(state.weights.get(a.id)>0)?'zero_weight':'eligible',extraQuota:a.route_block==='quota_exhausted'&&state.mode==='manual'&&state.weights.get(a.id)>0}))};
   }
   const busy=s=>preparing.has(s.member_id)||!!store.get("SELECT id FROM requests WHERE session_id=? AND status IN ('queued','running')",s.id);
   function move(session,target,reason){
@@ -260,5 +279,5 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     })().finally(()=>{running=null;});
     return running;
   }
-  return {settings,saveSettings,saveWeights,selectAccount,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs ORDER BY day DESC LIMIT 1')||null};}};
+  return {settings,saveSettings,saveWeights,selectAccount,explain,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs ORDER BY day DESC LIMIT 1')||null};}};
 }

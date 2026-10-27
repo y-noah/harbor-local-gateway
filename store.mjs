@@ -4,6 +4,7 @@ export const hash = value => createHash('sha256').update(value).digest('hex');
 export const token = () => 'hg_' + randomBytes(30).toString('base64url');
 export const id = () => randomUUID();
 export const now = () => Date.now();
+export const requestPhases=new Set(['queued','credentials','upstream','streaming','cli','settling','ok','failed','unknown','interrupted','cancelled','rejected']);
 export function nextDailyReset(at) {
   const day=86400000,offset=8*3600000;
   const end=Math.floor((at+offset)/day)*day-offset+2*3600000;
@@ -42,6 +43,8 @@ export class Store {
     add('requests','tracking_only','INTEGER NOT NULL DEFAULT 0');
     const missingFlag=!this.all('PRAGMA table_info(requests)').some(c=>c.name==='usage_unknown');
     add('requests','usage_unknown','INTEGER NOT NULL DEFAULT 0');
+    add('requests','phase','TEXT');add('requests','phase_at','INTEGER');add('requests','phase_history',"TEXT NOT NULL DEFAULT '[]'");
+    this.db.exec('CREATE INDEX IF NOT EXISTS audit_time ON audit(at DESC,id DESC)');
     if(missingFlag)this.db.exec("UPDATE requests SET usage_unknown=1 WHERE status IN ('unknown','interrupted')");
     add('keys','secret_cipher','TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS request_usage_time ON requests(COALESCE(ended,started))');
@@ -63,6 +66,8 @@ export class Store {
     try{
       this.db.exec("UPDATE keys SET unmetered=unmetered+(SELECT COUNT(*) FROM requests WHERE key_id=keys.id AND status='running' AND tracking_only=1)");
       this.db.exec("UPDATE sessions SET state='uncertain' WHERE id IN (SELECT session_id FROM requests WHERE status='running')");
+      for(const row of this.all("SELECT id FROM requests WHERE status='running'"))this.phase(row.id,'interrupted');
+      for(const row of this.all("SELECT id FROM requests WHERE status='queued'"))this.phase(row.id,'cancelled');
       this.db.prepare("UPDATE requests SET status='interrupted',usage_unknown=1,ended=?,error=CASE WHEN tracking_only=1 THEN '服务重启；本次用量可能未计入累计' ELSE '服务重启；上游用量未知，保留预占额度待核对' END WHERE status='running'").run(now());
       this.db.prepare("UPDATE requests SET status='cancelled',reserved=0,ended=?,error='服务重启；排队请求未调用上游，已释放预占' WHERE status='queued'").run(now());
       this.db.exec("UPDATE accounts SET state='offline',last_error='服务重启中断了官方登录，请重新登录' WHERE state='login' AND removed_at IS NULL");
@@ -139,13 +144,25 @@ export class Store {
       const reserved=this.allowance(member,reserveSize);
       const requestId=id();
       this.run("INSERT INTO requests(id,member_id,key_id,started,status,ip,agent,reserved,model) VALUES(?,?,?,?,'queued',?,?,?,?)",requestId,member.id,member.key_id,now(),ip,agent,reserved,model);
+      this.phase(requestId,'queued');
       this.db.exec('COMMIT'); return requestId;
     } catch(e) { this.db.exec('ROLLBACK'); throw e; }
   }
   observe(member,ip,agent,model){
     const requestId=id();
     this.run("INSERT INTO requests(id,member_id,key_id,started,status,ip,agent,reserved,model,predicted,tracking_only) VALUES(?,?,?,?,'queued',?,?,0,?,0,1)",requestId,member.id,member.key_id,now(),ip,agent,model);
+    this.phase(requestId,'queued');
     return requestId;
+  }
+  phase(requestId,phase,at=now()){
+    if(!requestPhases.has(phase))throw Error('Unknown request phase');
+    const row=this.get('SELECT status,ended,phase,phase_at,phase_history FROM requests WHERE id=?',requestId);
+    if(!row||row.ended!==null||!['queued','running'].includes(row.status)||row.phase===phase)return;
+    let history;try{history=JSON.parse(row.phase_history);}catch{history=[];}
+    if(!Array.isArray(history))history=[];
+    at=Math.max(at,row.phase_at||0);
+    history.push({phase,at});
+    this.run('UPDATE requests SET phase=?,phase_at=?,phase_history=? WHERE id=?',phase,at,JSON.stringify(history.slice(-32)),requestId);
   }
   finish(requestId,result,after) {
     this.db.exec('BEGIN IMMEDIATE');
@@ -153,6 +170,8 @@ export class Store {
       const row=this.get('SELECT * FROM requests WHERE id=?',requestId);
       if(!row || !['queued','running'].includes(row.status)) throw Error('Request already settled');
       const {input=0,output=0,cached=0,status='ok',error=null,usageKnown=true}=result;
+      this.phase(requestId,status==='ok'?'settling':status);
+      if(status==='ok')this.phase(requestId,'ok');
       this.run('UPDATE requests SET ended=?,status=?,input=?,output=?,cached=?,reserved=?,usage_unknown=?,error=? WHERE id=?',now(),status,input,output,cached,usageKnown?0:row.reserved,usageKnown?0:1,error,requestId);
       this.run('UPDATE members SET used=used+? WHERE id=?',input+output,row.member_id);
       this.run('UPDATE keys SET used=used+? WHERE id=?',input+output,row.key_id);

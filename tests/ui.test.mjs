@@ -7,12 +7,12 @@ const source=readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
 const snapshot=()=>({totals:{tokens:0,requests:0,success:0,reserved:0},accounts:[],members:[],daily:[],requests:[],busy:0,queue:0});
 const response=(body,status=200)=>({ok:status<400,status,json:async()=>body});
 async function ui(fetcher){
-  const nodes=new Map(),handlers=new Map(),downloads=[],popups=[],timers=[];
+  const nodes=new Map(),handlers=new Map(),downloads=[],popups=[],timers=[],copied=[];
   const node=id=>{if(!nodes.has(id))nodes.set(id,{classList:{values:new Set(),add(v){this.values.add(v);},remove(v){this.values.delete(v);},toggle(){}},value:'',textContent:'',innerHTML:'',open:false,close(){this.open=false;},showModal(){this.open=true;}});return nodes.get(id);};
   class BrowserURL extends URL{static createObjectURL(){return 'blob:test-only';}static revokeObjectURL(){}}
-  const context=vm.createContext({document:{querySelector:node,querySelectorAll:()=>[],addEventListener(type,handler){handlers.set(type,handler);},createElement(){return {click(){downloads.push(this.download);}};},activeElement:{tagName:'BODY'}},URL:BrowserURL,window:{open(){const popup={closed:false,close(){this.closed=true;},location:{replace(url){popup.url=url;}}};popups.push(popup);return popup;}},sessionStorage:{removeItem(){}},location:{hash:''},setInterval(){},setTimeout(fn,delay){const timer={fn,delay,active:true};timers.push(timer);return timer;},clearTimeout(timer){if(timer)timer.active=false;},fetch:async(path,options)=>path==='/api/auth/session'?response({authenticated:false}):fetcher(path,options),console});
+  const context=vm.createContext({URLSearchParams,navigator:{clipboard:{writeText:async value=>copied.push(value)}},document:{querySelector:node,querySelectorAll:()=>[],addEventListener(type,handler){handlers.set(type,handler);},createElement(){return {click(){downloads.push(this.download);}};},activeElement:{tagName:'BODY'}},URL:BrowserURL,window:{open(){const popup={closed:false,close(){this.closed=true;},location:{replace(url){popup.url=url;}}};popups.push(popup);return popup;}},sessionStorage:{removeItem(){}},location:{hash:''},setInterval(){},setTimeout(fn,delay){const timer={fn,delay,active:true};timers.push(timer);return timer;},clearTimeout(timer){if(timer)timer.active=false;},fetch:async(path,options)=>path==='/api/auth/session'?response({authenticated:false}):fetcher(path,options),console});
   vm.runInContext(source,context);await new Promise(setImmediate);
-  return {node,downloads,popups,timers,click:(action,id='')=>handlers.get('click')({target:{closest:selector=>selector==='[data-action]'?{dataset:{action,id}}:null}}),run:code=>vm.runInContext(code,context)};
+  return {node,downloads,popups,timers,copied,click:(action,id='')=>handlers.get('click')({target:{closest:selector=>selector==='[data-action]'?{dataset:{action,id}}:null}}),run:code=>vm.runInContext(code,context)};
 }
 
 test('late admin refresh cannot reopen the console after logout',async()=>{
@@ -25,6 +25,33 @@ test('late admin refresh cannot reopen the console after logout',async()=>{
   release();await pending;
   assert.equal(page.node('#shell').classList.values.has('hidden'),true);
   assert.equal(page.run('state'),null);
+});
+
+test('employee list pairs every full Key with its expiry and copy action below the name',async()=>{
+ const page=await ui(()=>response({ok:true}));
+ page.run("admin=true;tab='members';state={..."+JSON.stringify(snapshot())+",members:[{id:'m',name:'员工<&>',enabled:1}],keys:[{id:'k1',member_id:'m',full_key:'synthetic-key-one',expires:1,enabled:1},{id:'k2',member_id:'m',full_key:'synthetic-key-two',expires:null,enabled:1}]};render();");
+ const html=page.node('#content').innerHTML;assert.match(html,/员工&lt;&amp;&gt;/);assert.ok(html.indexOf('员工&lt;&amp;&gt;')<html.indexOf('synthetic-key-one'));
+ assert.match(html,/synthetic-key-one/);assert.match(html,/synthetic-key-two/);assert.match(html,/已过期/);assert.match(html,/永久有效/);
+ await page.click('copy-key','k2');assert.deepEqual(page.copied,['synthetic-key-two']);
+});
+
+test('late routing explanation cannot overwrite a dialog opened after closing it',async()=>{
+ let release;const page=await ui(()=>new Promise(r=>release=()=>r(response({mode:'auto',accounts:[],configuration:{},basis:null}))));
+ page.run('admin=true;');const pending=page.click('routing-explanation');await page.click('close');page.run("modal('<h2>另一个窗口</h2>')");release();await pending;
+ assert.equal(page.node('#modal-content').innerHTML,'<h2>另一个窗口</h2>');
+});
+
+test('closing a request phase dialog prevents late polling results from restoring it',async()=>{
+ let release;const page=await ui(()=>new Promise(r=>release=()=>r(response({id:'r',timeline:[]}))));
+ page.run('admin=true;');const pending=page.click('request-detail','r');await page.click('close');release();await pending;
+ assert.equal(page.node('#modal').open,false);assert.equal(page.node('#modal-content').innerHTML,'');assert.equal(page.run('requestDetailId'),'');
+});
+
+test('logout clears history cache and a pending history page cannot restore private data',async()=>{
+ let release;const page=await ui(path=>path.startsWith('/api/admin/history')?new Promise(r=>release=()=>r(response({accounts:[],rows:[{id:'private-history'}],pagination:{page:1,pageSize:25,total:1,totalPages:1}}))):response({ok:true}));
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),keys:[]})+";tab='requests';");
+ const pending=page.click('record-view','history');await page.node('#logout').onclick();release();await pending;
+ assert.equal(page.run('historyData'),null);assert.equal(page.node('#content').innerHTML,'');assert.equal(page.run('recordView'),'usage');
 });
 
 test('expired admin session closes modal and allows password entry',async()=>{
@@ -162,7 +189,7 @@ test('a login response arriving after logout cannot open the official page or re
 });
 test('Key deletion requires confirmation, cancellation is safe and history remains visible',async()=>{
  const calls=[],data={...snapshot(),keys:[],members:[{id:'member',name:'Fixture',used:70,quota:null,reserved:0}]};
- const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?data:{ok:true});});
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?data:path==='/api/admin/requests/request'?{id:'request',key_prefix:'fixture',key_removed_at:1,started:1,ended:2,timeline:[]}:{ok:true});});
  page.run("admin=true;state={keys:[{id:'key',member_id:'member',prefix:'fixture'}]};");
  await page.click('remove-key','key');assert.equal(calls.length,0);assert.match(page.node('#modal-content').innerHTML,/无法恢复/);await page.click('close');assert.equal(calls.length,0);
  await page.click('remove-key','key');await page.click('confirm-remove-key','key');assert.equal(calls[0][0],'/api/admin/keys/key');assert.equal(calls[0][1].method,'DELETE');assert.match(page.node('#toast').textContent,/已删除/);assert.ok(!page.node('#modal-content').innerHTML.includes('data-action="remove-key"'));
