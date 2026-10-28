@@ -116,5 +116,5 @@ Harbor为Codex客户端提供API Key鉴权、独立订阅账号管理、HTTP Res
 
 管理接口均要求管理员身份：`GET /api/admin/balancing/explanation`、`GET /api/admin/history`（`kind=audit|nightly`、`page`、`page_size`、`action`、`account`、`session`、毫秒时间戳 `start/end`）、`GET /api/admin/history/nightly/YYYY-MM-DD`、`GET /api/admin/requests/:id`。请求表新增可空 `phase/phase_at` 及默认空数组的 `phase_history`；配置中的计算快照为新增元数据，旧镜像可忽略，回滚不需删除记录。既有权重触发、会话绑定、夜间优先级、数据保留及用量口径不变。
 
-员工列表在用户名下逐把展示完整 Key、复制快捷按钮、北京时间到期时间和状态；永久、过期、停用及历史未保存全文分别显示。多Key不会只选一把代表。所有表格表头统一居中，正文保持按内容排版。
+员工列表在用户名下逐把展示完整 Key、复制快捷按钮、北京时间到期时间和状态；永久、过期、停用及历史未保存全文分别显示。多Key不会只选一把代表。表头沿用原有左对齐样式，与正文保持一致。
 
