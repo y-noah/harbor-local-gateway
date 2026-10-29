@@ -356,3 +356,17 @@ test('request refresh restores online status after an outage without accepting l
  release=null;const pending=page.run('automaticRefresh()');page.run("tab='members';render()");page.node('#connection').textContent='new-page-status';release();await pending;
  assert.equal(page.node('#connection').textContent,'new-page-status');
 });
+
+test('account entry separates subscription and Key types and preserves independent repeated additions',async()=>{
+ const created=[],page=await ui((path,options)=>{if(path==='/api/admin/accounts')created.push(JSON.parse(options.body));return response(path==='/api/admin/state'?snapshot():{id:'account-'+created.length});});
+ page.run('admin=true;state='+JSON.stringify(snapshot())+';globalThis.FormData=class{get(k){return formValues[k]??null;}};');
+ const submit=()=>page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
+ for(const name of ['API A','API B']){
+  await page.click('create-api-account');assert.match(page.node('#modal-content').innerHTML,/接入类型/);assert.equal(page.node('#new-api-fields').disabled,false);assert.equal(page.node('#new-subscription-fields').disabled,true);assert.equal(page.node('#new-api-key').required,true);
+  page.run('globalThis.formValues='+JSON.stringify({auth_mode:'openai_api',kind:'claude',name,api_key:'synthetic-'+name,api_weight:'0'}));await submit();
+ }
+ assert.equal(created.length,2);assert.notEqual(created[0].name,created[1].name);assert.ok(created.every(a=>a.auth_mode==='openai_api'&&a.kind==='codex'&&a.api_weight===0));
+ await page.click('create-api-account');page.node('#new-account-auth').onchange({target:{value:'subscription'}});assert.equal(page.node('#new-api-fields').disabled,true);assert.equal(page.node('#new-subscription-fields').disabled,false);assert.equal(page.node('#new-api-key').required,false);
+ page.run('formValues='+JSON.stringify({auth_mode:'subscription',kind:'claude',name:'Subscription C',api_key:'must-not-submit',api_weight:'80'}));await submit();assert.deepEqual(created[2],{name:'Subscription C',auth_mode:'subscription',kind:'claude'});
+ await page.click('create-account');assert.equal(page.node('#new-api-fields').disabled,true);assert.equal(page.node('#new-subscription-fields').disabled,false);
+});
