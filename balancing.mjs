@@ -20,10 +20,11 @@ export function quotaSnapshot(account,at){
   if(q.windows.some(w=>!Number.isFinite(w.used)||w.used<0||w.used>100||!Number.isFinite(w.minutes)||w.minutes<=0||!Number.isFinite(w.reset)||w.reset<=at))return null;
   return {...q,remaining:q.limitReached||account.route_block==='quota_exhausted'?0:Math.min(...q.windows.map(w=>100-w.used)),group:JSON.stringify([q.plan,q.windows.map(w=>w.minutes).sort((a,b)=>a-b)])};
 }
+const isApi=a=>a?.auth_mode==='openai_api';
 const available=a=>a.enabled&&!a.removed_at&&a.kind==='codex'&&['ready','degraded'].includes(a.state)&&(!a.route_block||a.route_block==='quota_exhausted');
 export function automaticWeights(accounts,at){
   const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)]));
-  const eligible=accounts.filter(a=>available(a)&&a.route_block!=='quota_exhausted'&&!(snapshots.get(a.id)?.limitReached||snapshots.get(a.id)?.remaining===0));
+  const eligible=accounts.filter(a=>!isApi(a)&&available(a)&&a.route_block!=='quota_exhausted'&&!(snapshots.get(a.id)?.limitReached||snapshots.get(a.id)?.remaining===0));
   let reason=null;
   if(eligible.some(a=>!snapshots.get(a.id)))reason='quota_unavailable';
   else if(new Set(eligible.map(a=>snapshots.get(a.id).group)).size>1||eligible.some(a=>snapshots.get(a.id).windows.length!==1))reason='incomparable_quota';
@@ -40,7 +41,7 @@ export const nextWeightReset=nextDailyReset;
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
 // Workload is a relative estimate, never a quota admission check.
 export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false}){
-  const window=nightlyWindow(at),eligible=accounts.filter(available);
+  const window=nightlyWindow(at),eligible=accounts.filter(a=>available(a)&&!isApi(a));
   const snapshots=new Map(eligible.map(a=>[a.id,quotaSnapshot(a,at)]));
   const active=new Map(),bySession=new Map(),latest=new Map();
   for(const r of requests){
@@ -108,6 +109,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   const manual=()=>readSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:0});
   const atomic=fn=>{if(store.db.isTransaction)return fn();store.db.exec('BEGIN IMMEDIATE');try{const result=fn();store.db.exec('COMMIT');return result;}catch(e){store.db.exec('ROLLBACK');throw e;}};
   function syncWeights(accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL"),at=clock(),force=false){
+    accounts=accounts.filter(a=>!isApi(a));
     const previous=readSetting('routing_auto',null),cycle=nextWeightReset(at)-day;
     const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)]));
     const states=Object.fromEntries(accounts.map(a=>[a.id,a.route_block==='quota_exhausted'?0:snapshots.get(a.id)?snapshots.get(a.id).remaining>0?1:0:previous?.states[a.id]??null]));
@@ -126,7 +128,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   }
   const previousSettings=readSetting('balancing',{});
   // Older manual routes had no deadline. Recover only human actions, not automatic moves.
-  const legacy=store.all('SELECT id,created FROM sessions WHERE nightly_enabled=0 AND nightly_expires IS NULL');
+  const legacy=store.all("SELECT s.id,s.created FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.nightly_enabled=0 AND s.nightly_expires IS NULL AND a.auth_mode='subscription'");
   if(legacy.length)atomic(()=>{
     const actions=new Map();
     for(const row of store.all("SELECT at,action,detail FROM audit WHERE action IN ('session.route','session.nightly') ORDER BY at")){
@@ -143,7 +145,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
       let weights={};
       if(value.mode==='manual'){
         weights=value.weights;
-        const ids=new Set(store.all("SELECT id FROM accounts WHERE kind='codex' AND removed_at IS NULL").map(a=>a.id));
+        const ids=new Set(store.all("SELECT id FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND removed_at IS NULL").map(a=>a.id));
         if(!weights||typeof weights!=='object'||Array.isArray(weights)||!Object.keys(weights).length||Object.entries(weights).some(([key,v])=>!ids.has(key)||!Number.isFinite(v)||v<0||v>100||Math.abs(v*100-Math.round(v*100))>1e-8)||Math.abs(Object.values(weights).reduce((n,v)=>n+v,0)-100)>1e-8)throw new AppError(400,'请填写有效账号权重，最多两位小数且总和必须为100%');
       }else if(value.weights!==undefined)throw new AppError(400,'自动模式无需填写权重');
       const next={mode:value.mode,weights,expires:value.mode==='manual'?nextWeightReset(clock()):null,version:current.version+1};
@@ -151,12 +153,17 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     });
   }
   function distribution(accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL")){
-    const at=clock(),weighted=settings().weighted,system=weighted?syncWeights(accounts,at):automaticWeights(accounts,at),configured=manual(),active=configured.mode==='manual'&&configured.expires>at;
-    const mode=!weighted?'legacy':active?'manual':system.eligible.some(a=>system.weights.get(a.id)===null)?'fallback':'auto';
-    const eligible=mode==='legacy'||mode==='manual'?accounts.filter(available):system.eligible;
-    const desired=a=>mode==='manual'?configured.weights[a.id]||0:system.weights.get(a.id)||0,sum=eligible.reduce((n,a)=>n+desired(a),0);
-    const weights=new Map(accounts.map(a=>[a.id,eligible.includes(a)&&sum>0?desired(a)/sum*100:0]));
-    return {mode,reason:system.reason,eligible,weights,system,configuration:{...configured,...(!active?{mode:'auto',expires:null}:{})},accounts:accounts.map(a=>({id:a.id,automatic:system.weights.get(a.id),effective:['legacy','fallback'].includes(mode)?null:weights.get(a.id),configured:active?configured.weights[a.id]??0:null}))};
+    const subscriptions=accounts.filter(a=>!isApi(a)),at=clock(),weighted=settings().weighted;
+    const system=weighted?syncWeights(subscriptions,at):automaticWeights(subscriptions,at),configured=manual(),active=configured.mode==='manual'&&configured.expires>at;
+    const subscriptionMode=!weighted?'legacy':active?'manual':system.eligible.some(a=>system.weights.get(a.id)===null)?'fallback':'auto';
+    const subEligible=subscriptionMode==='legacy'||subscriptionMode==='manual'?subscriptions.filter(available):system.eligible;
+    const desired=a=>['legacy','fallback'].includes(subscriptionMode)?1:subscriptionMode==='manual'?configured.weights[a.id]||0:system.weights.get(a.id)||0;
+    const sum=subEligible.reduce((n,a)=>n+desired(a),0),apis=accounts.filter(a=>isApi(a)&&available(a)&&!a.route_block&&a.api_weight>0),apiShare=apis.reduce((n,a)=>n+a.api_weight,0);
+    const weights=new Map(accounts.map(a=>[a.id,apis.includes(a)?a.api_weight:subEligible.includes(a)&&sum>0?Math.max(0,100-apiShare)*desired(a)/sum:0]));
+    const eligible=[...subEligible,...apis],total=eligible.reduce((n,a)=>n+weights.get(a.id),0);
+    if(total>0)for(const a of eligible)weights.set(a.id,weights.get(a.id)/total*100);
+    const mode=apis.length?'api_mixed':subscriptionMode;
+    return {mode,subscriptionMode,reason:system.reason,eligible,weights,system,configuration:{...configured,...(!active?{mode:'auto',expires:null}:{})},accounts:accounts.map(a=>({id:a.id,automatic:isApi(a)?null:system.weights.get(a.id),effective:isApi(a)?weights.get(a.id):['legacy','fallback'].includes(mode)?null:weights.get(a.id),configured:isApi(a)?a.api_weight:active?configured.weights[a.id]??0:null,manualApi:isApi(a)}))};
   }
   function allocation(state){
     const pool=state.eligible;
@@ -170,8 +177,8 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     if(selected)credits[selected.id]-=1;
     return {selected,schedule:{signature,credits}};
   }
-  function selectAccount(){
-    const state=distribution();
+  function selectAccount({protocol='responses'}={}){
+    const state=distribution(protocol==='responses'?undefined:store.all("SELECT * FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND removed_at IS NULL"));
     if(!state.eligible.length)throw new AppError(503,'所有账号均不可用，请等待额度恢复或重新登录','no_account');
     const result=allocation(state);
     if(!result.selected)throw new AppError(503,'没有生效权重大于0的可用账号，请调整权重或等待额度恢复','no_account');
@@ -187,11 +194,11 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
       const moved=[];
       for(const session of sessions){
         let target;
-        try{target=account.kind==='codex'?selectAccount():store.get("SELECT a.* FROM accounts a WHERE a.kind=? AND a.enabled=1 AND a.removed_at IS NULL AND a.state IN ('ready','degraded') ORDER BY (SELECT COUNT(*) FROM sessions s WHERE s.account_id=a.id),a.last_used,a.id LIMIT 1",account.kind);}
+        try{target=account.kind==='codex'?selectAccount({protocol:session.protocol}):store.get("SELECT a.* FROM accounts a WHERE a.kind=? AND a.enabled=1 AND a.removed_at IS NULL AND a.state IN ('ready','degraded') ORDER BY (SELECT COUNT(*) FROM sessions s WHERE s.account_id=a.id),a.last_used,a.id LIMIT 1",account.kind);}
         catch(e){if(e.code!=='no_account')throw e;throw new AppError(409,'没有可接收会话的同类型正权重账号，未停用或迁移任何会话','disable_no_target');}
         if(!target)throw new AppError(409,'没有可接收会话的同类型账号，未停用或迁移任何会话','disable_no_target');
-        const legacy=session.protocol!=='responses';
-        store.run(`UPDATE sessions SET account_id=?,upstream_thread=?,route_version=route_version+1,updated=?${legacy?",upstream_id=NULL,state='new',message_count=0,history_digest='',cum_input=0,cum_output=0,cum_cached=0":''} WHERE id=?`,target.id,id(),clock(),session.id);
+        const legacy=session.protocol!=='responses',expires=isApi(account)&&!isApi(target)&&!session.nightly_enabled&&session.nightly_expires===null?nextWeightReset(clock()):session.nightly_expires;
+        store.run(`UPDATE sessions SET account_id=?,upstream_thread=?,route_version=route_version+1,nightly_expires=?,updated=?${legacy?",upstream_id=NULL,state='new',message_count=0,history_digest='',cum_input=0,cum_output=0,cum_cached=0":''} WHERE id=?`,target.id,id(),expires,clock(),session.id);
         store.audit('session.route',JSON.stringify({sessionId:session.id,from:accountId,to:target.id,reason:'account_disabled',version:session.route_version+1}));
         moved.push(session.id);
       }
@@ -201,7 +208,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   function explain(){
     const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL"),state=distribution(accounts),next=allocation(state).selected;
     return {at:clock(),mode:state.mode,reason:state.reason,configuration:state.configuration,basis:state.system.basis??null,updated:state.system.updated??null,trigger:state.system.trigger??null,nextAccount:next?.id??null,
-      accounts:accounts.map(a=>({...state.accounts.find(x=>x.id===a.id),name:a.name,reason:!a.enabled?'disabled':a.route_block==='login_expired'?'login_expired':!available(a)?'not_ready':!state.eligible.some(x=>x.id===a.id)?'quota_exhausted':!['legacy','fallback'].includes(state.mode)&&!(state.weights.get(a.id)>0)?'zero_weight':'eligible',extraQuota:a.route_block==='quota_exhausted'&&state.mode==='manual'&&state.weights.get(a.id)>0}))};
+      accounts:accounts.map(a=>({...state.accounts.find(x=>x.id===a.id),name:a.name,reason:!a.enabled?'disabled':isApi(a)&&!a.route_block&&!(a.api_weight>0)?'manual_binding_only':a.route_block==='login_expired'?'login_expired':!available(a)?'not_ready':!state.eligible.some(x=>x.id===a.id)?'quota_exhausted':!['legacy','fallback'].includes(state.mode)&&!(state.weights.get(a.id)>0)?'zero_weight':'eligible',extraQuota:a.route_block==='quota_exhausted'&&state.mode==='manual'&&state.weights.get(a.id)>0}))};
   }
   const busy=s=>preparing.has(s.member_id)||!!store.get("SELECT id FROM requests WHERE session_id=? AND status IN ('queued','running')",s.id);
   function move(session,target,reason){
@@ -213,7 +220,8 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     if(!account)throw new AppError(503,'没有可用的目标账号','no_account');
     if(current.account_id===target)return current;
     return atomic(()=>{
-      store.run('UPDATE sessions SET account_id=?,upstream_thread=?,route_version=route_version+1 WHERE id=?',target,id(),current.id);
+      const source=store.get('SELECT auth_mode FROM accounts WHERE id=?',current.account_id),expires=isApi(source)&&!isApi(account)&&!current.nightly_enabled&&current.nightly_expires===null?nextWeightReset(clock()):current.nightly_expires;
+      store.run('UPDATE sessions SET account_id=?,upstream_thread=?,route_version=route_version+1,nightly_expires=? WHERE id=?',target,id(),expires,current.id);
       store.audit('session.route',JSON.stringify({session:current.id,from:current.account_id,to:target,reason}));return store.get('SELECT * FROM sessions WHERE id=?',current.id);
     });
   }
@@ -239,7 +247,8 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   }
   function route(session){
     const account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
-    const blocked=account?.route_block&&account.route_block!=='quota_exhausted';
+    if(isApi(account)&&account.enabled&&!account.removed_at&&['ready','degraded'].includes(account.state)&&!account.route_block)return session;
+    const blocked=account?.route_block&&(isApi(account)||account.route_block!=='quota_exhausted');
     if(blocked&&!settings().failover)throw new AppError(503,'绑定账号已阻断，自动切换未开启','session_account_blocked');
     if(!blocked){
       if(!settings().weighted)return session;
@@ -248,7 +257,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     return atomic(()=>move(session,selectAccount().id,blocked?account.route_block:'weight_zero'));
   }
   async function plan(at,preview=false){
-    const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND enabled=1 AND removed_at IS NULL");
+    const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND enabled=1 AND removed_at IS NULL");
     const refreshed=await Promise.all(accounts.map(a=>Promise.resolve().then(()=>preview?readQuota(a):refreshQuota(a,true)).catch(()=>null)));
     const freshById=new Map(accounts.map((a,index)=>{const current=store.get('SELECT quota_json,route_epoch FROM accounts WHERE id=?',a.id);return [a.id,{snapshot:refreshed[index],epoch:!preview&&refreshed[index]&&current.quota_json===JSON.stringify(refreshed[index])?current.route_epoch:a.route_epoch}];}));
     if(stopping())throw new AppError(503,'服务正在停止');

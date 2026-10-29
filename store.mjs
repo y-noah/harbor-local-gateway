@@ -36,6 +36,8 @@ export class Store {
     const add=(table,column,definition)=>{if(!this.all('PRAGMA table_info('+table+')').some(c=>c.name===column))this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);};
     add('accounts','quota_json','TEXT');add('accounts','quota_error','TEXT');add('accounts','token_budget','INTEGER');add('accounts','budget_used','INTEGER NOT NULL DEFAULT 0');add('accounts','since_check_tokens','INTEGER NOT NULL DEFAULT 0');add('accounts','tokens_per_percent','REAL NOT NULL DEFAULT 10000');add('accounts','quota_calibration','TEXT');
     add('accounts','removed_at','INTEGER');
+    add('accounts','auth_mode',"TEXT NOT NULL DEFAULT 'subscription'");add('accounts','api_weight','REAL NOT NULL DEFAULT 0');
+    add('accounts','api_secret_cipher','TEXT');add('accounts','api_secret_digest','TEXT');
     add('accounts','route_block','TEXT');add('accounts','route_epoch','INTEGER NOT NULL DEFAULT 0');add('accounts','route_blocked_at','INTEGER');
     this.db.exec("CREATE TABLE IF NOT EXISTS gateway_settings(name TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS balance_runs(day TEXT PRIMARY KEY,started INTEGER NOT NULL,ended INTEGER,status TEXT NOT NULL,summary TEXT);");
     this.run("UPDATE balance_runs SET status='interrupted',ended=? WHERE status='running'",now());
@@ -83,6 +85,14 @@ export class Store {
     cipher.setAAD(Buffer.from(keyId));
     const data=Buffer.concat([cipher.update(secret,'utf8'),cipher.final()]);
     return Buffer.concat([iv,cipher.getAuthTag(),data]).toString('base64');
+  }
+  saveUpstreamKey(accountId,secret) {
+    const encrypted=this.encryptKey(secret,'upstream:'+accountId);
+    if(!encrypted)throw new AppError(503,'上游凭据加密尚未配置','upstream_configuration');
+    this.run('UPDATE accounts SET api_secret_cipher=?,api_secret_digest=? WHERE id=?',encrypted,hash(secret),accountId);
+  }
+  upstreamKey(account) {
+    return this.revealKey({id:'upstream:'+account.id,secret_cipher:account.api_secret_cipher,digest:account.api_secret_digest});
   }
   revealKey(row) {
     if(!this.encryptionKey||!row.secret_cipher)return null;
@@ -196,7 +206,7 @@ export class Store {
       sessionsPagination:{page,pageSize:sessionPageSize,total:sessionTotal,totalPages:sessionPages},
       members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(m=>({...m,...scope('member_id',m.id)})),
       keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
-      accounts:this.all('SELECT id,name,kind,enabled,state,last_used,last_error,route_block,quota_json,quota_error,token_budget FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(a=>({...a,budget_used:scope('account_id',a.id).used})),
+      accounts:this.all('SELECT id,name,kind,auth_mode,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error,token_budget FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(({api_secret_digest,...a})=>({...a,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,budget_used:scope('account_id',a.id).used})),
       sessions:this.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${sessionFrom} ORDER BY s.updated DESC,s.id DESC LIMIT ? OFFSET ?`,...range,sessionPageSize,(page-1)*sessionPageSize).map(s=>({...s,nightly_enabled:Number(participatesNightly(s,at)),request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
       requests:this.all(`SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE ${where} ORDER BY started DESC LIMIT 200`,...range),
       totals:this.get(`SELECT COUNT(*) requests,COALESCE(SUM(input+output),0) tokens,COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0) success,COALESCE(SUM(reserved),0) reserved,COALESCE(SUM(usage_unknown),0) unmetered FROM requests WHERE ${where}`,...range),

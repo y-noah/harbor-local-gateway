@@ -321,3 +321,9 @@ test('account disable asks for confirmation then shows full migration result',as
  const calls=[];const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?{...snapshot(),accounts:[{id:'a',name:'A',kind:'codex',enabled:0}]}:{ok:true,moved:8,resetTextSessions:2});});
  page.run('admin=true;state='+JSON.stringify({...snapshot(),accounts:[{id:'a',name:'A',enabled:1}]})+";tab='accounts';");await page.click('toggle-account','a');assert.equal(calls.length,0);assert.match(page.node('#modal-content').innerHTML,/凌晨自动恢复/);await page.click('confirm-disable-account','a');assert.equal(JSON.parse(calls[0][1].body).enabled,false);assert.match(page.node('#toast').textContent,/迁移 8 个会话/);
 });
+
+test('a fixed API session created after its dialog closes cannot replace a newer dialog',async()=>{
+ let release;const page=await ui(path=>path==='/api/admin/sessions'?new Promise(r=>release=()=>r(response({session_id:'synthetic-fixed-session',header:'X-Harbor-Session'}))):response({ok:true}));
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),members:[{id:'m',name:'Fixture',enabled:1}],accounts:[{id:'a',name:'API',auth_mode:'openai_api',enabled:1,state:'ready'}]})+";globalThis.FormData=class{get(){return 'm';}};");
+ await page.click('create-fixed-session','a');const pending=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});await page.click('close');page.run("modal('<h2>new dialog</h2>')");release();await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
+});
