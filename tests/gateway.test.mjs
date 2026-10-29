@@ -361,10 +361,27 @@ test('disabling migrates a running legacy test and its queued peer without resto
  while(app.store.get("SELECT COUNT(*) n FROM requests WHERE status='queued'").n!==1){assert.ok(Date.now()<deadline);await new Promise(r=>setTimeout(r,5));}
  app.store.run("UPDATE accounts SET enabled=1,quota_json=(SELECT quota_json FROM accounts WHERE id='one') WHERE id='two'");
  const result=await app.call('/api/admin/accounts/one','PATCH',{enabled:false});assert.equal(result.status,200);assert.equal(result.body.moved,2);assert.equal(result.body.resetTextSessions,2);
+ assert.equal(app.store.get("SELECT route_version FROM requests WHERE status='running' AND account_id='one'").route_version,0);
  const moved=app.store.all('SELECT * FROM sessions');assert.ok(moved.every(s=>s.account_id==='two'&&s.route_version===1));
- const next=await queued;assert.equal(next.status,200);assert.equal(next.body.context_reset,true);assert.equal(calls[1].home,'receiver');assert.equal(calls[1].sessionId,null);
+ const next=await queued;assert.equal(next.status,200);assert.equal(next.body.context_reset,true);assert.equal(calls[1].home,'receiver');assert.equal(calls[1].sessionId,null);assert.equal(app.store.get('SELECT route_version FROM requests WHERE session_id=?',next.body.session_id).route_version,1);
  release();const old=await pending;assert.equal(old.status,200);
  const original=app.store.get('SELECT * FROM sessions WHERE id=?',old.body.session_id);assert.equal(original.state,'new');assert.equal(original.upstream_id,null);assert.equal(original.message_count,0);assert.equal(original.cum_input,0);
  const resumed=await app.chat(first.secret,{session_id:original.id});assert.equal(resumed.status,200);assert.equal(resumed.body.context_reset,true);assert.equal(calls.at(-1).home,'receiver');assert.equal(calls.at(-1).sessionId,null);
  assert.equal(app.store.get("SELECT budget_used FROM accounts WHERE id='one'").budget_used,6);assert.equal(app.store.get("SELECT enabled FROM accounts WHERE id='one'").enabled,0);
+});
+
+test('restart recovery isolates migrated dispatch versions, including return to the same account and legacy records',()=>{
+ const dir=temp(),file=join(dir,'recovery.sqlite');let store=new Store(file);
+ try{
+  const member=store.createMember('synthetic',null,null);
+  for(const id of ['a','b'])store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",id,id,id);
+  const cases=[['moved','b',1,'a',0,'new'],['returned','a',2,'a',0,'new'],['current','a',2,'a',2,'uncertain'],['legacy-moved','b',1,'a',null,'new'],['legacy-current','a',0,'a',null,'uncertain'],['queued','a',0,'a',0,'new']];
+  for(const [sid,account,version,dispatched,dispatchVersion] of cases){
+   store.run("INSERT INTO sessions(id,member_id,account_id,route_version,created,updated) VALUES(?,?,?,?,1,1)",sid,member.memberId,account,version);
+   store.run('INSERT INTO requests(id,member_id,session_id,account_id,route_version,started,status,ip,reserved) VALUES(?,?,?,?,?,1,?,?,100)',sid,member.memberId,sid,dispatched,dispatchVersion,sid==='queued'?'queued':'running','synthetic');
+  }
+  store.close();store=new Store(file);
+  for(const [sid,,,,,expected] of cases){assert.equal(store.get('SELECT state FROM sessions WHERE id=?',sid).state,expected,sid);assert.equal(store.get('SELECT status FROM requests WHERE id=?',sid).status,sid==='queued'?'cancelled':'interrupted');}
+  assert.equal(store.get("SELECT reserved FROM requests WHERE id='moved'").reserved,100);assert.equal(store.get("SELECT reserved FROM requests WHERE id='queued'").reserved,0);
+ }finally{store.close();cleanup(dir);}
 });

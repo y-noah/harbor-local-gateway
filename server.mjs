@@ -199,7 +199,7 @@ export function createGateway(options={}) {
     const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
     if(!current.enabled||current.removed_at||!['ready','degraded'].includes(current.state)||(job.responses&&current.route_block&&current.route_block!=='quota_exhausted')){store.finish(requestId,{status:'rejected',error:'绑定账号不可用'});reject(new AppError(503,'绑定账号不可用','session_account_unavailable'));return;}
     if(!job.responses&&!capacity(current,predicted,requestId).eligible){store.finish(requestId,{status:'rejected',error:'绑定账号预计额度不足'});reject(new AppError(429,'绑定账号预计额度不足；会话不会换号'));return;}
-    store.run("UPDATE requests SET status='running',account_id=? WHERE id=?",account.id,requestId);
+    store.run("UPDATE requests SET status='running',account_id=?,route_version=? WHERE id=?",account.id,session.route_version||0,requestId);
     store.run('UPDATE accounts SET last_used=? WHERE id=?',now(),account.id);
     try{
       if(job.responses){
