@@ -1,4 +1,5 @@
 import {AppError,requestPhases,usageWindow} from './store.mjs';
+import {referenceMetric} from './pricing.mjs';
 
 export const requestStatuses=new Set(['queued','running','ok','failed','unknown','interrupted','cancelled','rejected','reconciled']);
 export function requestsQuery(params){
@@ -17,16 +18,17 @@ export function requestsQuery(params){
 export function requestsReader(store,query,at=Date.now()){
   const window=usageWindow(at),range=[window.start,window.end],time='COALESCE(r.ended,r.started)',base=`${time}>=? AND ${time}<?`;
   const clauses=[base],args=[...range];
-  for(const [field,value] of [['member_id',query.member],['model',query.model],['status',query.status]])if(value){clauses.push(`r.${field}=?`);args.push(value);}
+  for(const [field,value] of [['member_id',query.member],['model',query.model],['status',query.status]])if(value){clauses.push((field==='model'?'COALESCE(r.billing_model,r.model)':`r.${field}`)+'=?');args.push(value);}
   const where=' WHERE '+clauses.join(' AND '),from=' FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id';
-  const aggregates=`COUNT(*) requests,COALESCE(SUM(r.status='ok'),0) success,COALESCE(SUM(r.input),0) input,COALESCE(SUM(r.output),0) output,COALESCE(SUM(r.cached),0) cached,COALESCE(SUM(r.usage_unknown),0) unmetered,COALESCE(SUM(r.status IN ('queued','running')),0) active,COALESCE(AVG(CASE WHEN r.ended>=r.started THEN r.ended-r.started END),0) average_ms`;
-  const summary=store.get(`SELECT ${aggregates}${from}${where}`,...args),totalPages=Math.max(1,Math.ceil(summary.requests/query.pageSize)),page=Math.min(query.page,totalPages);
-  const rows=store.all(`SELECT r.id,r.member_id,r.account_id,r.started,r.ended,r.status,r.model,r.input,r.output,r.cached,r.usage_unknown,r.phase,r.phase_at,r.ip,m.name member_name,a.name account_name${from}${where} ORDER BY r.started DESC,r.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(page-1)*query.pageSize);
+  const all=store.all(`SELECT r.*,m.name member_name,a.name account_name${from}${where} ORDER BY r.started DESC,r.id DESC`,...args);
+  const aggregate=items=>{const standard=store.pricing.summary(items,at),finished=items.filter(r=>r.ended!==null&&r.ended>=r.started);return {requests:items.length,success:items.filter(r=>r.status==='ok').length,active:items.filter(r=>['queued','running'].includes(r.status)).length,average_ms:finished.length?finished.reduce((n,r)=>n+r.ended-r.started,0)/finished.length:0,unmetered:standard.unmetered,unpriced:standard.unpriced,standard};};
+  const summary=aggregate(all),totalPages=Math.max(1,Math.ceil(summary.requests/query.pageSize)),page=Math.min(query.page,totalPages);
+  const rows=all.slice((page-1)*query.pageSize,page*query.pageSize).map(r=>store.pricing.decorate(r,at));
+  const grouped=(field,meta)=>{const groups=new Map();for(const r of all){const key=field==='model'?r.billing_model||r.model:r[field];if(!groups.has(key))groups.set(key,[]);groups.get(key).push(r);}return [...groups].map(([key,items])=>({[field]:key,...(meta?{[meta]:items[0][meta]}:{}),...aggregate(items)})).sort((a,b)=>(b.standard.total??-1)-(a.standard.total??-1)||String(a[field]).localeCompare(String(b[field])));};
   return {window,observedAt:at,summary,pagination:{page,pageSize:query.pageSize,total:summary.requests,totalPages},rows,
-    models:store.all(`SELECT DISTINCT r.model FROM requests r WHERE ${base} AND r.model IS NOT NULL AND r.model<>'' ORDER BY r.model`,...range).map(r=>r.model),
+    models:store.all(`SELECT DISTINCT COALESCE(r.billing_model,r.model) model FROM requests r WHERE ${base} AND COALESCE(r.billing_model,r.model) IS NOT NULL AND COALESCE(r.billing_model,r.model)<>'' ORDER BY model`,...range).map(r=>r.model),
     members:store.all(`SELECT DISTINCT m.id,m.name,m.removed_at FROM requests r JOIN members m ON m.id=r.member_id WHERE ${base} ORDER BY m.name,m.id`,...range),
-    byModel:store.all(`SELECT r.model,${aggregates}${from}${where} GROUP BY r.model ORDER BY SUM(r.input+r.output) DESC,r.model`,...args),
-    byMember:store.all(`SELECT r.member_id,m.name member_name,${aggregates}${from}${where} GROUP BY r.member_id,m.name ORDER BY SUM(r.input+r.output) DESC,r.member_id`,...args)};
+    byModel:grouped('model'),byMember:grouped('member_id','member_name')};
 }
 
 const parse=value=>{try{return JSON.parse(value);}catch{return null;}};
@@ -64,7 +66,8 @@ export function historyReader(store){
     if(row.action.startsWith('session.'))return {session:row.session_id||null,enabled:typeof d.enabled==='boolean'?d.enabled:null,expires:number(d.expires)};
     if(row.action==='balancing.settings')return {weighted:typeof d.weighted==='boolean'?d.weighted:null,nightly:typeof d.nightly==='boolean'?d.nightly:null,failover:typeof d.failover==='boolean'?d.failover:null,quietMinutes:number(d.quietMinutes)};
     if(row.action.startsWith('key.')){const k=store.get('SELECT prefix,member_id FROM keys WHERE id=?',row.detail);return k?{prefix:k.prefix,member:store.get('SELECT name FROM members WHERE id=?',k.member_id)?.name??null}:{};}
-    if(row.action==='request.settle'){const r=store.get('SELECT id,account_id,member_id FROM requests WHERE id=?',row.detail);return r?{request:r.id,account:known.has(r.account_id)?r.account_id:null,member:store.get('SELECT name FROM members WHERE id=?',r.member_id)?.name??null}:{};}
+    if(row.action==='request.settle'){const r=store.get('SELECT id,account_id,member_id FROM requests WHERE id=?',d.request||row.detail);return r?{request:r.id,account:known.has(r.account_id)?r.account_id:null,member:store.get('SELECT name FROM members WHERE id=?',r.member_id)?.name??null,...(d.metric===referenceMetric?{metric:referenceMetric,standard_usd:typeof d.standard_usd==='string'?d.standard_usd:null}:{})}:{};}
+    if(row.action==='pricing.configure')return {version:number(d.version),revision:typeof d.revision==='string'&&/^[a-f0-9]{64}$/.test(d.revision)?d.revision:null};
     if(row.action.startsWith('member.')&&row.action!=='member.create')return {member:store.get('SELECT name FROM members WHERE id=?',row.detail)?.name??null};
     return {};
   }
@@ -80,7 +83,7 @@ export function historyReader(store){
       if(session){clauses.push("EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(a.summary) THEN a.summary ELSE '{}' END) WHERE value=? OR value IN (SELECT id FROM sessions WHERE client_session_id=?))");args.push(session,session);}
     }else{
       const detail="CASE WHEN json_valid(a.detail) THEN a.detail ELSE '{}' END";
-      join=` LEFT JOIN requests r ON a.action='request.settle' AND r.id=a.detail LEFT JOIN sessions s ON s.id=COALESCE(json_extract(${detail},'$.session'),json_extract(${detail},'$.sessionId'),CASE WHEN a.action IN ('session.enable','session.disable') THEN a.detail END,r.session_id)`;
+      join=` LEFT JOIN requests r ON a.action='request.settle' AND r.id=COALESCE(json_extract(${detail},'$.request'),a.detail) LEFT JOIN sessions s ON s.id=COALESCE(json_extract(${detail},'$.session'),json_extract(${detail},'$.sessionId'),CASE WHEN a.action IN ('session.enable','session.disable') THEN a.detail END,r.session_id)`;
       if(session){clauses.push('(s.id=? OR s.client_session_id=?)');args.push(session,session);}
       if(account){clauses.push(`(json_extract(${detail},'$.from')=? OR json_extract(${detail},'$.to')=? OR json_extract(${detail},'$.account')=? OR (a.action NOT IN ('session.route','request.settle') AND s.account_id=?) OR r.account_id=? OR (a.action LIKE 'account.%' AND a.detail=?) OR EXISTS(SELECT 1 FROM json_each(${detail},'$.weights') WHERE key=?) OR EXISTS(SELECT 1 FROM json_each(${detail},'$.previous') WHERE key=?) OR EXISTS(SELECT 1 FROM json_each(${detail},'$.previous.weights') WHERE key=?))`);args.push(account,account,account,account,account,account,account,account,account);}
     }
@@ -94,19 +97,21 @@ export function historyReader(store){
     if(!/^\d{4}-\d{2}-\d{2}$/.test(day))throw new AppError(400,'夜间批次无效');
     const row=store.get('SELECT * FROM balance_runs WHERE day=?',day);if(!row)throw new AppError(404,'夜间批次不存在');
     const source=parse(row.summary),raw=source&&typeof source==='object'?source:{},known=new Set(accounts().map(a=>a.id));
+    const comparable=raw.metric===referenceMetric;
     const nums=value=>Object.fromEntries(Object.entries(value||{}).filter(([id,n])=>known.has(id)&&Number.isFinite(n)));
+    const amounts=value=>comparable?nums(value):{};
     const sessionInfo=id=>{const s=store.get('SELECT id,client_session_id,member_id FROM sessions WHERE id=?',id);return {session_id:s?.id??null,client_session_id:s?.client_session_id??null,member:s?store.get('SELECT name FROM members WHERE id=?',s.member_id)?.name??null:null};};
-    return {day:row.day,status:row.status,started:row.started,ended:row.ended,accounts:accounts(),window:raw.window?{start:number(raw.window.start),end:number(raw.window.end)}:null,reason:reason(raw.reason),
-      moves:(Array.isArray(raw.moves)?raw.moves:[]).map(m=>({...sessionInfo(m.session_id),from:known.has(m.from)?m.from:null,to:known.has(m.to)?m.to:null,weight:number(m.weight),applied:Array.isArray(raw.applied)?raw.applied.includes(m.session_id):null})),
+    return {day:row.day,status:row.status,started:row.started,ended:row.ended,metric:comparable?referenceMetric:null,priceRevisions:comparable?(raw.priceRevisions||[]).filter(v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v)):[],accounts:accounts(),window:raw.window?{start:number(raw.window.start),end:number(raw.window.end)}:null,reason:reason(raw.reason),
+      moves:(Array.isArray(raw.moves)?raw.moves:[]).map(m=>({...sessionInfo(m.session_id),from:known.has(m.from)?m.from:null,to:known.has(m.to)?m.to:null,weight:comparable?number(m.weight):null,applied:Array.isArray(raw.applied)?raw.applied.includes(m.session_id):null})),
       skipped:(Array.isArray(raw.skipped)?raw.skipped:[]).map(m=>({...(m.session_id?sessionInfo(m.session_id):{}),account:known.has(m.account_id)?m.account_id:null,accounts:(Array.isArray(m.accounts)?m.accounts:[]).filter(id=>known.has(id)),reason:reason(m.reason)})),
-      summaries:(Array.isArray(raw.summaries)?raw.summaries:[]).map(g=>({accounts:(g.accounts||[]).filter(id=>known.has(id)),weights:nums(g.weights),before:nums(g.before),after:nums(g.after),target:nums(g.target),fixedLoad:nums(g.fixedLoad),planning:g.planning?{reason:reason(g.planning.reason),strategy:g.planning.strategy==='heavy-bias-first-v2'?'heavy-bias-first-v2':null,beforeDeviation:number(g.planning.beforeDeviation),afterDeviation:number(g.planning.afterDeviation),tolerance:number(g.planning.tolerance),optimizationComplete:g.planning.optimizationComplete===true,directionComplete:g.planning.directionComplete===true,prioritySessions:Array.isArray(g.planning.prioritySessions)?g.planning.prioritySessions.map(sessionInfo):[],heavySkipped:Array.isArray(g.planning.heavySkipped)?g.planning.heavySkipped.map(m=>({...sessionInfo(m.session_id),reason:reason(m.reason)})):[]}:null}))};
+      summaries:(Array.isArray(raw.summaries)?raw.summaries:[]).map(g=>({accounts:(g.accounts||[]).filter(id=>known.has(id)),weights:nums(g.weights),before:amounts(g.before),after:amounts(g.after),target:amounts(g.target),fixedLoad:amounts(g.fixedLoad),planning:g.planning?{reason:reason(g.planning.reason),strategy:g.planning.strategy==='heavy-bias-first-v2'?'heavy-bias-first-v2':null,beforeDeviation:number(g.planning.beforeDeviation),afterDeviation:number(g.planning.afterDeviation),tolerance:number(g.planning.tolerance),optimizationComplete:g.planning.optimizationComplete===true,directionComplete:g.planning.directionComplete===true,prioritySessions:Array.isArray(g.planning.prioritySessions)?g.planning.prioritySessions.map(sessionInfo):[],heavySkipped:Array.isArray(g.planning.heavySkipped)?g.planning.heavySkipped.map(m=>({...sessionInfo(m.session_id),reason:reason(m.reason)})):[]}:null}))};
   }
   return {list,nightly};
 }
 
 export function requestObservation(store,id,at=Date.now()){
-  const r=store.get('SELECT r.id,r.started,r.ended,r.status,r.phase,r.phase_at,r.phase_history,r.account_id,r.session_id,r.model,r.input,r.output,r.cached,r.reserved,r.error,r.ip,r.agent,r.key_id,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE r.id=?',id);
+  const r=store.get('SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE r.id=?',id);
   if(!r)throw new AppError(404,'请求记录不存在');
   const raw=parse(r.phase_history),timeline=(Array.isArray(raw)?raw:[]).filter(p=>p&&requestPhases.has(p.phase)&&Number.isFinite(p.at));
-  return {...r,phase_history:undefined,observedAt:at,timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??r.ended??at)-p.at)}))};
+  return {...store.pricing.decorate(r,at),phase_history:undefined,observedAt:at,timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??r.ended??at)-p.at)}))};
 }

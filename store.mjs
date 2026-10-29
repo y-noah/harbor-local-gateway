@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes, randomUUID, createCipheriv, createDecipheriv } from 'node:crypto';
+import {createPricing} from './pricing.mjs';
 export const hash = value => createHash('sha256').update(value).digest('hex');
 export const token = () => 'hg_' + randomBytes(30).toString('base64url');
 export const id = () => randomUUID();
@@ -20,7 +21,7 @@ export function usageWindow(at=now()) {
   return {start:today-6*day,end:today+day,timeZone:'Asia/Shanghai',days:7};
 }
 export class Store {
-  constructor(filename,{encryptionKey}={}) {
+  constructor(filename,{encryptionKey,pricingOptions}={}) {
     this.encryptionKey=encryptionKey;
     this.db = new DatabaseSync(filename);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -44,6 +45,7 @@ export class Store {
     add('members','removed_at','INTEGER');
     add('requests','tracking_only','INTEGER NOT NULL DEFAULT 0');
     add('requests','route_version','INTEGER');
+    add('requests','price_version','TEXT');add('requests','billing_model','TEXT');add('requests','manual_cost_atoms','TEXT');
     const missingFlag=!this.all('PRAGMA table_info(requests)').some(c=>c.name==='usage_unknown');
     add('requests','usage_unknown','INTEGER NOT NULL DEFAULT 0');
     add('requests','phase','TEXT');add('requests','phase_at','INTEGER');add('requests','phase_history',"TEXT NOT NULL DEFAULT '[]'");
@@ -78,6 +80,7 @@ export class Store {
       this.db.exec('COMMIT');
     }catch(e){this.db.exec('ROLLBACK');throw e;}
     this.pruneUsage();
+    this.pricing=createPricing(this,{windowStart:at=>usageWindow(at).start,...pricingOptions});
   }
   encryptKey(secret,keyId) {
     if(!this.encryptionKey)return null;
@@ -106,7 +109,7 @@ export class Store {
   pruneUsage(at=now()) {
     const window=usageWindow(at);
     if(this.prunedStart!==window.start){
-      this.run('UPDATE requests SET input=0,output=0,cached=0,usage_unknown=0 WHERE ended IS NOT NULL AND ended<? AND (input<>0 OR output<>0 OR cached<>0 OR usage_unknown<>0)',window.start);
+      this.run('UPDATE requests SET input=0,output=0,cached=0,usage_unknown=0,manual_cost_atoms=NULL WHERE ended IS NOT NULL AND ended<? AND (input<>0 OR output<>0 OR cached<>0 OR usage_unknown<>0 OR manual_cost_atoms IS NOT NULL)',window.start);
       this.prunedStart=window.start;
     }
     return window;
@@ -156,6 +159,7 @@ export class Store {
       const reserved=this.allowance(member,reserveSize);
       const requestId=id();
       this.run("INSERT INTO requests(id,member_id,key_id,started,status,ip,agent,reserved,model) VALUES(?,?,?,?,'queued',?,?,?,?)",requestId,member.id,member.key_id,now(),ip,agent,reserved,model);
+      this.pricing?.stamp(requestId);
       this.phase(requestId,'queued');
       this.db.exec('COMMIT'); return requestId;
     } catch(e) { this.db.exec('ROLLBACK'); throw e; }
@@ -163,6 +167,7 @@ export class Store {
   observe(member,ip,agent,model){
     const requestId=id();
     this.run("INSERT INTO requests(id,member_id,key_id,started,status,ip,agent,reserved,model,predicted,tracking_only) VALUES(?,?,?,?,'queued',?,?,0,?,0,1)",requestId,member.id,member.key_id,now(),ip,agent,model);
+    this.pricing?.stamp(requestId);
     this.phase(requestId,'queued');
     return requestId;
   }
@@ -185,6 +190,7 @@ export class Store {
       this.phase(requestId,status==='ok'?'settling':status);
       if(status==='ok')this.phase(requestId,'ok');
       this.run('UPDATE requests SET ended=?,status=?,input=?,output=?,cached=?,reserved=?,usage_unknown=?,error=? WHERE id=?',now(),status,input,output,cached,usageKnown?0:row.reserved,usageKnown?0:1,error,requestId);
+      this.pricing?.capture(requestId,result.actualModel);
       this.run('UPDATE members SET used=used+? WHERE id=?',input+output,row.member_id);
       this.run('UPDATE keys SET used=used+? WHERE id=?',input+output,row.key_id);
       if(row.tracking_only&&!usageKnown)this.run('UPDATE keys SET unmetered=unmetered+1 WHERE id=?',row.key_id);
@@ -199,20 +205,21 @@ export class Store {
     const sessionTotal=this.get(`SELECT COUNT(*) total ${sessionFrom}`,...range).total;
     const sessionPages=Math.max(1,Math.ceil(sessionTotal/sessionPageSize)),page=Math.min(sessionPage,sessionPages);
     const recentUsageWindow={start:at-12*3600000,end:at,hours:12};
-    const scope=(column,value)=>this.get(`SELECT COALESCE(SUM(input+output),0) used,COALESCE(SUM(CASE WHEN COALESCE(ended,started)>=? AND COALESCE(ended,started)<? THEN input+output ELSE 0 END),0) used_12h,COALESCE(SUM(usage_unknown),0) unmetered,COUNT(DISTINCT ip) ips,MAX(started) last_seen,COALESCE(SUM(reserved),0) reserved FROM requests WHERE ${column}=? AND ${where}`,recentUsageWindow.start,recentUsageWindow.end,value,...range);
-    return {
+    const scope=(column,value)=>this.get(`SELECT COUNT(DISTINCT ip) ips,MAX(started) last_seen FROM requests WHERE ${column}=? AND ${where}`,value,...range);
+    const snapshot={
       usageWindow:window,
       recentUsageWindow,
       sessionsPagination:{page,pageSize:sessionPageSize,total:sessionTotal,totalPages:sessionPages},
       members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(m=>({...m,...scope('member_id',m.id)})),
       keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
-      accounts:this.all('SELECT id,name,kind,auth_mode,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error,token_budget FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(({api_secret_digest,...a})=>({...a,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,budget_used:scope('account_id',a.id).used})),
+      accounts:this.all('SELECT id,name,kind,auth_mode,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(({api_secret_digest,...a})=>({...a,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null})),
       sessions:this.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${sessionFrom} ORDER BY s.updated DESC,s.id DESC LIMIT ? OFFSET ?`,...range,sessionPageSize,(page-1)*sessionPageSize).map(s=>({...s,nightly_enabled:Number(participatesNightly(s,at)),request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
       requests:this.all(`SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE ${where} ORDER BY started DESC LIMIT 200`,...range),
-      totals:this.get(`SELECT COUNT(*) requests,COALESCE(SUM(input+output),0) tokens,COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0) success,COALESCE(SUM(reserved),0) reserved,COALESCE(SUM(usage_unknown),0) unmetered FROM requests WHERE ${where}`,...range),
-      daily:this.all(`SELECT strftime('%Y-%m-%d',COALESCE(ended,started)/1000,'unixepoch','+8 hours') day,SUM(input+output) tokens,COUNT(*) requests FROM requests WHERE ${where} GROUP BY day ORDER BY day`,...range),
+      totals:this.get(`SELECT COUNT(*) requests,COALESCE(SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END),0) success FROM requests WHERE ${where}`,...range),
+      daily:this.all(`SELECT strftime('%Y-%m-%d',COALESCE(ended,started)/1000,'unixepoch','+8 hours') day,COUNT(*) requests FROM requests WHERE ${where} GROUP BY day ORDER BY day`,...range),
       audit:this.all('SELECT * FROM audit WHERE at>=? AND at<? ORDER BY at DESC LIMIT 30',...range)
     };
+    return this.pricing.snapshot(snapshot,at);
   }
   close(){this.db.close();}
 }

@@ -6,6 +6,12 @@ import {join} from 'node:path';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
 import {Store} from '../store.mjs';
+import {quoteReference} from '../pricing.mjs';
+// Explicit synthetic $1-per-input/output pricing isolates planner priority tests from model price changes.
+const plannerRates=Object.fromEntries(['fixture-model','fixture'].map(name=>[name,{input:'100',cached:'100',output:'100'}]));
+const fixtureRates=Object.fromEntries(['fixture-model','fixture'].map(name=>[name,{input:'1000000',cached:'1000000',output:'1000000'}]));
+function priceFixture(store){const cfg=store.pricing.status().settings;if(!cfg.manualRates['fixture-model'])store.pricing.configure({expectedVersion:cfg.version,manualRates:fixtureRates});return store;}
+function pricedStore(...args){return priceFixture(new Store(...args));}
 import {createGateway} from '../server.mjs';
 import {createResponsesTransport,structuredFailure,refreshCredentials} from '../responses.mjs';
 import {balanceSettings,nightlyWindow,planBalance,createBalancer,automaticWeights,nextWeightReset} from '../balancing.mjs';
@@ -13,8 +19,8 @@ import {balanceSettings,nightlyWindow,planBalance,createBalancer,automaticWeight
 const at=Date.parse('2026-10-14T02:00:15+08:00'),hour=3600000;
 const account=(id,remaining=50)=>({id,kind:'codex',enabled:1,removed_at:null,state:'ready',route_block:null,route_epoch:0,quota_json:JSON.stringify({plan:'same-plan',checked:at,remaining,windows:[{used:100-remaining,minutes:300,reset:at+hour}],limitReached:false})});
 const session=(id,account_id,extra={})=>({id,account_id,member_id:'member',member_enabled:1,member_removed:null,protocol:'responses',enabled:1,nightly_enabled:1,route_version:0,...extra});
-const request=(session_id,weight,extra={})=>({session_id,started:at-2*hour,ended:at-hour,status:'ok',model:'fixture-model',input:weight,output:0,usage_unknown:0,...extra});
-const plan=(accounts,sessions,requests,extra={})=>planBalance({accounts,sessions,requests,at,...extra});
+const request=(session_id,weight,extra={})=>({session_id,started:at-2*hour,ended:at-hour,status:'ok',model:'fixture-model',input:Math.round(weight*10000),output:0,usage_unknown:0,...extra});
+const plan=(accounts,sessions,requests,extra={})=>planBalance({accounts,sessions,requests,at,quoteUsage:r=>quoteReference(r,{rates:plannerRates,aliases:[]}),...extra});
 const until=async fn=>{const deadline=Date.now()+3000;while(!await fn()){assert.ok(Date.now()<deadline,'condition timeout');await new Promise(r=>setTimeout(r,5));}};
 
 test('nightly calendar is Beijing 02:00 with exact 16-hour window and one-minute trigger',()=>{
@@ -137,6 +143,7 @@ async function gateway(t,{rateReader=async()=>{throw Error('unavailable');},cloc
   return new Response(output.map(x=>'data: '+JSON.stringify(x)+'\n\n').join(''),{headers:{'Content-Type':'text/event-stream'}});
  }});
  const app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'fixture-admin',codexBinary:'unused',reserveTokens:100},rateReader,responsesTransport:transport,...(clock?{clock}:{})});
+ priceFixture(app.store);
  for(const a of ['a','b'])app.store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
  app.balancer.saveSettings({failover:true,weighted:true});
  const member=app.store.createMember('Fixture',null,null);await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+app.server.address().port;
@@ -181,7 +188,7 @@ test('admin-only controls, switch-off behavior and manual nightly exclusion',asy
 });
 
 test('scheduler persists one daily execution, versioned moves and restart idempotence',async()=>{
- const store=new Store(':memory:');let clock=at,refreshes=0;const m=store.createMember('Fixture',null,null);
+ const store=pricedStore(':memory:');let clock=at,refreshes=0;const m=store.createMember('Fixture',null,null);
  try{
   for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   for(const i of [1,2,3,4]){const s='s'+i;store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'a','responses',?,?)",s,m.memberId,at-2*hour,at-hour);store.run("INSERT INTO requests(id,member_id,account_id,session_id,started,ended,status,input,model,ip,agent) VALUES(?,?,'a',?,?,?,'ok',100,'fixture-model','127.0.0.1','fixture')",'r'+i,m.memberId,s,at-2*hour,at-hour);}
@@ -192,7 +199,7 @@ test('scheduler persists one daily execution, versioned moves and restart idempo
  }finally{store.close();}
 });
 test('preview computes the complete direction-first plan and the nightly batch applies each session only once',async()=>{
- const store=new Store(':memory:');
+ const store=pricedStore(':memory:');
  try{
   const member=store.createMember('Fixture',null,null),weights=[40,40,15,4,1];
   for(const a of [account('a',60),account('b',40)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
@@ -212,7 +219,7 @@ test('preview computes the complete direction-first plan and the nightly batch a
  }finally{store.close();}
 });
 for(const expires of [false,true])test('a complete nightly combination is committed together, quota expires '+expires,async()=>{
- const store=new Store(':memory:');let clock=at;
+ const store=pricedStore(':memory:');let clock=at;
  try{
   const member=store.createMember('Fixture',null,null),rows=[['fixed-a','a',30,0],['move-a','a',30,1],['fixed-b','b',20,0],['move-b','b',20,1]];
   for(const a of [account('a'),account('b')]){
@@ -242,7 +249,7 @@ for(const expires of [false,true])test('a complete nightly combination is commit
  }finally{store.close();}
 });
 test('a group becoming busy rolls back its whole combination without cancelling an independent group',async()=>{
- const store=new Store(':memory:'),preparing=new Set();
+ const store=pricedStore(':memory:'),preparing=new Set();
  try{
   const members=[store.createMember('Fixture one',null,null),store.createMember('Fixture two',null,null)];
   for(const [index,ids] of [['a','b'],['c','d']].entries()){
@@ -282,7 +289,7 @@ test('recovery requires new positive evidence and never moves sessions back',asy
 });
 
 test('nightly refresh failure skips cached quota and concurrent manual binding is protected',async()=>{
- const store=new Store(':memory:');const member=store.createMember('Fixture',null,null);
+ const store=pricedStore(':memory:');const member=store.createMember('Fixture',null,null);
  try{
   for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async()=>undefined});b.saveSettings({nightly:true});await b.tick();
@@ -394,11 +401,11 @@ test('manual 100/0 validates the admin contract and official zero does not overr
 test('manual settings expire at the next Beijing 02:00 even with nightly disabled, restart or missed trigger',async()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-expiry-'));let store,clock=Date.parse('2026-10-15T23:00:00+08:00');
  try{
-  store=new Store(join(root,'db.sqlite'));for(const a of ['a','b'])store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
+  store=pricedStore(join(root,'db.sqlite'));for(const a of ['a','b'])store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
   const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});
   let b=create();b.saveSettings({weighted:true});b.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
   const expires=Date.parse('2026-10-16T02:00:00+08:00');assert.equal(b.status().weights.configuration.expires,expires);assert.equal(nextWeightReset(expires),expires+24*hour);
-  store.db.close();store=new Store(join(root,'db.sqlite'));b=create();assert.equal(b.status().weights.mode,'manual');
+  store.db.close();store=pricedStore(join(root,'db.sqlite'));b=create();assert.equal(b.status().weights.mode,'manual');
   clock=expires+3*hour;assert.equal(b.status().weights.configuration.mode,'auto','deadline is enforced before maintenance');
   await b.tick();assert.equal(b.status().weights.configuration.mode,'auto');assert.equal(b.status().weights.configuration.version,2);assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0);
   const before=store.get("SELECT value FROM gateway_settings WHERE name='routing_schedule'");
@@ -408,7 +415,7 @@ test('manual settings expire at the next Beijing 02:00 even with nightly disable
 test('nightly uses the same hourly weights and accepts quota recovered by its own refresh',async()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-night-'));let store;
  try{
-  store=new Store(join(root,'db.sqlite'));const m=store.createMember('Fixture',null,null);
+  store=pricedStore(join(root,'db.sqlite'));const m=store.createMember('Fixture',null,null);
   for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   for(let i=0;i<10;i++){store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'b','responses',?,?)",'night-'+i,m.memberId,at-2*hour,at-hour);store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,ip,model,input) VALUES(?,?,?,'b',?,?,'ok','fixture','fixture',10)",'r'+i,m.memberId,'night-'+i,at-2*hour,at-hour);}
   const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async a=>{const q=JSON.parse(a.quota_json);b.recover(a,q);return q;}});
@@ -421,24 +428,24 @@ test('nightly uses the same hourly weights and accepts quota recovered by its ow
 test('weighted switch preserves the old balancing settings contract across disable and restart',()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-rollback-'));let store;
  try{
-  store=new Store(join(root,'db.sqlite'));const create=()=>createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async()=>null});
+  store=pricedStore(join(root,'db.sqlite'));const create=()=>createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async()=>null});
   let b=create();b.saveSettings({weighted:true,failover:true,nightly:true});
   assert.deepEqual(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),{failover:true,nightly:true,quietMinutes:30});
   b.saveSettings({weighted:false});assert.deepEqual(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),{failover:true,nightly:true,quietMinutes:30});
-  store.db.close();store=new Store(join(root,'db.sqlite'));b=create();assert.equal(b.settings().weighted,false);assert.equal(b.settings().nightly,true);
+  store.db.close();store=pricedStore(join(root,'db.sqlite'));b=create();assert.equal(b.settings().weighted,false);assert.equal(b.settings().nightly,true);
   store.run("UPDATE gateway_settings SET value=? WHERE name='balancing'",JSON.stringify({failover:true,nightly:true,quietMinutes:30,weighted:true}));b=create();assert.ok(!Object.hasOwn(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),'weighted'));assert.equal(b.settings().weighted,false,'existing independent setting wins over transitional data');
  }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
 });
 
 test('automatic weights change only at initialization, quota transitions or the Beijing daily reset',async()=>{
- const root=mkdtempSync(join(tmpdir(),'harbor-weight-auto-restart-'));let store=new Store(join(root,'db.sqlite')),clock=at;
+ const root=mkdtempSync(join(tmpdir(),'harbor-weight-auto-restart-'));let store=pricedStore(join(root,'db.sqlite')),clock=at;
  try{
   for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});let b=create();b.saveSettings({weighted:true});
   const original=b.status().weights.accounts.map(a=>a.automatic);assert.ok(Math.abs(original[0]-68.9655172414)<1e-8);
   store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',10,24).quota_json,'a');
   assert.deepEqual(b.status().weights.accounts.map(a=>a.automatic),original,'positive quota changes do not rewrite saved weights');
-  store.close();store=new Store(join(root,'db.sqlite'));b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.automatic),original,'reopening the database retains weights');
+  store.close();store=pricedStore(join(root,'db.sqlite'));b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.automatic),original,'reopening the database retains weights');
   store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',0,24).quota_json,'a');
   assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),[0,100]);
   store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',60,24).quota_json,'a');
@@ -480,7 +487,7 @@ test('positive changes retain an existing binding while zero reroutes once even 
  assert.deepEqual(app.calls.map(c=>c.home),['a','a','b','b']);
 });
 test('stale exhausted snapshots stay at zero across restart and a failed daily refresh completes on fresh evidence',async()=>{
- const store=new Store(':memory:');let clock=at;
+ const store=pricedStore(':memory:');let clock=at;
  try{
   for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});let b=create();b.saveSettings({weighted:true});
@@ -635,7 +642,7 @@ test('manual routes and exclusions expire at the next Beijing 02:00; clients can
 });
 
 test('legacy manual routes use the latest human action, ignore automatic moves, and recover after restart',async()=>{
- const root=mkdtempSync(join(tmpdir(),'harbor-session-deadline-')),file=join(root,'db.sqlite');let store=new Store(file),clock=at;
+ const root=mkdtempSync(join(tmpdir(),'harbor-session-deadline-')),file=join(root,'db.sqlite');let store=pricedStore(file),clock=at;
  try{
   const member=store.createMember('Fixture',null,null);
   for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
@@ -650,7 +657,7 @@ test('legacy manual routes use the latest human action, ignore automatic moves, 
   assert.equal(store.snapshot(at).sessions.find(s=>s.id==='old').nightly_enabled,1,'effective before maintenance');
   const before=store.all('SELECT * FROM sessions'),audits=store.get('SELECT COUNT(*) n FROM audit').n;
   await b.preview();assert.deepEqual(store.all('SELECT * FROM sessions'),before);assert.equal(store.get('SELECT COUNT(*) n FROM audit').n,audits);
-  store.close();store=new Store(file);b=create();await b.tick();
+  store.close();store=pricedStore(file);b=create();await b.tick();
   assert.ok(store.all('SELECT nightly_enabled FROM sessions').every(s=>s.nightly_enabled===1));assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.nightly.expired'").n,3);
   await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.nightly.expired'").n,3);
   assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0,'disabled nightly still expires manual settings');
@@ -658,7 +665,7 @@ test('legacy manual routes use the latest human action, ignore automatic moves, 
 });
 
 test('nightly rechecks a manual hold created while quota refresh was in progress',async()=>{
- const store=new Store(':memory:');
+ const store=pricedStore(':memory:');
  try{
   const member=store.createMember('Fixture',null,null);
   for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
