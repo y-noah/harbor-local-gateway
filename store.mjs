@@ -41,6 +41,7 @@ export class Store {
     this.run("UPDATE balance_runs SET status='interrupted',ended=? WHERE status='running'",now());
     add('members','removed_at','INTEGER');
     add('requests','tracking_only','INTEGER NOT NULL DEFAULT 0');
+    add('requests','route_version','INTEGER');
     const missingFlag=!this.all('PRAGMA table_info(requests)').some(c=>c.name==='usage_unknown');
     add('requests','usage_unknown','INTEGER NOT NULL DEFAULT 0');
     add('requests','phase','TEXT');add('requests','phase_at','INTEGER');add('requests','phase_history',"TEXT NOT NULL DEFAULT '[]'");
@@ -65,7 +66,8 @@ export class Store {
     this.db.exec("BEGIN IMMEDIATE");
     try{
       this.db.exec("UPDATE keys SET unmetered=unmetered+(SELECT COUNT(*) FROM requests WHERE key_id=keys.id AND status='running' AND tracking_only=1)");
-      this.db.exec("UPDATE sessions SET state='uncertain' WHERE id IN (SELECT session_id FROM requests WHERE status='running')");
+      // Older requests have no dispatch version; retain conservative recovery only for compatible accounts.
+      this.db.exec("UPDATE sessions SET state='uncertain' WHERE id IN (SELECT r.session_id FROM requests r JOIN sessions s ON s.id=r.session_id WHERE r.status='running' AND (r.account_id IS NULL OR r.account_id=s.account_id) AND (r.route_version IS NULL OR r.route_version=s.route_version))");
       for(const row of this.all("SELECT id FROM requests WHERE status='running'"))this.phase(row.id,'interrupted');
       for(const row of this.all("SELECT id FROM requests WHERE status='queued'"))this.phase(row.id,'cancelled');
       this.db.prepare("UPDATE requests SET status='interrupted',usage_unknown=1,ended=?,error=CASE WHEN tracking_only=1 THEN '服务重启；本次用量可能未计入累计' ELSE '服务重启；上游用量未知，保留预占额度待核对' END WHERE status='running'").run(now());

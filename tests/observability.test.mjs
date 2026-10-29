@@ -4,7 +4,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from '../store.mjs';
-import {historyReader,historyQuery,requestObservation} from '../observability.mjs';
+import {historyReader,historyQuery,requestObservation,requestsQuery,requestsReader} from '../observability.mjs';
 import {createBalancer} from '../balancing.mjs';
 import {createResponsesTransport} from '../responses.mjs';
 import {createGateway} from '../server.mjs';
@@ -108,7 +108,7 @@ test('new management endpoints require admin auth and reject malformed history w
   const dir=mkdtempSync(join(tmpdir(),'harbor-observe-api-')),app=createGateway({dataDir:join(dir,'data'),runtimeDir:join(dir,'runtime'),config:{adminToken:'test-only-admin'}});
   await new Promise(r=>app.server.listen(0,'127.0.0.1',r));t.after(async()=>{await app.close();rmSync(dir,{recursive:true,force:true});});
   const base='http://127.0.0.1:'+app.server.address().port,member=app.store.createMember('fixture',null,null);
-  for(const path of ['/api/admin/history','/api/admin/history/nightly/2026-10-27','/api/admin/balancing/explanation','/api/admin/requests/unknown'])assert.equal((await fetch(base+path,{headers:{Authorization:'Bearer '+member.secret}})).status,401);
+  for(const path of ['/api/admin/requests','/api/admin/history','/api/admin/history/nightly/2026-10-27','/api/admin/balancing/explanation','/api/admin/requests/unknown'])assert.equal((await fetch(base+path,{headers:{Authorization:'Bearer '+member.secret}})).status,401);
   assert.equal((await fetch(base+'/api/admin/history?page_size=101',{headers:{Authorization:'Bearer test-only-admin'}})).status,400);
   const r=await fetch(base+'/api/admin/history',{headers:{Authorization:'Bearer test-only-admin'}});assert.equal(r.status,200);assert.ok(!(await r.text()).includes(member.secret));
 });
@@ -118,4 +118,22 @@ test('real Responses transport exposes credentials, upstream wait and first rece
   const transport=createResponsesTransport({credentials:async()=>{await authGate;return {token:'test-only',accountId:'test-only'};},fetchImpl:async()=>{await headerGate;return new Response(new ReadableStream({async start(c){c.enqueue(Buffer.from('data: {"type":"response.created"}\n\n'));await tailGate;c.enqueue(Buffer.from('data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":2},"output":[]}}\n\n'));c.close();}}),{headers:{'Content-Type':'text/event-stream'}});}});
   const pending=transport.run({binary:'unused',home:'unused',payload:{model:'fixture'},onPhase:p=>phases.push(p)});
   assert.deepEqual(phases,['credentials']);releaseAuth();await until(()=>phases.includes('upstream'));assert.ok(!phases.includes('streaming'));releaseHeaders();await until(()=>phases.includes('streaming'));releaseTail();assert.equal((await pending).input,8);assert.deepEqual(phases,['credentials','upstream','streaming']);
+});
+
+
+test('request query validates all filters and pagination without interpreting model names as SQL',()=>{
+ for(const raw of ['page=0','page=2&page=3','page_size=101','page_size=2.5','status=invalid','member=bad%20id','model=%00','unknown=1'])assert.throws(()=>requestsQuery(new URLSearchParams(raw)),{status:400},raw);
+ assert.equal(requestsQuery(new URLSearchParams({model:"x' OR 1=1 --"})).model,"x' OR 1=1 --");
+});
+test('request totals cover all pages, combine filters and keep users with identical names distinct',t=>{
+ const {store,member,at}=fixture(t),other=store.createMember('观测测试员工',null,null),read=values=>requestsReader(store,requestsQuery(new URLSearchParams(values)),at);
+ const window=read({}).window;
+ for(let i=0;i<251;i++)store.run("INSERT INTO requests(id,member_id,started,ended,status,model,ip,input,output,cached,usage_unknown) VALUES(?,?,?,?,'ok',?,'fixture',10,2,3,?)",'request-'+String(i).padStart(3,'0'),i<201?member.memberId:other.memberId,at-1000,at,i%2?'model-b':'model-a',i===250?1:0);
+ store.run("INSERT INTO requests(id,member_id,started,ended,status,model,ip,input) VALUES('expired',?, ?,?,'ok','old','fixture',999999)",member.memberId,window.start-1001,window.start-1);
+ store.run("INSERT INTO requests(id,member_id,started,status,model,ip) VALUES('pending',?,?,'running','model-a','fixture')",member.memberId,at);
+ const all=read({});assert.equal(all.summary.requests,252);assert.equal(all.summary.input,2510);assert.equal(all.summary.cached,753);assert.equal(all.summary.unmetered,1);assert.equal(all.summary.active,1);assert.equal(all.summary.average_ms,1000);assert.equal(all.byMember.length,2);assert.equal(all.members.length,2);assert.equal(all.rows.length,25);
+ const pages=Array.from({length:3},(_,i)=>read({page:String(i+1),page_size:'100'}));assert.equal(new Set(pages.flatMap(x=>x.rows.map(r=>r.id))).size,252);
+ const filtered=read({member:member.memberId,model:'model-a',status:'ok'});assert.equal(filtered.summary.requests,101);assert.equal(filtered.summary.output,202);assert.equal(filtered.byMember.length,1);assert.equal(filtered.byModel.length,1);assert.equal(filtered.members.length,2);assert.equal(filtered.models.length,2);
+ assert.equal(read({model:"x' OR 1=1 --"}).summary.requests,0);assert.equal(read({page:'999'}).pagination.page,11);
+ assert.ok(!JSON.stringify(all).includes(member.secret));
 });
