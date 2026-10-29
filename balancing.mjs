@@ -178,6 +178,26 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     if(result.schedule)writeSetting('routing_schedule',result.schedule);
     return result.selected;
   }
+  function disableAccount(accountId){
+    return atomic(()=>{
+      const account=store.get('SELECT * FROM accounts WHERE id=? AND removed_at IS NULL',accountId);
+      if(!account)throw new AppError(404,'账号不存在或已移除');
+      const sessions=store.all('SELECT * FROM sessions WHERE account_id=? ORDER BY id',accountId);
+      if(account.enabled||sessions.length)store.run('UPDATE accounts SET enabled=0,route_epoch=route_epoch+1 WHERE id=?',accountId);
+      const moved=[];
+      for(const session of sessions){
+        let target;
+        try{target=account.kind==='codex'?selectAccount():store.get("SELECT a.* FROM accounts a WHERE a.kind=? AND a.enabled=1 AND a.removed_at IS NULL AND a.state IN ('ready','degraded') ORDER BY (SELECT COUNT(*) FROM sessions s WHERE s.account_id=a.id),a.last_used,a.id LIMIT 1",account.kind);}
+        catch(e){if(e.code!=='no_account')throw e;throw new AppError(409,'没有可接收会话的同类型正权重账号，未停用或迁移任何会话','disable_no_target');}
+        if(!target)throw new AppError(409,'没有可接收会话的同类型账号，未停用或迁移任何会话','disable_no_target');
+        const legacy=session.protocol!=='responses';
+        store.run(`UPDATE sessions SET account_id=?,upstream_thread=?,route_version=route_version+1,updated=?${legacy?",upstream_id=NULL,state='new',message_count=0,history_digest='',cum_input=0,cum_output=0,cum_cached=0":''} WHERE id=?`,target.id,id(),clock(),session.id);
+        store.audit('session.route',JSON.stringify({sessionId:session.id,from:accountId,to:target.id,reason:'account_disabled',version:session.route_version+1}));
+        moved.push(session.id);
+      }
+      return {moved:moved.length,resetTextSessions:sessions.filter(s=>s.protocol!=='responses').length};
+    });
+  }
   function explain(){
     const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL"),state=distribution(accounts),next=allocation(state).selected;
     return {at:clock(),mode:state.mode,reason:state.reason,configuration:state.configuration,basis:state.system.basis??null,updated:state.system.updated??null,trigger:state.system.trigger??null,nextAccount:next?.id??null,
@@ -279,5 +299,5 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     })().finally(()=>{running=null;});
     return running;
   }
-  return {settings,saveSettings,saveWeights,selectAccount,explain,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs ORDER BY day DESC LIMIT 1')||null};}};
+  return {settings,saveSettings,saveWeights,selectAccount,disableAccount,explain,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs ORDER BY day DESC LIMIT 1')||null};}};
 }

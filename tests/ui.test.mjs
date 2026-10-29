@@ -303,3 +303,21 @@ test('balancing preview renders identifiers supplied by the preview even outside
  const page=await ui(()=>response({window:{end:Date.now()},summaries:[],skipped:[],moves:[{session_id:'not-on-page',from:'a',to:'b',protocol:'responses',client_session_id:client},{session_id:'missing',from:'a',to:'b',protocol:'responses',client_session_id:null}]}));
  page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[]};`);await page.click('balancing-preview');assert.match(page.node('#modal-content').innerHTML,new RegExp(client));assert.match(page.node('#modal-content').innerHTML,/未获取/);
 });
+
+test('request list combines filters with complete totals and discards stale or logged-out responses',async()=>{
+ const result={summary:{requests:251,success:250,input:100,output:20,cached:5,unmetered:1,active:0,average_ms:1000},pagination:{page:1,pageSize:25,total:251,totalPages:11},rows:[],models:['alpha','beta'],members:[{id:'m1',name:'同名'},{id:'m2',name:'同名'}],byModel:[],byMember:[]};
+ const pending=[];const page=await ui((path)=>path.startsWith('/api/admin/requests?')?new Promise(r=>pending.push({path,release:body=>r(response(body))})):response({ok:true}));
+ page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';");
+ const first=page.run('loadRequests()');assert.match(page.node('#content').innerHTML,/正在读取/);pending[0].release(result);await first;assert.match(page.node('#content').innerHTML,/251/);
+ const older=page.run("requestsFilters.model='alpha';loadRequests()");const newer=page.run("requestsFilters.member='m1';loadRequests()");assert.match(pending[2].path,/member=m1&model=alpha/);pending[2].release({...result,summary:{...result.summary,requests:4}});await newer;pending[1].release(result);await older;assert.equal(page.run('requestsData.summary.requests'),4);
+ const last=page.run('loadRequests()');await page.node('#logout').onclick();pending[3].release(result);await last;assert.equal(page.run('requestsData'),null);assert.equal(page.node('#content').innerHTML,'');
+});
+test('combined connection view preserves drafts and prevents employee access to admin instructions',async()=>{
+ const page=await ui(()=>response({ok:true}));page.run('admin=true;state='+JSON.stringify({...snapshot(),endpoint:'http://localhost/v1'})+";tab='playground';draft='待发送';render();");
+ assert.match(page.node('#content').innerHTML,/接入与测试/);await page.click('connection-view','guide');assert.match(page.node('#content').innerHTML,/Codex Windows/);assert.equal(page.run('draft'),'待发送');await page.click('connection-view','test');assert.match(page.node('#content').innerHTML,/待发送/);
+ page.run('sending=true');await page.click('connection-view','guide');assert.equal(page.run('connectionView'),'test');page.run('sending=false;admin=false');await page.click('connection-view','guide');assert.equal(page.run('connectionView'),'test');assert.ok(!page.node('#content').innerHTML.includes('data-action="backup"'));
+});
+test('account disable asks for confirmation then shows full migration result',async()=>{
+ const calls=[];const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?{...snapshot(),accounts:[{id:'a',name:'A',kind:'codex',enabled:0}]}:{ok:true,moved:8,resetTextSessions:2});});
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),accounts:[{id:'a',name:'A',enabled:1}]})+";tab='accounts';");await page.click('toggle-account','a');assert.equal(calls.length,0);assert.match(page.node('#modal-content').innerHTML,/凌晨自动恢复/);await page.click('confirm-disable-account','a');assert.equal(JSON.parse(calls[0][1].body).enabled,false);assert.match(page.node('#toast').textContent,/迁移 8 个会话/);
+});

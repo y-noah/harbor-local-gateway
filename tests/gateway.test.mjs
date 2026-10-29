@@ -349,3 +349,22 @@ test('gateway restart retains its encryption key and decrypted Key without raw s
  const restarted=createGateway({dataDir:app.data,runtimeDir:app.runtime,config:app.config});
  try{assert.equal(restarted.store.snapshot().keys[0].full_key,m.secret);assert.ok(!JSON.stringify(restarted.store.all('SELECT * FROM keys')).includes(m.secret));}finally{await restarted.close();}
 });
+
+test('disabling migrates a running legacy test and its queued peer without restoring old CLI context',async t=>{
+ let release,entered=0;const calls=[];
+ const app=await setup(t,async args=>{calls.push(args);if(++entered===1)await new Promise(r=>{release=r;args.signal.addEventListener('abort',r,{once:true});});return {text:'fixture',input:4,output:2,cached:0,usageKnown:true,threadId:'completed-'+entered};});
+ app.store.run("INSERT INTO accounts(id,name,home,state,last_used,enabled) VALUES('two','Receiver','receiver','ready',9999999999999,0)");
+ const first=app.member(),second=app.member();
+ const pending=app.chat(first.secret);const deadline=Date.now()+4000;
+ while(!release){assert.ok(Date.now()<deadline);await new Promise(r=>setTimeout(r,5));}
+ const queued=app.chat(second.secret);
+ while(app.store.get("SELECT COUNT(*) n FROM requests WHERE status='queued'").n!==1){assert.ok(Date.now()<deadline);await new Promise(r=>setTimeout(r,5));}
+ app.store.run("UPDATE accounts SET enabled=1,quota_json=(SELECT quota_json FROM accounts WHERE id='one') WHERE id='two'");
+ const result=await app.call('/api/admin/accounts/one','PATCH',{enabled:false});assert.equal(result.status,200);assert.equal(result.body.moved,2);assert.equal(result.body.resetTextSessions,2);
+ const moved=app.store.all('SELECT * FROM sessions');assert.ok(moved.every(s=>s.account_id==='two'&&s.route_version===1));
+ const next=await queued;assert.equal(next.status,200);assert.equal(next.body.context_reset,true);assert.equal(calls[1].home,'receiver');assert.equal(calls[1].sessionId,null);
+ release();const old=await pending;assert.equal(old.status,200);
+ const original=app.store.get('SELECT * FROM sessions WHERE id=?',old.body.session_id);assert.equal(original.state,'new');assert.equal(original.upstream_id,null);assert.equal(original.message_count,0);assert.equal(original.cum_input,0);
+ const resumed=await app.chat(first.secret,{session_id:original.id});assert.equal(resumed.status,200);assert.equal(resumed.body.context_reset,true);assert.equal(calls.at(-1).home,'receiver');assert.equal(calls.at(-1).sessionId,null);
+ assert.equal(app.store.get("SELECT budget_used FROM accounts WHERE id='one'").budget_used,6);assert.equal(app.store.get("SELECT enabled FROM accounts WHERE id='one'").enabled,0);
+});

@@ -1,8 +1,37 @@
-import {AppError,requestPhases} from './store.mjs';
+import {AppError,requestPhases,usageWindow} from './store.mjs';
+
+export const requestStatuses=new Set(['queued','running','ok','failed','unknown','interrupted','cancelled','rejected','reconciled']);
+export function requestsQuery(params){
+  const allowed=new Set(['member','model','status','page','page_size']);
+  for(const key of params.keys())if(!allowed.has(key)||params.getAll(key).length!==1)throw new AppError(400,'请求查询参数无效');
+  const positive=(key,fallback,max)=>{
+    const raw=params.get(key);if(raw===null||raw==='')return fallback;
+    if(!/^[1-9]\d*$/.test(raw)||!Number.isSafeInteger(Number(raw))||Number(raw)>max)throw new AppError(400,'请求分页参数无效');
+    return Number(raw);
+  };
+  const result={member:params.get('member')||'',model:params.get('model')||'',status:params.get('status')||'',page:positive('page',1,1e7),pageSize:positive('page_size',25,100)};
+  if(result.member&&!/^[a-zA-Z0-9-]{1,100}$/.test(result.member)||result.model.length>200||/[\x00-\x1f]/.test(result.model)||result.status&&!requestStatuses.has(result.status))throw new AppError(400,'请求筛选条件无效');
+  return result;
+}
+
+export function requestsReader(store,query,at=Date.now()){
+  const window=usageWindow(at),range=[window.start,window.end],time='COALESCE(r.ended,r.started)',base=`${time}>=? AND ${time}<?`;
+  const clauses=[base],args=[...range];
+  for(const [field,value] of [['member_id',query.member],['model',query.model],['status',query.status]])if(value){clauses.push(`r.${field}=?`);args.push(value);}
+  const where=' WHERE '+clauses.join(' AND '),from=' FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id';
+  const aggregates=`COUNT(*) requests,COALESCE(SUM(r.status='ok'),0) success,COALESCE(SUM(r.input),0) input,COALESCE(SUM(r.output),0) output,COALESCE(SUM(r.cached),0) cached,COALESCE(SUM(r.usage_unknown),0) unmetered,COALESCE(SUM(r.status IN ('queued','running')),0) active,COALESCE(AVG(CASE WHEN r.ended>=r.started THEN r.ended-r.started END),0) average_ms`;
+  const summary=store.get(`SELECT ${aggregates}${from}${where}`,...args),totalPages=Math.max(1,Math.ceil(summary.requests/query.pageSize)),page=Math.min(query.page,totalPages);
+  const rows=store.all(`SELECT r.id,r.member_id,r.account_id,r.started,r.ended,r.status,r.model,r.input,r.output,r.cached,r.usage_unknown,r.phase,r.phase_at,r.ip,m.name member_name,a.name account_name${from}${where} ORDER BY r.started DESC,r.id DESC LIMIT ? OFFSET ?`,...args,query.pageSize,(page-1)*query.pageSize);
+  return {window,observedAt:at,summary,pagination:{page,pageSize:query.pageSize,total:summary.requests,totalPages},rows,
+    models:store.all(`SELECT DISTINCT r.model FROM requests r WHERE ${base} AND r.model IS NOT NULL AND r.model<>'' ORDER BY r.model`,...range).map(r=>r.model),
+    members:store.all(`SELECT DISTINCT m.id,m.name,m.removed_at FROM requests r JOIN members m ON m.id=r.member_id WHERE ${base} ORDER BY m.name,m.id`,...range),
+    byModel:store.all(`SELECT r.model,${aggregates}${from}${where} GROUP BY r.model ORDER BY SUM(r.input+r.output) DESC,r.model`,...args),
+    byMember:store.all(`SELECT r.member_id,m.name member_name,${aggregates}${from}${where} GROUP BY r.member_id,m.name ORDER BY SUM(r.input+r.output) DESC,r.member_id`,...args)};
+}
 
 const parse=value=>{try{return JSON.parse(value);}catch{return null;}};
 const number=value=>Number.isFinite(value)?value:null;
-const reasonCodes=new Set(['manual','nightly','quota','initialize','recovery','weight_zero','quota_exhausted','login_expired','unknown_workload','busy','protected','no_measured_work','quota_unavailable','incomparable_quota','unknown_fixed_load','session_disabled','session_busy','nightly_plan_changed','planning_failed','balanced','within_tolerance','direction_unavailable','infeasible','search_limited','priority_unresolved','cannot_fit']);
+const reasonCodes=new Set(['manual','nightly','quota','initialize','recovery','weight_zero','account_disabled','quota_exhausted','login_expired','unknown_workload','busy','protected','no_measured_work','quota_unavailable','incomparable_quota','unknown_fixed_load','session_disabled','session_busy','nightly_plan_changed','planning_failed','balanced','within_tolerance','direction_unavailable','infeasible','search_limited','priority_unresolved','cannot_fit']);
 const reason=value=>reasonCodes.has(value)?value:null;
 
 // Only structured routing metadata crosses the history boundary. Never return raw audit text.

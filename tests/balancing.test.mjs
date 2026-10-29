@@ -682,3 +682,38 @@ test('admin preview returns client metadata for planned moves outside the select
  assert.deepEqual(app.store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),before);assert.equal(app.store.get('SELECT COUNT(*) n FROM audit').n,audits);
  const denied=await fetch(app.base+'/api/admin/balancing/preview',{method:'POST',headers:{Authorization:'Bearer '+app.member.secret,'Content-Type':'application/json'},body:'{}'});assert.equal(denied.status,401);
 });
+
+test('disabling immediately moves all bindings including inactive, protected and in-flight sessions',async t=>{
+ const app=await gateway(t);await app.send();const first=app.store.get('SELECT * FROM sessions');
+ app.store.run("INSERT INTO sessions(id,member_id,account_id,protocol,enabled,nightly_enabled,nightly_expires,created,updated,upstream_id,message_count,cum_input) VALUES('old-test',?,'a','chat',0,0,123,1,1,'old-context',4,99)",app.member.memberId);
+ app.mode('hold');const pending=app.send();await until(()=>app.arrivals()===2);
+ const before=app.store.get('SELECT route_epoch FROM accounts WHERE id=?','a').route_epoch;
+ const result=await fetch(app.base+'/api/admin/accounts/a',{method:'PATCH',headers:{Authorization:'Bearer fixture-admin','Content-Type':'application/json'},body:JSON.stringify({enabled:false})});assert.equal(result.status,200);assert.deepEqual(await result.json(),{ok:true,moved:2,resetTextSessions:1});
+ const moved=app.store.get('SELECT * FROM sessions WHERE id=?',first.id),legacy=app.store.get("SELECT * FROM sessions WHERE id='old-test'");
+ assert.equal(moved.account_id,'b');assert.equal(moved.route_version,first.route_version+1);assert.notEqual(moved.upstream_thread,first.upstream_thread);assert.equal(legacy.enabled,0);assert.equal(legacy.nightly_enabled,0);assert.equal(legacy.nightly_expires,123);assert.equal(legacy.upstream_id,null);assert.equal(legacy.cum_input,0);assert.equal(legacy.message_count,0);assert.equal(legacy.state,'new');
+ app.release();assert.equal((await pending).status,200);assert.equal(app.store.get('SELECT account_id FROM sessions WHERE id=?',first.id).account_id,'b');assert.equal(app.store.get('SELECT account_id FROM requests ORDER BY started DESC LIMIT 1').account_id,'a');
+ app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');assert.equal(app.store.get("SELECT enabled FROM accounts WHERE id='a'").enabled,0);
+ assert.equal(app.balancer.disableAccount('a').moved,0);assert.equal(app.store.get("SELECT route_epoch FROM accounts WHERE id='a'").route_epoch,before+1);
+ assert.equal(app.store.all("SELECT * FROM audit WHERE action='session.route'").filter(r=>JSON.parse(r.detail).reason==='account_disabled').length,2);
+});
+test('disable rolls back account, sessions and schedule when no positive-weight receiver exists',async t=>{
+ const app=await gateway(t);await app.send();app.balancer.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
+ const before=app.store.get('SELECT * FROM sessions'),source=app.store.get("SELECT * FROM accounts WHERE id='a'"),settings=app.store.all('SELECT * FROM gateway_settings ORDER BY name');
+ assert.throws(()=>app.balancer.disableAccount('a'),{status:409,code:'disable_no_target'});
+ assert.deepEqual(app.store.get('SELECT * FROM sessions'),before);assert.deepEqual(app.store.get("SELECT * FROM accounts WHERE id='a'"),source);assert.deepEqual(app.store.all('SELECT * FROM gateway_settings ORDER BY name'),settings);
+});
+test('disable distributes all sessions over multiple weighted receivers and respects extra-quota override',async t=>{
+ const app=await gateway(t);app.store.run("INSERT INTO accounts(id,name,home,state) VALUES('c','c','c','ready')");
+ app.balancer.saveWeights({mode:'manual',weights:{a:0,b:75,c:25},expected_version:0});
+ app.store.run("UPDATE accounts SET route_block='quota_exhausted' WHERE id='b'");
+ for(let i=0;i<20;i++)app.store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'a','responses',1,1)",'batch-'+i,app.member.memberId);
+ assert.equal(app.balancer.disableAccount('a').moved,20);assert.deepEqual(app.store.all('SELECT account_id,COUNT(*) n FROM sessions GROUP BY account_id ORDER BY account_id').map(r=>({...r})),[{account_id:'b',n:15},{account_id:'c',n:5}]);
+ app.store.run("UPDATE accounts SET enabled=0 WHERE id='c'");assert.equal(app.balancer.disableAccount('a').moved,0);
+});
+
+test('late failure from a disabled source cannot poison the migrated Responses session',async t=>{
+ const app=await gateway(t);await app.send();app.mode('hold');const pending=app.send();await until(()=>app.arrivals()===2);
+ app.balancer.disableAccount('a');const moved=app.store.get('SELECT * FROM sessions');app.mode('network');app.release();assert.equal((await pending).status,502);
+ assert.deepEqual(app.store.get('SELECT * FROM sessions'),moved);assert.equal(app.store.get("SELECT enabled FROM accounts WHERE id='a'").enabled,0);
+ app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');
+});

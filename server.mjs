@@ -15,7 +15,7 @@ import {networkConfig,acceptsRequest} from './network.mjs';
 import {startCodexLogin,startLocalLogin} from './account-login.mjs';
 import {readJsonBody,responseBodyBytes} from './request-body.mjs';
 import {createResponsesTransport,validateResponses,validateCodexJson,codexJsonRoutes} from './responses.mjs';
-import {historyReader,historyQuery,requestObservation} from './observability.mjs';
+import {historyReader,historyQuery,requestObservation,requestsQuery,requestsReader} from './observability.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
 function integer(value,label,{nullable=false,min=0,max=1e12}={}) {
@@ -149,7 +149,9 @@ export function createGateway(options={}) {
       session=store.get('SELECT * FROM sessions WHERE id=? AND member_id=?',sessionId,member.id);
       if(!session.enabled)throw new AppError(403,'该会话已被禁止访问','session_disabled');
       if(session.state==='uncertain')throw new AppError(409,'此会话的上次调用状态不确定，请创建新会话','session_uncertain');
-      if(!capacity(store.get('SELECT * FROM accounts WHERE id=?',account.id),predicted).eligible)throw new AppError(429,'会话绑定账号预计额度不足；请等待恢复或创建新会话','session_quota_exhausted');
+      const latestAccount=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
+      if(!latestAccount?.enabled||latestAccount.removed_at||!['ready','degraded'].includes(latestAccount.state))throw new AppError(503,'会话绑定账号不可用','session_account_unavailable');
+      if(!capacity(latestAccount,predicted).eligible)throw new AppError(429,'会话绑定账号预计额度不足；请等待恢复或创建新会话','session_quota_exhausted');
       let delta=messages;
       if(session.message_count&&messages.length>1){
         if(messages.length<=session.message_count||digestMessages('',messages.slice(0,session.message_count))!==session.history_digest)throw new AppError(409,'完整历史与会话不匹配；请只发送本轮新消息，或创建新会话');
@@ -204,7 +206,7 @@ export function createGateway(options={}) {
         const result=await (job.jsonPath?responses.runJson:responses.run)({binary:config.codexBinary,home:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.upstream_thread||session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,collectOutput:job.collectOutput,onEvent:job.onEvent,onPhase:phase=>store.phase(requestId,phase)});
         store.finish(requestId,result,()=>{
           store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
-          store.run("UPDATE sessions SET state='active',updated=? WHERE id=?",now(),session.id);
+          store.run("UPDATE sessions SET state='active',updated=? WHERE id=? AND route_version=? AND account_id=?",now(),session.id,session.route_version||0,account.id);
         });
         complete(result);void refreshQuota(store.get('SELECT * FROM accounts WHERE id=?',account.id));return;
       }
@@ -213,11 +215,11 @@ export function createGateway(options={}) {
       const result=await upstream.run({binary:upstream.binary,home:account.home,workspace:join(runtime,'jobs',session.id),messages,model,sessionId:session.upstream_id,previousUsage:{input:session.cum_input||0,output:session.cum_output||0,cached:session.cum_cached||0},signal:controller.signal});
       store.finish(requestId,result,()=>{
         store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
-        store.run("UPDATE sessions SET upstream_id=?,state='active',message_count=?,history_digest=?,updated=? WHERE id=?",result.threadId||session.upstream_id,session.message_count+messages.length+1,digestMessages(session.history_digest,[...messages,{role:'assistant',content:result.text}]),now(),session.id);
+        store.run("UPDATE sessions SET upstream_id=?,state='active',message_count=?,history_digest=?,updated=? WHERE id=? AND route_version=? AND account_id=?",result.threadId||session.upstream_id,session.message_count+messages.length+1,digestMessages(session.history_digest,[...messages,{role:'assistant',content:result.text}]),now(),session.id,session.route_version||0,account.id);
         const cumulative=result.cumulativeUsage||{input:(session.cum_input||0)+result.input,output:(session.cum_output||0)+result.output,cached:(session.cum_cached||0)+result.cached};
-        store.run('UPDATE sessions SET cum_input=?,cum_output=?,cum_cached=? WHERE id=?',cumulative.input,cumulative.output,cumulative.cached,session.id);
+        store.run('UPDATE sessions SET cum_input=?,cum_output=?,cum_cached=? WHERE id=? AND route_version=? AND account_id=?',cumulative.input,cumulative.output,cumulative.cached,session.id,session.route_version||0,account.id);
       });
-      complete({...result,sessionId:session.id});
+      complete({...result,sessionId:session.id,contextReset:session.state==='new'&&(session.route_version||0)>0});
       void refreshQuota(store.get('SELECT * FROM accounts WHERE id=?',account.id),true);
     }catch(e){
       const known=e.usageKnown===true;
@@ -227,12 +229,12 @@ export function createGateway(options={}) {
           if(failureAccount)balancer.block(failureAccount,e.routeFailure);
           if(e.code==='upstream_authentication'&&failureAccount)store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
           store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',(e.input||0)+(e.output||0),(e.input||0)+(e.output||0),account.id);
-          if(!known)store.run("UPDATE sessions SET state='uncertain',updated=? WHERE id=?",now(),session.id);
+          if(!known)store.run("UPDATE sessions SET state='uncertain',updated=? WHERE id=? AND route_version=? AND account_id=?",now(),session.id,session.route_version||0,account.id);
           return;
         }
         store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",e.message,account.id);
         store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',(e.input||0)+(e.output||0),(e.input||0)+(e.output||0),account.id);
-        store.run("UPDATE sessions SET state='uncertain',upstream_id=COALESCE(?,upstream_id),updated=? WHERE id=?",e.threadId||null,now(),session.id);
+        store.run("UPDATE sessions SET state='uncertain',upstream_id=COALESCE(?,upstream_id),updated=? WHERE id=? AND route_version=? AND account_id=?",e.threadId||null,now(),session.id,session.route_version||0,account.id);
       });
       reject(job.responses&&e.status?e:new AppError(502,e.message,'upstream_error'));
     }
@@ -253,6 +255,7 @@ export function createGateway(options={}) {
       if(path==='/api/auth/session'&&method==='GET')return json(res,200,{authenticated:adminAuth.authenticated(req)});
       if(path.startsWith('/api/admin/')){
         authAdmin(req);
+        if(path==='/api/admin/requests'&&method==='GET')return json(res,200,requestsReader(store,requestsQuery(url.searchParams)));
         if(path==='/api/admin/balancing/explanation'&&method==='GET')return json(res,200,balancer.explain());
         if(path==='/api/admin/history'&&method==='GET')return json(res,200,historyReader(store).list(historyQuery(url.searchParams)));
         const batch=path.match(/^\/api\/admin\/history\/nightly\/(\d{4}-\d{2}-\d{2})$/);
@@ -369,7 +372,18 @@ export function createGateway(options={}) {
             const pending=logins.get(account.id);if(pending){authVersions.set(account.id,(authVersions.get(account.id)||0)+1);pending.flow.cancel();logins.delete(account.id);store.run("UPDATE accounts SET state='offline',last_error='登录已取消' WHERE id=?",account.id);store.audit('account.login.cancel',account.id);pump();}
             return json(res,200,{ok:true});
           }
-          if(method==='PATCH'&&!accountMatch[2]){const b=await body(req);store.run('UPDATE accounts SET enabled=?,token_budget=?,tokens_per_percent=? WHERE id=?',b.enabled===undefined?account.enabled:bool(b.enabled),b.token_budget===undefined?account.token_budget:integer(b.token_budget,'本地预算',{nullable:true}),b.tokens_per_percent===undefined?account.tokens_per_percent:integer(b.tokens_per_percent,'容量换算',{min:100,max:1e7}),account.id);store.audit('account.update',account.id);pump();return json(res,200,{ok:true});}
+          if(method==='PATCH'&&!accountMatch[2]){
+            const b=await body(req),current=store.get('SELECT * FROM accounts WHERE id=? AND removed_at IS NULL',account.id);
+            if(!current)throw new AppError(404,'账号不存在或已移除');
+            const enabled=b.enabled===undefined?current.enabled:bool(b.enabled),budget=b.token_budget===undefined?current.token_budget:integer(b.token_budget,'本地预算',{nullable:true}),perPercent=b.tokens_per_percent===undefined?current.tokens_per_percent:integer(b.tokens_per_percent,'容量换算',{min:100,max:1e7});
+            const result=balancer.atomic(()=>{
+              const migration=b.enabled===false?balancer.disableAccount(account.id):{moved:0,resetTextSessions:0};
+              store.run('UPDATE accounts SET enabled=?,token_budget=?,tokens_per_percent=? WHERE id=?',enabled,budget,perPercent,account.id);store.audit('account.update',account.id);return migration;
+            });
+            // Queued jobs have not been dispatched; use the committed binding and reset CLI cursor.
+            for(const job of queue)if(job.session.account_id===account.id){const latest=store.get('SELECT * FROM sessions WHERE id=?',job.session.id);if(latest)job.session=latest;}
+            pump();return json(res,200,{ok:true,...result});
+          }
           if(method==='POST'&&accountMatch[2]==='quota'){await refreshQuota(account,true);return json(res,200,{ok:true});}
           if(method==='POST'&&accountMatch[2]==='check'){
             if(logins.has(account.id))throw new AppError(409,'账号正在登录，请完成登录后再检查');
@@ -534,7 +548,7 @@ export function createGateway(options={}) {
           });
           if(res.destroyed)return;
           const usage={prompt_tokens:result.input,completion_tokens:result.output,total_tokens:result.input+result.output,prompt_tokens_details:{cached_tokens:result.cached}};
-          const common={id:'chatcmpl-'+requestId,created:Math.floor(now()/1000),model:kind,session_id:session.id};res.setHeader('X-Harbor-Session',session.id);
+          const common={id:'chatcmpl-'+requestId,created:Math.floor(now()/1000),model:kind,session_id:session.id,...(result.contextReset?{context_reset:true}:{})};res.setHeader('X-Harbor-Session',session.id);
           if(b.stream){
             res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no'});
             res.write('data: '+JSON.stringify({...common,object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',content:result.text},finish_reason:null}]})+'\n\n');

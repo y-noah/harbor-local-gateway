@@ -2,14 +2,16 @@ const $=s=>document.querySelector(s), esc=v=>String(v??'').replace(/[&<>"']/g,c=
 const fmt=n=>Number(n||0).toLocaleString('zh-CN'),date=t=>t?new Date(t).toLocaleString('zh-CN',{hour12:false}):'—';
 const tokenBillions=n=>(Number(n||0)/1e8).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
 const beijingDate=t=>t?new Date(t).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—';
-let admin=false,authEpoch=0,state=null,tab='overview',testKey='',chat=[],chatSession='',chatModel='codex',draft='',chatOwner='',sending=false,requestFilter='',statusFilter='';
+let admin=false,authEpoch=0,state=null,tab='overview',testKey='',chat=[],chatSession='',chatModel='codex',draft='',chatOwner='',sending=false,requestFilter='';
+let requestsData=null,requestsLoading=false,requestsVersion=0,connectionView='test';
+let requestsFilters={member:'',model:'',status:'',page:1,pageSize:25};
 let sessionsPage=1,sessionsPageSize=25,sessionsLoading=false,refreshVersion=0;
 let recordView='usage',historyData=null,historyLoading=false,historyVersion=0,dialogVersion=0,requestDetailId='',requestDetailVersion=0;
 let historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};
 const phaseLabels={queued:'等待执行',credentials:'准备凭据',upstream:'连接上游 / 等待响应',streaming:'接收上游数据',cli:'官方 CLI 执行中',settling:'统计收尾',ok:'完成',failed:'失败',unknown:'结束 · 用量待核对',interrupted:'重启中断',cancelled:'已取消',rejected:'已拒绝'};
 const actionLabels={'session.route':'会话换绑','session.nightly':'会话自动调整设置','session.nightly.expired':'会话临时固定到期','session.nightly.deadline':'历史固定期限补全','session.enable':'恢复会话访问','session.disable':'禁止会话访问','balancing.settings':'负载均衡设置','balancing.weights':'手动调整权重','balancing.weights.auto':'系统更新权重','balancing.weights.expired':'手动权重到期','account.route_block':'账号路由受限','account.route_recover':'账号路由恢复','account.create':'添加账号','account.remove':'移除账号','account.update':'修改账号','account.login':'开始账号登录','account.login.success':'账号登录成功','account.login.failed':'账号登录失败','account.login.cancel':'取消账号登录','key.create':'创建 Key','key.remove':'删除 Key','key.update':'修改 Key','member.create':'创建员工','member.update':'修改员工','member.remove':'移除员工','backup.create':'创建数据库备份','request.settle':'核对请求用量'};
-const reasonLabels={manual:'手动操作',initialize:'首次初始化',nightly:'夜间调整',quota:'额度耗尽或恢复',recovery:'账号恢复',weight_zero:'原账号权重为0',quota_exhausted:'确认订阅额度耗尽',login_expired:'确认登录失效',disabled:'账号已停用',not_ready:'账号尚未就绪',zero_weight:'生效权重为0',eligible:'可参与新会话分配',quota_unavailable:'额度快照缺失、过期或已越过重置点',incomparable_quota:'额度窗口或套餐不可比较',unknown_fixed_load:'固定会话的历史负载不足以估计',unknown_workload:'缺少可用的历史用量样本',busy:'会话有请求执行中',protected:'受静默期、临时固定或其他保护条件限制',no_measured_work:'没有可计量的历史负载',session_disabled:'会话不可迁移',session_busy:'会话仍有请求执行中',nightly_plan_changed:'执行前条件发生变化，本组未迁移',planning_failed:'计划计算失败',cannot_fit:'会话负载无法放入其他账号的容差范围',infeasible:'不存在满足约束的完整迁移方案',search_limited:'计算预算不足，未确认可行方案'};
-const labels={overview:'运行总览',members:'员工与密钥',accounts:'订阅账号池',sessions:'会话绑定',requests:'使用记录',playground:'请求测试',guide:'接入说明'};
+const reasonLabels={account_disabled:'账号停用',manual:'手动操作',initialize:'首次初始化',nightly:'夜间调整',quota:'额度耗尽或恢复',recovery:'账号恢复',weight_zero:'原账号权重为0',quota_exhausted:'确认订阅额度耗尽',login_expired:'确认登录失效',disabled:'账号已停用',not_ready:'账号尚未就绪',zero_weight:'生效权重为0',eligible:'可参与新会话分配',quota_unavailable:'额度快照缺失、过期或已越过重置点',incomparable_quota:'额度窗口或套餐不可比较',unknown_fixed_load:'固定会话的历史负载不足以估计',unknown_workload:'缺少可用的历史用量样本',busy:'会话有请求执行中',protected:'受静默期、临时固定或其他保护条件限制',no_measured_work:'没有可计量的历史负载',session_disabled:'会话不可迁移',session_busy:'会话仍有请求执行中',nightly_plan_changed:'执行前条件发生变化，本组未迁移',planning_failed:'计划计算失败',cannot_fit:'会话负载无法放入其他账号的容差范围',infeasible:'不存在满足约束的完整迁移方案',search_limited:'计算预算不足，未确认可行方案'};
+const labels={overview:'运行总览',members:'员工与密钥',accounts:'订阅账号池',sessions:'会话绑定',requests:'使用记录',playground:'接入与测试'};
 sessionStorage.removeItem('harbor-admin');if(location.hash)history.replaceState(null,'',location.pathname);
 let toastTimer;function toast(message){$('#toast').textContent=message;$('#toast').classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.add('hidden'),5000);}
 async function api(path,method='GET',data,credential=''){
@@ -55,12 +57,12 @@ function routingCard(a){
 async function refresh(renderPage=true){
   if(!admin)return;const epoch=authEpoch,version=++refreshVersion;
   const query=sessionsPage===1&&sessionsPageSize===25?'':`?session_page=${sessionsPage}&session_page_size=${sessionsPageSize}`;
-  try{const next=await api('/api/admin/state'+query);if(!admin||epoch!==authEpoch||version!==refreshVersion)return;if(tab==='sessions'&&$('#modal').open)return;state=next;sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=next.sessionsPagination?.pageSize??sessionsPageSize;sessionsLoading=false;$('#connection').textContent='● 服务在线';if(renderPage)render();}
+  try{const next=await api('/api/admin/state'+query);if(!admin||epoch!==authEpoch||version!==refreshVersion)return;if(tab==='sessions'&&$('#modal').open)return;state=next;sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=next.sessionsPagination?.pageSize??sessionsPageSize;sessionsLoading=false;$('#connection').textContent='● 服务在线';if(renderPage)render();if(tab==='requests'&&recordView==='requests'&&!requestsLoading&&!$('#modal').open)await loadRequests();}
   catch(e){if(!admin||epoch!==authEpoch||version!==refreshVersion)return;sessionsLoading=false;sessionsPage=state?.sessionsPagination?.page??1;sessionsPageSize=state?.sessionsPagination?.pageSize??25;$('#connection').textContent='连接异常';if(!state){showLogin();}else if(renderPage)render();toast(e.message);}
 }
-function showLogin(){historyVersion++;historyData=null;historyLoading=false;recordView='usage';historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};if($('#modal').open)close();sessionsPage=1;sessionsPageSize=25;sessionsLoading=false;testKey='';chat=[];chatSession='';chatOwner='';draft='';$('#modal-content').innerHTML='';$('#content').innerHTML='';$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}
+function showLogin(){requestsVersion++;requestsData=null;requestsLoading=false;requestsFilters={member:'',model:'',status:'',page:1,pageSize:25};connectionView='test';historyVersion++;historyData=null;historyLoading=false;recordView='usage';historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};if($('#modal').open)close();sessionsPage=1;sessionsPageSize=25;sessionsLoading=false;testKey='';chat=[];chatSession='';chatOwner='';draft='';$('#modal-content').innerHTML='';$('#content').innerHTML='';$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}
 function showShell(){$('#login').classList.add('hidden');$('#shell').classList.remove('hidden');}
-function setTab(next){if(sending)return toast('请等待当前请求完成后再切换页面');if(!admin&&next!=='playground'){toast('请先进入管理后台');return;}tab=next;render();}
+function setTab(next){if(sending)return toast('请等待当前请求完成后再切换页面');if(next==='guide'){next='playground';if(admin)connectionView='guide';}if(!admin&&next!=='playground'){toast('请先进入管理后台');return;}if(!admin)connectionView='test';requestsVersion++;requestsLoading=false;tab=next;render();if(tab==='requests'&&recordView==='requests')void loadRequests();}
 function memberTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>员工 / Key及有效期</th><th>近7天来源 IP</th><th>最近使用</th><th>状态</th><th>管理</th></tr></thead><tbody>${rows.map(m=>`<tr><td class="member-identity"><div class="member-cell"><span class="avatar">${esc(m.name.slice(0,1))}</span><strong>${esc(m.name)}</strong></div><div class="member-keys">${(state.keys||[]).filter(k=>k.member_id===m.id).map(k=>`<div class="member-key"><div class="mono">${keyDisplay(k)}</div><small>${k.expires?'到期：'+beijingDate(k.expires)+'（北京时间）':'永久有效'} · ${!k.enabled?'已停用':!m.enabled?'员工已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</small></div>`).join('')||'<small>暂无 Key</small>'}</div></td><td>${button('ips',fmt(m.ips)+' 个 IP','table-button',m.id)}</td><td>${date(m.last_seen)}</td><td>${m.enabled?'<span class="badge">启用</span>':'<span class="badge off">已停用</span>'}</td><td>${button('member-detail','管理','table-button',m.id)}</td></tr>`).join('')}</tbody></table></div>`:empty('还没有员工。创建第一个 Key，开始使用。');}
 function requestTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>时间 / 员工</th><th>账号 / 模型</th><th>输入 / 输出（亿 Token）</th><th>来源 IP</th><th>总耗时 / 当前阶段</th><th>状态 / 详情</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${date(r.started)}<small>${esc(r.member_name)}</small></td><td>${esc(r.account_name||'—')}<small>${esc(r.model)}</small></td><td>${tokenBillions(r.input)} / ${tokenBillions(r.output)}<small>其中缓存 ${tokenBillions(r.cached)}</small></td><td class="mono">${esc(r.ip)}</td><td>${((Math.max(0,(r.ended||Date.now())-r.started))/1000).toFixed(1)}s<small>${esc(phaseLabels[r.phase]||'旧记录未记录阶段')}${!r.ended&&r.phase_at?' · '+(Math.max(0,Date.now()-r.phase_at)/1000).toFixed(1)+'s':''}</small></td><td>${button('request-detail',badge(r.status),'table-button',r.id)}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无请求记录。测试一次请求后，数据会显示在这里。');}
 function usageRows(){return (state.keys||[]).map(k=>({...k,member_name:state.members.find(m=>m.id===k.member_id)?.name||'已移除员工',member_enabled:state.members.find(m=>m.id===k.member_id)?.enabled}));}
@@ -73,6 +75,35 @@ async function copyKey(value){
 function recentUsageTitle(){return '最近用量 <button type="button" class="usage-help table-button" data-action="usage-help" aria-label="最近用量说明" title="查看统计口径与漏计说明">?</button>';}
 function usageTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>员工</th><th>Key</th><th>近7天 Token（亿）</th><th>近12小时 Token（亿）</th><th>状态</th></tr></thead><tbody>${rows.map(k=>`<tr><td>${esc(k.member_name)}</td><td class="mono key-cell">${keyDisplay(k)}</td><td>${tokenBillions(k.used)}</td><td>${tokenBillions(k.used_12h)}</td><td>${!k.enabled||!k.member_enabled?'已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无 Key 用量。');}
 function recordTabs(){return `<div class="actions record-tabs" aria-label="使用记录分类">${[['usage','Key 用量'],['requests','请求明细'],['history','操作历史']].map(([id,label])=>button('record-view',label,recordView===id?'primary':'secondary',id)).join('')}</div>`;}
+async function loadRequests(){
+  if(!admin||tab!=='requests'||recordView!=='requests')return;
+  const epoch=authEpoch,version=++requestsVersion,filters={...requestsFilters};requestsLoading=true;render();
+  const query=new URLSearchParams({page:String(filters.page),page_size:String(filters.pageSize)});
+  for(const field of ['member','model','status'])if(filters[field])query.set(field,filters[field]);
+  try{
+    const data=await api('/api/admin/requests?'+query);
+    if(!admin||epoch!==authEpoch||version!==requestsVersion||tab!=='requests'||recordView!=='requests')return;
+    requestsData=data;requestsFilters.page=data.pagination.page;requestsLoading=false;render();
+  }catch(e){if(admin&&epoch===authEpoch&&version===requestsVersion){requestsLoading=false;requestsData=null;render();toast(e.message);}}
+}
+function requestsSection(){
+  const data=requestsData,f=requestsFilters;
+  const select=(field,label,rows)=>`<label>${label}<select id="requests-${field}" aria-label="${label}"><option value="">全部</option>${rows.map(([value,text])=>`<option value="${esc(value)}" ${f[field]===value?'selected':''}>${esc(text)}</option>`).join('')}</select></label>`;
+  const filters=`<div class="history-filters request-filters">${select('member','用户',(data?.members||[]).map(x=>[x.id,x.name+(x.removed_at?'（已移除）':'')]))}${select('model','模型',(data?.models||[]).map(x=>[x,x]))}${select('status','状态',['running','queued','ok','failed','unknown','interrupted','cancelled','rejected','reconciled'].map(x=>[x,phaseLabels[x]||({running:'执行中',reconciled:'已核对'})[x]||x]))}</div>`;
+  if(requestsLoading)return panel('近7天请求明细',`<div class="panel-body">${filters}</div>${empty('正在读取筛选结果…')}`);
+  if(!data)return panel('近7天请求明细',`<div class="panel-body">${filters}</div>${empty('暂无请求数据。')}`,button('requests-reload','重新读取','text-button'));
+  const t=data.summary,p=data.pagination;
+  const summary=`<div class="stats request-stats">${[['请求 / 成功',fmt(t.requests)+' / '+fmt(t.success),'处理中 '+fmt(t.active)],['总 Token（亿）',tokenBillions(t.input+t.output),'缓存已包含在输入中'],['未计量请求',fmt(t.unmetered),'不估算缺失用量'],['完成平均耗时',(t.average_ms/1000).toFixed(1)+'s','仅统计已结束请求']].map(([label,value,hint])=>`<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value}</div><small>${hint}</small></div>`).join('')}</div>`;
+  const grouped=(title,rows,name)=>panel(title,rows.length?`<div class="table-wrap"><table><thead><tr><th>${name==='model'?'模型':'用户'}</th><th>请求 / 成功</th><th>输入 / 输出（亿 Token）</th><th>缓存（亿 Token）</th><th>未计量</th></tr></thead><tbody>${rows.map(x=>`<tr><td>${esc(x[name]||'未记录')}</td><td>${fmt(x.requests)} / ${fmt(x.success)}</td><td>${tokenBillions(x.input)} / ${tokenBillions(x.output)}</td><td>${tokenBillions(x.cached)}</td><td>${fmt(x.unmetered)}</td></tr>`).join('')}</tbody></table></div>`:empty('当前筛选无数据。'));
+  const pager=`<div class="session-pager"><span>第 ${p.page} / ${p.totalPages} 页 · 共 ${fmt(p.total)} 条</span><label>每页<select id="requests-page-size">${[25,50,100].map(n=>`<option value="${n}" ${p.pageSize===n?'selected':''}>${n}</option>`).join('')}</select>条</label><div class="actions">${button('requests-page','上一页','secondary',p.page-1,p.page<=1)}${button('requests-page','下一页','secondary',p.page+1,p.page>=p.totalPages)}</div></div>`;
+  return panel('近7天请求明细',`<div class="panel-body">${filters}<p class="hint">北京时间今天及前6天，按完成时间归属；进行中按开始时间。下方统计覆盖全部筛选结果，分页仅影响明细。</p></div>`+summary+requestTable(data.rows)+pager,button('requests-reload','刷新请求','text-button'))+`<div class="two-col">${grouped('按模型统计',data.byModel,'model')}${grouped('按用户统计',data.byMember,'member_name')}</div>`;
+}
+function bindRequestFilters(){
+  if(tab!=='requests'||recordView!=='requests')return;
+  for(const field of ['member','model','status'])$(`#requests-${field}`).onchange=e=>{requestsFilters[field]=e.target.value;requestsFilters.page=1;void loadRequests();};
+  if($('#requests-page-size'))$('#requests-page-size').onchange=e=>{requestsFilters.pageSize=Number(e.target.value);requestsFilters.page=1;void loadRequests();};
+}
+function connectionTabs(){return `<div class="actions record-tabs" aria-label="接入与测试分类">${[['guide','接入说明'],['test','请求测试']].map(([value,label])=>button('connection-view',label,connectionView===value?'primary':'secondary',value,sending)).join('')}</div>`;}
 function historyName(id){return historyData?.accounts?.find(a=>a.id===id)?.name||state?.accounts?.find(a=>a.id===id)?.name||id||'—';}
 function weightsText(weights){return weights?Object.entries(weights).map(([id,n])=>historyName(id)+' '+weightPercent(n)).join('；')||'自动模式':'此前值未记录';}
 function historyText(r){
@@ -140,7 +171,8 @@ function sessionPager(){
 function render(){
   if(!admin&&tab!=='playground'){showLogin();return;}
   showShell();document.querySelectorAll('[data-tab]').forEach(el=>el.classList.toggle('active',el.dataset.tab===tab));$('#crumb').textContent=labels[tab];
-  if(!state&&tab!=='playground'){$('#content').innerHTML=empty('正在读取工作空间…');return;}
+  const showGuide=tab==='playground'&&admin&&connectionView==='guide';
+  if(!state&&(tab!=='playground'||showGuide)){$('#content').innerHTML=empty('正在读取工作空间…');return;}
   let html='';
   if(tab==='overview'){
     const total=state.totals,active=state.accounts.filter(a=>a.enabled&&a.state==='ready').length;
@@ -157,13 +189,13 @@ function render(){
     const rows=usageRows().filter(k=>!requestFilter||k.member_name.includes(requestFilter)||(k.full_key||k.prefix).includes(requestFilter));
     html=heading('CUMULATIVE USAGE','使用记录','查看用量、请求阶段与操作历史；不记录对话正文。')+recordTabs();
     if(recordView==='usage')html+=`<div class="toolbar"><input id="request-filter" placeholder="搜索员工或 Key" value="${esc(requestFilter)}" aria-label="搜索员工或 Key"></div>`+panel(recentUsageTitle(),usageTable(rows));
-    if(recordView==='requests')html+=panel('近7天最近200条请求',requestTable((state.requests||[]).filter(r=>!statusFilter||r.status===statusFilter)),`<label class="inline-filter">状态<select id="request-status-filter"><option value="">全部状态</option>${['running','queued','ok','failed','unknown','interrupted','cancelled','rejected','reconciled'].map(s=>`<option value="${s}" ${statusFilter===s?'selected':''}>${esc(phaseLabels[s]||({running:'执行中',reconciled:'已核对'})[s]||s)}</option>`).join('')}</select></label>`);
+    if(recordView==='requests')html+=requestsSection();
     if(recordView==='history')html+=historySection();
   }
-  if(tab==='playground'){
-    html=heading('PLAYGROUND','发送第一条请求','用员工 Key 验证鉴权、订阅调用与额度统计。')+`<div class="chat-layout"><section class="panel"><div class="chat-controls"><h2>连接设置</h2><label>员工 API Key<input id="test-key" type="password" autocomplete="off" placeholder="hg_…" value="${esc(testKey)}" ${sending?'disabled':''}></label><button class="secondary" id="check-key">查看近7天用量</button><div id="my-quota" class="details-line"></div><label>模型<select id="chat-model" ${sending?'disabled':''}><option value="codex" ${chatModel==='codex'?'selected':''}>Codex</option><option value="claude" ${chatModel==='claude'?'selected':''}>Claude</option></select></label><p class="hint">同一对话持续使用同一个上游 session。新会话才重新分配账号。</p><div class="notice">纯文本模式<br>不执行代码或访问工作文件。</div>${button('clear-chat','＋ 新建会话','text-button')}<p class="hint mono">${chatSession?esc(chatSession):'尚未创建会话'}</p><p class="hint">页面刷新会清空显示。上游上下文保存在本机独立 Codex 会话目录，可通过 session_id 继续。</p></div></section><section class="panel"><div class="panel-heading"><h2>对话测试</h2><span class="hint">${chatSession?'会话已绑定':'新会话'}</span></div><div class="chat-log" id="chat-log">${renderChat()}</div><form class="composer" id="chat-form"><textarea id="prompt" placeholder="例如：用一句话解释什么是 API 网关" aria-label="消息" required ${sending?'disabled':''}>${esc(draft)}</textarea><div class="composer-bottom"><span class="hint">${sending?'正在等待回复，最长约 2 分钟…':'每次请求会消耗真实订阅额度'}</span><button class="primary" ${sending?'disabled':''}>${sending?'处理中…':'发送请求 ↗'}</button></div></form></section></div>`;
+  if(tab==='playground'&&!showGuide){
+    html=heading('CONNECTION & TEST','接入与测试','用员工 Key 验证鉴权、订阅调用与额度统计。')+(admin?connectionTabs():'')+`<div class="chat-layout"><section class="panel"><div class="chat-controls"><h2>连接设置</h2><label>员工 API Key<input id="test-key" type="password" autocomplete="off" placeholder="hg_…" value="${esc(testKey)}" ${sending?'disabled':''}></label><button class="secondary" id="check-key">查看近7天用量</button><div id="my-quota" class="details-line"></div><label>模型<select id="chat-model" ${sending?'disabled':''}><option value="codex" ${chatModel==='codex'?'selected':''}>Codex</option><option value="claude" ${chatModel==='claude'?'selected':''}>Claude</option></select></label><p class="hint">同一对话持续使用同一个上游 session。新会话才重新分配账号。</p><div class="notice">纯文本模式<br>不执行代码或访问工作文件。</div>${button('clear-chat','＋ 新建会话','text-button')}<p class="hint mono">${chatSession?esc(chatSession):'尚未创建会话'}</p><p class="hint">页面刷新会清空显示。上游上下文保存在本机独立 Codex 会话目录，可通过 session_id 继续。</p></div></section><section class="panel"><div class="panel-heading"><h2>对话测试</h2><span class="hint">${chatSession?'会话已绑定':'新会话'}</span></div><div class="chat-log" id="chat-log">${renderChat()}</div><form class="composer" id="chat-form"><textarea id="prompt" placeholder="例如：用一句话解释什么是 API 网关" aria-label="消息" required ${sending?'disabled':''}>${esc(draft)}</textarea><div class="composer-bottom"><span class="hint">${sending?'正在等待回复，最长约 2 分钟…':'每次请求会消耗真实订阅额度'}</span><button class="primary" ${sending?'disabled':''}>${sending?'处理中…':'发送请求 ↗'}</button></div></form></section></div>`;
   }
-  if(tab==='guide')html=heading('CONNECTION GUIDE','简单接入，随时掌握。','使用员工 Key 从 Windows、WSL 或其他机器连接网关。')+`<div class="guide-grid">${panel('纯文本聊天配置',`<div class="panel-body"><label>Base URL</label><div class="code">${esc(state.endpoint)}</div><label>API Key</label><div class="code">员工 Key（hg_ 开头）</div><label>模型</label><div class="code">codex</div><p class="hint">此处是网页聊天使用的旧文本接口。Codex Windows / WSL 使用下方 Responses 配置，支持增量流和客户端工具调用。</p></div>`)}${panel('运行与数据',`<div class="panel-body"><ul class="guide-list"><li>客户端使用本页 Base URL 连接；订阅登录保存在网关服务器。</li><li>每账号并发 1，同员工并发 1，最多排队 5 个请求。</li><li>到期、停用或额度耗尽的 Key 会被拒绝。</li><li>来源 IP 使用实际连接地址，不信任客户端伪造的转发头。</li><li>异常用量未知时保留预占额度，管理员核对后释放。</li><li>SQLite 保存统计；官方凭证在独立 runtime 目录中。</li></ul>${button('backup','创建数据库备份','secondary')}</div>`)}</div>`+panel('请求示例',`<div class="panel-body"><pre class="code">POST /v1/chat/completions
+  if(showGuide)html=heading('CONNECTION & TEST','接入与测试','使用员工 Key 从 Windows、WSL 或其他机器连接网关。')+connectionTabs()+`<div class="guide-grid">${panel('纯文本聊天配置',`<div class="panel-body"><label>Base URL</label><div class="code">${esc(state.endpoint)}</div><label>API Key</label><div class="code">员工 Key（hg_ 开头）</div><label>模型</label><div class="code">codex</div><p class="hint">此处是网页聊天使用的旧文本接口。Codex Windows / WSL 使用下方 Responses 配置，支持增量流和客户端工具调用。</p></div>`)}${panel('运行与数据',`<div class="panel-body"><ul class="guide-list"><li>客户端使用本页 Base URL 连接；订阅登录保存在网关服务器。</li><li>每账号并发 1，同员工并发 1，最多排队 5 个请求。</li><li>到期、停用或额度耗尽的 Key 会被拒绝。</li><li>来源 IP 使用实际连接地址，不信任客户端伪造的转发头。</li><li>异常用量未知时保留预占额度，管理员核对后释放。</li><li>SQLite 保存统计；官方凭证在独立 runtime 目录中。</li></ul>${button('backup','创建数据库备份','secondary')}</div>`)}</div>`+panel('请求示例',`<div class="panel-body"><pre class="code">POST /v1/chat/completions
 Authorization: Bearer hg_你的员工Key
 Content-Type: application/json
 
@@ -172,12 +204,12 @@ Content-Type: application/json
   "messages": [{"role": "user", "content": "你好"}],
   "stream": false
 }</pre><p class="hint">Token 总量 = 输入 + 输出；缓存 Token 已包含在输入中。不支持 max_tokens 硬上限，也不把本地 Token 配额换算成订阅剩余额度。</p></div>`);
-  if(tab==='guide')html+=panel('保持同一个会话',`<div class="panel-body"><p class="hint">第一条请求返回 session_id。后续请求带上该值，只发送本轮新消息；不提供 session_id 就会创建新会话、重新选择账号。</p><pre class="code">{
+  if(showGuide)html+=panel('保持同一个会话',`<div class="panel-body"><p class="hint">第一条请求返回 session_id。后续请求带上该值，只发送本轮新消息；不提供 session_id 就会创建新会话、重新选择账号。</p><pre class="code">{
   "model": "codex",
   "session_id": "上一条响应中的会话ID",
   "messages": [{"role": "user", "content": "继续上一个问题"}]
 }</pre><p class="hint">也可使用 X-Harbor-Session 请求头。完整历史会校验后去重；不同员工无法访问同一个会话。账号不足时暂停，不自动切换。上游会话正文保存在独立 Codex 目录，平台统计库只保存映射与摘要。</p></div>`);
-  if(tab==='guide')html+=panel('Codex Windows / WSL 接入',`<div class="panel-body"><p>Windows：%USERPROFILE%&#92;.codex&#92;config.toml；WSL：~/.codex/config.toml。合并以下配置，顶层键放在第一个表头之前，不覆盖已有配置。</p><pre class="code">model = "gpt-6.1-sol"
+  if(showGuide)html+=panel('Codex Windows / WSL 接入',`<div class="panel-body"><p>Windows：%USERPROFILE%&#92;.codex&#92;config.toml；WSL：~/.codex/config.toml。合并以下配置，顶层键放在第一个表头之前，不覆盖已有配置。</p><pre class="code">model = "gpt-6.1-sol"
 model_provider = "harbor"
 web_search = "disabled"
 
@@ -195,10 +227,10 @@ memories = false
 [memories]
 generate_memories = false
 use_memories = false</pre><p>将员工 Key 放入客户端进程的 HARBOR_API_KEY 环境变量，然后完全退出并重启客户端。Windows 桌面应用必须能读取该变量；WSL需单独设置。不要把Key写进TOML或工程。</p><p>默认使用 gpt-6.1-sol，可在 Codex 中切换；模型名使用 GET /v1/models 返回的实际名称，推理强度按客户端选择转发。为让模型选择器显示最新模型，请带员工Key从 /v1/codex/models 下载目录，设置顶层 model_catalog_json 为文件的绝对路径并重启客户端；模型更新后重新下载。</p><p>网页版聊天和记忆不接入。文件读写和命令在客户端执行，平台只转发订阅请求。使用 HTTP 完整历史续聊；同一个 Key、同一个订阅账号均支持多会话并行；只累计已获取用量，不预占、不按本地额度拦截。中断后可在原任务继续。</p></div>`);
-  if(tab==='guide')html+=panel('image2 图片生成与编辑（测试接入）',imageGuide(state.endpoint));
+  if(showGuide)html+=panel('image2 图片生成与编辑（测试接入）',imageGuide(state.endpoint));
   $('#content').innerHTML=html;document.querySelectorAll('[data-height]').forEach(el=>el.style.height=el.dataset.height+'px');document.querySelectorAll('[data-width]').forEach(el=>el.style.width=el.dataset.width+'%');
-  bindHistoryForm();if(tab==='requests'&&recordView==='requests')$('#request-status-filter').onchange=e=>{statusFilter=e.target.value;render();};
-  if(tab==='playground'){$('#chat-form').onsubmit=sendChat;$('#check-key').onclick=checkKey;$('#test-key').oninput=e=>{testKey=e.target.value;$('#my-quota').textContent='';};$('#prompt').oninput=e=>draft=e.target.value;$('#chat-model').onchange=e=>{if(sending)return;chatModel=e.target.value;chat=[];chatSession='';chatOwner='';render();};$('#chat-log').scrollTop=$('#chat-log').scrollHeight;}
+  bindHistoryForm();bindRequestFilters();
+  if(tab==='playground'&&!showGuide){$('#chat-form').onsubmit=sendChat;$('#check-key').onclick=checkKey;$('#test-key').oninput=e=>{testKey=e.target.value;$('#my-quota').textContent='';};$('#prompt').oninput=e=>draft=e.target.value;$('#chat-model').onchange=e=>{if(sending)return;chatModel=e.target.value;chat=[];chatSession='';chatOwner='';render();};$('#chat-log').scrollTop=$('#chat-log').scrollHeight;}
   if(tab==='sessions'){$('#session-page-size').onchange=async e=>{if(sessionsLoading)return;sessionsPageSize=Number(e.target.value);sessionsPage=1;sessionsLoading=true;render();await refresh();};}
   if(tab==='requests'&&recordView==='usage'){$('#request-filter').onchange=e=>{requestFilter=e.target.value;render();};}
 }
@@ -275,7 +307,7 @@ async function sendChat(e){
     chatOwner=member.id;chat.push({role:'user',content});appended=true;draft='';if(tab==='playground')render();
     const r=await api('/v1/chat/completions','POST',{model:chatModel,messages:chatSession?[chat.at(-1)]:chat,stream:false,...(chatSession?{session_id:chatSession}:{})},testKey);
     if(epoch!==authEpoch)return;
-    chatSession=r.session_id;chat.push({role:'assistant',content:r.choices[0].message.content});toast('完成 · '+tokenBillions(r.usage.total_tokens)+' 亿 Token');
+    if(r.context_reset)chat=[{role:'user',content}];chatSession=r.session_id;chat.push({role:'assistant',content:r.choices[0].message.content});toast((r.context_reset?'测试上下文已重置 · ':'完成 · ')+tokenBillions(r.usage.total_tokens)+' 亿 Token');
   }catch(err){if(epoch===authEpoch){if(appended)chat.pop();draft=content;toast(err.message+'；输入已保留');}}
   finally{sending=false;if(admin&&epoch===authEpoch)await refresh(false);if(tab==='playground'&&epoch===authEpoch)render();}
 }
@@ -284,7 +316,10 @@ document.addEventListener('click',async e=>{
   const nav=e.target.closest('[data-tab]');if(nav)return setTab(nav.dataset.tab);
   const el=e.target.closest('[data-action]');if(!el)return;const action=el.dataset.action,identifier=el.dataset.id;
   try{
-    if(action==='record-view'){if(!['usage','requests','history'].includes(identifier))return;recordView=identifier;historyVersion++;historyLoading=false;render();if(identifier==='history')return await loadHistory();return;}
+    if(action==='connection-view'){if(sending)return toast('请等待当前请求完成');if(!admin||!['guide','test'].includes(identifier))return;connectionView=identifier;render();return;}
+    if(action==='requests-reload')return await loadRequests();
+    if(action==='requests-page'){if(requestsLoading||!requestsData)return;const page=Number(identifier);if(!Number.isInteger(page)||page<1||page>requestsData.pagination.totalPages)return;requestsFilters.page=page;return await loadRequests();}
+    if(action==='record-view'){if(!['usage','requests','history'].includes(identifier))return;recordView=identifier;historyVersion++;historyLoading=false;requestsVersion++;requestsLoading=false;render();if(identifier==='history')return await loadHistory();if(identifier==='requests')return await loadRequests();return;}
     if(action==='history-reload')return await loadHistory();
     if(action==='history-reset'){historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};historyData=null;return await loadHistory();}
     if(action==='history-page'){if(historyLoading)return;historyFilters.page=Number(identifier);return await loadHistory();}
@@ -305,7 +340,7 @@ document.addEventListener('click',async e=>{
     if(action==='renew-key'){close();return formModal('Key 有效期','更改有效期不会重置近7天用量。',`<label>有效期<select name="days"><option value="keep">保持当前到期时间</option><option value="7">从现在起 7 天</option><option value="30">从现在起 30 天</option><option value="90">从现在起 90 天</option><option value="0">永久</option></select></label>`,async f=>{await api('/api/admin/keys/'+identifier,'PATCH',f.get('days')==='keep'?{}:{expires:expiresFrom(f)});close();await refresh();toast('Key 已更新');});}
     if(action==='copy-key'){const key=state.keys.find(k=>k.id===identifier);if(key?.full_key){await copyKey(key.full_key);toast('已复制 Key');}return;}
     if(action==='copy-secret'){await copyKey($('#new-secret').textContent);return toast('已复制 Key');}
-    if(action==='use-secret'){testKey=$('#new-secret').textContent;close();setTab('playground');return;}
+    if(action==='use-secret'){testKey=$('#new-secret').textContent;close();connectionView='test';setTab('playground');return;}
     if(action==='ips'||action==='key-ips'){const key=action==='key-ips'?state.keys.find(k=>k.id===identifier):null;const rows=await api('/api/admin/ips?member='+(key?key.member_id:identifier)+(key?'&key='+key.id:''));close();return modal(`<h2>${key?'此 Key 的':'员工全部 Key 的'}来源 IP</h2><p class="hint">IP 数量不等于设备数。本机测试通常显示 127.0.0.1。</p>${rows.length?rows.map(r=>`<div class="mini-row"><div><strong class="mono">${esc(r.ip)}</strong><small>首次 ${date(r.first_seen)}<br>最近 ${date(r.last_seen)}<br>${esc(r.agent)}</small></div><span>${r.requests} 次</span></div>`).join(''):empty('暂无记录')}<div class="dialog-actions">${button('close','关闭','primary')}</div>`);}
     if(action==='routing-weights'){
       const w=state.balancing?.weights;
@@ -348,7 +383,8 @@ document.addEventListener('click',async e=>{
     if(action==='create-account')return formModal('添加订阅账号','创建独立登录目录后，可使用官方登录。重新登录会结束该账号已有会话绑定，后续须新建会话。','<label>账号类型<select name="kind"><option value="codex">Codex 订阅</option><option value="claude">Claude 订阅（待真实验证）</option></select></label><label>账号名称<input name="name" required maxlength="60" placeholder="例如：测试账号 02"></label>',async f=>{await api('/api/admin/accounts','POST',{name:f.get('name'),kind:f.get('kind')});close();await refresh();toast('账号已创建，请完成官方登录');});
     if(action==='refresh-quotas'){el.disabled=true;await api('/api/admin/quotas/refresh','POST',{});await refresh();return toast(state.accounts.some(a=>a.enabled&&a.quota_error)?'部分账号额度未能刷新，已保留上次结果':'官方额度已更新');}
     if(action==='budget-account'){const a=state.accounts.find(x=>x.id===identifier);return formModal('本地 Token 预算','这是手动估算预算，不是官方订阅额度。已用 '+fmt(a.budget_used)+' Token；预算留空表示不设置本地上限。',`<label>总预算（Token）<input name="quota" type="number" min="0" step="1" value="${a.token_budget??''}" placeholder="留空"></label>${a.kind!=='claude'?`<label>每 1% 额度的预计 Token 容量<input name="capacity" type="number" min="100" max="10000000" step="1" value="${Math.round(a.tokens_per_percent||10000)}"></label><small>仅用于预测排序；会随官方额度变化校准，不是官方余额。</small>`:''}`,async f=>{await api('/api/admin/accounts/'+identifier,'PATCH',{token_budget:quotaValue(f),...(a.kind!=='claude'?{tokens_per_percent:Number(f.get('capacity'))}:{})});close();await refresh();toast('预算已保存');});}
-    if(action==='toggle-account'){const a=state.accounts.find(x=>x.id===identifier);await api('/api/admin/accounts/'+identifier,'PATCH',{enabled:!a.enabled});await refresh();return;}
+    if(action==='toggle-account'){const a=state.accounts.find(x=>x.id===identifier);if(!a)return;if(a.enabled)return modal(`<h2>停用 ${esc(a.name)}？</h2><p>立即迁移全部绑定会话，正在执行的请求按原账号完成，后续请求使用新绑定。网页测试聊天清空旧上下文，Codex客户端继续使用自己的历史。</p><p class="hint">停用不会在凌晨自动恢复，须手动启用。仅临时设置权重为0才会在北京时间02:00恢复自动；无可用接收账号时整笔操作拒绝。</p><div class="dialog-actions">${button('close','取消','secondary')}${button('confirm-disable-account','确认停用并迁移','primary',identifier)}</div>`);await api('/api/admin/accounts/'+identifier,'PATCH',{enabled:true});await refresh();return;}
+    if(action==='confirm-disable-account'){el.disabled=true;try{const r=await api('/api/admin/accounts/'+identifier,'PATCH',{enabled:false});close();await refresh();toast(`账号已停用，迁移 ${r.moved} 个会话${r.resetTextSessions?'，其中 '+r.resetTextSessions+' 个测试会话已清空旧上下文':''}`);}finally{el.disabled=false;}return;}
     if(action==='login-account'){el.disabled=true;return await loginAccountFlow(identifier);}
     if(action==='cancel-login'){el.disabled=true;await api('/api/admin/accounts/'+identifier+'/login/cancel','POST',{});close();await refresh();return toast('登录已取消，可重新登录');}
     if(action==='check-account'){el.disabled=true;const r=await api('/api/admin/accounts/'+identifier+'/check','POST',{});await refresh();return toast(r.ready?'已检测到订阅登录':'未检测到订阅登录');}
@@ -362,7 +398,7 @@ document.addEventListener('click',async e=>{
   }catch(err){toast(err.message);}finally{el.disabled=false;}
 });
 $('#login-form').onsubmit=async e=>{e.preventDefault();const submit=e.submitter;submit.disabled=true;try{await api('/api/auth/login','POST',{password:$('#admin-input').value});authEpoch++;admin=true;$('#admin-input').value='';await refresh();}catch(err){toast(err.message);}finally{submit.disabled=false;}};
-$('#employee-entry').onclick=()=>{tab='playground';render();};$('#refresh').onclick=()=>refresh();$('#logout').onclick=async()=>{if(sending)return toast('请等待当前请求完成后退出');try{await api('/api/auth/logout','POST',{});authEpoch++;admin=false;state=null;testKey='';chat=[];chatSession='';chatOwner='';draft='';showLogin();}catch(err){toast(err.message);}};
+$('#employee-entry').onclick=()=>{connectionView='test';tab='playground';render();};$('#refresh').onclick=()=>refresh();$('#logout').onclick=async()=>{if(sending)return toast('请等待当前请求完成后退出');try{await api('/api/auth/logout','POST',{});authEpoch++;admin=false;state=null;testKey='';chat=[];chatSession='';chatOwner='';draft='';showLogin();}catch(err){toast(err.message);}};
 setInterval(()=>{if(admin&&!sessionsLoading&&tab!=='playground'&&!$('#modal').open&&!document.hidden&&!['INPUT','SELECT'].includes(document.activeElement.tagName)){refresh();if(tab==='requests'&&recordView==='history'&&!historyLoading)loadHistory().catch(e=>toast(e.message));}},12000);
 setInterval(()=>{if(admin&&requestDetailId&&$('#modal').open&&!document.hidden)requestDetail(requestDetailId,false).catch(e=>toast(e.message));},4000);
 const initialAuthEpoch=authEpoch;api('/api/auth/session').then(r=>{if(initialAuthEpoch!==authEpoch)return;admin=r.authenticated;if(admin)refresh();else showLogin();}).catch(()=>{if(initialAuthEpoch===authEpoch)showLogin();});
