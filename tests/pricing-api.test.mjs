@@ -53,14 +53,15 @@ test('closing the gateway aborts an in-flight price source read without waiting 
  const closing=a.close().then(()=>completed=true);await until(()=>aborted);await until(()=>completed);await closing;await pending;assert.equal(aborted,true);
 });
 
-test('reconciling expired history releases its reservation without retaining an out-of-window reference amount',async t=>{
+test('archived requests stay intact and cannot be read or reconciled through admin endpoints',async t=>{
  const a=await setup(t),m=a.store.createMember('Fixture',null,null),id=a.store.observe(a.store.authenticate(m.secret),'synthetic','fixture','unknown');a.store.finish(id,{usageKnown:false,status:'unknown'});
  a.store.run('UPDATE requests SET ended=?,started=?,reserved=100 WHERE id=?',Date.now()-8*86400000,Date.now()-8*86400000,id);
- a.store.prunedStart=null;a.store.pruneUsage();
- assert.equal((await a.call('/api/admin/requests/'+id+'/settle','POST',{standard_usd:'1.25'})).status,200);
- const row=a.store.get('SELECT * FROM requests WHERE id=?',id);assert.equal(row.reserved,0);assert.equal(row.manual_cost_atoms,null);
- assert.equal((await a.call('/api/admin/requests/'+id)).body.standard.state,'expired');assert.equal(a.store.snapshot().totals.standard.total,0);assert.equal((await a.call('/api/admin/requests/'+id+'/settle','POST',{standard_usd:'1.25'})).status,409);
+ a.store.pruneUsage();const before=a.store.get('SELECT * FROM requests WHERE id=?',id);
+ assert.equal((await a.call('/api/admin/requests/'+id+'/settle','POST',{standard_usd:'1.25'})).status,404);
+ assert.deepEqual(a.store.get('SELECT * FROM requests WHERE id=?',id),before);assert.equal(before.usage_unknown,1);assert.equal(before.reserved,100);
+ assert.equal((await a.call('/api/admin/requests/'+id)).status,404);assert.equal(a.store.snapshot().totals.standard.total,0);
 });
+
 test('legacy manual-token records can be reconciled once in USD without rewriting their compatibility counts',async t=>{
  const a=await setup(t),m=a.store.createMember('Fixture',null,null),id=a.store.observe(a.store.authenticate(m.secret),'synthetic','fixture','gpt-6.1-sol');a.store.finish(id,{usageKnown:false,status:'unknown'});
  a.store.run("UPDATE requests SET status='reconciled',input=1000000,usage_unknown=0 WHERE id=?",id);

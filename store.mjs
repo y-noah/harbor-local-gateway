@@ -115,14 +115,8 @@ export class Store {
       return hash(secret)===row.digest?secret:null;
     }catch{return null;}
   }
-  pruneUsage(at=now()) {
-    const window=usageWindow(at);
-    if(this.prunedStart!==window.start){
-      this.run('UPDATE requests SET input=0,output=0,cached=0,usage_unknown=0,manual_cost_atoms=NULL WHERE ended IS NOT NULL AND ended<? AND (input<>0 OR output<>0 OR cached<>0 OR usage_unknown<>0 OR manual_cost_atoms IS NOT NULL)',window.start);
-      this.prunedStart=window.start;
-    }
-    return window;
-  }
+  // Compatibility entry point: compute the visible window without erasing archived measurements.
+  pruneUsage(at=now()) { return usageWindow(at); }
   usageFor(column,value,at=now()) {
     if(!['key_id','member_id','account_id'].includes(column))throw Error('Invalid usage scope');
     const w=this.pruneUsage(at);

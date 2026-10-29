@@ -50,7 +50,7 @@ export function historyQuery(params){
   return result;
 }
 
-export function historyReader(store){
+export function historyReader(store,{clock=Date.now}={}){
   const accounts=()=>store.all('SELECT id,name FROM accounts');
   function details(row,known){
     const value=parse(row.detail),d=value&&typeof value==='object'&&!Array.isArray(value)?value:{};
@@ -74,8 +74,8 @@ export function historyReader(store){
   function list(query){
     const {kind,start,end,action,account,session,pageSize}=query,clauses=[],args=[],catalog=accounts(),known=new Set(catalog.map(a=>a.id));
     const isNight=kind==='nightly',time=isNight?'a.started':'a.at',table=isNight?'balance_runs':'audit';
-    if(start!==null){clauses.push(time+'>=?');args.push(start);}
-    if(end!==null){clauses.push(time+'<?');args.push(end);}
+    const window=usageWindow(clock());
+    clauses.push(time+'>=?',time+'<?');args.push(Math.max(start??window.start,window.start),Math.min(end??window.end,window.end));
     if(action){clauses.push('a.action=?');args.push(action);}
     let join='';
     if(isNight){
@@ -91,11 +91,11 @@ export function historyReader(store){
     const total=store.get('SELECT COUNT(*) total'+from,...args).total,totalPages=Math.max(1,Math.ceil(total/pageSize)),page=Math.min(query.page,totalPages);
     const columns=isNight?'a.day,a.started,a.ended,a.status':"a.id,a.at,a.action,a.detail,s.id session_id,s.client_session_id";
     const rows=store.all(`SELECT ${columns}${from} ORDER BY ${time} DESC,${isNight?'a.day':'a.id'} DESC LIMIT ? OFFSET ?`,...args,pageSize,(page-1)*pageSize);
-    return {kind,accounts:catalog,actions:store.all('SELECT DISTINCT action FROM audit ORDER BY action').map(r=>r.action),pagination:{page,pageSize,total,totalPages},rows:isNight?rows:rows.map(r=>({id:r.id,at:r.at,action:r.action,session:r.session_id,clientSession:r.client_session_id,detail:details(r,known)}))};
+    return {kind,usageWindow:window,accounts:catalog,actions:store.all('SELECT DISTINCT action FROM audit WHERE at>=? AND at<? ORDER BY action',window.start,window.end).map(r=>r.action),pagination:{page,pageSize,total,totalPages},rows:isNight?rows:rows.map(r=>({id:r.id,at:r.at,action:r.action,session:r.session_id,clientSession:r.client_session_id,detail:details(r,known)}))};
   }
   function nightly(day){
     if(!/^\d{4}-\d{2}-\d{2}$/.test(day))throw new AppError(400,'夜间批次无效');
-    const row=store.get('SELECT * FROM balance_runs WHERE day=?',day);if(!row)throw new AppError(404,'夜间批次不存在');
+    const window=usageWindow(clock()),row=store.get('SELECT * FROM balance_runs WHERE day=? AND started>=? AND started<?',day,window.start,window.end);if(!row)throw new AppError(404,'夜间批次不存在');
     const source=parse(row.summary),raw=source&&typeof source==='object'?source:{},known=new Set(accounts().map(a=>a.id));
     const comparable=raw.metric===referenceMetric;
     const nums=value=>Object.fromEntries(Object.entries(value||{}).filter(([id,n])=>known.has(id)&&Number.isFinite(n)));
@@ -111,7 +111,8 @@ export function historyReader(store){
 
 export function requestObservation(store,id,at=Date.now()){
   const r=store.get('SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE r.id=?',id);
-  if(!r)throw new AppError(404,'请求记录不存在');
+  const window=usageWindow(at),time=r?.ended??r?.started;
+  if(!r||time<window.start||time>=window.end)throw new AppError(404,'请求记录不存在或超出近7天可见范围');
   const raw=parse(r.phase_history),timeline=(Array.isArray(raw)?raw:[]).filter(p=>p&&requestPhases.has(p.phase)&&Number.isFinite(p.at));
   return {...store.pricing.decorate(r,at),phase_history:undefined,observedAt:at,timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??r.ended??at)-p.at)}))};
 }

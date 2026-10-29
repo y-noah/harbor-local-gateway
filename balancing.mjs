@@ -1,4 +1,4 @@
-import {AppError,id,nextDailyReset,participatesNightly} from './store.mjs';
+import {AppError,id,nextDailyReset,participatesNightly,usageWindow} from './store.mjs';
 import {planNightly} from './nightly-plan.mjs';
 import {quoteReference,referenceMetric} from './pricing.mjs';
 
@@ -316,5 +316,5 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     })().finally(()=>{running=null;});
     return running;
   }
-  return {settings,saveSettings,saveWeights,selectAccount,disableAccount,explain,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs ORDER BY day DESC LIMIT 1')||null};}};
+  return {settings,saveSettings,saveWeights,selectAccount,disableAccount,explain,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs WHERE started>=? AND started<? ORDER BY day DESC LIMIT 1',usageWindow(clock()).start,usageWindow(clock()).end)||null};}};
 }
