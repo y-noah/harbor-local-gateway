@@ -56,7 +56,7 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
   }
   const samples=new Map();
   for(const rows of bySession.values())for(const r of rows)if(r.ended&&!r.usage_unknown){
-    const value=quoteUsage(r);if(value.totalAtoms===null||value.totalAtoms===0n)continue;
+    const value=quoteUsage(r);if(value.state!=='priced'||value.totalAtoms===null||value.totalAtoms===0n)continue;
     const key=value.model||r.billing_model||r.model||'';if(!samples.has(key))samples.set(key,[]);samples.get(key).push(r);
   }
   const uncertainAccounts=new Set(),skipped=[];

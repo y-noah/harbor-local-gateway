@@ -27,3 +27,12 @@ test('inflight estimation reprices same-model raw samples at the dispatch revisi
 test('legacy manually merged token counts cannot become nightly work or comparable estimation samples',()=>{
  const p=plan(rows.map(r=>r.session_id==='astra'?{...r,status:'reconciled',model:'gpt-6.1-sol',input:1000000}:r));assert.equal(p.moves.length,0);assert.ok(p.skipped.some(x=>x.reason==='unknown_fixed_load'));
 });
+test('USD reconciliation counts completed work but never substitutes for raw samples of inflight requests',()=>{
+ const work=[session('manual','a'),session('running','a'),session('sample','b')];
+ const make=model=>[req('manual',model,1000000,{status:'reconciled',manual_cost_atoms:'3250000000000'}),req('running',model,0,{ended:null,status:'running'})];
+ const unknown=planBalance({accounts:[account('a'),account('b')],sessions:work,requests:make('codex-auto-review'),at});
+ assert.equal(unknown.moves.length,0);assert.ok(unknown.skipped.some(x=>x.reason==='unknown_fixed_load'));
+ const rows=make('gpt-6.1-sol');rows.push(req('sample','gpt-6.1-sol',1000));
+ const known=planBalance({accounts:[account('a'),account('b')],sessions:work,requests:rows,at});
+ assert.equal(known.skipped.some(x=>x.reason==='unknown_fixed_load'),false);assert.equal(known.summaries[0].fixedLoad.a,0.002);assert.equal(known.summaries[0].before.a,3.252);assert.equal(rows[0].input,1000000);
+});
