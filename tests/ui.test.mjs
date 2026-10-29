@@ -208,8 +208,8 @@ test('a late Key deletion response after logout cannot reopen employee details',
 
 test('usage displays full Keys and reference USD without raw Token statistics',async()=>{
  const page=await ui(()=>response(snapshot()));page.run(`admin=true;state={members:[{id:'m',name:'Fixture',enabled:1}],keys:[{id:'k',member_id:'m',prefix:'hg_fixture',full_key:'hg_fixture_complete_only',standard:{total:0.000001,unmetered:0,unpriced:0},standard_12h:{total:0},enabled:1}]};`);
- const html=page.run('usageTable(usageRows())');assert.match(html,/hg_fixture_complete_only/);assert.match(html,/copy-key/);assert.match(html,/近7天参考消耗（USD）/);assert.match(html,/\$0\.000001/);assert.doesNotMatch(html,/亿 Token/);
- assert.equal(page.run('referenceMoney(3.3)'), '$3.30');assert.equal(page.run('referenceMoney(null)'), '—');assert.equal(page.run('referenceMoney(0.00000001)'), '<$0.000001');
+ const html=page.run('usageTable(usageRows())');assert.match(html,/hg_fixture_complete_only/);assert.match(html,/copy-key/);assert.match(html,/近7天参考消耗（USD）/);assert.match(html,/\$0\.00</);assert.doesNotMatch(html,/亿 Token/);
+ assert.equal(page.run('referenceMoney(3.3)'), '$3.30');assert.equal(page.run('referenceMoney(null)'), '—');assert.equal(page.run('referenceMoney(0.00000001)'), '$0.00');assert.equal(page.run('referenceMoney(1.005)'), '$1.01');assert.equal(page.run('referenceMoney(1234.567)'), '$1,234.57');
  assert.match(page.run("keyDisplay({prefix:'old'})"),/下次成功调用后补全/);
 });
 test('stale official quotas remain visible with their age instead of disappearing',async()=>{
@@ -360,13 +360,14 @@ test('request refresh restores online status after an outage without accepting l
 test('account entry separates subscription and Key types and preserves independent repeated additions',async()=>{
  const created=[],page=await ui((path,options)=>{if(path==='/api/admin/accounts')created.push(JSON.parse(options.body));return response(path==='/api/admin/state'?snapshot():{id:'account-'+created.length});});
  page.run('admin=true;state='+JSON.stringify(snapshot())+';globalThis.FormData=class{get(k){return formValues[k]??null;}};');
+ page.run("tab='accounts';render();");assert.equal((page.node('#content').innerHTML.match(/＋ 添加账户/g)||[]).length,2);assert.doesNotMatch(page.node('#content').innerHTML,/create-api-account|添加一个独立账号|添加订阅账号|添加API Key/);
  const submit=()=>page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
  for(const name of ['API A','API B']){
-  await page.click('create-api-account');assert.match(page.node('#modal-content').innerHTML,/接入类型/);assert.equal(page.node('#new-api-fields').disabled,false);assert.equal(page.node('#new-subscription-fields').disabled,true);assert.equal(page.node('#new-api-key').required,true);
+  await page.click('create-account');page.node('#new-account-auth').onchange({target:{value:'openai_api'}});assert.match(page.node('#modal-content').innerHTML,/接入类型/);assert.equal(page.node('#new-api-fields').disabled,false);assert.equal(page.node('#new-subscription-fields').disabled,true);assert.equal(page.node('#new-api-key').required,true);
   page.run('globalThis.formValues='+JSON.stringify({auth_mode:'openai_api',kind:'claude',name,api_key:'synthetic-'+name,api_weight:'0'}));await submit();
  }
  assert.equal(created.length,2);assert.notEqual(created[0].name,created[1].name);assert.ok(created.every(a=>a.auth_mode==='openai_api'&&a.kind==='codex'&&a.api_weight===0));
- await page.click('create-api-account');page.node('#new-account-auth').onchange({target:{value:'subscription'}});assert.equal(page.node('#new-api-fields').disabled,true);assert.equal(page.node('#new-subscription-fields').disabled,false);assert.equal(page.node('#new-api-key').required,false);
+ await page.click('create-account');page.node('#new-account-auth').onchange({target:{value:'subscription'}});assert.equal(page.node('#new-api-fields').disabled,true);assert.equal(page.node('#new-subscription-fields').disabled,false);assert.equal(page.node('#new-api-key').required,false);
  page.run('formValues='+JSON.stringify({auth_mode:'subscription',kind:'claude',name:'Subscription C',api_key:'must-not-submit',api_weight:'80'}));await submit();assert.deepEqual(created[2],{name:'Subscription C',auth_mode:'subscription',kind:'claude'});
  await page.click('create-account');assert.equal(page.node('#new-api-fields').disabled,true);assert.equal(page.node('#new-subscription-fields').disabled,false);
 });
@@ -374,7 +375,7 @@ test('account entry separates subscription and Key types and preserves independe
 const pricingState=()=>({seedCaptured:'2026-10-29',settings:{enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[]},state:{active:'a'.repeat(64)},unpricedModels:[{model:'new-model',requests:2}],rates:[{model:'gpt-6.1-sol',input:'2',cached:'0.1',output:'10',manual:false}]});
 test('late fee settings cannot replace a newer dialog and the settings view identifies missing prices without raw usage',async()=>{
  let release;const page=await ui(()=>new Promise(r=>release=()=>r(response(pricingState()))));page.run('admin=true;');const pending=page.click('pricing-settings');await page.click('close');page.run("modal('<h2>other</h2>')");release();await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>other</h2>');
- const html=page.run('pricingOverview('+JSON.stringify(pricingState())+')');assert.match(html,/new-model：2条/);assert.match(html,/缺价不按0/);assert.match(html,/Standard参考消耗USD/);assert.doesNotMatch(html,/亿 Token/);
+ const html=page.run('pricingOverview('+JSON.stringify(pricingState())+')');assert.match(html,/new-model：2条/);assert.match(html,/缺价不按0/);assert.match(html,/Standard参考消耗USD/);assert.doesNotMatch(html,/亿 Token/);assert.match(html,/\$2\.00/);assert.match(html,/\$0\.10/);
 });
 test('fee alias removal identifies the exact mapping even after the server has reordered the list',async()=>{
  const a={name:'alias-a',target:'gpt-6.1-sol',from:1,to:null,source:'fixture A'},b={name:'alias-b',target:'gpt-6.1-sol',from:1,to:null,source:'fixture B'},calls=[];
@@ -393,4 +394,15 @@ test('session management shows its own reference amount and coverage without bor
  page.run("sessionDetail('a')");assert.match(page.node('#modal-content').innerHTML,/\$0\.58/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/\$3\.88/);
  page.run("sessionDetail('b')");assert.match(page.node('#modal-content').innerHTML,/\$3\.30/);
  page.run("sessionDetail('c')");assert.match(page.node('#modal-content').innerHTML,/1条缺费率/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/\$0\.00/);
+});
+
+test('Key model selection preserves exact names, saved versions and ignores stale async dialogs',async()=>{
+ const calls=[],state={...snapshot(),keys:[{id:'k',member_id:'m',allowed_models:['sol'],model_policy_version:7}]};
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?pricingState():state);});
+ page.run('admin=true;state='+JSON.stringify(state)+';globalThis.FormData=class{get(k){return formValues[k]??null;}};');
+ await page.click('key-models','k');assert.match(page.node('#modal-content').innerHTML,/只允许指定模型/);assert.match(page.node('#modal-content').innerHTML,/gpt-6.1-sol/);
+ page.node('[name="allowed_models"]').value='sol';page.node('#key-model-suggestion').onchange({target:{value:'gpt-6.1-sol'}});assert.equal(page.node('[name="allowed_models"]').value,'sol\ngpt-6.1-sol');assert.equal(page.node('[name="model_policy_mode"]').value,'limited');
+ page.run('globalThis.formValues={model_policy_mode:"limited",allowed_models:"sol, astra"};');await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
+ const sent=calls.find(([p,o])=>p==='/api/admin/keys/k'&&o.method==='PATCH');assert.deepEqual(JSON.parse(sent[1].body),{allowed_models:['sol','astra'],expected_model_policy_version:7});
+ let release;const delayed=await ui(()=>new Promise(r=>release=()=>r(response(pricingState()))));delayed.run('admin=true;state='+JSON.stringify(state));const pending=delayed.click('key-models','k');await delayed.click('close');delayed.run("modal('<h2>new dialog</h2>')");release();await pending;assert.equal(delayed.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
 });

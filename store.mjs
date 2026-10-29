@@ -15,6 +15,15 @@ export const participatesNightly=(s,at)=>!!s.nightly_enabled||(Number.isFinite(s
 export class AppError extends Error {
   constructor(status, message, code = 'invalid_request') { super(message); this.status = status; this.code = code; }
 }
+export function modelAllowlist(value) {
+  if(value===null)return null;
+  if(!Array.isArray(value)||!value.length||value.length>50||value.some(model=>typeof model!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(model)||['codex','claude'].includes(model)))throw new AppError(400,'请选择1至50个精确模型ID；不能使用codex/claude路由别名','invalid_model_policy');
+  return [...new Set(value)];
+}
+function storedModelAllowlist(value) {
+  if(value===null)return null;
+  try{return modelAllowlist(JSON.parse(value));}catch{throw new AppError(403,'Key模型权限配置无效，请联系管理员','model_policy_invalid');}
+}
 export function usageWindow(at=now()) {
   const day=86400000, offset=8*3600000;
   const today=Math.floor((at+offset)/day)*day-offset;
@@ -51,7 +60,7 @@ export class Store {
     add('requests','phase','TEXT');add('requests','phase_at','INTEGER');add('requests','phase_history',"TEXT NOT NULL DEFAULT '[]'");
     this.db.exec('CREATE INDEX IF NOT EXISTS audit_time ON audit(at DESC,id DESC)');
     if(missingFlag)this.db.exec("UPDATE requests SET usage_unknown=1 WHERE status IN ('unknown','interrupted')");
-    add('keys','secret_cipher','TEXT');
+    add('keys','secret_cipher','TEXT');add('keys','allowed_models','TEXT');add('keys','model_policy_version','INTEGER NOT NULL DEFAULT 0');
     this.db.exec('CREATE INDEX IF NOT EXISTS request_usage_time ON requests(COALESCE(ended,started))');
     add('requests','session_id','TEXT REFERENCES sessions(id)');add('requests','predicted','INTEGER NOT NULL DEFAULT 10000');
     add('sessions','cum_input','INTEGER NOT NULL DEFAULT 0');add('sessions','cum_output','INTEGER NOT NULL DEFAULT 0');add('sessions','cum_cached','INTEGER NOT NULL DEFAULT 0');
@@ -117,24 +126,42 @@ export class Store {
   get(sql,...args) { return this.db.prepare(sql).get(...args); }
   run(sql,...args) { return this.db.prepare(sql).run(...args); }
   audit(action,detail) { this.run('INSERT INTO audit VALUES(?,?,?,?)',id(),now(),action,detail); }
-  createMember(name,quota,expires) {
+  createMember(name,quota,expires,allowedModels=null) {
+    allowedModels=modelAllowlist(allowedModels);
     const memberId=id(); this.run('INSERT INTO members(id,name,quota,created) VALUES(?,?,?,?)',memberId,name,quota,now());
-    const key=this.createKey(memberId,expires); this.audit('member.create',name); return {memberId,...key};
+    const key=this.createKey(memberId,expires,null,allowedModels); this.audit('member.create',name); return {memberId,...key};
   }
-  createKey(memberId,expires=null,quota=null) {
+  createKey(memberId,expires=null,quota=null,allowedModels=null) {
+    allowedModels=modelAllowlist(allowedModels);
     if(!this.get('SELECT id FROM members WHERE id=? AND removed_at IS NULL',memberId)) throw new AppError(404,'员工不存在或已移除');
     const secret=token(), keyId=id();
-    this.run('INSERT INTO keys(id,member_id,digest,prefix,expires,created,quota,secret_cipher) VALUES(?,?,?,?,?,?,?,?)',keyId,memberId,hash(secret),secret.slice(0,11),expires,now(),quota,this.encryptKey(secret,keyId));
-    this.audit('key.create',keyId); return {keyId,secret};
+    this.run('INSERT INTO keys(id,member_id,digest,prefix,expires,created,quota,secret_cipher,allowed_models) VALUES(?,?,?,?,?,?,?,?,?)',keyId,memberId,hash(secret),secret.slice(0,11),expires,now(),quota,this.encryptKey(secret,keyId),allowedModels===null?null:JSON.stringify(allowedModels));
+    this.audit('key.create',keyId);if(allowedModels!==null)this.audit('key.models',JSON.stringify({key:keyId,allowed_models:allowedModels})); return {keyId,secret};
   }
   authenticate(secret) {
-    const row=this.get(`SELECT k.id key_id,k.secret_cipher,k.expires,k.enabled key_enabled,k.quota key_quota,k.used key_used,m.* FROM keys k JOIN members m ON m.id=k.member_id WHERE k.digest=? AND k.removed_at IS NULL AND m.removed_at IS NULL`,hash(secret));
+    const row=this.get(`SELECT k.id key_id,k.secret_cipher,k.expires,k.allowed_models,k.enabled key_enabled,k.quota key_quota,k.used key_used,m.* FROM keys k JOIN members m ON m.id=k.member_id WHERE k.digest=? AND k.removed_at IS NULL AND m.removed_at IS NULL`,hash(secret));
     if(!row) throw new AppError(401,'Key 无效','invalid_api_key');
     if(!row.enabled || !row.key_enabled) throw new AppError(403,'Key 或员工已停用','key_disabled');
     if(row.expires!==null && row.expires<=now()) throw new AppError(403,'Key 已到期','key_expired');
     if(this.encryptionKey&&!row.secret_cipher)this.run('UPDATE keys SET secret_cipher=? WHERE id=? AND secret_cipher IS NULL',this.encryptKey(secret,row.key_id),row.key_id);
     delete row.secret_cipher;
     return row;
+  }
+  allowedModels(member) {
+    const key=this.get('SELECT allowed_models FROM keys WHERE id=? AND member_id=? AND removed_at IS NULL',member.key_id,member.id);
+    if(!key)throw new AppError(401,'Key无效','invalid_api_key');
+    return storedModelAllowlist(key.allowed_models);
+  }
+  checkModel(member,model,tools) {
+    const allowed=this.allowedModels(member);if(allowed===null)return;
+    if(!allowed.includes(model))throw new AppError(403,'此Key只允许使用：'+allowed.join('、'),'model_not_allowed');
+    // Hosted image tools can choose their own model; use an explicitly checked image endpoint instead.
+    const checkTools=items=>{if(!Array.isArray(items))return;for(const tool of items){
+      if(!tool||typeof tool!=='object')continue;
+      if(tool.type==='image_generation')throw new AppError(403,'受限Key不能使用隐式图片模型工具，请使用获准模型的图片接口','model_not_allowed');
+      if(tool.model!==undefined&&!allowed.includes(tool.model))throw new AppError(403,'工具模型不在此Key允许列表中','model_not_allowed');
+      checkTools(tool.tools);
+    }};checkTools(tools);
   }
   allowance(member,reserveSize) {
       const m=this.get('SELECT * FROM members WHERE id=?',member.id);
@@ -205,7 +232,7 @@ export class Store {
       recentUsageWindow,
       sessionsPagination:{page,pageSize:sessionPageSize,total:sessionTotal,totalPages:sessionPages},
       members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(m=>({...m,...scope('member_id',m.id)})),
-      keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
+      keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,allowed_models:storedModelAllowlist(k.allowed_models),model_policy_version:k.model_policy_version,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
       accounts:this.all('SELECT id,name,kind,auth_mode,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(({api_secret_digest,...a})=>({...a,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null})),
       sessions:this.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${sessionFrom} ORDER BY s.updated DESC,s.id DESC LIMIT ? OFFSET ?`,...range,sessionPageSize,(page-1)*sessionPageSize).map(s=>({...s,nightly_enabled:Number(participatesNightly(s,at)),request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
       requests:this.all(`SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id LEFT JOIN keys k ON k.id=r.key_id WHERE ${where} ORDER BY started DESC LIMIT 200`,...range),

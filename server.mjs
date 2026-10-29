@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { Store, AppError, id, now, hash, usageWindow, nextDailyReset } from './store.mjs';
+import { Store, AppError, id, now, hash, usageWindow, nextDailyReset, modelAllowlist } from './store.mjs';
 import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
 import {createBalancer} from './balancing.mjs';
@@ -200,7 +200,7 @@ export function createGateway(options={}) {
     const authVersion=authVersions.get(account.id)||0;
     if(controller.signal.aborted){store.finish(requestId,{status:'cancelled',error:'排队期间取消'});reject(new AppError(499,'请求已取消'));return;}
     try{
-      const currentMember=store.authenticate(secret);
+      const currentMember=store.authenticate(secret);store.checkModel(currentMember,model,job.responses?.tools);
       if(!job.responses){
       const held=store.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE member_id=? AND id<>?",currentMember.id,requestId).n;
       const heldKey=store.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE key_id=? AND id<>?",currentMember.key_id,requestId).n;
@@ -339,7 +339,7 @@ export function createGateway(options={}) {
           return json(res,200,{ok:true,route_version:version});
         }
         if(path==='/api/admin/members'&&method==='POST'){
-          const b=await body(req);return json(res,201,store.createMember(name(b.name),integer(b.quota,'额度',{nullable:true}),expiry(b.expires)));
+          const b=await body(req);return json(res,201,store.createMember(name(b.name),integer(b.quota,'额度',{nullable:true}),expiry(b.expires),modelAllowlist(b.allowed_models===undefined?null:b.allowed_models)));
         }
         const memberMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
         if(memberMatch&&method==='DELETE'){
@@ -357,7 +357,7 @@ export function createGateway(options={}) {
           const b=await body(req),m=store.get('SELECT * FROM members WHERE id=? AND removed_at IS NULL',memberMatch[1]);if(!m)throw new AppError(404,'员工不存在或已移除');
           store.run('UPDATE members SET name=?,quota=?,enabled=? WHERE id=?',b.name===undefined?m.name:name(b.name),b.quota===undefined?m.quota:integer(b.quota,'额度',{nullable:true}),b.enabled===undefined?m.enabled:bool(b.enabled),m.id);store.audit('member.update',m.id);return json(res,200,{ok:true});
         }
-        if(path==='/api/admin/keys'&&method==='POST'){const b=await body(req);return json(res,201,store.createKey(b.memberId,expiry(b.expires),b.quota===undefined?null:integer(b.quota,'Key 额度',{nullable:true})));}
+        if(path==='/api/admin/keys'&&method==='POST'){const b=await body(req);return json(res,201,store.createKey(b.memberId,expiry(b.expires),b.quota===undefined?null:integer(b.quota,'Key 额度',{nullable:true}),modelAllowlist(b.allowed_models===undefined?null:b.allowed_models)));}
         const keyMatch=path.match(/^\/api\/admin\/keys\/([a-f0-9-]+)$/);
         if(keyMatch&&method==='DELETE'){
           const k=store.get('SELECT * FROM keys WHERE id=? AND removed_at IS NULL',keyMatch[1]);if(!k)throw new AppError(404,'Key 不存在或已删除');
@@ -370,7 +370,10 @@ export function createGateway(options={}) {
         }
         if(keyMatch&&method==='PATCH'){
           const b=await body(req),k=store.get('SELECT * FROM keys WHERE id=? AND removed_at IS NULL',keyMatch[1]);if(!k)throw new AppError(404,'Key 不存在或已删除');
-          store.run('UPDATE keys SET enabled=?,expires=?,quota=? WHERE id=?',b.enabled===undefined?k.enabled:bool(b.enabled),b.expires===undefined?k.expires:expiry(b.expires),b.quota===undefined?k.quota:integer(b.quota,'Key 额度',{nullable:true}),k.id);store.audit('key.update',k.id);return json(res,200,{ok:true});
+          const changesModels=b.allowed_models!==undefined;
+          if(changesModels&&b.expected_model_policy_version!==k.model_policy_version)throw new AppError(409,'模型权限已变化，请重新打开设置','model_policy_conflict');
+          const allowed=changesModels?(b.allowed_models===null?null:JSON.stringify(modelAllowlist(b.allowed_models))):k.allowed_models;
+          store.run('UPDATE keys SET enabled=?,expires=?,quota=?,allowed_models=?,model_policy_version=? WHERE id=?',b.enabled===undefined?k.enabled:bool(b.enabled),b.expires===undefined?k.expires:expiry(b.expires),b.quota===undefined?k.quota:integer(b.quota,'Key 额度',{nullable:true}),allowed,k.model_policy_version+(changesModels?1:0),k.id);store.audit('key.update',k.id);if(b.allowed_models!==undefined)store.audit('key.models',JSON.stringify({key:k.id,allowed_models:b.allowed_models}));return json(res,200,{ok:true});
         }
         if(path==='/api/admin/accounts'&&method==='POST'){
           const b=await body(req),accountId=id(),home=join(runtime,'accounts',accountId);mkdirSync(home,{recursive:true});
@@ -476,7 +479,7 @@ export function createGateway(options={}) {
         if(path==='/api/admin/export'&&method==='GET'){
           const rows=store.all('SELECT r.*,m.name FROM requests r LEFT JOIN members m ON m.id=r.member_id WHERE COALESCE(r.ended,r.started)>=? AND COALESCE(r.ended,r.started)<? ORDER BY started DESC,r.id',usageWindow().start,usageWindow().end);
           const cell=v=>{const text=String(v??'');return '"'+(/^[\s\x00-\x1f\x7f]*[=+@-]/.test(text)?"'":"")+text.replaceAll('"','""')+'"';};
-          res.setHeader('Content-Type','text/csv; charset=utf-8');res.setHeader('Content-Disposition','attachment; filename="harbor-usage.csv"');return res.end('\ufeff'+['时间,员工,IP,状态,Standard输入参考USD,Standard输出参考USD,其中缓存参考USD,人工核对参考USD,Standard合计参考USD,计价状态,模型,费率版本',...rows.map(r=>{const u=store.pricing.usage(r);return [new Date(r.started).toISOString(),r.name,r.ip,r.status,u.input_exact,u.output_exact,u.cached_exact,u.adjustment_exact,u.total_exact,u.state,u.model||r.billing_model||r.model,u.revision].map(cell).join(',');})].join('\r\n'));
+          res.setHeader('Content-Type','text/csv; charset=utf-8');res.setHeader('Content-Disposition','attachment; filename="harbor-usage.csv"');return res.end('\ufeff'+['时间,员工,IP,状态,Standard输入参考USD,Standard输出参考USD,其中缓存参考USD,人工核对参考USD,Standard合计参考USD,计价状态,模型,费率版本',...rows.map(r=>{const u=store.pricing.usage(r);return [new Date(r.started).toISOString(),r.name,r.ip,r.status,...[u.input_exact,u.output_exact,u.cached_exact,u.adjustment_exact,u.total_exact].map(value=>value===null?'':Number(value).toLocaleString('en-US',{useGrouping:false,minimumFractionDigits:2,maximumFractionDigits:2})),u.state,u.model||r.billing_model||r.model,u.revision].map(cell).join(',');})].join('\r\n'));
         }
         if(path==='/api/admin/backup'&&method==='POST'){
           const backupDir=join(data,'backups');mkdirSync(backupDir,{recursive:true});const filename='gateway-'+now()+'.sqlite';store.db.prepare('VACUUM INTO ?').run(join(backupDir,filename));store.audit('backup.create',filename);return json(res,200,{file:'data/backups/'+filename});
@@ -496,12 +499,13 @@ export function createGateway(options={}) {
           ...store.all("SELECT id FROM accounts WHERE auth_mode='openai_api' AND enabled=1 AND state='ready' AND route_block IS NULL AND removed_at IS NULL").map(a=>apiResponses.models({home:a.id}))
         ]);
         const successful=catalogs.filter(x=>x.status==='fulfilled');if(!successful.length&&catalogs.length)throw catalogs[0].reason;
-        const models=[...new Map(successful.flatMap(x=>x.value).map(m=>[m.slug,m])).values()];
+        const allowed=store.allowedModels(employee(req));
+        const models=[...new Map(successful.flatMap(x=>x.value).map(m=>[m.slug,m])).values()].filter(m=>allowed===null||allowed.includes(m.slug));
         if(path==='/v1/codex/models')return json(res,200,{models});
-        return json(res,200,{object:'list',data:[...['codex','claude'].map(id=>({id,object:'model',owned_by:'local'})),...models.map(m=>({id:m.slug,object:'model',owned_by:'openai'}))],models});
+        return json(res,200,{object:'list',data:[...(allowed===null?['codex','claude']:[]).map(id=>({id,object:'model',owned_by:'local'})),...models.map(m=>({id:m.slug,object:'model',owned_by:'openai'}))],models});
       }
       if(path==='/api/me'&&method==='GET'){
-        const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,standard:store.pricing.inWindow('member_id',m.id),keyStandard:store.pricing.inWindow('key_id',m.key_id),expires:m.expires,usageWindow:w});
+        const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,standard:store.pricing.inWindow('member_id',m.id),keyStandard:store.pricing.inWindow('key_id',m.key_id),expires:m.expires,allowed_models:store.allowedModels(m),usageWindow:w});
       }
       if((path==='/v1/responses'||codexJsonRoutes.has(path.slice(3))&&path.startsWith('/v1/'))&&method==='POST'){
         const m=employee(req);
@@ -514,6 +518,7 @@ export function createGateway(options={}) {
           try{original=await readJsonBody(req,{maxBytes:responseBodyBytes,compressed:true});}
           finally{const remaining=responsePreparing.get(m.id)-1;if(remaining)responsePreparing.set(m.id,remaining);else responsePreparing.delete(m.id);}
           const payload=jsonPath?validateCodexJson(original,jsonPath):validateResponses(original);
+          store.checkModel(m,payload.model,payload.tools);
           if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开','client_cancelled');
           const clientId=req.headers['thread-id']||req.headers['session-id']||req.headers.session_id||req.headers['x-codex-thread-id']||payload.prompt_cache_key;
           if(clientId!==undefined&&(typeof clientId!=='string'||!clientId.length))throw new AppError(400,'客户端会话标识无效');
@@ -586,7 +591,7 @@ export function createGateway(options={}) {
         if(!Array.isArray(b.messages)||!b.messages.length||b.messages.length>100||b.messages.some(v=>!v||!['system','user','assistant','developer'].includes(v.role)||typeof v.content!=='string'))throw new AppError(400,'仅支持 1–100 条纯文本 messages');
         if(b.tools||b.functions)throw new AppError(400,'此版本是纯文本网关，不支持工具调用');
         if(b.model!==undefined&&!['codex','claude'].includes(b.model))throw new AppError(400,'本地模型名为 codex 或 claude');
-        const kind=b.model||'codex';
+        const kind=b.model||'codex';store.checkModel(m,kind);
         if(b.max_tokens!==undefined||b.max_completion_tokens!==undefined)throw new AppError(400,'订阅 CLI 无硬输出 Token 上限，暂不支持 max_tokens 参数');
         if(b.stream!==undefined&&typeof b.stream!=='boolean')throw new AppError(400,'stream 必须为布尔值');
         if(stopping||queue.length>=5)throw new AppError(429,'队列已满，请稍后重试');
