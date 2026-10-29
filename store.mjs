@@ -67,7 +67,7 @@ export class Store {
     try{
       this.db.exec("UPDATE keys SET unmetered=unmetered+(SELECT COUNT(*) FROM requests WHERE key_id=keys.id AND status='running' AND tracking_only=1)");
       // Older requests have no dispatch version; retain conservative recovery only for compatible accounts.
-      this.db.exec("UPDATE sessions SET state='uncertain' WHERE EXISTS (SELECT 1 FROM requests r WHERE r.session_id=sessions.id AND r.status='running' AND (r.account_id IS NULL OR r.account_id=sessions.account_id) AND (r.route_version IS NULL OR r.route_version=sessions.route_version))");
+      this.db.exec("UPDATE sessions SET state='uncertain' WHERE id IN (SELECT r.session_id FROM requests r JOIN sessions s ON s.id=r.session_id WHERE r.status='running' AND (r.account_id IS NULL OR r.account_id=s.account_id) AND (r.route_version IS NULL OR r.route_version=s.route_version))");
       for(const row of this.all("SELECT id FROM requests WHERE status='running'"))this.phase(row.id,'interrupted');
       for(const row of this.all("SELECT id FROM requests WHERE status='queued'"))this.phase(row.id,'cancelled');
       this.db.prepare("UPDATE requests SET status='interrupted',usage_unknown=1,ended=?,error=CASE WHEN tracking_only=1 THEN '服务重启；本次用量可能未计入累计' ELSE '服务重启；上游用量未知，保留预占额度待核对' END WHERE status='running'").run(now());
