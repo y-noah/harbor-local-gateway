@@ -3,7 +3,7 @@ const fmt=n=>Number(n||0).toLocaleString('zh-CN'),date=t=>t?new Date(t).toLocale
 const tokenBillions=n=>(Number(n||0)/1e8).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
 const beijingDate=t=>t?new Date(t).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—';
 let admin=false,authEpoch=0,state=null,tab='overview',testKey='',chat=[],chatSession='',chatModel='codex',draft='',chatOwner='',sending=false,requestFilter='';
-let requestsData=null,requestsLoading=false,requestsVersion=0,connectionView='test';
+let requestsData=null,requestsLoading=false,requestsVersion=0,connectionView='test',autoRefreshPending=false;
 let requestsFilters={member:'',model:'',status:'',page:1,pageSize:25};
 let sessionsPage=1,sessionsPageSize=25,sessionsLoading=false,refreshVersion=0;
 let recordView='usage',historyData=null,historyLoading=false,historyVersion=0,dialogVersion=0,requestDetailId='',requestDetailVersion=0;
@@ -29,6 +29,7 @@ function heading(eyebrow,title,sub,action=''){return `<div class="page-heading">
 function button(action,label,css='secondary',id='',disabled=false){return `<button type="button" class="${css}" data-action="${action}" data-id="${esc(id)}"${disabled?' disabled':''}>${label}</button>`;}
 function empty(text){return `<div class="empty"><span class="empty-symbol">◌</span>${text}</div>`;}
 function panel(title,inside,action=''){return `<section class="panel"><div class="panel-heading"><h2>${title}</h2>${action}</div>${inside}</section>`;}
+function fixedSessionCommand(identifier){return `codex -c 'model_providers.harbor.http_headers.X-Harbor-Session="${identifier}"'`;}
 function apiAccount(a){return a?.auth_mode==='openai_api';}
 function quotaCard(a){
   if(apiAccount(a))return `<div class="quota"><span class="hint">官方API余额</span><div class="quota-number">—</div><small>普通Key未提供公开余额查询；请在官方账单后台核对。平台用量不等于赠额抵扣。</small><small>Key ${a.api_key_configured?'已配置 · 指纹 '+esc(a.api_key_fingerprint):'未配置'}</small></div>`;
@@ -57,11 +58,34 @@ function routingCard(a){
   const mode=({api_mixed:'API人工占比＋订阅组原规则',auto:w.reason?'自动 · 等待额度确认，沿用已知权重':'自动',manual:'临时手动',fallback:'额度待确认 · 按原顺序',legacy:'新权重未开启'})[w.mode];
   return `<div class="quota"><div class="quota-row">系统权重<strong>${esc(weightPercent(row.automatic))}</strong></div><div class="quota-row">生效权重<strong>${esc(weightPercent(row.effective))}</strong></div><small>${esc(mode)}${w.configuration.mode==='manual'?' · 手动到期：'+beijingDate(w.configuration.expires):''}</small></div>`;
 }
-async function refresh(renderPage=true){
+function automaticRefreshScope(){
+  if(!admin||document.hidden||$('#modal').open)return '';
+  const focus=document.activeElement;if(['INPUT','SELECT','TEXTAREA'].includes(focus?.tagName)||focus?.isContentEditable)return '';
+  if(['overview','accounts','sessions'].includes(tab))return 'state:'+tab;
+  if(tab==='requests'&&recordView==='requests'&&requestsFilters.page===1&&!requestsFilters.member&&!requestsFilters.model&&!requestsFilters.status)return 'requests:latest';
+  return '';
+}
+function stateSnapshot(value){const {recentUsageWindow,...data}=value||{};return JSON.stringify(data);}
+function requestsSnapshot(value){const {observedAt,...data}=value||{};return JSON.stringify(data);}
+async function automaticRefresh(){
+  const scope=automaticRefreshScope();if(!scope||autoRefreshPending||sessionsLoading||requestsLoading)return;
+  autoRefreshPending=true;try{if(scope==='requests:latest')await loadRequests(scope);else await refresh(true,scope);}finally{autoRefreshPending=false;}
+}
+async function refresh(renderPage=true,automaticScope=''){
   if(!admin)return;const epoch=authEpoch,version=++refreshVersion;
   const query=sessionsPage===1&&sessionsPageSize===25?'':`?session_page=${sessionsPage}&session_page_size=${sessionsPageSize}`;
-  try{const next=await api('/api/admin/state'+query);if(!admin||epoch!==authEpoch||version!==refreshVersion)return;if(tab==='sessions'&&$('#modal').open)return;state=next;sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=next.sessionsPagination?.pageSize??sessionsPageSize;sessionsLoading=false;$('#connection').textContent='● 服务在线';if(renderPage)render();if(tab==='requests'&&recordView==='requests'&&!requestsLoading&&!$('#modal').open)await loadRequests();}
-  catch(e){if(!admin||epoch!==authEpoch||version!==refreshVersion)return;sessionsLoading=false;sessionsPage=state?.sessionsPagination?.page??1;sessionsPageSize=state?.sessionsPagination?.pageSize??25;$('#connection').textContent='连接异常';if(!state){showLogin();}else if(renderPage)render();toast(e.message);}
+  try{
+    const next=await api('/api/admin/state'+query);
+    if(!admin||epoch!==authEpoch||version!==refreshVersion||automaticScope&&automaticRefreshScope()!==automaticScope)return;
+    if(tab==='sessions'&&$('#modal').open)return;
+    const changed=stateSnapshot(next)!==stateSnapshot(state);state=next;sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=next.sessionsPagination?.pageSize??sessionsPageSize;sessionsLoading=false;
+    $('#connection').textContent='● 服务在线';if(renderPage&&(!automaticScope||changed))render();
+    if(tab==='requests'&&recordView==='requests'&&!requestsLoading&&!$('#modal').open)await loadRequests();
+  }catch(e){
+    if(!admin||epoch!==authEpoch||version!==refreshVersion||automaticScope&&automaticRefreshScope()!==automaticScope)return;
+    sessionsLoading=false;sessionsPage=state?.sessionsPagination?.page??1;sessionsPageSize=state?.sessionsPagination?.pageSize??25;$('#connection').textContent='连接异常';
+    if(automaticScope)return;if(!state)showLogin();else if(renderPage)render();toast(e.message);
+  }
 }
 function showLogin(){requestsVersion++;requestsData=null;requestsLoading=false;requestsFilters={member:'',model:'',status:'',page:1,pageSize:25};connectionView='test';historyVersion++;historyData=null;historyLoading=false;recordView='usage';historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};if($('#modal').open)close();sessionsPage=1;sessionsPageSize=25;sessionsLoading=false;testKey='';chat=[];chatSession='';chatOwner='';draft='';$('#modal-content').innerHTML='';$('#content').innerHTML='';$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}
 function showShell(){$('#login').classList.add('hidden');$('#shell').classList.remove('hidden');}
@@ -78,16 +102,18 @@ async function copyKey(value){
 function recentUsageTitle(){return '最近用量 <button type="button" class="usage-help table-button" data-action="usage-help" aria-label="最近用量说明" title="查看统计口径与漏计说明">?</button>';}
 function usageTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>员工</th><th>Key</th><th>近7天 Token（亿）</th><th>近12小时 Token（亿）</th><th>状态</th></tr></thead><tbody>${rows.map(k=>`<tr><td>${esc(k.member_name)}</td><td class="mono key-cell">${keyDisplay(k)}</td><td>${tokenBillions(k.used)}</td><td>${tokenBillions(k.used_12h)}</td><td>${!k.enabled||!k.member_enabled?'已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无 Key 用量。');}
 function recordTabs(){return `<div class="actions record-tabs" aria-label="使用记录分类">${[['usage','Key 用量'],['requests','请求明细'],['history','操作历史']].map(([id,label])=>button('record-view',label,recordView===id?'primary':'secondary',id)).join('')}</div>`;}
-async function loadRequests(){
+async function loadRequests(automaticScope=''){
   if(!admin||tab!=='requests'||recordView!=='requests')return;
-  const epoch=authEpoch,version=++requestsVersion,filters={...requestsFilters};requestsLoading=true;render();
+  const epoch=authEpoch,version=++requestsVersion,filters={...requestsFilters};if(!automaticScope){requestsLoading=true;render();}
   const query=new URLSearchParams({page:String(filters.page),page_size:String(filters.pageSize)});
   for(const field of ['member','model','status'])if(filters[field])query.set(field,filters[field]);
   try{
     const data=await api('/api/admin/requests?'+query);
     if(!admin||epoch!==authEpoch||version!==requestsVersion||tab!=='requests'||recordView!=='requests')return;
-    requestsData=data;requestsFilters.page=data.pagination.page;requestsLoading=false;render();
-  }catch(e){if(admin&&epoch===authEpoch&&version===requestsVersion){requestsLoading=false;requestsData=null;render();toast(e.message);}}
+    if(automaticScope&&automaticRefreshScope()!==automaticScope)return;
+    $('#connection').textContent='● 服务在线';
+    const changed=requestsSnapshot(data)!==requestsSnapshot(requestsData);requestsData=data;requestsFilters.page=data.pagination.page;requestsLoading=false;if(!automaticScope||changed||data.summary?.active>0)render();
+  }catch(e){if(admin&&epoch===authEpoch&&version===requestsVersion){if(automaticScope){if(automaticRefreshScope()===automaticScope)$('#connection').textContent='连接异常';return;}requestsLoading=false;requestsData=null;render();toast(e.message);}}
 }
 function requestsSection(){
   const data=requestsData,f=requestsFilters;
@@ -396,7 +422,7 @@ document.addEventListener('click',async e=>{
     }
     if(action==='create-fixed-session'){
       const a=state.accounts.find(x=>x.id===identifier),members=state.members.filter(m=>m.enabled);if(!apiAccount(a)||!members.length)return toast('请先创建可用员工');
-      return formModal('创建API固定会话','使用所选员工现有Key，新开一个客户端对话，专用于此上游。',`<p>绑定账号：${esc(a.name)}</p><label>所属员工<select name="member_id">${members.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('')}</select></label>`,async f=>{const version=dialogVersion,epoch=authEpoch,r=await api('/api/admin/sessions','POST',{member_id:f.get('member_id'),account_id:identifier});if(!admin||epoch!==authEpoch||version!==dialogVersion||!$('#modal').open)return;close();modal(`<h2>API固定会话已创建</h2><p>在对应员工的Codex配置中，将下面一行加入现有 model_providers.harbor 表，完全重启客户端后新建对话。它仅能用于该员工的一条客户端对话；不要复用于其他新对话。</p><pre class="code">http_headers = { "X-Harbor-Session" = "${esc(r.session_id)}" }</pre><p class="hint">模型须填写该官方Key可用的实际模型。测试后移除此行并重启，正常对话恢复原分配。此标识不替代员工Key；Key始终只保存在网关。余额抵扣需与官方账单核对。</p><div class="dialog-actions">${button('close','完成','primary')}</div>`,true);});
+      return formModal('创建API固定会话','使用所选员工现有Key，新开一个客户端对话，专用于此上游。',`<p>绑定账号：${esc(a.name)}</p><label>所属员工<select name="member_id">${members.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('')}</select></label>`,async f=>{const version=dialogVersion,epoch=authEpoch,r=await api('/api/admin/sessions','POST',{member_id:f.get('member_id'),account_id:identifier});if(!admin||epoch!==authEpoch||version!==dialogVersion||!$('#modal').open)return;close();modal(`<h2>API固定会话已创建</h2><p>在已配置Harbor（provider名harbor）与所属员工Key的PowerShell或WSL终端执行下面命令，启动一个专用CLI对话。参数仅对这个进程生效，不修改全局配置或其他已开的会话。</p><pre class="code">${esc(fixedSessionCommand(r.session_id))}</pre><p class="hint">模型须选择该官方Key可用的实际模型。此进程只使用一条客户端对话，不要复用于其他新对话；结束后退出即可。固定标识不替代员工Key，官方Key始终只保存在网关。余额抵扣需与官方账单核对。</p><div class="dialog-actions">${button('close','完成','primary')}</div>`,true);});
     }
     if(action==='refresh-quotas'){el.disabled=true;await api('/api/admin/quotas/refresh','POST',{});await refresh();return toast(state.accounts.some(a=>a.enabled&&a.quota_error)?'部分账号额度未能刷新，已保留上次结果':'官方额度已更新');}
     if(action==='budget-account'){const a=state.accounts.find(x=>x.id===identifier);return formModal('本地 Token 预算','这是手动估算预算，不是官方订阅额度。已用 '+fmt(a.budget_used)+' Token；预算留空表示不设置本地上限。',`<label>总预算（Token）<input name="quota" type="number" min="0" step="1" value="${a.token_budget??''}" placeholder="留空"></label>${a.kind!=='claude'?`<label>每 1% 额度的预计 Token 容量<input name="capacity" type="number" min="100" max="10000000" step="1" value="${Math.round(a.tokens_per_percent||10000)}"></label><small>仅用于预测排序；会随官方额度变化校准，不是官方余额。</small>`:''}`,async f=>{await api('/api/admin/accounts/'+identifier,'PATCH',{token_budget:quotaValue(f),...(a.kind!=='claude'?{tokens_per_percent:Number(f.get('capacity'))}:{})});close();await refresh();toast('预算已保存');});}
@@ -416,6 +442,6 @@ document.addEventListener('click',async e=>{
 });
 $('#login-form').onsubmit=async e=>{e.preventDefault();const submit=e.submitter;submit.disabled=true;try{await api('/api/auth/login','POST',{password:$('#admin-input').value});authEpoch++;admin=true;$('#admin-input').value='';await refresh();}catch(err){toast(err.message);}finally{submit.disabled=false;}};
 $('#employee-entry').onclick=()=>{connectionView='test';tab='playground';render();};$('#refresh').onclick=()=>refresh();$('#logout').onclick=async()=>{if(sending)return toast('请等待当前请求完成后退出');try{await api('/api/auth/logout','POST',{});authEpoch++;admin=false;state=null;testKey='';chat=[];chatSession='';chatOwner='';draft='';showLogin();}catch(err){toast(err.message);}};
-setInterval(()=>{if(admin&&!sessionsLoading&&tab!=='playground'&&!$('#modal').open&&!document.hidden&&!['INPUT','SELECT'].includes(document.activeElement.tagName)){refresh();if(tab==='requests'&&recordView==='history'&&!historyLoading)loadHistory().catch(e=>toast(e.message));}},12000);
+setInterval(()=>{void automaticRefresh();},12000);
 setInterval(()=>{if(admin&&requestDetailId&&$('#modal').open&&!document.hidden)requestDetail(requestDetailId,false).catch(e=>toast(e.message));},4000);
 const initialAuthEpoch=authEpoch;api('/api/auth/session').then(r=>{if(initialAuthEpoch!==authEpoch)return;admin=r.authenticated;if(admin)refresh();else showLogin();}).catch(()=>{if(initialAuthEpoch===authEpoch)showLogin();});

@@ -245,16 +245,17 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
       return result.changes>0;
     });
   }
-  function route(session){
+  function route(session,{protocol='responses'}={}){
     const account=store.get('SELECT * FROM accounts WHERE id=?',session.account_id);
+    if(protocol!=='responses'&&isApi(account))throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');
     if(isApi(account)&&account.enabled&&!account.removed_at&&['ready','degraded'].includes(account.state)&&!account.route_block)return session;
     const blocked=account?.route_block&&(isApi(account)||account.route_block!=='quota_exhausted');
     if(blocked&&!settings().failover)throw new AppError(503,'绑定账号已阻断，自动切换未开启','session_account_blocked');
     if(!blocked){
       if(!settings().weighted)return session;
-      const state=distribution();if(state.mode==='fallback'?state.eligible.some(a=>a.id===account.id):state.weights.get(account.id)>0)return session;
+      const state=distribution(protocol==='responses'?undefined:store.all("SELECT * FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND removed_at IS NULL"));if(state.mode==='fallback'?state.eligible.some(a=>a.id===account.id):state.weights.get(account.id)>0)return session;
     }
-    return atomic(()=>move(session,selectAccount().id,blocked?account.route_block:'weight_zero'));
+    return atomic(()=>move(session,selectAccount({protocol}).id,blocked?account.route_block:'weight_zero'));
   }
   async function plan(at,preview=false){
     const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND enabled=1 AND removed_at IS NULL");

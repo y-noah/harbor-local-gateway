@@ -426,7 +426,7 @@ export function createGateway(options={}) {
               if(current.removed_at||(authVersions.get(account.id)||0)!==version||current.route_epoch!==epoch)throw new AppError(409,'Key配置已变化，请重新检查');
               store.run("UPDATE accounts SET state='ready',last_error=NULL,route_block=NULL,route_epoch=route_epoch+1 WHERE id=?",account.id);store.audit('account.api.check',account.id);
               return json(res,200,{ready:true,models:models.map(m=>m.slug),balance:{available:false,reason:'official_api_not_provided'}});
-            }catch(e){if((authVersions.get(account.id)||0)===version&&store.get('SELECT route_epoch FROM accounts WHERE id=?',account.id)?.route_epoch===epoch){store.run("UPDATE accounts SET state='degraded',last_error=? WHERE id=?",'官方API Key检查未通过，请核对权限和配置',account.id);balancer.block(account,e.routeFailure);}throw e;}
+            }catch(e){if((authVersions.get(account.id)||0)===version&&store.get('SELECT route_epoch FROM accounts WHERE id=?',account.id)?.route_epoch===epoch){store.run("UPDATE accounts SET state=?,last_error=? WHERE id=?",['ready','degraded'].includes(account.state)?'degraded':'offline','官方API Key检查未通过，请核对权限和配置',account.id);balancer.block(account,e.routeFailure);}throw e;}
           }
           if(method==='POST'&&accountMatch[2]==='check'){
             if(logins.has(account.id))throw new AppError(409,'账号正在登录，请完成登录后再检查');
@@ -528,10 +528,10 @@ export function createGateway(options={}) {
           if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开');
           if(stopping)throw new AppError(503,'服务停止','service_stopping');
           const secret=(req.headers.authorization||'').replace(/^Bearer /,'');store.authenticate(secret);
-          if(session)session=balancer.route(session);
+          if(session)session=balancer.route(session,{protocol:jsonPath?'images':'responses'});
           if(jsonPath&&session&&usesApi(store.get('SELECT * FROM accounts WHERE id=?',session.account_id)))throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');
           const requestId=balancer.atomic(()=>{
-            if(!session)session={id:id(),account_id:(jsonPath?balancer.selectAccount({protocol:'chat'}):responseAccount()).id};
+            if(!session)session={id:id(),account_id:(jsonPath?balancer.selectAccount({protocol:'images'}):responseAccount()).id};
             const requestId=store.observe(m,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model);
             if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,client_session_id,created,updated) VALUES(?,?,?,'responses',?,?,?,?)",session.id,m.id,session.account_id,clientKey,clientSessionId,now(),now());
             else {

@@ -11,13 +11,13 @@ async function setup(t){
  const root=mkdtempSync(join(tmpdir(),'harbor-api-accounts-')),calls=[];let app,mode='ok',quotaReads=0,releaseModels;
  const transport=createResponsesTransport({apiKeyMode:true,credentials:async(_b,id)=>({token:app.store.upstreamKey(app.store.get('SELECT * FROM accounts WHERE id=?',id))}),fetchImpl:async(url,options)=>{
   calls.push({url,options});assert.ok(url.startsWith('https://api.openai.com/v1/'));assert.equal(options.headers['ChatGPT-Account-ID'],undefined);
-  if(url.endsWith('/models')){if(mode==='hold-models')await new Promise((resolve,reject)=>{releaseModels=resolve;options.signal?.addEventListener('abort',()=>reject(options.signal.reason),{once:true});});return Response.json({data:[{id:'gpt-6-luna',object:'model'}]});}
+  if(url.endsWith('/models')){if(mode==='model-fail')return Response.json({error:{message:'synthetic-private-marker'}},{status:502});if(mode==='hold-models')await new Promise((resolve,reject)=>{releaseModels=resolve;options.signal?.addEventListener('abort',()=>reject(options.signal.reason),{once:true});});return Response.json({data:[{id:'gpt-6-luna',object:'model'}]});}
   if(mode==='quota')return Response.json({error:{code:'insufficient_quota',message:'synthetic-upstream-private-key'}},{status:429});
   if(mode==='auth')return Response.json({error:{code:'invalid_api_key',message:'synthetic-upstream-private-key'}},{status:401});
   const response={id:'resp_api_fixture',object:'response',status:'completed',model:'gpt-6-luna',output:[{id:'msg_api_fixture',type:'message',role:'assistant',content:[{type:'output_text',text:'API fixture'}]}],usage:{input_tokens:10,output_tokens:2,input_tokens_details:{cached_tokens:3}}};
   return new Response([{type:'response.created',response:{id:response.id}},{type:'response.completed',response}].map(x=>'data: '+JSON.stringify(x)+'\n\n').join(''),{headers:{'Content-Type':'text/event-stream'}});
  }});
- app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'fixture-admin',reserveTokens:100,codexBinary:'unused'},apiResponsesTransport:transport,responsesTransport:{run:async()=>{throw Error('subscription transport must not run');},models:async()=>[{slug:'subscription-model'}]},rateReader:async()=>{quotaReads++;return null;}});
+ app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'fixture-admin',reserveTokens:100,codexBinary:'unused'},apiResponsesTransport:transport,responsesTransport:{run:async()=>{throw Error('subscription transport must not run');},runJson:async()=>({response:{data:[{b64_json:'c3ludGhldGlj'}]},input:1,output:1,cached:0,usageKnown:true}),models:async()=>[{slug:'subscription-model'}]},rateReader:async()=>{quotaReads++;return null;}});
  await new Promise(r=>app.server.listen(0,'127.0.0.1',r));const base='http://127.0.0.1:'+app.server.address().port;
  const member=app.store.createMember('API verification fixture',null,null);
  t.after(async()=>{await app.close();rmSync(root,{recursive:true,force:true});});
@@ -71,4 +71,21 @@ test('Key update and an older asynchronous authentication check cannot race to e
  const update=await a.call('/api/admin/accounts/'+id,'PATCH',{api_key:'synthetic-replacement-private-key'});a.releaseModels();assert.equal((await checking).status,409);a.mode('ok');assert.equal(update.status,200);const row=a.store.get('SELECT * FROM accounts WHERE id=?',id);assert.equal(row.state,'offline');assert.equal(a.store.upstreamKey(row),'synthetic-replacement-private-key');assert.equal(row.api_weight,0);
  const events=a.store.all("SELECT action,detail FROM audit WHERE action LIKE 'account.api.%'");assert.ok(events.some(e=>e.action==='account.api.key'));assert.ok(!JSON.stringify(events).includes('synthetic-replacement-private-key'));
  assert.equal((await a.call('/api/admin/sessions','POST',{member_id:a.member.memberId,account_id:id})).status,400);
+});
+
+
+test('unverified new and rotated API Keys remain offline after a failed catalog check until a successful recheck',async t=>{
+ const a=await setup(t),id=await a.add(20);a.mode('model-fail');assert.equal((await a.call('/api/admin/accounts/'+id+'/check','POST',{})).status,502);
+ assert.equal(a.store.get('SELECT state FROM accounts WHERE id=?',id).state,'offline');assert.throws(()=>a.balancer.selectAccount(),{code:'no_account'});assert.equal((await a.call('/api/admin/sessions','POST',{member_id:a.member.memberId,account_id:id})).status,400);
+ a.mode('ok');assert.equal((await a.call('/api/admin/accounts/'+id+'/check','POST',{})).status,200);const fixed=await a.call('/api/admin/sessions','POST',{member_id:a.member.memberId,account_id:id});assert.equal(fixed.status,201);
+ await a.call('/api/admin/accounts/'+id,'PATCH',{api_key:'synthetic-rotated-unverified-key'});a.mode('model-fail');assert.equal((await a.call('/api/admin/accounts/'+id+'/check','POST',{})).status,502);assert.equal(a.store.get('SELECT state FROM accounts WHERE id=?',id).state,'offline');assert.equal((await a.send(fixed.body.session_id)).status,503);assert.equal(a.calls.filter(x=>x.url.endsWith('/responses')).length,0);
+ a.mode('ok');assert.equal((await a.call('/api/admin/accounts/'+id+'/check','POST',{})).status,200);assert.equal((await a.send(fixed.body.session_id)).status,200);
+});
+test('images keep subscription-only routing even when API share is 100%, including repeat calls and zero-weight reroute',async t=>{
+ const a=await setup(t),api=await a.add(100);await a.call('/api/admin/accounts/'+api+'/check','POST',{});const time=Date.now();
+ for(const id of ['sub-a','sub-b'])a.store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",id,id,'unused',JSON.stringify({checked:time,plan:'same',remaining:50,windows:[{used:50,minutes:10080,reset:time+86400000}]}));a.balancer.saveSettings({weighted:true});
+ const image=(headers={})=>a.call('/v1/images/generations','POST',{model:'gpt-image-2',prompt:'synthetic'},a.member.secret,{'thread-id':'image-fixture-thread',...headers});
+ assert.equal((await image()).status,200);const original=a.store.get("SELECT * FROM sessions WHERE client_key IS NOT NULL");assert.ok(original.account_id.startsWith('sub-'));assert.equal((await image()).status,200);assert.equal(a.store.get('SELECT account_id FROM sessions WHERE id=?',original.id).account_id,original.account_id);
+ const other=original.account_id==='sub-a'?'sub-b':'sub-a';a.balancer.saveWeights({mode:'manual',weights:{[original.account_id]:0,[other]:100},expected_version:0});assert.equal((await image()).status,200);assert.equal(a.store.get('SELECT account_id FROM sessions WHERE id=?',original.id).account_id,other);
+ const fixed=await a.call('/api/admin/sessions','POST',{member_id:a.member.memberId,account_id:api});assert.equal((await image({'x-harbor-session':fixed.body.session_id})).status,400);assert.equal(a.store.get('SELECT account_id FROM sessions WHERE id=?',fixed.body.session_id).account_id,api);
 });
