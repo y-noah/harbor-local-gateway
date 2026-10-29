@@ -395,3 +395,14 @@ test('session management shows its own reference amount and coverage without bor
  page.run("sessionDetail('b')");assert.match(page.node('#modal-content').innerHTML,/\$3\.30/);
  page.run("sessionDetail('c')");assert.match(page.node('#modal-content').innerHTML,/1条缺费率/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/\$0\.00/);
 });
+
+test('Key model selection preserves exact names, saved versions and ignores stale async dialogs',async()=>{
+ const calls=[],state={...snapshot(),keys:[{id:'k',member_id:'m',allowed_models:['sol'],model_policy_version:7}]};
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?pricingState():state);});
+ page.run('admin=true;state='+JSON.stringify(state)+';globalThis.FormData=class{get(k){return formValues[k]??null;}};');
+ await page.click('key-models','k');assert.match(page.node('#modal-content').innerHTML,/只允许指定模型/);assert.match(page.node('#modal-content').innerHTML,/gpt-6.1-sol/);
+ page.node('[name="allowed_models"]').value='sol';page.node('#key-model-suggestion').onchange({target:{value:'gpt-6.1-sol'}});assert.equal(page.node('[name="allowed_models"]').value,'sol\ngpt-6.1-sol');assert.equal(page.node('[name="model_policy_mode"]').value,'limited');
+ page.run('globalThis.formValues={model_policy_mode:"limited",allowed_models:"sol, astra"};');await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
+ const sent=calls.find(([p,o])=>p==='/api/admin/keys/k'&&o.method==='PATCH');assert.deepEqual(JSON.parse(sent[1].body),{allowed_models:['sol','astra'],expected_model_policy_version:7});
+ let release;const delayed=await ui(()=>new Promise(r=>release=()=>r(response(pricingState()))));delayed.run('admin=true;state='+JSON.stringify(state));const pending=delayed.click('key-models','k');await delayed.click('close');delayed.run("modal('<h2>new dialog</h2>')");release();await pending;assert.equal(delayed.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
+});
