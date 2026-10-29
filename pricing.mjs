@@ -149,7 +149,7 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
   }
   function status(){
     const current=book(state.active),missing=new Map();
-    for(const r of store.all('SELECT * FROM requests WHERE COALESCE(ended,started)>=?',windowStart(clock()))){if(rawQuote(r).state==='unpriced'){const name=r.billing_model||r.model||'未记录';missing.set(name,(missing.get(name)||0)+1);}}
+    for(const r of store.all('SELECT * FROM requests WHERE COALESCE(ended,started)>=? AND COALESCE(ended,started)<?',windowStart(clock()),windowStart(clock())+7*86400000)){if(rawQuote(r).state==='unpriced'){const name=r.billing_model||r.model||'未记录';missing.set(name,(missing.get(name)||0)+1);}}
     return {metric:referenceMetric,currency:'USD',basis:seed.basis,source:seed.source,seedCaptured:seed.captured,state:{...state},settings:{...settings},
       rates:Object.entries(current.rates).map(([model,rate])=>({model,...rate,manual:Object.hasOwn(settings.manualRates,model)})),unpricedModels:[...missing].map(([model,requests])=>({model,requests}))};
   }

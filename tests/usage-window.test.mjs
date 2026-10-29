@@ -23,7 +23,7 @@ test('rolling twelve hours use completion boundaries across midnight and isolate
  assert.equal(result.keys.find(k=>k.id===b.keyId).standard_12h.total_exact,'0.0000781');assert.equal(result.keys.find(k=>k.id===a.keyId).standard.total_exact,'0.0006743');
  assert.equal(s.snapshot(at+1).keys.find(k=>k.id===a.keyId).standard_12h.total_exact,'0.0004181');
 });
-test('all aggregate scopes use the same seven days and physically remove expired token statistics',t=>{
+test('all aggregate scopes use the same seven days and retain archived measurements outside the visible window',t=>{
  const f=fixture(t),s=f.store,m=s.createMember('Fixture',null,null),at=Date.now(),w=usageWindow(at);
  s.run("INSERT INTO accounts(id,name,home,state) VALUES('account','Fixture','unused','ready')");
  const old=record(s,m,w.start-1,9000),first=record(s,m,w.start,10),current=record(s,m,at,20,'unknown',1);
@@ -32,10 +32,10 @@ test('all aggregate scopes use the same seven days and physically remove expired
  assert.equal(snapshot.totals.standard.total_exact,'0.0000381');assert.equal(snapshot.totals.requests,2);assert.equal(snapshot.totals.success,1);assert.equal(snapshot.totals.standard.unmetered,1);
  for(const x of [snapshot.keys[0],snapshot.members[0]]){assert.equal(x.standard.total_exact,'0.0000381');assert.equal(x.standard.unmetered,1);assert.equal(x.ips,1);}
  assert.equal(snapshot.accounts[0].standard.total_exact,'0.0000381');assert.equal(snapshot.daily.reduce((n,d)=>n+d.requests,0),2);assert.equal(snapshot.daily.reduce((n,d)=>n+(d.standard.total||0),0),0.0000381);
- assert.equal(s.get('SELECT input+output+cached+usage_unknown n FROM requests WHERE id=?',old).n,0);
+ assert.equal(s.get('SELECT input+output+cached+usage_unknown n FROM requests WHERE id=?',old).n,9003);
  assert.equal(snapshot.requests.length,2);assert.equal(s.usageFor('key_id',m.keyId,at).used,34);
- // The boundary-day row expires on the next Beijing day; other rows remain.
- s.snapshot(w.end);assert.equal(s.get('SELECT input+output n FROM requests WHERE id=?',first).n,0);assert.equal(s.get('SELECT input+output n FROM requests WHERE id=?',current).n,22);
+ // The boundary-day row leaves the visible window but its stored measurements remain.
+ s.snapshot(w.end);assert.equal(s.get('SELECT input+output n FROM requests WHERE id=?',first).n,12);assert.equal(s.get('SELECT input+output n FROM requests WHERE id=?',current).n,22);
 });
 test('encryption survives restart, old hashes backfill only after valid authentication, ciphertext is row-bound',t=>{
  const f=fixture(t),s=f.store,m=s.createMember('Fixture',null,null),other=s.createKey(m.memberId);

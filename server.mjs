@@ -139,7 +139,7 @@ export function createGateway(options={}) {
     for(const account of store.all("SELECT * FROM accounts WHERE enabled=1 AND removed_at IS NULL AND kind='codex' AND state IN ('ready','degraded')"))void refreshQuota(account);
   }
   const maintenance=setInterval(()=>{store.pruneUsage();refreshQuotas();void balancer.tick();void store.pricing.refresh();},30000);maintenance.unref();
-  function expectedTokens(messages){const avg=store.get("SELECT AVG(input+output) n FROM (SELECT input,output FROM requests WHERE status='ok' ORDER BY started DESC LIMIT 10)").n||10000;return Math.ceil(Math.max(10000,avg,JSON.stringify(messages).length/2+9000));}
+  function expectedTokens(messages){const avg=store.get("SELECT AVG(CASE WHEN ended<? THEN 0 ELSE input+output END) n FROM (SELECT input,output,ended FROM requests WHERE status='ok' ORDER BY started DESC LIMIT 10)",usageWindow().start).n||10000;return Math.ceil(Math.max(10000,avg,JSON.stringify(messages).length/2+9000));}
   function capacity(account,predicted,exclude=''){
     const pending=store.get("SELECT COALESCE(SUM(predicted),0) n FROM requests WHERE account_id=? AND id<>? AND status IN ('queued','running','unknown','interrupted')",account.id,exclude).n;
     return accountCapacity(account,predicted,pending);
@@ -462,10 +462,10 @@ export function createGateway(options={}) {
         }
         const settleMatch=path.match(/^\/api\/admin\/requests\/([a-f0-9-]+)\/settle$/);
         if(settleMatch&&method==='POST'){
-          const b=await body(req),r=store.get('SELECT * FROM requests WHERE id=?',settleMatch[1]);if(!r||!needsReferenceReconciliation(r,usageWindow().start))throw new AppError(409,'该请求无需核对');
+          const b=await body(req),r=store.get('SELECT * FROM requests WHERE id=?',settleMatch[1]),window=usageWindow();if(!r||(r.ended??r.started)<window.start||(r.ended??r.started)>=window.end)throw new AppError(404,'请求记录不存在或超出近7天可见范围');if(!needsReferenceReconciliation(r,usageWindow().start))throw new AppError(409,'该请求无需核对');
           if(typeof b.standard_usd!=='string'||!/^\d{1,12}(?:\.\d{1,6})?$/.test(b.standard_usd)||Object.keys(b).some(k=>k!=='standard_usd'))throw new AppError(400,'请填写最多六位小数的Standard参考消耗USD');
           const [whole,fraction='']=b.standard_usd.split('.'),actual=(BigInt(whole)*1000000n+BigInt(fraction.padEnd(6,'0')))*1000000n;
-          store.db.exec('BEGIN IMMEDIATE');try{store.run("UPDATE requests SET status='reconciled',reserved=0,manual_cost_atoms=?,error='管理员已核对Standard参考消耗；原始计量未补造' WHERE id=?",actual.toString(),r.id);store.audit('request.settle',JSON.stringify({request:r.id,metric:'openai-standard-short-usd-v1',standard_usd:b.standard_usd}));store.prunedStart=null;store.pruneUsage();store.db.exec('COMMIT');}catch(e){store.db.exec('ROLLBACK');throw e;}
+          store.db.exec('BEGIN IMMEDIATE');try{store.run("UPDATE requests SET status='reconciled',reserved=0,manual_cost_atoms=?,error='管理员已核对Standard参考消耗；原始计量未补造' WHERE id=?",actual.toString(),r.id);store.audit('request.settle',JSON.stringify({request:r.id,metric:'openai-standard-short-usd-v1',standard_usd:b.standard_usd}));store.db.exec('COMMIT');}catch(e){store.db.exec('ROLLBACK');throw e;}
           return json(res,200,{ok:true});
         }
         if(path==='/api/admin/ips'&&method==='GET'){

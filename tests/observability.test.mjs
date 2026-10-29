@@ -24,9 +24,9 @@ test('history query rejects ambiguous and unsafe pagination, filters and time bo
   for(const value of ['page=0','page=1&page=2','page_size=101','page_size=1.5','start=NaN','start=100&end=100','kind=invalid','kind=nightly&action=session.route','account=a%27+OR+1%3D1','session=bad%20id','unknown=value'])assert.throws(()=>historyQuery(new URLSearchParams(value)),{status:400},value);
   assert.equal(query({page:'9999'}).page,9999);
 });
-test('audit history pages all retained dates with deterministic ties and protects raw metadata',t=>{
+test('audit history pages visible dates with deterministic ties and protects raw metadata',t=>{
   const {store,at}=fixture(t);store.run('DELETE FROM audit');
-  for(let i=0;i<67;i++)store.run('INSERT INTO audit VALUES(?,?,?,?)','event-'+String(i).padStart(3,'0'),at-20*86400000,'session.route',JSON.stringify({sessionId:'session-one',from:'a',to:'b',reason:'nightly',prompt:'synthetic-private-marker',access_token:'synthetic-private-marker'}));
+  for(let i=0;i<67;i++)store.run('INSERT INTO audit VALUES(?,?,?,?)','event-'+String(i).padStart(3,'0'),at-2*86400000,'session.route',JSON.stringify({sessionId:'session-one',from:'a',to:'b',reason:'nightly',prompt:'synthetic-private-marker',access_token:'synthetic-private-marker'}));
   store.audit('member.create','synthetic-private-marker');store.audit('unknown.event','synthetic-private-marker');
   const reader=historyReader(store),pages=[1,2,3].map(page=>reader.list(query({page:String(page),action:'session.route'})));
   assert.equal(pages[0].pagination.total,67);assert.equal(pages[2].rows.length,17);
