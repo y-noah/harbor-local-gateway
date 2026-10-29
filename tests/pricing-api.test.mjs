@@ -38,7 +38,7 @@ test('manual USD reconciliation is reflected consistently in details, employee u
  const row=a.store.get('SELECT * FROM requests');assert.equal(row.input,0);assert.equal(row.usage_unknown,1);assert.equal(row.reserved,0);
  const details=await a.call('/api/admin/requests/'+id);assert.equal(details.body.standard.total_exact,'0.123456');assert.equal(details.body.standard.model_source,'manual');
  const me=await a.call('/api/me','GET',undefined,m.secret);assert.equal(me.body.keyStandard.total_exact,'0.123456');assert.ok(!('keyUsed' in me.body));
- const exported=await fetch(a.base+'/api/admin/export',{headers:{Authorization:'Bearer synthetic-pricing-admin'}}),csv=await exported.text();assert.match(csv,/Standard合计参考USD/);assert.match(csv,/0\.123456/);assert.doesNotMatch(csv,/输入Token|输出Token/);
+ const exported=await fetch(a.base+'/api/admin/export',{headers:{Authorization:'Bearer synthetic-pricing-admin'}}),csv=await exported.text();assert.match(csv,/Standard合计参考USD/);assert.match(csv,/"0\.12"/);assert.doesNotMatch(csv,/0\.123456/);assert.doesNotMatch(csv,/输入Token|输出Token/);
 });
 test('source refresh merges current administrator overrides rather than overwriting configuration saved during fetch',async t=>{
  let entered=false,release;const a=await setup(t,{pricingFetch:async()=>{entered=true;await new Promise(r=>release=r);return new Response(official);}});
