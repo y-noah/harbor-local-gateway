@@ -76,7 +76,7 @@ test('disconnecting five callers cancels queue, preserves only running uncertain
   people.forEach((person,i)=>{if(!queuedMembers.has(person.memberId))controllers[i].abort();});await deadline(Promise.all(calls),'disconnect clients');
   await waitFor(()=>active===0&&app.store.get("SELECT COUNT(*) n FROM requests WHERE status IN ('queued','running')").n===0,'disconnect settlement');
   assert.equal(aborts,3);assert.equal(app.store.get("SELECT COUNT(*) n FROM requests WHERE status='cancelled' AND reserved=0").n,2);
-  for(const row of app.store.all("SELECT * FROM requests WHERE status='unknown'")){assert.equal(row.reserved,100);assert.equal((await app.post('/api/admin/requests/'+row.id+'/settle',{tokens:0})).status,200);}
+  for(const row of app.store.all("SELECT * FROM requests WHERE status='unknown'")){assert.equal(row.reserved,100);assert.equal((await app.post('/api/admin/requests/'+row.id+'/settle',{standard_usd:'0'})).status,200);}
   assert.equal(app.store.get('SELECT SUM(reserved) n FROM requests').n,0);
   waiting=false;for(const m of people)assert.equal((await app.chat(m)).status,200);
 });

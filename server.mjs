@@ -10,6 +10,7 @@ import { Store, AppError, id, now, hash, usageWindow, nextDailyReset } from './s
 import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
 import {createBalancer} from './balancing.mjs';
+import {needsReferenceReconciliation} from './pricing.mjs';
 import {runClaude,checkClaudeLogin,claudeEnv} from './claude.mjs';
 import {networkConfig,acceptsRequest} from './network.mjs';
 import {startCodexLogin,startLocalLogin} from './account-login.mjs';
@@ -66,7 +67,7 @@ export function createGateway(options={}) {
   if(!existsSync(encryptionPath))writeFileSync(encryptionPath,randomBytes(32),{mode:0o600,flag:'wx'});
   const encryptionKey=readFileSync(encryptionPath);
   if(encryptionKey.length!==32)throw Error('Key encryption key invalid');
-  const store=new Store(join(data,'gateway.sqlite'),{encryptionKey});
+  const store=new Store(join(data,'gateway.sqlite'),{encryptionKey,pricingOptions:{clock:options.clock||Date.now,fetchImpl:options.pricingFetch||fetch}});
   const executor=options.executor||runCodex, checker=options.checker||checkLogin,rateReader=options.rateReader||readRateLimits;
   const responses=options.responsesTransport||createResponsesTransport();
   const apiResponses=options.apiResponsesTransport||createResponsesTransport({apiKeyMode:true,credentials:async(_binary,accountId)=>{
@@ -137,7 +138,7 @@ export function createGateway(options={}) {
     if(stopping)return;
     for(const account of store.all("SELECT * FROM accounts WHERE enabled=1 AND removed_at IS NULL AND kind='codex' AND state IN ('ready','degraded')"))void refreshQuota(account);
   }
-  const maintenance=setInterval(()=>{store.pruneUsage();refreshQuotas();void balancer.tick();},30000);maintenance.unref();
+  const maintenance=setInterval(()=>{store.pruneUsage();refreshQuotas();void balancer.tick();void store.pricing.refresh();},30000);maintenance.unref();
   function expectedTokens(messages){const avg=store.get("SELECT AVG(input+output) n FROM (SELECT input,output FROM requests WHERE status='ok' ORDER BY started DESC LIMIT 10)").n||10000;return Math.ceil(Math.max(10000,avg,JSON.stringify(messages).length/2+9000));}
   function capacity(account,predicted,exclude=''){
     const pending=store.get("SELECT COALESCE(SUM(predicted),0) n FROM requests WHERE account_id=? AND id<>? AND status IN ('queued','running','unknown','interrupted')",account.id,exclude).n;
@@ -236,7 +237,7 @@ export function createGateway(options={}) {
       void refreshQuota(store.get('SELECT * FROM accounts WHERE id=?',account.id),true);
     }catch(e){
       const known=e.usageKnown===true;
-      store.finish(requestId,{input:e.input||0,output:e.output||0,cached:e.cached||0,status:known?'failed':'unknown',error:e.message,usageKnown:known},()=>{
+      store.finish(requestId,{input:e.input||0,output:e.output||0,cached:e.cached||0,actualModel:e.actualModel,status:known?'failed':'unknown',error:e.message,usageKnown:known},()=>{
         if(job.responses){
           const failureAccount=e.routeFailure==='login_expired'?((authVersions.get(account.id)||0)===authVersion?store.get('SELECT * FROM accounts WHERE id=?',account.id):null):account;
           if(failureAccount)balancer.block(failureAccount,e.routeFailure);
@@ -288,6 +289,9 @@ export function createGateway(options={}) {
           if(pagination.sessionPageSize>100)throw new AppError(400,'每页最多100个会话');
           refreshQuotas();return json(res,200,{...store.snapshot(now(),pagination),balancing:balancer.status(),queue:queue.length,busy:[...busy.values()].reduce((a,b)=>a+b,0),preparing:[...responseMembers.values()].reduce((a,b)=>a+b,0),endpoint:`http://${host}/v1`,mode:'本机 · 订阅测试',reserveTokens:config.reserveTokens});}
         if(path==='/api/admin/balancing'&&method==='PATCH')return json(res,200,balancer.saveSettings(await body(req)));
+        if(path==='/api/admin/pricing'&&method==='GET')return json(res,200,store.pricing.status());
+        if(path==='/api/admin/pricing'&&method==='PATCH')return json(res,200,store.pricing.configure(await body(req)));
+        if(path==='/api/admin/pricing/refresh'&&method==='POST')return json(res,200,await store.pricing.refresh({force:true}));
         if(path==='/api/admin/balancing/weights'&&method==='PATCH')return json(res,200,balancer.saveWeights(await body(req)));
         if(path==='/api/admin/balancing/preview'&&method==='POST'){
           const result=await balancer.preview();
@@ -458,8 +462,10 @@ export function createGateway(options={}) {
         }
         const settleMatch=path.match(/^\/api\/admin\/requests\/([a-f0-9-]+)\/settle$/);
         if(settleMatch&&method==='POST'){
-          const b=await body(req),r=store.get('SELECT * FROM requests WHERE id=?',settleMatch[1]);if(!r||!['unknown','interrupted'].includes(r.status))throw new AppError(409,'该请求无需核对');
-          const actual=integer(b.tokens,'补记 Token');store.db.exec('BEGIN IMMEDIATE');try{store.run("UPDATE requests SET status='reconciled',usage_unknown=0,reserved=0,input=input+?,error='管理员已核对并补记用量' WHERE id=?",actual,r.id);store.run('UPDATE members SET used=used+? WHERE id=?',actual,r.member_id);store.run('UPDATE keys SET used=used+? WHERE id=?',actual,r.key_id);if(r.account_id)store.run('UPDATE accounts SET budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?',actual,actual,r.account_id);store.audit('request.settle',r.id);store.prunedStart=null;store.pruneUsage();store.db.exec('COMMIT');}catch(e){store.db.exec('ROLLBACK');throw e;}
+          const b=await body(req),r=store.get('SELECT * FROM requests WHERE id=?',settleMatch[1]);if(!r||!needsReferenceReconciliation(r,usageWindow().start))throw new AppError(409,'该请求无需核对');
+          if(typeof b.standard_usd!=='string'||!/^\d{1,12}(?:\.\d{1,6})?$/.test(b.standard_usd)||Object.keys(b).some(k=>k!=='standard_usd'))throw new AppError(400,'请填写最多六位小数的Standard参考消耗USD');
+          const [whole,fraction='']=b.standard_usd.split('.'),actual=(BigInt(whole)*1000000n+BigInt(fraction.padEnd(6,'0')))*1000000n;
+          store.db.exec('BEGIN IMMEDIATE');try{store.run("UPDATE requests SET status='reconciled',reserved=0,manual_cost_atoms=?,error='管理员已核对Standard参考消耗；原始计量未补造' WHERE id=?",actual.toString(),r.id);store.audit('request.settle',JSON.stringify({request:r.id,metric:'openai-standard-short-usd-v1',standard_usd:b.standard_usd}));store.prunedStart=null;store.pruneUsage();store.db.exec('COMMIT');}catch(e){store.db.exec('ROLLBACK');throw e;}
           return json(res,200,{ok:true});
         }
         if(path==='/api/admin/ips'&&method==='GET'){
@@ -468,9 +474,9 @@ export function createGateway(options={}) {
           return json(res,200,store.all('SELECT ip,COUNT(*) requests,MIN(started) first_seen,MAX(started) last_seen,MAX(agent) agent FROM requests WHERE member_id=?'+(key?' AND key_id=?':'')+' AND COALESCE(ended,started)>=? AND COALESCE(ended,started)<? GROUP BY ip ORDER BY last_seen DESC',...[member,...(key?[key]:[]),usageWindow().start,usageWindow().end]));
         }
         if(path==='/api/admin/export'&&method==='GET'){
-          const rows=store.all('SELECT r.started,m.name,r.ip,r.status,r.input,r.output,r.cached,r.model FROM requests r LEFT JOIN members m ON m.id=r.member_id WHERE COALESCE(r.ended,r.started)>=? AND COALESCE(r.ended,r.started)<? ORDER BY started DESC LIMIT 10000',usageWindow().start,usageWindow().end);
+          const rows=store.all('SELECT r.*,m.name FROM requests r LEFT JOIN members m ON m.id=r.member_id WHERE COALESCE(r.ended,r.started)>=? AND COALESCE(r.ended,r.started)<? ORDER BY started DESC,r.id',usageWindow().start,usageWindow().end);
           const cell=v=>{const text=String(v??'');return '"'+(/^[\s\x00-\x1f\x7f]*[=+@-]/.test(text)?"'":"")+text.replaceAll('"','""')+'"';};
-          res.setHeader('Content-Type','text/csv; charset=utf-8');res.setHeader('Content-Disposition','attachment; filename="harbor-usage.csv"');return res.end('\ufeff'+['时间,员工,IP,状态,输入Token,输出Token,缓存Token,模型',...rows.map(r=>[new Date(r.started).toISOString(),r.name,r.ip,r.status,r.input,r.output,r.cached,r.model].map(cell).join(','))].join('\r\n'));
+          res.setHeader('Content-Type','text/csv; charset=utf-8');res.setHeader('Content-Disposition','attachment; filename="harbor-usage.csv"');return res.end('\ufeff'+['时间,员工,IP,状态,Standard输入参考USD,Standard输出参考USD,其中缓存参考USD,人工核对参考USD,Standard合计参考USD,计价状态,模型,费率版本',...rows.map(r=>{const u=store.pricing.usage(r);return [new Date(r.started).toISOString(),r.name,r.ip,r.status,u.input_exact,u.output_exact,u.cached_exact,u.adjustment_exact,u.total_exact,u.state,u.model||r.billing_model||r.model,u.revision].map(cell).join(',');})].join('\r\n'));
         }
         if(path==='/api/admin/backup'&&method==='POST'){
           const backupDir=join(data,'backups');mkdirSync(backupDir,{recursive:true});const filename='gateway-'+now()+'.sqlite';store.db.prepare('VACUUM INTO ?').run(join(backupDir,filename));store.audit('backup.create',filename);return json(res,200,{file:'data/backups/'+filename});
@@ -495,7 +501,7 @@ export function createGateway(options={}) {
         return json(res,200,{object:'list',data:[...['codex','claude'].map(id=>({id,object:'model',owned_by:'local'})),...models.map(m=>({id:m.slug,object:'model',owned_by:'openai'}))],models});
       }
       if(path==='/api/me'&&method==='GET'){
-        const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,used:store.usageFor('member_id',m.id).used,keyUsed:store.usageFor('key_id',m.key_id).used,unmetered:store.usageFor('key_id',m.key_id).unmetered,expires:m.expires,usageWindow:w});
+        const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,standard:store.pricing.inWindow('member_id',m.id),keyStandard:store.pricing.inWindow('key_id',m.key_id),expires:m.expires,usageWindow:w});
       }
       if((path==='/v1/responses'||codexJsonRoutes.has(path.slice(3))&&path.startsWith('/v1/'))&&method==='POST'){
         const m=employee(req);
@@ -606,7 +612,7 @@ export function createGateway(options={}) {
           });
           if(res.destroyed)return;
           const usage={prompt_tokens:result.input,completion_tokens:result.output,total_tokens:result.input+result.output,prompt_tokens_details:{cached_tokens:result.cached}};
-          const common={id:'chatcmpl-'+requestId,created:Math.floor(now()/1000),model:kind,session_id:session.id,...(result.contextReset?{context_reset:true}:{})};res.setHeader('X-Harbor-Session',session.id);
+          const common={id:'chatcmpl-'+requestId,created:Math.floor(now()/1000),model:kind,session_id:session.id,harbor_standard_usage:store.pricing.usage(store.get('SELECT * FROM requests WHERE id=?',requestId)),...(result.contextReset?{context_reset:true}:{})};res.setHeader('X-Harbor-Session',session.id);
           if(b.stream){
             res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no'});
             res.write('data: '+JSON.stringify({...common,object:'chat.completion.chunk',choices:[{index:0,delta:{role:'assistant',content:result.text},finish_reason:null}]})+'\n\n');
@@ -625,7 +631,7 @@ export function createGateway(options={}) {
   }
   const server=http.createServer(handler);
   let closePromise;
-  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;clearInterval(maintenance);for(const c of controllers)c.abort();for(const c of logins.values())c.flow.cancel();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks,...loginTasks,...quotaReads.values(),...quotaFetches.values(),balancer.pending()]);store.close();})();return closePromise;}
+  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;clearInterval(maintenance);const pricingClosed=store.pricing.close();for(const c of controllers)c.abort();for(const c of logins.values())c.flow.cancel();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks,...loginTasks,...quotaReads.values(),...quotaFetches.values(),balancer.pending()]);await pricingClosed;store.close();})();return closePromise;}
   return {server,store,config,close,data,runtime,network,balancer};
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){

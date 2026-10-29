@@ -7,7 +7,7 @@ import {randomBytes} from 'node:crypto';
 import {Store,usageWindow} from '../store.mjs';
 
 function fixture(t){const root=mkdtempSync(join(tmpdir(),'harbor-seven-test-')),file=join(root,'db.sqlite'),encryptionKey=randomBytes(32);let store=new Store(file,{encryptionKey});t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});return {get store(){return store;},restart(){store.close();store=new Store(file,{encryptionKey});return store;}};}
-function record(s,m,ended,tokens,status='ok',missing=0){const r=s.observe(s.authenticate(m.secret),'fixture-ip','fixture-agent','fixture');s.run('UPDATE requests SET account_id=?,started=?,ended=?,status=?,input=?,output=?,cached=?,usage_unknown=? WHERE id=?','account',ended-10,ended,status,tokens,2,1,missing,r);return r;}
+function record(s,m,ended,tokens,status='ok',missing=0){const r=s.observe(s.authenticate(m.secret),'fixture-ip','fixture-agent','gpt-6.1-sol');s.run('UPDATE requests SET account_id=?,started=?,ended=?,status=?,input=?,output=?,cached=?,usage_unknown=? WHERE id=?','account',ended-10,ended,status,tokens,2,1,missing,r);return r;}
 test('seven Beijing calendar days cross midnight and Monday without weekly resets',()=>{
  const sunday=Date.parse('2026-10-11T23:59:59+08:00'),w=usageWindow(sunday);
  assert.equal(w.start,Date.parse('2026-10-05T00:00:00+08:00'));assert.equal(w.end,Date.parse('2026-10-12T00:00:00+08:00'));
@@ -19,9 +19,9 @@ test('rolling twelve hours use completion boundaries across midnight and isolate
  record(s,a,start-1,100);record(s,a,start,10);record(s,a,at-1,20,'unknown',1);record(s,a,at,200);record(s,b,at-1,30);
  const result=s.snapshot(at);
  assert.deepEqual(result.recentUsageWindow,{start,end:at,hours:12});
- assert.equal(result.keys.find(k=>k.id===a.keyId).used_12h,34);assert.equal(result.members.find(m=>m.id===a.memberId).used_12h,34);
- assert.equal(result.keys.find(k=>k.id===b.keyId).used_12h,32);assert.equal(result.keys.find(k=>k.id===a.keyId).used,338);
- assert.equal(s.snapshot(at+1).keys.find(k=>k.id===a.keyId).used_12h,224);
+ assert.equal(result.keys.find(k=>k.id===a.keyId).standard_12h.total_exact,'0.0000381');assert.equal(result.members.find(m=>m.id===a.memberId).standard_12h.total_exact,'0.0000381');
+ assert.equal(result.keys.find(k=>k.id===b.keyId).standard_12h.total_exact,'0.0000781');assert.equal(result.keys.find(k=>k.id===a.keyId).standard.total_exact,'0.0006743');
+ assert.equal(s.snapshot(at+1).keys.find(k=>k.id===a.keyId).standard_12h.total_exact,'0.0004181');
 });
 test('all aggregate scopes use the same seven days and physically remove expired token statistics',t=>{
  const f=fixture(t),s=f.store,m=s.createMember('Fixture',null,null),at=Date.now(),w=usageWindow(at);
@@ -29,9 +29,9 @@ test('all aggregate scopes use the same seven days and physically remove expired
  const old=record(s,m,w.start-1,9000),first=record(s,m,w.start,10),current=record(s,m,at,20,'unknown',1);
  record(s,m,w.end,8000);s.prunedStart=null;
  const snapshot=s.snapshot(at);
- assert.equal(snapshot.totals.tokens,34);assert.equal(snapshot.totals.requests,2);assert.equal(snapshot.totals.success,1);assert.equal(snapshot.totals.unmetered,1);
- for(const x of [snapshot.keys[0],snapshot.members[0]]){assert.equal(x.used,34);assert.equal(x.unmetered,1);assert.equal(x.ips,1);}
- assert.equal(snapshot.accounts[0].budget_used,34);assert.equal(snapshot.daily.reduce((n,d)=>n+d.requests,0),2);assert.equal(snapshot.daily.reduce((n,d)=>n+d.tokens,0),34);
+ assert.equal(snapshot.totals.standard.total_exact,'0.0000381');assert.equal(snapshot.totals.requests,2);assert.equal(snapshot.totals.success,1);assert.equal(snapshot.totals.standard.unmetered,1);
+ for(const x of [snapshot.keys[0],snapshot.members[0]]){assert.equal(x.standard.total_exact,'0.0000381');assert.equal(x.standard.unmetered,1);assert.equal(x.ips,1);}
+ assert.equal(snapshot.accounts[0].standard.total_exact,'0.0000381');assert.equal(snapshot.daily.reduce((n,d)=>n+d.requests,0),2);assert.equal(snapshot.daily.reduce((n,d)=>n+(d.standard.total||0),0),0.0000381);
  assert.equal(s.get('SELECT input+output+cached+usage_unknown n FROM requests WHERE id=?',old).n,0);
  assert.equal(snapshot.requests.length,2);assert.equal(s.usageFor('key_id',m.keyId,at).used,34);
  // The boundary-day row expires on the next Beijing day; other rows remain.
@@ -49,8 +49,8 @@ test('encryption survives restart, old hashes backfill only after valid authenti
 });
 test('known and missing usage remain distinct and repeated finish cannot double count',t=>{
  const f=fixture(t),s=f.store,m=s.createMember('Fixture',null,null),person=s.authenticate(m.secret);
- const a=s.observe(person,'fixture','fixture','fixture'),b=s.observe(person,'fixture','fixture','fixture');
+ const a=s.observe(person,'fixture','fixture','gpt-6.1-sol'),b=s.observe(person,'fixture','fixture','gpt-6.1-sol');
  s.finish(a,{input:3,output:2,usageKnown:true});s.finish(b,{usageKnown:false});
- assert.equal(s.snapshot().keys[0].used,5);assert.equal(s.snapshot().keys[0].unmetered,1);assert.throws(()=>s.finish(a,{input:10}),/already settled/);
- assert.equal(f.restart().snapshot().keys[0].unmetered,1);
+ assert.equal(s.snapshot().keys[0].standard.total_exact,'0.000026');assert.equal(s.snapshot().keys[0].standard.unmetered,1);assert.throws(()=>s.finish(a,{input:10}),/already settled/);
+ assert.equal(f.restart().snapshot().keys[0].standard.unmetered,1);
 });

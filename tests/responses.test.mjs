@@ -243,7 +243,7 @@ test('plain and zstd HTTP requests larger than the old 8MiB limit reach upstream
   assert.equal(response.status,200);await response.json();const sent=JSON.parse(app.calls.filter(c=>c.url.endsWith('/responses')).at(-1).options.body);
   assert.equal(digest(sent.input[0].content),digest(large));assert.deepEqual(sent.input[1],payload.input[1]);assert.deepEqual(sent.context_management,payload.context_management);
  }
- assert.equal(app.store.snapshot().keys[0].used,180);
+ assert.equal(app.store.get('SELECT SUM(input+output) used FROM requests').used,180);assert.equal(app.store.snapshot().keys[0].standard.unpriced,2);assert.equal(app.store.snapshot().keys[0].standard.total,null);
 });
 test('bad compression is rejected before inference and unauthenticated requests never decode it',async t=>{
  const app=await setup(t),m=app.member();

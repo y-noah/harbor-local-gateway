@@ -39,7 +39,7 @@ export function runCodex({binary,home,workspace,messages,model,sessionId,previou
   mkdirSync(workspace,{recursive:true});
   return new Promise((resolve,reject)=>{
     const child=spawnProcess(binary,argsFor(workspace,model,sessionId),{env:runnerEnv(home),windowsHide:true,stdio:['pipe','pipe','pipe']});
-    let buffer='',text='',usage=null,reason='',size=0,done=false,forced=false,threadId=sessionId||null;
+    let buffer='',text='',usage=null,reason='',size=0,done=false,forced=false,threadId=sessionId||null,actualModel;
     const decoder=new StringDecoder('utf8');
     const fail=message=>{reason=message;forced=true;child.kill();};
     const timer=setTimeout(()=>fail('请求超过 120 秒；上游用量可能已产生'),timeoutMs);
@@ -48,6 +48,7 @@ export function runCodex({binary,home,workspace,messages,model,sessionId,previou
     const cleanup=()=>{clearTimeout(timer);signal?.removeEventListener('abort',abort);};
     function event(line){
       let e;try{e=JSON.parse(line);}catch{return;}
+      if(['thread.started','turn.started','turn.completed'].includes(e.type)&&typeof e.model==='string')actualModel=e.model;
       if(e.type==='thread.started'&&typeof e.thread_id==='string')threadId=e.thread_id;
       if(e.type==='item.completed' && e.item?.type==='agent_message')text+=e.item.text||'';
       if(e.type==='turn.completed') { usage=e.usage; done=true; }
@@ -63,8 +64,8 @@ export function runCodex({binary,home,workspace,messages,model,sessionId,previou
       let valid=usage && ['input_tokens','output_tokens'].every(k=>Number.isSafeInteger(usage[k])&&usage[k]>=0),counts={};
       if(valid){try{counts=usageDelta(usage,previousUsage);}catch(e){valid=false;reason=e.message;}}
       if(sessionId&&threadId!==sessionId){valid=false;counts={};reason='上游返回了不同的会话，已停止续聊并保留用量待核对';}
-      if(code===0&&done&&valid&&!forced&&!reason&&threadId)resolve({text,...counts,usageKnown:true,threadId});
-      else reject(Object.assign(new Error(reason||'Codex 未返回完整结果；请检查账号连接'),{...counts,usageKnown:!!valid,threadId}));
+      if(code===0&&done&&valid&&!forced&&!reason&&threadId)resolve({text,...counts,usageKnown:true,threadId,...(actualModel?{actualModel}:{})});
+      else reject(Object.assign(new Error(reason||'Codex 未返回完整结果；请检查账号连接'),{...counts,usageKnown:!!valid,threadId,...(actualModel?{actualModel}:{})}));
     });
     child.stdin.end((sessionId?'Continue the existing conversation with these NEW messages only.':'Respond to this conversation.')+' Return only the assistant response.\n'+JSON.stringify(messages));
     if(signal?.aborted)abort();

@@ -128,19 +128,20 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
   async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,onPhase=()=>{}}){
     if(apiKeyMode)throw Object.assign(new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route'),{usageKnown:true});
     if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
-    let usage=null;
+    let usage=null,actualModel;
     try{
       const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json',onPhase});
       onPhase('streaming');
       let response;try{response=await result.json();}catch{throw new AppError(502,'上游工具返回了无效 JSON','upstream_protocol');}
       if(!response||typeof response!=='object'||Array.isArray(response))throw new AppError(502,'上游工具响应无效','upstream_protocol');
       usage=responseUsage(response);
+      actualModel=typeof response.model==='string'?response.model:undefined;
       if(!Array.isArray(response.data)||!response.data.length||response.data.some(image=>typeof image?.b64_json!=='string'||!image.b64_json))throw new AppError(502,'上游图片响应缺少图片数据','upstream_protocol');
-      return {input:0,output:0,cached:0,...usage,usageKnown:!!usage,response};
+      return {input:0,output:0,cached:0,...usage,usageKnown:!!usage,...(actualModel?{actualModel}:{}),response};
     }catch(error){
       if(signal?.aborted)error=new AppError(499,'客户端已取消或服务停止','request_cancelled');
       if(!(error instanceof AppError))error=new AppError(502,'上游工具连接中断','upstream_connection');
-      throw Object.assign(error,usage||{},{usageKnown:!!usage||error.usageKnown===true});
+      throw Object.assign(error,usage||{},{actualModel,usageKnown:!!usage||error.usageKnown===true});
     }
   }
   async function models({binary,home,signal,force=false}){
@@ -153,7 +154,7 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
   }
   async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,onEvent=async()=>{},onPhase=()=>{}}){
     const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
-    let completed=null,knownUsage=null,dispatched=false;
+    let completed=null,knownUsage=null,dispatched=false,actualModel;
     const finishedItems=new Map();
     try{
       dispatched=true;const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal,onPhase});
@@ -165,6 +166,7 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
         const data=frame.split('\n').filter(l=>l.startsWith('data:')).map(l=>l.slice(5).trimStart()).join('\n');if(!data||data==='[DONE]')return;
         let event;try{event=JSON.parse(data);}catch{throw new AppError(502,'上游事件格式无效','upstream_protocol');}
         if(typeof event.type!=='string'||!/^[-a-zA-Z0-9_.]+$/.test(event.type))throw new AppError(502,'上游事件缺少类型','upstream_protocol');
+        if(typeof event.response?.model==='string')actualModel=event.response.model;
         if(event.type==='response.completed'){
           if(completed)throw new AppError(502,'上游重复结束事件','upstream_protocol');
           knownUsage=responseUsage(event.response);
@@ -188,11 +190,11 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
       // Keep streamed events intact; non-streaming clients also need items from done events.
       const responseBody=(!completed.response?.output?.length&&finishedItems.size)
         ?{...completed.response,output:[...finishedItems].sort(([a],[b])=>a-b).map(([,item])=>item)}:completed.response;
-      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,terminal:completed,response:responseBody};
+      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,...(actualModel?{actualModel}:{}),terminal:completed,response:responseBody};
     }catch(error){
       if(controller.signal.aborted)error=signal?.aborted?new AppError(499,'客户端已取消或服务停止','request_cancelled'):controller.signal.reason;
       if(!(error instanceof AppError))error=new AppError(502,'上游连接中断','upstream_connection');
-      throw Object.assign(error,knownUsage||{},{usageKnown:!!knownUsage||error.usageKnown===true||!dispatched});
+      throw Object.assign(error,knownUsage||{},{actualModel,usageKnown:!!knownUsage||error.usageKnown===true||!dispatched});
     }finally{signal?.removeEventListener('abort',abort);}
   }
   return {run,runJson,models};

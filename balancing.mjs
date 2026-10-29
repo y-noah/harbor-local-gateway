@@ -1,5 +1,6 @@
 import {AppError,id,nextDailyReset,participatesNightly} from './store.mjs';
 import {planNightly} from './nightly-plan.mjs';
+import {quoteReference,referenceMetric} from './pricing.mjs';
 
 const minute=60000,day=24*60*minute;
 export const balanceDefaults=Object.freeze({failover:false,nightly:false,quietMinutes:30,weighted:false});
@@ -40,7 +41,7 @@ export function automaticWeights(accounts,at){
 export const nextWeightReset=nextDailyReset;
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
 // Workload is a relative estimate, never a quota admission check.
-export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false}){
+export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false,quoteUsage=row=>quoteReference(row)}){
   const window=nightlyWindow(at),eligible=accounts.filter(a=>available(a)&&!isApi(a));
   const snapshots=new Map(eligible.map(a=>[a.id,quotaSnapshot(a,at)]));
   const active=new Map(),bySession=new Map(),latest=new Map();
@@ -54,18 +55,24 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     }
   }
   const samples=new Map();
-  for(const rows of bySession.values())for(const r of rows)if(r.ended&&!r.usage_unknown&&r.input+r.output>0){
-    const key=r.model||'';if(!samples.has(key))samples.set(key,[]);samples.get(key).push(r.input+r.output);
+  for(const rows of bySession.values())for(const r of rows)if(r.ended&&!r.usage_unknown){
+    const value=quoteUsage(r);if(value.totalAtoms===null||value.totalAtoms===0n)continue;
+    const key=value.model||r.billing_model||r.model||'';if(!samples.has(key))samples.set(key,[]);samples.get(key).push(r);
   }
   const uncertainAccounts=new Set(),skipped=[];
   for(const s of sessions){
     const rows=bySession.get(s.id);if(!rows)continue;
-    let weight=0,unknown=false;
+    let measuredAtoms=0n,estimatedAtoms=0,unknown=false;
     for(const r of rows){
-      if(r.ended&&!r.usage_unknown){weight+=r.input+r.output;continue;}
-      const estimate=median(samples.get(r.model||'')||[]);
-      if(estimate===null)unknown=true;else weight+=estimate;
+      const value=quoteUsage(r);
+      if(r.ended&&value.totalAtoms!==null){measuredAtoms+=value.totalAtoms;continue;}
+      if(value.state==='unpriced'||value.state==='legacy_manual'){unknown=true;continue;}
+      const key=value.model||r.billing_model||r.model||'';
+      const comparable=(samples.get(key)||[]).map(sample=>quoteUsage(sample,r.price_version)).filter(q=>q.totalAtoms!==null).map(q=>Number(q.totalAtoms));
+      const estimate=median(comparable);
+      if(estimate===null)unknown=true;else estimatedAtoms+=estimate;
     }
+    const weight=(Number(measuredAtoms)+estimatedAtoms)/1e12;
     if(weight===0&&!unknown){skipped.push({session_id:s.id,reason:'no_measured_work'});continue;}
     const running=rows.some(r=>['queued','running'].includes(r.status));
     const last=latest.get(s.id);
@@ -97,7 +104,7 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     for(const m of selected)moves.push(m);
     summaries.push({planning,accounts:pool.map(a=>a.id),weights:Object.fromEntries(shares),before,after:Object.fromEntries(loads),target:Object.fromEntries(target),fixed:work.filter(s=>s.fixed).map(s=>s.id),fixedLoad:Object.fromEntries(pool.map(a=>[a.id,work.filter(s=>s.fixed&&s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0)]))});
   }
-  return {window,moves,skipped,summaries};
+  return {metric:referenceMetric,priceRevisions:[...new Set(requests.map(r=>r.price_version).filter(Boolean))],window,moves,skipped,summaries};
 }
 
 export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>null,clock=Date.now,stopping=()=>false}){
@@ -264,7 +271,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     if(stopping())throw new AppError(503,'服务正在停止');
     const planningAccounts=store.all('SELECT * FROM accounts').map(a=>({...a,quota_json:freshById.get(a.id)?.epoch===a.route_epoch&&freshById.get(a.id)?.snapshot?JSON.stringify(freshById.get(a.id).snapshot):null}));
     if(!preview&&settings().weighted)syncWeights(planningAccounts,clock(),'nightly');
-    return planBalance({accounts:planningAccounts,sessions:store.all('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id'),requests:store.all("SELECT * FROM requests WHERE COALESCE(ended,started)>=? OR status IN ('queued','running')",nightlyWindow(at).start),at:clock(),quietMinutes:settings().quietMinutes,weighted:settings().weighted,preparing});
+    return planBalance({accounts:planningAccounts,sessions:store.all('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id'),requests:store.all("SELECT * FROM requests WHERE COALESCE(ended,started)>=? OR status IN ('queued','running')",nightlyWindow(at).start),at:clock(),quietMinutes:settings().quietMinutes,weighted:settings().weighted,preparing,quoteUsage:(r,revision)=>store.pricing.quoteAt(r,revision)});
   }
   async function tick(){
     const at=clock(),window=nightlyWindow(at);

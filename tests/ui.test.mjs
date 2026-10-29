@@ -50,7 +50,7 @@ test('closing a request phase dialog prevents late polling results from restorin
 test('nightly history names skipped account groups and preserves heavy-session exclusion reasons',async()=>{
  const page=await ui(()=>response({ok:true}));
  const result={day:'2026-10-27',status:'completed',accounts:[{id:'a',name:'测试组A'},{id:'b',name:'测试组B'},{id:'c',name:'测试组C'}],moves:[],skipped:[{accounts:['a','b'],reason:'incomparable_quota'},{accounts:['c'],reason:'unknown_fixed_load'}],summaries:[{accounts:[],planning:{reason:'infeasible',prioritySessions:[{session_id:'heavy-one'}],heavySkipped:[{session_id:'heavy-two',reason:'cannot_fit'}]}}]};
- const html=page.run('nightlyHistory('+JSON.stringify(result)+')');assert.match(html,/测试组A \/ 测试组B/);assert.match(html,/测试组C/);assert.match(html,/额度窗口或套餐不可比较/);assert.match(html,/固定会话的历史负载不足以估计/);assert.match(html,/heavy-one/);assert.match(html,/heavy-two/);assert.match(html,/会话负载无法放入其他账号的容差范围/);
+ const html=page.run('nightlyHistory('+JSON.stringify(result)+')');assert.match(html,/测试组A \/ 测试组B/);assert.match(html,/测试组C/);assert.match(html,/额度窗口或套餐不可比较/);assert.match(html,/固定会话缺少明确模型费率或历史样本/);assert.match(html,/heavy-one/);assert.match(html,/heavy-two/);assert.match(html,/会话负载无法放入其他账号的容差范围/);
 });
 
 test('logout clears history cache and a pending history page cannot restore private data',async()=>{
@@ -206,10 +206,10 @@ test('a late Key deletion response after logout cannot reopen employee details',
  page.run("admin=true;state={keys:[{id:'key',member_id:'member'}]};");const pending=page.click('confirm-remove-key','key');await new Promise(setImmediate);await page.node('#logout').onclick();release();await pending;assert.equal(page.node('#modal').open,false);assert.equal(page.run('state'),null);
 });
 
-test('usage displays full Keys and seven-day billion units with exactly two decimals',async()=>{
- const page=await ui(()=>response(snapshot()));page.run(`admin=true;state={members:[{id:'m',name:'Fixture',enabled:1}],keys:[{id:'k',member_id:'m',prefix:'hg_fixture',full_key:'hg_fixture_complete_only',used:1,enabled:1,unmetered:0}]};`);
- const html=page.run('usageTable(usageRows())');assert.match(html,/hg_fixture_complete_only/);assert.match(html,/copy-key/);assert.match(html,/近7天 Token（亿）/);assert.match(html,/0\.00/);
- assert.equal(page.run('tokenBillions(123456789)'), '1.23');assert.equal(page.run('tokenBillions(100000000)'), '1.00');
+test('usage displays full Keys and reference USD without raw Token statistics',async()=>{
+ const page=await ui(()=>response(snapshot()));page.run(`admin=true;state={members:[{id:'m',name:'Fixture',enabled:1}],keys:[{id:'k',member_id:'m',prefix:'hg_fixture',full_key:'hg_fixture_complete_only',standard:{total:0.000001,unmetered:0,unpriced:0},standard_12h:{total:0},enabled:1}]};`);
+ const html=page.run('usageTable(usageRows())');assert.match(html,/hg_fixture_complete_only/);assert.match(html,/copy-key/);assert.match(html,/近7天参考消耗（USD）/);assert.match(html,/\$0\.000001/);assert.doesNotMatch(html,/亿 Token/);
+ assert.equal(page.run('referenceMoney(3.3)'), '$3.30');assert.equal(page.run('referenceMoney(null)'), '—');assert.equal(page.run('referenceMoney(0.00000001)'), '<$0.000001');
  assert.match(page.run("keyDisplay({prefix:'old'})"),/下次成功调用后补全/);
 });
 test('stale official quotas remain visible with their age instead of disappearing',async()=>{
@@ -248,10 +248,10 @@ test('temporary weight editor uses server version and offers explicit automatic 
 
 test('recent usage renders both windows and exposes accessible estimate help',async()=>{
  const page=await ui(()=>response(snapshot()));
- page.run(`admin=true;state={...${JSON.stringify(snapshot())},keys:[{id:'key',member_id:'member',prefix:'hg_fixture',used:200000000,used_12h:30000000,unmetered:12,enabled:1}],members:[{id:'member',name:'Fixture',enabled:1}],sessions:[]};tab='overview';render();`);
+ page.run(`admin=true;state={...${JSON.stringify(snapshot())},keys:[{id:'key',member_id:'member',prefix:'hg_fixture',standard:{total:2,unmetered:12,unpriced:1},standard_12h:{total:0.3,unmetered:0,unpriced:0},enabled:1}],members:[{id:'member',name:'Fixture',enabled:1}],sessions:[]};tab='overview';render();`);
  assert.match(page.node('#content').innerHTML,/最近用量/);assert.match(page.node('#content').innerHTML,/aria-label="最近用量说明"/);
- assert.match(page.node('#content').innerHTML,/近12小时 Token（亿）/);assert.match(page.node('#content').innerHTML,/0\.30/);assert.doesNotMatch(page.node('#content').innerHTML,/近7天未计量请求/);
- await page.click('usage-help');assert.match(page.node('#modal-content').innerHTML,/可能漏计/);assert.match(page.node('#modal-content').innerHTML,/不等于官方订阅额度/);
+ assert.match(page.node('#content').innerHTML,/近12小时参考消耗（USD）/);assert.match(page.node('#content').innerHTML,/0\.30/);assert.doesNotMatch(page.node('#content').innerHTML,/近7天未计量请求/);
+ await page.click('usage-help');assert.match(page.node('#modal-content').innerHTML,/缺计量/);assert.match(page.node('#modal-content').innerHTML,/不是实际扣款或订阅扣额/);
  page.run("tab='requests';render();");assert.match(page.node('#content').innerHTML,/最近用量/);
 });
 test('uncertain Responses warning appears only in session management, with temporary deadline',async()=>{
@@ -369,4 +369,28 @@ test('account entry separates subscription and Key types and preserves independe
  await page.click('create-api-account');page.node('#new-account-auth').onchange({target:{value:'subscription'}});assert.equal(page.node('#new-api-fields').disabled,true);assert.equal(page.node('#new-subscription-fields').disabled,false);assert.equal(page.node('#new-api-key').required,false);
  page.run('formValues='+JSON.stringify({auth_mode:'subscription',kind:'claude',name:'Subscription C',api_key:'must-not-submit',api_weight:'80'}));await submit();assert.deepEqual(created[2],{name:'Subscription C',auth_mode:'subscription',kind:'claude'});
  await page.click('create-account');assert.equal(page.node('#new-api-fields').disabled,true);assert.equal(page.node('#new-subscription-fields').disabled,false);
+});
+
+const pricingState=()=>({seedCaptured:'2026-10-29',settings:{enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[]},state:{active:'a'.repeat(64)},unpricedModels:[{model:'new-model',requests:2}],rates:[{model:'gpt-6.1-sol',input:'2',cached:'0.1',output:'10',manual:false}]});
+test('late fee settings cannot replace a newer dialog and the settings view identifies missing prices without raw usage',async()=>{
+ let release;const page=await ui(()=>new Promise(r=>release=()=>r(response(pricingState()))));page.run('admin=true;');const pending=page.click('pricing-settings');await page.click('close');page.run("modal('<h2>other</h2>')");release();await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>other</h2>');
+ const html=page.run('pricingOverview('+JSON.stringify(pricingState())+')');assert.match(html,/new-model：2条/);assert.match(html,/缺价不按0/);assert.match(html,/Standard参考消耗USD/);assert.doesNotMatch(html,/亿 Token/);
+});
+test('fee alias removal identifies the exact mapping even after the server has reordered the list',async()=>{
+ const a={name:'alias-a',target:'gpt-6.1-sol',from:1,to:null,source:'fixture A'},b={name:'alias-b',target:'gpt-6.1-sol',from:1,to:null,source:'fixture B'},calls=[];
+ const state=pricingState();state.settings.aliases=[b,a];state.settings.version=1;
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?state:snapshot());});page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='accounts';modal('<h2>pricing</h2>')");
+ await page.click('pricing-alias-remove',JSON.stringify([a.name,a.target,a.from,a.to]));const sent=calls.find(([p,o])=>p==='/api/admin/pricing'&&o.method==='PATCH');assert.deepEqual(JSON.parse(sent[1].body),{expectedVersion:1,aliases:[b]});
+});
+test('every rendered reference amount comes from Standard data rather than legacy counters',async()=>{
+ const page=await ui(()=>response(snapshot()));page.run('admin=true;state='+JSON.stringify({...snapshot(),members:[{id:'m',name:'Fixture',enabled:1}],keys:[{id:'k',member_id:'m',enabled:1,prefix:'synthetic',used:999999999999,used_12h:999999999999,standard:{total:null,unpriced:3},standard_12h:{total:0.58,unmetered:0,unpriced:0}}]})+";tab='requests';recordView='usage';render();");
+ const html=page.node('#content').innerHTML;assert.match(html,/3条缺费率/);assert.match(html,/\$0\.58/);assert.doesNotMatch(html,/999999999999|亿 Token/);assert.match(html,/—/);
+});
+test('session management shows its own reference amount and coverage without borrowing account totals',async()=>{
+ const page=await ui(()=>response({ok:true}));
+ const sessions=[{id:'a',standard:{total:0.58}},{id:'b',standard:{total:3.3}},{id:'c',standard:{total:null,unpriced:1}}].map(s=>({...s,protocol:'responses',client_session_id:s.id,member_name:'Fixture',account_name:'Account',account_id:'account',enabled:1,nightly_enabled:1}));
+ page.run('admin=true;state='+JSON.stringify({sessions,accounts:[{id:'account',standard:{total:3.88}}]})+';');
+ page.run("sessionDetail('a')");assert.match(page.node('#modal-content').innerHTML,/\$0\.58/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/\$3\.88/);
+ page.run("sessionDetail('b')");assert.match(page.node('#modal-content').innerHTML,/\$3\.30/);
+ page.run("sessionDetail('c')");assert.match(page.node('#modal-content').innerHTML,/1条缺费率/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/\$0\.00/);
 });

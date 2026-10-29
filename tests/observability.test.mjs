@@ -96,7 +96,7 @@ test('phase transitions persist bounded metadata and late callbacks cannot reope
   store.run("UPDATE requests SET status='running' WHERE id=?",r);store.phase(r,'credentials');store.phase(r,'upstream');store.phase(r,'streaming');store.phase(r,'streaming');
   store.finish(r,{input:8,output:2,cached:3});const data=requestObservation(store,r);
   assert.deepEqual(data.timeline.map(p=>p.phase),['queued','credentials','upstream','streaming','settling','ok']);
-  assert.ok(data.timeline.every(p=>p.duration>=0));assert.equal(data.input,8);assert.equal(data.cached,3);
+  assert.ok(data.timeline.every(p=>p.duration>=0));assert.equal(store.get('SELECT input FROM requests WHERE id=?',r).input,8);assert.equal(store.get('SELECT cached FROM requests WHERE id=?',r).cached,3);assert.equal(data.standard.state,'unpriced');assert.ok(!('input' in data));
   const saved=store.get('SELECT phase_history FROM requests WHERE id=?',r).phase_history;store.phase(r,'upstream');assert.equal(store.get('SELECT phase_history FROM requests WHERE id=?',r).phase_history,saved);
 });
 test('restart closes running phase while preserving known timings and leaving old completed rows without fabricated stages',t=>{
@@ -128,12 +128,12 @@ test('request query validates all filters and pagination without interpreting mo
 test('request totals cover all pages, combine filters and keep users with identical names distinct',t=>{
  const {store,member,at}=fixture(t),other=store.createMember('观测测试员工',null,null),read=values=>requestsReader(store,requestsQuery(new URLSearchParams(values)),at);
  const window=read({}).window;
- for(let i=0;i<251;i++)store.run("INSERT INTO requests(id,member_id,started,ended,status,model,ip,input,output,cached,usage_unknown) VALUES(?,?,?,?,'ok',?,'fixture',10,2,3,?)",'request-'+String(i).padStart(3,'0'),i<201?member.memberId:other.memberId,at-1000,at,i%2?'model-b':'model-a',i===250?1:0);
+ for(let i=0;i<251;i++)store.run("INSERT INTO requests(id,member_id,started,ended,status,model,ip,input,output,cached,usage_unknown) VALUES(?,?,?,?,'ok',?,'fixture',10,2,3,?)",'request-'+String(i).padStart(3,'0'),i<201?member.memberId:other.memberId,at-1000,at,i%2?'gpt-6-sol':'gpt-6.1-sol',i===250?1:0);
  store.run("INSERT INTO requests(id,member_id,started,ended,status,model,ip,input) VALUES('expired',?, ?,?,'ok','old','fixture',999999)",member.memberId,window.start-1001,window.start-1);
- store.run("INSERT INTO requests(id,member_id,started,status,model,ip) VALUES('pending',?,?,'running','model-a','fixture')",member.memberId,at);
- const all=read({});assert.equal(all.summary.requests,252);assert.equal(all.summary.input,2510);assert.equal(all.summary.cached,753);assert.equal(all.summary.unmetered,1);assert.equal(all.summary.active,1);assert.equal(all.summary.average_ms,1000);assert.equal(all.byMember.length,2);assert.equal(all.members.length,2);assert.equal(all.rows.length,25);
+ store.run("INSERT INTO requests(id,member_id,started,status,model,ip) VALUES('pending',?,?,'running','gpt-6.1-sol','fixture')",member.memberId,at);
+ const all=read({});assert.equal(all.summary.requests,252);assert.equal(all.summary.standard.input_exact,'0.0036125');assert.equal(all.summary.standard.cached_exact,'0.0001125');assert.equal(all.summary.unmetered,1);assert.equal(all.summary.active,1);assert.equal(all.summary.average_ms,1000);assert.equal(all.byMember.length,2);assert.equal(all.members.length,2);assert.equal(all.rows.length,25);
  const pages=Array.from({length:3},(_,i)=>read({page:String(i+1),page_size:'100'}));assert.equal(new Set(pages.flatMap(x=>x.rows.map(r=>r.id))).size,252);
- const filtered=read({member:member.memberId,model:'model-a',status:'ok'});assert.equal(filtered.summary.requests,101);assert.equal(filtered.summary.output,202);assert.equal(filtered.byMember.length,1);assert.equal(filtered.byModel.length,1);assert.equal(filtered.members.length,2);assert.equal(filtered.models.length,2);
+ const filtered=read({member:member.memberId,model:'gpt-6.1-sol',status:'ok'});assert.equal(filtered.summary.requests,101);assert.equal(filtered.summary.standard.output_exact,'0.00202');assert.equal(filtered.byMember.length,1);assert.equal(filtered.byModel.length,1);assert.equal(filtered.members.length,2);assert.equal(filtered.models.length,2);
  assert.equal(read({model:"x' OR 1=1 --"}).summary.requests,0);assert.equal(read({page:'999'}).pagination.page,11);
  assert.ok(!JSON.stringify(all).includes(member.secret));
 });
