@@ -105,12 +105,14 @@ export function responseUsage(response){
   if(!Number.isSafeInteger(cached)||cached<0||cached>usage.input_tokens)return null;
   return {input:usage.input_tokens,output:usage.output_tokens,cached};
 }
-export function createResponsesTransport({fetchImpl=fetch,credentials=accountCredentials,version=installedVersion}={}){
+export function createResponsesTransport({fetchImpl=fetch,credentials=accountCredentials,version=installedVersion,apiKeyMode=false}={}){
   const catalogs=new Map();
   async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={},accept='text/event-stream',onPhase=()=>{}}={}){
     onPhase('credentials');
     let auth;try{auth=await credentials(binary,home);}catch(error){throw Object.assign(error,{usageKnown:true});}
-    const headers={'Authorization':'Bearer '+auth.token,'ChatGPT-Account-ID':auth.accountId,'Accept':accept,'Content-Type':'application/json'};
+    const headers={'Authorization':'Bearer '+auth.token,'Accept':accept,'Content-Type':'application/json'};
+    if(!apiKeyMode)headers['ChatGPT-Account-ID']=auth.accountId;
+    else if(typeof protocolHeaders['user-agent']==='string')headers['User-Agent']=protocolHeaders['user-agent'];
     if(sessionId){headers['session-id']=sessionId;headers['thread-id']=sessionId;}
     if(path.startsWith('/images/'))headers['x-codex-image-turn-id']=randomUUID();
     for(const name of ['originator','openai-beta','x-codex-beta-features','x-openai-internal-codex-responses-lite']){
@@ -118,12 +120,13 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     }
     let result;
     onPhase('upstream');
-    try{result=await fetchImpl(upstreamOrigin+path,{method:payload?'POST':'GET',headers,body:payload?JSON.stringify(payload):undefined,signal,redirect:'error'});}
+    try{result=await fetchImpl((apiKeyMode?'https://api.openai.com/v1':upstreamOrigin)+path,{method:payload?'POST':'GET',headers,body:payload?JSON.stringify(payload):undefined,signal,redirect:'error'});}
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
-    if(!result.ok){const details=await errorPayload(result);const classified=[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
+    if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?Object.assign(new AppError(429,'官方API额度不足，请在官方账单后台核对','upstream_quota_exhausted'),{routeFailure:'quota_exhausted'}):[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
   }
   async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,onPhase=()=>{}}){
+    if(apiKeyMode)throw Object.assign(new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route'),{usageKnown:true});
     if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
     let usage=null;
     try{
@@ -142,8 +145,9 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
   }
   async function models({binary,home,signal,force=false}){
     const cached=catalogs.get(home);if(!force&&cached?.expires>Date.now())return cached.models;
-    const result=await request(binary,home,'/models?client_version='+encodeURIComponent(await version(binary)),{signal:signal||AbortSignal.timeout(15000)});
+    const result=await request(binary,home,apiKeyMode?'/models':'/models?client_version='+encodeURIComponent(await version(binary)),{signal:signal||AbortSignal.timeout(15000),accept:'application/json'});
     let value;try{value=await result.json();}catch{throw new AppError(502,'模型目录响应无效','upstream_protocol');}
+    if(apiKeyMode&&Array.isArray(value.data))value.models=value.data.map(m=>({slug:m.id,display_name:m.id}));
     if(!Array.isArray(value.models)||!value.models.length||value.models.some(m=>typeof m.slug!=='string'))throw new AppError(502,'模型目录响应无效','upstream_protocol');
     catalogs.set(home,{expires:Date.now()+60000,models:value.models});return value.models;
   }

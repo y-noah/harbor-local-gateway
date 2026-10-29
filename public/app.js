@@ -3,14 +3,14 @@ const fmt=n=>Number(n||0).toLocaleString('zh-CN'),date=t=>t?new Date(t).toLocale
 const tokenBillions=n=>(Number(n||0)/1e8).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
 const beijingDate=t=>t?new Date(t).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—';
 let admin=false,authEpoch=0,state=null,tab='overview',testKey='',chat=[],chatSession='',chatModel='codex',draft='',chatOwner='',sending=false,requestFilter='';
-let requestsData=null,requestsLoading=false,requestsVersion=0,connectionView='test';
+let requestsData=null,requestsLoading=false,requestsVersion=0,connectionView='test',autoRefreshPending=false;
 let requestsFilters={member:'',model:'',status:'',page:1,pageSize:25};
 let sessionsPage=1,sessionsPageSize=25,sessionsLoading=false,refreshVersion=0;
 let recordView='usage',historyData=null,historyLoading=false,historyVersion=0,dialogVersion=0,requestDetailId='',requestDetailVersion=0;
 let historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};
 const phaseLabels={queued:'等待执行',credentials:'准备凭据',upstream:'连接上游 / 等待响应',streaming:'接收上游数据',cli:'官方 CLI 执行中',settling:'统计收尾',ok:'完成',failed:'失败',unknown:'结束 · 用量待核对',interrupted:'重启中断',cancelled:'已取消',rejected:'已拒绝'};
-const actionLabels={'session.route':'会话换绑','session.nightly':'会话自动调整设置','session.nightly.expired':'会话临时固定到期','session.nightly.deadline':'历史固定期限补全','session.enable':'恢复会话访问','session.disable':'禁止会话访问','balancing.settings':'负载均衡设置','balancing.weights':'手动调整权重','balancing.weights.auto':'系统更新权重','balancing.weights.expired':'手动权重到期','account.route_block':'账号路由受限','account.route_recover':'账号路由恢复','account.create':'添加账号','account.remove':'移除账号','account.update':'修改账号','account.login':'开始账号登录','account.login.success':'账号登录成功','account.login.failed':'账号登录失败','account.login.cancel':'取消账号登录','key.create':'创建 Key','key.remove':'删除 Key','key.update':'修改 Key','member.create':'创建员工','member.update':'修改员工','member.remove':'移除员工','backup.create':'创建数据库备份','request.settle':'核对请求用量'};
-const reasonLabels={account_disabled:'账号停用',manual:'手动操作',initialize:'首次初始化',nightly:'夜间调整',quota:'额度耗尽或恢复',recovery:'账号恢复',weight_zero:'原账号权重为0',quota_exhausted:'确认订阅额度耗尽',login_expired:'确认登录失效',disabled:'账号已停用',not_ready:'账号尚未就绪',zero_weight:'生效权重为0',eligible:'可参与新会话分配',quota_unavailable:'额度快照缺失、过期或已越过重置点',incomparable_quota:'额度窗口或套餐不可比较',unknown_fixed_load:'固定会话的历史负载不足以估计',unknown_workload:'缺少可用的历史用量样本',busy:'会话有请求执行中',protected:'受静默期、临时固定或其他保护条件限制',no_measured_work:'没有可计量的历史负载',session_disabled:'会话不可迁移',session_busy:'会话仍有请求执行中',nightly_plan_changed:'执行前条件发生变化，本组未迁移',planning_failed:'计划计算失败',cannot_fit:'会话负载无法放入其他账号的容差范围',infeasible:'不存在满足约束的完整迁移方案',search_limited:'计算预算不足，未确认可行方案'};
+const actionLabels={'account.api.check':'检查官方Key','account.api.weight':'调整API人工权重','account.api.key':'更新官方Key','session.route':'会话换绑','session.nightly':'会话自动调整设置','session.nightly.expired':'会话临时固定到期','session.nightly.deadline':'历史固定期限补全','session.enable':'恢复会话访问','session.disable':'禁止会话访问','balancing.settings':'负载均衡设置','balancing.weights':'手动调整权重','balancing.weights.auto':'系统更新权重','balancing.weights.expired':'手动权重到期','account.route_block':'账号路由受限','account.route_recover':'账号路由恢复','account.create':'添加账号','account.remove':'移除账号','account.update':'修改账号','account.login':'开始账号登录','account.login.success':'账号登录成功','account.login.failed':'账号登录失败','account.login.cancel':'取消账号登录','key.create':'创建 Key','key.remove':'删除 Key','key.update':'修改 Key','member.create':'创建员工','member.update':'修改员工','member.remove':'移除员工','backup.create':'创建数据库备份','request.settle':'核对请求用量'};
+const reasonLabels={manual_binding_only:'仅人工绑定，不分配新会话',account_disabled:'账号停用',manual:'手动操作',initialize:'首次初始化',nightly:'夜间调整',quota:'额度耗尽或恢复',recovery:'账号恢复',weight_zero:'原账号权重为0',quota_exhausted:'确认订阅额度耗尽',login_expired:'确认登录失效',disabled:'账号已停用',not_ready:'账号尚未就绪',zero_weight:'生效权重为0',eligible:'可参与新会话分配',quota_unavailable:'额度快照缺失、过期或已越过重置点',incomparable_quota:'额度窗口或套餐不可比较',unknown_fixed_load:'固定会话的历史负载不足以估计',unknown_workload:'缺少可用的历史用量样本',busy:'会话有请求执行中',protected:'受静默期、临时固定或其他保护条件限制',no_measured_work:'没有可计量的历史负载',session_disabled:'会话不可迁移',session_busy:'会话仍有请求执行中',nightly_plan_changed:'执行前条件发生变化，本组未迁移',planning_failed:'计划计算失败',cannot_fit:'会话负载无法放入其他账号的容差范围',infeasible:'不存在满足约束的完整迁移方案',search_limited:'计算预算不足，未确认可行方案'};
 const labels={overview:'运行总览',members:'员工与密钥',accounts:'订阅账号池',sessions:'会话绑定',requests:'使用记录',playground:'接入与测试'};
 sessionStorage.removeItem('harbor-admin');if(location.hash)history.replaceState(null,'',location.pathname);
 let toastTimer;function toast(message){$('#toast').textContent=message;$('#toast').classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.add('hidden'),5000);}
@@ -29,7 +29,10 @@ function heading(eyebrow,title,sub,action=''){return `<div class="page-heading">
 function button(action,label,css='secondary',id='',disabled=false){return `<button type="button" class="${css}" data-action="${action}" data-id="${esc(id)}"${disabled?' disabled':''}>${label}</button>`;}
 function empty(text){return `<div class="empty"><span class="empty-symbol">◌</span>${text}</div>`;}
 function panel(title,inside,action=''){return `<section class="panel"><div class="panel-heading"><h2>${title}</h2>${action}</div>${inside}</section>`;}
+function fixedSessionCommand(identifier){return `codex -c 'model_providers.harbor.http_headers.X-Harbor-Session="${identifier}"'`;}
+function apiAccount(a){return a?.auth_mode==='openai_api';}
 function quotaCard(a){
+  if(apiAccount(a))return `<div class="quota"><span class="hint">官方API余额</span><div class="quota-number">—</div><small>普通Key未提供公开余额查询；请在官方账单后台核对。平台用量不等于赠额抵扣。</small><small>Key ${a.api_key_configured?'已配置 · 指纹 '+esc(a.api_key_fingerprint):'未配置'}</small></div>`;
   let q=null;try{q=JSON.parse(a.quota_json);}catch{}
   if(q?.windows?.length){
     const stale=q.checked<=Date.now()-300000||q.windows.some(w=>w.reset&&w.reset<=Date.now());
@@ -48,17 +51,41 @@ function planningHint(p){
   return `<p class="hint">整组偏差 ${esc(Number(p.beforeDeviation).toFixed(2))} → ${esc(Number(p.afterDeviation).toFixed(2))} 个百分点（容差 ${esc(p.tolerance)}）。${esc(reason)}。优先迁移重会话 ${fmt(p.prioritySessions?.length)} 个${p.heavySkipped?.length?'，无法纳入或待确认 '+fmt(p.heavySkipped.length)+' 个':''}。${p.reason==='balanced'&&!p.optimizationComplete?'已满足重会话优先，计算预算已用完，'+(p.directionComplete?'偏差方向已达到保护条件允许的最优，尚未证明迁移数量最少。':'尚未证明偏差方向最优或迁移数量最少。'):''}</p>`;
 }
 function routingCard(a){
+  if(apiAccount(a))return `<div class="quota"><div class="quota-row">人工新会话占比<strong>${esc(weightPercent(a.api_weight||0))}</strong></div><small>开关、权重长期由人工控制。权重0仅不分配新会话；人工固定绑定仍使用此Key，停用会迁出全部绑定。</small></div>`;
   if(a.kind!=='codex'||!state.balancing?.weights)return '';
   const w=state.balancing.weights,row=w.accounts.find(x=>x.id===a.id);
   if(!row)return '';
-  const mode=({auto:w.reason?'自动 · 等待额度确认，沿用已知权重':'自动',manual:'临时手动',fallback:'额度待确认 · 按原顺序',legacy:'新权重未开启'})[w.mode];
+  const mode=({api_mixed:'API人工占比＋订阅组原规则',auto:w.reason?'自动 · 等待额度确认，沿用已知权重':'自动',manual:'临时手动',fallback:'额度待确认 · 按原顺序',legacy:'新权重未开启'})[w.mode];
   return `<div class="quota"><div class="quota-row">系统权重<strong>${esc(weightPercent(row.automatic))}</strong></div><div class="quota-row">生效权重<strong>${esc(weightPercent(row.effective))}</strong></div><small>${esc(mode)}${w.configuration.mode==='manual'?' · 手动到期：'+beijingDate(w.configuration.expires):''}</small></div>`;
 }
-async function refresh(renderPage=true){
+function automaticRefreshScope(){
+  if(!admin||document.hidden||$('#modal').open)return '';
+  const focus=document.activeElement;if(['INPUT','SELECT','TEXTAREA'].includes(focus?.tagName)||focus?.isContentEditable)return '';
+  if(['overview','accounts','sessions'].includes(tab))return 'state:'+tab;
+  if(tab==='requests'&&recordView==='requests'&&requestsFilters.page===1&&!requestsFilters.member&&!requestsFilters.model&&!requestsFilters.status)return 'requests:latest';
+  return '';
+}
+function stateSnapshot(value){const {recentUsageWindow,...data}=value||{};return JSON.stringify(data);}
+function requestsSnapshot(value){const {observedAt,...data}=value||{};return JSON.stringify(data);}
+async function automaticRefresh(){
+  const scope=automaticRefreshScope();if(!scope||autoRefreshPending||sessionsLoading||requestsLoading)return;
+  autoRefreshPending=true;try{if(scope==='requests:latest')await loadRequests(scope);else await refresh(true,scope);}finally{autoRefreshPending=false;}
+}
+async function refresh(renderPage=true,automaticScope=''){
   if(!admin)return;const epoch=authEpoch,version=++refreshVersion;
   const query=sessionsPage===1&&sessionsPageSize===25?'':`?session_page=${sessionsPage}&session_page_size=${sessionsPageSize}`;
-  try{const next=await api('/api/admin/state'+query);if(!admin||epoch!==authEpoch||version!==refreshVersion)return;if(tab==='sessions'&&$('#modal').open)return;state=next;sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=next.sessionsPagination?.pageSize??sessionsPageSize;sessionsLoading=false;$('#connection').textContent='● 服务在线';if(renderPage)render();if(tab==='requests'&&recordView==='requests'&&!requestsLoading&&!$('#modal').open)await loadRequests();}
-  catch(e){if(!admin||epoch!==authEpoch||version!==refreshVersion)return;sessionsLoading=false;sessionsPage=state?.sessionsPagination?.page??1;sessionsPageSize=state?.sessionsPagination?.pageSize??25;$('#connection').textContent='连接异常';if(!state){showLogin();}else if(renderPage)render();toast(e.message);}
+  try{
+    const next=await api('/api/admin/state'+query);
+    if(!admin||epoch!==authEpoch||version!==refreshVersion||automaticScope&&automaticRefreshScope()!==automaticScope)return;
+    if(tab==='sessions'&&$('#modal').open)return;
+    const changed=stateSnapshot(next)!==stateSnapshot(state);state=next;sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=next.sessionsPagination?.pageSize??sessionsPageSize;sessionsLoading=false;
+    $('#connection').textContent='● 服务在线';if(renderPage&&(!automaticScope||changed))render();
+    if(tab==='requests'&&recordView==='requests'&&!requestsLoading&&!$('#modal').open)await loadRequests();
+  }catch(e){
+    if(!admin||epoch!==authEpoch||version!==refreshVersion||automaticScope&&automaticRefreshScope()!==automaticScope)return;
+    sessionsLoading=false;sessionsPage=state?.sessionsPagination?.page??1;sessionsPageSize=state?.sessionsPagination?.pageSize??25;$('#connection').textContent='连接异常';
+    if(automaticScope)return;if(!state)showLogin();else if(renderPage)render();toast(e.message);
+  }
 }
 function showLogin(){requestsVersion++;requestsData=null;requestsLoading=false;requestsFilters={member:'',model:'',status:'',page:1,pageSize:25};connectionView='test';historyVersion++;historyData=null;historyLoading=false;recordView='usage';historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};if($('#modal').open)close();sessionsPage=1;sessionsPageSize=25;sessionsLoading=false;testKey='';chat=[];chatSession='';chatOwner='';draft='';$('#modal-content').innerHTML='';$('#content').innerHTML='';$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}
 function showShell(){$('#login').classList.add('hidden');$('#shell').classList.remove('hidden');}
@@ -75,16 +102,18 @@ async function copyKey(value){
 function recentUsageTitle(){return '最近用量 <button type="button" class="usage-help table-button" data-action="usage-help" aria-label="最近用量说明" title="查看统计口径与漏计说明">?</button>';}
 function usageTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>员工</th><th>Key</th><th>近7天 Token（亿）</th><th>近12小时 Token（亿）</th><th>状态</th></tr></thead><tbody>${rows.map(k=>`<tr><td>${esc(k.member_name)}</td><td class="mono key-cell">${keyDisplay(k)}</td><td>${tokenBillions(k.used)}</td><td>${tokenBillions(k.used_12h)}</td><td>${!k.enabled||!k.member_enabled?'已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</td></tr>`).join('')}</tbody></table></div>`:empty('暂无 Key 用量。');}
 function recordTabs(){return `<div class="actions record-tabs" aria-label="使用记录分类">${[['usage','Key 用量'],['requests','请求明细'],['history','操作历史']].map(([id,label])=>button('record-view',label,recordView===id?'primary':'secondary',id)).join('')}</div>`;}
-async function loadRequests(){
+async function loadRequests(automaticScope=''){
   if(!admin||tab!=='requests'||recordView!=='requests')return;
-  const epoch=authEpoch,version=++requestsVersion,filters={...requestsFilters};requestsLoading=true;render();
+  const epoch=authEpoch,version=++requestsVersion,filters={...requestsFilters};if(!automaticScope){requestsLoading=true;render();}
   const query=new URLSearchParams({page:String(filters.page),page_size:String(filters.pageSize)});
   for(const field of ['member','model','status'])if(filters[field])query.set(field,filters[field]);
   try{
     const data=await api('/api/admin/requests?'+query);
     if(!admin||epoch!==authEpoch||version!==requestsVersion||tab!=='requests'||recordView!=='requests')return;
-    requestsData=data;requestsFilters.page=data.pagination.page;requestsLoading=false;render();
-  }catch(e){if(admin&&epoch===authEpoch&&version===requestsVersion){requestsLoading=false;requestsData=null;render();toast(e.message);}}
+    if(automaticScope&&automaticRefreshScope()!==automaticScope)return;
+    $('#connection').textContent='● 服务在线';
+    const changed=requestsSnapshot(data)!==requestsSnapshot(requestsData);requestsData=data;requestsFilters.page=data.pagination.page;requestsLoading=false;if(!automaticScope||changed||data.summary?.active>0)render();
+  }catch(e){if(admin&&epoch===authEpoch&&version===requestsVersion){if(automaticScope){if(automaticRefreshScope()===automaticScope)$('#connection').textContent='连接异常';return;}requestsLoading=false;requestsData=null;render();toast(e.message);}}
 }
 function requestsSection(){
   const data=requestsData,f=requestsFilters;
@@ -108,6 +137,7 @@ function historyName(id){return historyData?.accounts?.find(a=>a.id===id)?.name|
 function weightsText(weights){return weights?Object.entries(weights).map(([id,n])=>historyName(id)+' '+weightPercent(n)).join('；')||'自动模式':'此前值未记录';}
 function historyText(r){
   const d=r.detail;
+  if(r.action==='account.api.weight')return `${historyName(d.account)} · ${weightPercent(d.from)} → ${weightPercent(d.to)}（人工持久设置）`;
   if(r.action==='session.route')return `${historyName(d.from)} → ${historyName(d.to)} · ${reasonLabels[d.reason]||'历史原因未记录'}`;
   if(r.action==='balancing.weights.auto')return `${d.previous?weightsText(d.previous):'此前值未记录'} → ${weightsText(d.weights)} · ${reasonLabels[d.reason]||'历史触发原因未记录'}${d.retained?' · 数据待确认，沿用已知权重':''}`;
   if(r.action==='balancing.weights')return `${d.previous?.mode==='manual'?weightsText(d.previous.weights):d.previous?'自动模式':'此前值未记录'} → ${d.mode==='manual'?weightsText(d.weights):'自动模式'}${d.expires?' · 到期 '+beijingDate(d.expires):''}`;
@@ -151,8 +181,8 @@ async function requestDetail(identifier,initial=true){
   $('#modal-content').innerHTML=phaseDetail(r);if(r.ended)requestDetailId='';
 }
 function routingExplanation(r){
-  const basis=r.basis,mode=({auto:'系统自动权重',manual:'临时手动权重',legacy:'原顺序分配',fallback:'额度待确认，按原顺序'})[r.mode]||r.mode;
-  return `<h2>调度依据</h2><p>当前方式：${esc(mode)}。下一条新会话预计分配给：${esc(r.accounts.find(a=>a.id===r.nextAccount)?.name||'暂无可用账号')}。</p><p class="hint">这是当前快照的试算，不推进分配顺序；并发请求、配置和额度状态变化后结果可能不同。已有正权重会话保持绑定。</p>${r.reason?`<div class="notice warn">${esc(reasonLabels[r.reason]||'等待额度确认')}；系统沿用已有权重或原顺序，不按页面读取时间重算比例。</div>`:''}<div class="table-wrap"><table><thead><tr><th>账号</th><th>系统权重</th><th>生效权重</th><th>参与情况</th></tr></thead><tbody>${r.accounts.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(weightPercent(a.automatic))}</td><td>${esc(weightPercent(a.effective))}</td><td>${esc(reasonLabels[a.reason]||a.reason)}${a.extraQuota?'<small>手动正权重允许使用额外额度</small>':''}</td></tr>`).join('')}</tbody></table></div><h3>系统权重计算依据</h3>${basis?`<p class="hint">快照时间：${beijingDate(basis.at)}（北京时间）；预算值＝剩余百分比 ÷ max（距重置小时数，24），再归一化。${r.mode==='manual'?'当前生效权重来自手动设置，不由下表决定。':''}</p><div class="table-wrap"><table><thead><tr><th>账号</th><th>当时剩余</th><th>当时距重置</th><th>除数</th><th>预算值</th><th>重置时间</th></tr></thead><tbody>${basis.accounts.map(a=>`<tr><td>${esc(r.accounts.find(x=>x.id===a.id)?.name||a.id)}</td><td>${a.remaining===null?'未确认':Number(a.remaining).toFixed(2)+'%'}</td><td>${a.hours===null?'—':Number(a.hours).toFixed(2)+'h'}</td><td>${a.denominator===null?'—':Number(a.denominator).toFixed(2)+'h'}</td><td>${a.score===null?'未计算':Number(a.score).toFixed(4)}</td><td>${beijingDate(a.reset)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">历史权重没有保存计算快照，下次系统正常重算后可查看；不会为展示依据强制重算。</p>'}${r.configuration.expires?`<p>临时手动到期：${beijingDate(r.configuration.expires)}（北京时间）。</p>`:''}<p class="hint">自动比例在每日02:00、确认耗尽或恢复等既有触发时更新。夜间仍按重会话优先、偏差方向、最少迁移的顺序计算，并保留在途保护。</p><div class="dialog-actions">${button('routing-history','查看调整历史','secondary')}${button('close','关闭','primary')}</div>`;
+  const basis=r.basis,mode=({api_mixed:'API人工占比＋订阅组原规则',auto:'系统自动权重',manual:'临时手动权重',legacy:'原顺序分配',fallback:'额度待确认，按原顺序'})[r.mode]||r.mode;
+  return `<h2>调度依据</h2><p>当前方式：${esc(mode)}。下一条新会话预计分配给：${esc(r.accounts.find(a=>a.id===r.nextAccount)?.name||'暂无可用账号')}。</p><p class="hint">这是当前快照的试算，不推进分配顺序；并发请求、配置和额度状态变化后结果可能不同。已有正权重会话保持绑定。</p>${r.reason?`<div class="notice warn">${esc(reasonLabels[r.reason]||'等待额度确认')}；系统沿用已有权重或原顺序，不按页面读取时间重算比例。</div>`:''}<div class="table-wrap"><table><thead><tr><th>账号</th><th>系统权重</th><th>生效权重</th><th>参与情况</th></tr></thead><tbody>${r.accounts.map(a=>`<tr><td>${esc(a.name)}</td><td>${a.manualApi?'人工设定，不自动重置':esc(weightPercent(a.automatic))}</td><td>${esc(weightPercent(a.effective))}</td><td>${esc(reasonLabels[a.reason]||a.reason)}${a.extraQuota?'<small>手动正权重允许使用额外额度</small>':''}</td></tr>`).join('')}</tbody></table></div><h3>系统权重计算依据</h3>${basis?`<p class="hint">快照时间：${beijingDate(basis.at)}（北京时间）；预算值＝剩余百分比 ÷ max（距重置小时数，24），再归一化。${r.mode==='manual'?'当前生效权重来自手动设置，不由下表决定。':''}</p><div class="table-wrap"><table><thead><tr><th>账号</th><th>当时剩余</th><th>当时距重置</th><th>除数</th><th>预算值</th><th>重置时间</th></tr></thead><tbody>${basis.accounts.map(a=>`<tr><td>${esc(r.accounts.find(x=>x.id===a.id)?.name||a.id)}</td><td>${a.remaining===null?'未确认':Number(a.remaining).toFixed(2)+'%'}</td><td>${a.hours===null?'—':Number(a.hours).toFixed(2)+'h'}</td><td>${a.denominator===null?'—':Number(a.denominator).toFixed(2)+'h'}</td><td>${a.score===null?'未计算':Number(a.score).toFixed(4)}</td><td>${beijingDate(a.reset)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">历史权重没有保存计算快照，下次系统正常重算后可查看；不会为展示依据强制重算。</p>'}${r.configuration.expires?`<p>临时手动到期：${beijingDate(r.configuration.expires)}（北京时间）。</p>`:''}<p class="hint">自动比例在每日02:00、确认耗尽或恢复等既有触发时更新。夜间仍按重会话优先、偏差方向、最少迁移的顺序计算，并保留在途保护。</p><div class="dialog-actions">${button('routing-history','查看调整历史','secondary')}${button('close','关闭','primary')}</div>`;
 }
 function heavyHistory(planning){
   if(!planning)return '';
@@ -183,7 +213,7 @@ function render(){
     html+=panel(recentUsageTitle(),usageTable(usageRows()),button('go-requests','查看全部 →','text-button'));
   }
   if(tab==='members')html=heading('PEOPLE & ACCESS','员工与密钥','管理 Key 的有效期、启停和删除；近7天用量见使用记录。',button('create-member','＋ 创建员工 Key','primary'))+panel('员工列表',memberTable(state.members),`<span class="hint">${state.members.length} 位员工</span>`);
-  if(tab==='accounts')html=heading('SUBSCRIPTION POOL','订阅账号池','Codex 新会话按生效权重分配，已有正权重绑定保持；不同会话并行。',`<div class="actions">${button('routing-explanation','调度依据','secondary')}${button('routing-weights','临时设置权重','secondary')}${button('balancing-settings','负载均衡','secondary')}${button('refresh-quotas','↻ 刷新额度','secondary')}${button('create-account','＋ 添加账号','primary')}</div>`)+`<div class="notice">Codex 直接并行转发，不按本地预测 Token 阻止请求。自动权重在每日02:00、额度耗尽或恢复时更新，也可临时手动设置；0权重不接收后续请求，全部为0时暂停转发。Claude 仍为旧文本兼容入口，尚待真实验收。</div><div class="cards">${state.accounts.map(a=>`<article class="account-card"><div class="account-top"><span class="account-logo">C</span>${a.enabled?badge(a.state):'<span class="badge off">已停用</span>'}</div><h2>${esc(a.name)}</h2><small>${esc(a.kind==='claude'?'Claude 订阅 · 待真实验证':'Codex 订阅')}</small>${quotaCard(a)}${routingCard(a)}${a.route_block?`<div class="error-line">${a.route_block==='quota_exhausted'?'订阅额度耗尽 · 自动权重为0，可临时设置正权重使用额外额度':'登录失效 · 暂停接收请求'}</div>`:''}<p>最近调用：${date(a.last_used)}<br>近7天消耗：${tokenBillions(a.budget_used)} 亿 Token</p>${a.last_error||a.quota_error?`<div class="error-line">${esc(a.last_error||a.quota_error)}</div>`:''}<div class="actions">${button('check-account','检查登录','secondary',a.id)}${button('login-account',a.state==='offline'?'登录账号':'重新登录（重建会话）','text-button',a.id)}${button('toggle-account',a.enabled?'停用':'启用','text-button',a.id)}${button('remove-account','移除账号','text-button danger',a.id)}</div></article>`).join('')}<div class="account-card add">${button('create-account','＋ 添加一个独立账号','big-add')}</div></div>`;
+  if(tab==='accounts')html=heading('SUBSCRIPTION POOL','订阅账号池','Codex 新会话按生效权重分配，已有正权重绑定保持；不同会话并行。',`<div class="actions">${button('routing-explanation','调度依据','secondary')}${button('routing-weights','临时设置权重','secondary')}${button('balancing-settings','负载均衡','secondary')}${button('refresh-quotas','↻ 刷新额度','secondary')}${button('create-account','＋ 添加账号','primary')}</div>`)+`<div class="notice">Codex 直接并行转发，不按本地预测 Token 阻止请求。自动权重在每日02:00、额度耗尽或恢复时更新，也可临时手动设置；订阅账号0权重不接收后续请求。API Key由人工控制，权重0不分配新会话，人工固定会话仍可使用；停用会迁出绑定。Claude 仍为旧文本兼容入口，尚待真实验收。</div><div class="cards">${state.accounts.map(a=>`<article class="account-card"><div class="account-top"><span class="account-logo">${apiAccount(a)?'K':'C'}</span>${a.enabled?badge(a.state):'<span class="badge off">已停用</span>'}</div><h2>${esc(a.name)}</h2><small>${esc(apiAccount(a)?'OpenAI 官方API Key':a.kind==='claude'?'Claude 订阅 · 待真实验证':'Codex 订阅')}</small>${quotaCard(a)}${routingCard(a)}${a.route_block?`<div class="error-line">${apiAccount(a)?a.route_block==='quota_exhausted'?'官方API额度不足，请核对账单后手动检查恢复':'官方Key认证失效，请检查或更换Key':a.route_block==='quota_exhausted'?'订阅额度耗尽 · 自动权重为0，可临时设置正权重使用额外额度':'登录失效 · 暂停接收请求'}</div>`:''}<p>最近调用：${date(a.last_used)}<br>近7天消耗：${tokenBillions(a.budget_used)} 亿 Token</p>${a.last_error||a.quota_error?`<div class="error-line">${esc(a.last_error||a.quota_error)}</div>`:''}<div class="actions">${button('check-account',apiAccount(a)?'检查Key':'检查登录','secondary',a.id)}${apiAccount(a)?button('api-account-settings','Key与人工权重','text-button',a.id)+button('create-fixed-session','创建固定会话','text-button',a.id,!a.enabled||a.state!=='ready'||!!a.route_block):button('login-account',a.state==='offline'?'登录账号':'重新登录（重建会话）','text-button',a.id)}${button('toggle-account',a.enabled?'停用':'启用','text-button',a.id)}${button('remove-account','移除账号','text-button danger',a.id)}</div></article>`).join('')}<div class="account-card add">${button('create-account','＋ 添加一个独立账号','big-add')}</div></div>`;
   if(tab==='sessions')html=heading('SESSION AFFINITY','会话绑定','新会话自动分配账号，已有会话保持绑定；需要时可手动修改。')+`<div class="notice">手动切换从下一次请求生效；正在处理的会话须等待完成。禁止访问仅阻止该会话的新请求，不中断已经开始的请求。</div>`+panel('近7天活动会话',(state.sessions.length?`<div class="table-wrap"><table><thead><tr><th>Codex Session / 员工</th><th>绑定账号</th><th>近7天请求数</th><th>最近活动</th><th>操作</th></tr></thead><tbody>${state.sessions.map(s=>`<tr><td class="mono">${esc(sessionDisplayId(s))}<small>${esc(s.member_name)}</small></td><td>${esc(s.account_name)}</td><td>${fmt(s.request_count)}</td><td>${date(s.updated)}</td><td>${button('session-actions','管理会话','table-button',s.id,sessionsLoading)}</td></tr>`).join('')}</tbody></table></div>`:empty('发送第一条请求后自动创建会话。'))+sessionPager());
   if(tab==='requests'){
     const rows=usageRows().filter(k=>!requestFilter||k.member_name.includes(requestFilter)||(k.full_key||k.prefix).includes(requestFilter));
@@ -292,7 +322,8 @@ function sessionDisplayId(s){return s.protocol==='responses'?(s.client_session_i
 function sessionStatus(s){return !s.enabled?'已禁止访问':s.state==='active'?'已绑定':s.state==='uncertain'?(s.protocol==='responses'?'可继续 · 用量可能漏计':'需新建会话'):'待首次请求';}
 function sessionDetail(identifier){
   const s=state.sessions.find(x=>x.id===identifier);if(!s)return toast('会话不在当前列表，请刷新后重试');
-  modal(`<h2>管理会话</h2><p class="mono muted">${esc(sessionDisplayId(s))}</p><div class="details-line">员工：${esc(s.member_name)}<br>当前状态：${sessionStatus(s)}<br>绑定账号：${esc(s.account_name)}<br>自动调整：${s.nightly_enabled?'已参与':'临时固定至 '+beijingDate(s.nightly_expires)+'（北京时间02:00）'}</div><div class="actions">${s.protocol==='responses'&&s.enabled?button('route-session','修改绑定账号','secondary',s.id):''}${s.protocol==='responses'?button('nightly-session',s.nightly_enabled?'临时固定至02:00':'恢复自动调整','secondary',s.id):''}${button('toggle-session',s.enabled?'禁止该会话访问':'恢复该会话访问',s.enabled?'text-button danger':'secondary',s.id)}</div>${s.protocol!=='responses'?'<p class="hint">旧 CLI Session 的上下文保存在原账号目录，暂不支持修改绑定账号。</p>':''}<div class="dialog-actions">${button('close','关闭','primary')}</div>`);
+  const fixedApi=apiAccount((state.accounts||[]).find(a=>a.id===s.account_id));
+  modal(`<h2>管理会话</h2><p class="mono muted">${esc(sessionDisplayId(s))}</p><div class="details-line">员工：${esc(s.member_name)}<br>当前状态：${sessionStatus(s)}<br>绑定账号：${esc(s.account_name)}<br>自动调整：${fixedApi?'API人工固定，不参与夜间调整':s.nightly_enabled?'已参与':'临时固定至 '+beijingDate(s.nightly_expires)+'（北京时间02:00）'}</div><div class="actions">${s.protocol==='responses'&&s.enabled?button('route-session','修改绑定账号','secondary',s.id):''}${s.protocol==='responses'&&!fixedApi?button('nightly-session',s.nightly_enabled?'临时固定至02:00':'恢复自动调整','secondary',s.id):''}${button('toggle-session',s.enabled?'禁止该会话访问':'恢复该会话访问',s.enabled?'text-button danger':'secondary',s.id)}</div>${s.protocol!=='responses'?'<p class="hint">旧 CLI Session 的上下文保存在原账号目录，暂不支持修改绑定账号。</p>':''}<div class="dialog-actions">${button('close','关闭','primary')}</div>`);
 }
 function memberDetail(memberId){const m=state.members.find(x=>x.id===memberId),keys=state.keys.filter(k=>k.member_id===memberId);modal(`<h2>${esc(m.name)}</h2><div class="actions">${button('edit-member','修改名称','secondary',m.id)}${button('new-key','新增 Key','secondary',m.id)}${button('toggle-member',m.enabled?'停用员工':'启用员工','text-button',m.id)}</div>${keys.map(k=>`<div class="mini-row"><div class="mono">${esc(k.prefix)}…<small>${k.expires?'到期 '+date(k.expires):'永久有效'} · ${!k.enabled?'已停用':!m.enabled?'员工已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</small></div><div>${button('key-ips',fmt(k.ips)+' 个 IP','table-button',k.id)}${button('renew-key','续期','table-button',k.id)}${button('toggle-key',k.enabled?'停用':'启用','table-button',k.id)}${button('remove-key','删除','table-button',k.id)}</div></div>`).join('')}<p class="hint">近7天用量见使用记录。换 Key 不影响其他 Key 的统计。</p><div class="dialog-actions">${button('close','完成','primary')}</div>`);}
 async function checkKey(){testKey=$('#test-key').value.trim();const key=testKey,epoch=authEpoch;try{const m=await api('/api/me','GET',undefined,key);if(epoch!==authEpoch||tab!=='playground'||$('#test-key')?.value.trim()!==key)return;$('#my-quota').textContent=`${m.name}：此 Key 近7天 ${tokenBillions(m.keyUsed)} 亿 Token`;}catch(e){if(epoch===authEpoch)toast(e.message);}}
@@ -345,7 +376,7 @@ document.addEventListener('click',async e=>{
     if(action==='routing-weights'){
       const w=state.balancing?.weights;
       if(!w)return toast('请先刷新账号状态');
-      const accounts=state.accounts.filter(a=>a.kind==='codex');
+      const accounts=state.accounts.filter(a=>a.kind==='codex'&&!apiAccount(a));
       if(!accounts.length)return toast('请先添加Codex账号');
       const cfg=w.configuration;
       const seeds=accounts.map(a=>({a,value:cfg.mode==='manual'?cfg.weights[a.id]||0:w.accounts.find(x=>x.id===a.id)?.automatic}));
@@ -373,21 +404,33 @@ document.addEventListener('click',async e=>{
     if(action==='route-session'){
       const s=state.sessions.find(x=>x.id===identifier),accounts=state.accounts.filter(a=>a.kind==='codex'&&a.enabled&&a.state==='ready'&&!a.route_block);
       if(!accounts.some(a=>a.id!==s.account_id))return toast('暂无其他已连接的 Codex 账号');
-      return formModal('修改绑定账号','从下一次请求起使用选定账号，临时固定至下次北京时间02:00；届时自动规则接管。不会重发失败请求；客户端须携带完整历史。',`<p class="hint">当前绑定：${esc(s.account_name)}</p><label>目标账号<select name="account_id">${accounts.map(a=>`<option value="${esc(a.id)}" ${a.id===s.account_id?'selected':''}>${esc(a.name)}</option>`).join('')}</select></label>`,async f=>{await api('/api/admin/sessions/'+identifier,'PATCH',{account_id:f.get('account_id'),expected_route_version:s.route_version});close();await refresh();toast('绑定已更新，下次请求生效');});
+      return formModal('修改绑定账号','从下一次请求起使用选定账号。订阅账号固定至下次02:00；官方API Key绑定由人工控制。不会重发失败请求；客户端须携带完整历史。',`<p class="hint">当前绑定：${esc(s.account_name)}</p><label>目标账号<select name="account_id">${accounts.map(a=>`<option value="${esc(a.id)}" ${a.id===s.account_id?'selected':''}>${esc(a.name)}</option>`).join('')}</select></label>`,async f=>{await api('/api/admin/sessions/'+identifier,'PATCH',{account_id:f.get('account_id'),expected_route_version:s.route_version});close();await refresh();toast('绑定已更新，下次请求生效');});
     }
     if(action==='toggle-session'){
       const s=state.sessions.find(x=>x.id===identifier);
       return modal(`<h2>${s.enabled?'禁止该会话访问？':'恢复该会话访问？'}</h2><p class="hint">${s.enabled?'该会话后续请求将被拒绝，已经开始的请求允许完成。其他会话与员工 Key 不受影响。':'恢复后继续使用当前绑定账号，不自动切换账号。'}</p><div class="dialog-actions">${button('close','取消','secondary')}${button(s.enabled?'disable-session':'enable-session',s.enabled?'确认禁止':'确认恢复','primary',identifier)}</div>`);
     }
     if(action==='disable-session'||action==='enable-session'){await api('/api/admin/sessions/'+identifier,'PATCH',{enabled:action==='enable-session'});close();await refresh();return toast(action==='enable-session'?'会话访问已恢复':'该会话已禁止访问');}
-    if(action==='create-account')return formModal('添加订阅账号','创建独立登录目录后，可使用官方登录。重新登录会结束该账号已有会话绑定，后续须新建会话。','<label>账号类型<select name="kind"><option value="codex">Codex 订阅</option><option value="claude">Claude 订阅（待真实验证）</option></select></label><label>账号名称<input name="name" required maxlength="60" placeholder="例如：测试账号 02"></label>',async f=>{await api('/api/admin/accounts','POST',{name:f.get('name'),kind:f.get('kind')});close();await refresh();toast('账号已创建，请完成官方登录');});
+    if(action==='create-account'){
+      formModal('添加上游账号','订阅账号走官方登录；API Key仅加密保存，默认不分配新会话。',`<label>接入方式<select name="kind" id="new-account-kind"><option value="codex">Codex订阅</option><option value="openai_api">OpenAI官方API Key</option><option value="claude">Claude订阅（待真实验证）</option></select></label><label>账号名称<input name="name" required maxlength="60"></label><div id="new-api-fields" class="hidden"><label>官方API Key<input name="api_key" type="password" autocomplete="new-password" maxlength="4096"></label><label>人工新会话占比（%）<input name="api_weight" type="number" min="0" max="100" step="0.01" value="0"></label><p class="hint">0只用于人工固定会话，不加入其他人的新会话分配。占比与启停不在凌晨自动修改，余额需在官方后台核对。</p></div>`,async f=>{
+        const mode=f.get('kind');await api('/api/admin/accounts','POST',{name:f.get('name'),kind:mode==='openai_api'?'codex':mode,...(mode==='openai_api'?{auth_mode:mode,api_key:f.get('api_key'),api_weight:Number(f.get('api_weight'))}:{})});close();await refresh();toast(mode==='openai_api'?'已加密保存，请检查Key后创建固定会话':'账号已创建，请完成官方登录');
+      });$('#new-account-kind').onchange=e=>$('#new-api-fields').classList.toggle('hidden',e.target.value!=='openai_api');return;
+    }
+    if(action==='api-account-settings'){
+      const a=state.accounts.find(x=>x.id===identifier);if(!apiAccount(a))return;
+      return formModal('官方Key与人工权重','Key留空保持现值；更换后须重新检查。配置长期保留，不受每日02:00影响。',`<label>更换官方Key<input name="api_key" type="password" autocomplete="new-password" maxlength="4096" placeholder="留空保持现有Key"></label><label>人工新会话占比（%）<input name="api_weight" type="number" min="0" max="100" step="0.01" value="${a.api_weight||0}" required></label><p class="hint">全部API账号占比之和最多100%；其余由订阅组按原规则分配。权重0仍允许使用人工固定会话，停用才会迁出全部绑定。Key明文不会回显。</p>`,async f=>{const key=f.get('api_key').trim();await api('/api/admin/accounts/'+identifier,'PATCH',{api_weight:Number(f.get('api_weight')),...(key?{api_key:key}:{})});close();await refresh();toast('人工配置已保存');});
+    }
+    if(action==='create-fixed-session'){
+      const a=state.accounts.find(x=>x.id===identifier),members=state.members.filter(m=>m.enabled);if(!apiAccount(a)||!members.length)return toast('请先创建可用员工');
+      return formModal('创建API固定会话','使用所选员工现有Key，新开一个客户端对话，专用于此上游。',`<p>绑定账号：${esc(a.name)}</p><label>所属员工<select name="member_id">${members.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('')}</select></label>`,async f=>{const version=dialogVersion,epoch=authEpoch,r=await api('/api/admin/sessions','POST',{member_id:f.get('member_id'),account_id:identifier});if(!admin||epoch!==authEpoch||version!==dialogVersion||!$('#modal').open)return;close();modal(`<h2>API固定会话已创建</h2><p>在已配置Harbor（provider名harbor）与所属员工Key的PowerShell或WSL终端执行下面命令，启动一个专用CLI对话。参数仅对这个进程生效，不修改全局配置或其他已开的会话。</p><pre class="code">${esc(fixedSessionCommand(r.session_id))}</pre><p class="hint">模型须选择该官方Key可用的实际模型。此进程只使用一条客户端对话，不要复用于其他新对话；结束后退出即可。固定标识不替代员工Key，官方Key始终只保存在网关。余额抵扣需与官方账单核对。</p><div class="dialog-actions">${button('close','完成','primary')}</div>`,true);});
+    }
     if(action==='refresh-quotas'){el.disabled=true;await api('/api/admin/quotas/refresh','POST',{});await refresh();return toast(state.accounts.some(a=>a.enabled&&a.quota_error)?'部分账号额度未能刷新，已保留上次结果':'官方额度已更新');}
     if(action==='budget-account'){const a=state.accounts.find(x=>x.id===identifier);return formModal('本地 Token 预算','这是手动估算预算，不是官方订阅额度。已用 '+fmt(a.budget_used)+' Token；预算留空表示不设置本地上限。',`<label>总预算（Token）<input name="quota" type="number" min="0" step="1" value="${a.token_budget??''}" placeholder="留空"></label>${a.kind!=='claude'?`<label>每 1% 额度的预计 Token 容量<input name="capacity" type="number" min="100" max="10000000" step="1" value="${Math.round(a.tokens_per_percent||10000)}"></label><small>仅用于预测排序；会随官方额度变化校准，不是官方余额。</small>`:''}`,async f=>{await api('/api/admin/accounts/'+identifier,'PATCH',{token_budget:quotaValue(f),...(a.kind!=='claude'?{tokens_per_percent:Number(f.get('capacity'))}:{})});close();await refresh();toast('预算已保存');});}
     if(action==='toggle-account'){const a=state.accounts.find(x=>x.id===identifier);if(!a)return;if(a.enabled)return modal(`<h2>停用 ${esc(a.name)}？</h2><p>立即迁移全部绑定会话，正在执行的请求按原账号完成，后续请求使用新绑定。网页测试聊天清空旧上下文，Codex客户端继续使用自己的历史。</p><p class="hint">停用不会在凌晨自动恢复，须手动启用。仅临时设置权重为0才会在北京时间02:00恢复自动；无可用接收账号时整笔操作拒绝。</p><div class="dialog-actions">${button('close','取消','secondary')}${button('confirm-disable-account','确认停用并迁移','primary',identifier)}</div>`);await api('/api/admin/accounts/'+identifier,'PATCH',{enabled:true});await refresh();return;}
     if(action==='confirm-disable-account'){el.disabled=true;try{const r=await api('/api/admin/accounts/'+identifier,'PATCH',{enabled:false});close();await refresh();toast(`账号已停用，迁移 ${r.moved} 个会话${r.resetTextSessions?'，其中 '+r.resetTextSessions+' 个测试会话已清空旧上下文':''}`);}finally{el.disabled=false;}return;}
     if(action==='login-account'){el.disabled=true;return await loginAccountFlow(identifier);}
     if(action==='cancel-login'){el.disabled=true;await api('/api/admin/accounts/'+identifier+'/login/cancel','POST',{});close();await refresh();return toast('登录已取消，可重新登录');}
-    if(action==='check-account'){el.disabled=true;const r=await api('/api/admin/accounts/'+identifier+'/check','POST',{});await refresh();return toast(r.ready?'已检测到订阅登录':'未检测到订阅登录');}
+    if(action==='check-account'){el.disabled=true;const r=await api('/api/admin/accounts/'+identifier+'/check','POST',{});await refresh();return toast(r.ready?(apiAccount(state.accounts.find(a=>a.id===identifier))?'官方Key认证检查通过；余额仍请在官方核对':'已检测到订阅登录'):'未检测到订阅登录');}
     if(action==='remove-account'){const account=state.accounts.find(x=>x.id===identifier);return modal(`<h2>移除 ${esc(account.name)}？</h2><p class="hint">移除后不再使用此账号，正在登录的流程会取消，绑定会话需新建。历史用量、会话记录和独立目录保留；不会删除其他账号。正在处理或排队的请求须先完成。</p><div class="dialog-actions">${button('close','取消','secondary')}${button('confirm-remove-account','确认移除','primary',identifier)}</div>`);}
     if(action==='confirm-remove-account'){el.disabled=true;await api('/api/admin/accounts/'+identifier,'DELETE');close();await refresh();return toast('账号已移除，历史用量保留');}
     if(action==='request-detail')return await requestDetail(identifier);
@@ -399,6 +442,6 @@ document.addEventListener('click',async e=>{
 });
 $('#login-form').onsubmit=async e=>{e.preventDefault();const submit=e.submitter;submit.disabled=true;try{await api('/api/auth/login','POST',{password:$('#admin-input').value});authEpoch++;admin=true;$('#admin-input').value='';await refresh();}catch(err){toast(err.message);}finally{submit.disabled=false;}};
 $('#employee-entry').onclick=()=>{connectionView='test';tab='playground';render();};$('#refresh').onclick=()=>refresh();$('#logout').onclick=async()=>{if(sending)return toast('请等待当前请求完成后退出');try{await api('/api/auth/logout','POST',{});authEpoch++;admin=false;state=null;testKey='';chat=[];chatSession='';chatOwner='';draft='';showLogin();}catch(err){toast(err.message);}};
-setInterval(()=>{if(admin&&!sessionsLoading&&tab!=='playground'&&!$('#modal').open&&!document.hidden&&!['INPUT','SELECT'].includes(document.activeElement.tagName)){refresh();if(tab==='requests'&&recordView==='history'&&!historyLoading)loadHistory().catch(e=>toast(e.message));}},12000);
+setInterval(()=>{void automaticRefresh();},12000);
 setInterval(()=>{if(admin&&requestDetailId&&$('#modal').open&&!document.hidden)requestDetail(requestDetailId,false).catch(e=>toast(e.message));},4000);
 const initialAuthEpoch=authEpoch;api('/api/auth/session').then(r=>{if(initialAuthEpoch!==authEpoch)return;admin=r.authenticated;if(admin)refresh();else showLogin();}).catch(()=>{if(initialAuthEpoch===authEpoch)showLogin();});

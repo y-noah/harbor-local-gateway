@@ -7,12 +7,12 @@ const source=readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
 const snapshot=()=>({totals:{tokens:0,requests:0,success:0,reserved:0},accounts:[],members:[],daily:[],requests:[],busy:0,queue:0});
 const response=(body,status=200)=>({ok:status<400,status,json:async()=>body});
 async function ui(fetcher){
-  const nodes=new Map(),handlers=new Map(),downloads=[],popups=[],timers=[],copied=[];
+  const nodes=new Map(),handlers=new Map(),downloads=[],popups=[],timers=[],copied=[],intervals=[];
   const node=id=>{if(!nodes.has(id))nodes.set(id,{classList:{values:new Set(),add(v){this.values.add(v);},remove(v){this.values.delete(v);},toggle(){}},value:'',textContent:'',innerHTML:'',open:false,close(){this.open=false;},showModal(){this.open=true;}});return nodes.get(id);};
   class BrowserURL extends URL{static createObjectURL(){return 'blob:test-only';}static revokeObjectURL(){}}
-  const context=vm.createContext({URLSearchParams,navigator:{clipboard:{writeText:async value=>copied.push(value)}},document:{querySelector:node,querySelectorAll:()=>[],addEventListener(type,handler){handlers.set(type,handler);},createElement(){return {click(){downloads.push(this.download);}};},activeElement:{tagName:'BODY'}},URL:BrowserURL,window:{open(){const popup={closed:false,close(){this.closed=true;},location:{replace(url){popup.url=url;}}};popups.push(popup);return popup;}},sessionStorage:{removeItem(){}},location:{hash:''},setInterval(){},setTimeout(fn,delay){const timer={fn,delay,active:true};timers.push(timer);return timer;},clearTimeout(timer){if(timer)timer.active=false;},fetch:async(path,options)=>path==='/api/auth/session'?response({authenticated:false}):fetcher(path,options),console});
+  const context=vm.createContext({URLSearchParams,navigator:{clipboard:{writeText:async value=>copied.push(value)}},document:{querySelector:node,querySelectorAll:()=>[],addEventListener(type,handler){handlers.set(type,handler);},createElement(){return {click(){downloads.push(this.download);}};},activeElement:{tagName:'BODY'}},URL:BrowserURL,window:{open(){const popup={closed:false,close(){this.closed=true;},location:{replace(url){popup.url=url;}}};popups.push(popup);return popup;}},sessionStorage:{removeItem(){}},location:{hash:''},setInterval(fn,delay){intervals.push({fn,delay});},setTimeout(fn,delay){const timer={fn,delay,active:true};timers.push(timer);return timer;},clearTimeout(timer){if(timer)timer.active=false;},fetch:async(path,options)=>path==='/api/auth/session'?response({authenticated:false}):fetcher(path,options),console});
   vm.runInContext(source,context);await new Promise(setImmediate);
-  return {node,downloads,popups,timers,copied,click:(action,id='')=>handlers.get('click')({target:{closest:selector=>selector==='[data-action]'?{dataset:{action,id}}:null}}),run:code=>vm.runInContext(code,context)};
+  return {node,downloads,popups,timers,copied,intervals,click:(action,id='')=>handlers.get('click')({target:{closest:selector=>selector==='[data-action]'?{dataset:{action,id}}:null}}),run:code=>vm.runInContext(code,context)};
 }
 
 test('late admin refresh cannot reopen the console after logout',async()=>{
@@ -320,4 +320,39 @@ test('combined connection view preserves drafts and prevents employee access to 
 test('account disable asks for confirmation then shows full migration result',async()=>{
  const calls=[];const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?{...snapshot(),accounts:[{id:'a',name:'A',kind:'codex',enabled:0}]}:{ok:true,moved:8,resetTextSessions:2});});
  page.run('admin=true;state='+JSON.stringify({...snapshot(),accounts:[{id:'a',name:'A',enabled:1}]})+";tab='accounts';");await page.click('toggle-account','a');assert.equal(calls.length,0);assert.match(page.node('#modal-content').innerHTML,/凌晨自动恢复/);await page.click('confirm-disable-account','a');assert.equal(JSON.parse(calls[0][1].body).enabled,false);assert.match(page.node('#toast').textContent,/迁移 8 个会话/);
+});
+
+test('a fixed API session created after its dialog closes cannot replace a newer dialog',async()=>{
+ let release;const page=await ui(path=>path==='/api/admin/sessions'?new Promise(r=>release=()=>r(response({session_id:'synthetic-fixed-session',header:'X-Harbor-Session'}))):response({ok:true}));
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),members:[{id:'m',name:'Fixture',enabled:1}],accounts:[{id:'a',name:'API',auth_mode:'openai_api',enabled:1,state:'ready'}]})+";globalThis.FormData=class{get(){return 'm';}};");
+ await page.click('create-fixed-session','a');const pending=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});await page.click('close');page.run("modal('<h2>new dialog</h2>')");release();await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
+});
+
+test('automatic refresh is limited to live views and the unfiltered first request page',async()=>{
+ const calls=[];const page=await ui(path=>{calls.push(path);return response(snapshot());});page.run('admin=true;state='+JSON.stringify(snapshot())+';');
+ for(const tab of ['members','playground']){page.run('tab='+JSON.stringify(tab));await page.run('automaticRefresh()');}
+ for(const record of ['usage','history']){page.run("tab='requests';recordView="+JSON.stringify(record));await page.run('automaticRefresh()');}
+ page.run("tab='requests';recordView='requests';requestsFilters.page=2;");await page.run('automaticRefresh()');page.run("requestsFilters.page=1;requestsFilters.model='gpt-fixture'");await page.run('automaticRefresh()');assert.deepEqual(calls,[]);
+ for(const tab of ['overview','accounts','sessions']){page.run('tab='+JSON.stringify(tab));await page.run('automaticRefresh()');}assert.equal(calls.length,3);assert.ok(calls.every(x=>x==='/api/admin/state'));
+ page.run("tab='overview';document.hidden=true");await page.run('automaticRefresh()');page.run("document.hidden=false;document.activeElement.tagName='TEXTAREA'");await page.run('automaticRefresh()');page.run("document.activeElement.tagName='BODY'");page.node('#modal').open=true;await page.run('automaticRefresh()');assert.equal(calls.length,3);
+});
+test('a late automatic response cannot refresh a static page reached after the request began',async()=>{
+ let release;const page=await ui(()=>new Promise(r=>release=()=>r(response({...snapshot(),busy:42}))));page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='overview';");const pending=page.run('automaticRefresh()');page.run("tab='members';render()");const before=page.node('#content').innerHTML;release();await pending;assert.equal(page.node('#content').innerHTML,before);assert.equal(page.run('state.busy'),0);assert.equal(page.run('autoRefreshPending'),false);
+});
+test('automatic latest-request refresh does not flash loading or replace unchanged rows; manual refresh remains available',async()=>{
+ let release;const result={observedAt:1,summary:{requests:1,success:1,input:1,output:1,cached:0,unmetered:0,active:0,average_ms:1000},pagination:{page:1,pageSize:25,total:1,totalPages:1},rows:[],models:[],members:[],byModel:[],byMember:[]};
+ const calls=[];const page=await ui(path=>{calls.push(path);return new Promise(r=>release=()=>r(response({...result,observedAt:2})));});page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(result)+";render();");const before=page.node('#content').innerHTML,pending=page.run('automaticRefresh()');assert.equal(page.node('#content').innerHTML,before);assert.ok(!page.node('#content').innerHTML.includes('正在读取'));release();await pending;assert.equal(page.node('#content').innerHTML,before);assert.ok(calls[0].startsWith('/api/admin/requests?'));assert.ok(!calls.includes('/api/admin/state'));
+ page.run("recordView='history';historyData=null;render()");assert.equal(page.run('automaticRefreshScope()'),'');
+});
+
+test('request refresh restores online status after an outage without accepting late responses',async()=>{
+ const data={summary:{active:0},pagination:{page:1,pageSize:25,total:0,totalPages:1},rows:[],models:[],members:[],byModel:[],byMember:[]};
+ let failing=true,release;
+ const page=await ui(()=>release===null?new Promise(r=>release=()=>r(response(data))):failing?response({error:{message:'synthetic outage'}},502):response(data));
+ page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(data));
+ await page.run('automaticRefresh()');assert.equal(page.node('#connection').textContent,'连接异常');
+ failing=false;await page.run('automaticRefresh()');assert.equal(page.node('#connection').textContent,'● 服务在线');
+ failing=true;await page.run('automaticRefresh()');failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'● 服务在线');
+ release=null;const pending=page.run('automaticRefresh()');page.run("tab='members';render()");page.node('#connection').textContent='new-page-status';release();await pending;
+ assert.equal(page.node('#connection').textContent,'new-page-status');
 });

@@ -69,6 +69,19 @@ export function createGateway(options={}) {
   const store=new Store(join(data,'gateway.sqlite'),{encryptionKey});
   const executor=options.executor||runCodex, checker=options.checker||checkLogin,rateReader=options.rateReader||readRateLimits;
   const responses=options.responsesTransport||createResponsesTransport();
+  const apiResponses=options.apiResponsesTransport||createResponsesTransport({apiKeyMode:true,credentials:async(_binary,accountId)=>{
+    const account=store.get('SELECT * FROM accounts WHERE id=? AND removed_at IS NULL',accountId),key=account&&store.upstreamKey(account);
+    if(!account?.enabled||account.auth_mode!=='openai_api'||!key)throw new AppError(503,'官方API Key不可用，请检查账号配置','upstream_authentication');
+    return {token:key};
+  }});
+  const usesApi=account=>account?.auth_mode==='openai_api';
+  const inference=account=>usesApi(account)?apiResponses:responses;
+  const apiKeyValue=value=>{if(typeof value!=='string'||!value.trim()||value.length>4096||/\s/.test(value.trim()))throw new AppError(400,'请填写有效的官方API Key');return value.trim();};
+  function apiWeight(accountId,value){
+    if(!Number.isFinite(value)||value<0||value>100||Math.abs(value*100-Math.round(value*100))>1e-8)throw new AppError(400,'API分配占比须为0至100，最多两位小数');
+    const other=store.get("SELECT COALESCE(SUM(api_weight),0) n FROM accounts WHERE auth_mode='openai_api' AND removed_at IS NULL AND id<>?",accountId).n;
+    if(other+value>100+1e-8)throw new AppError(400,'所有API账号的人工占比总和不能超过100%');return value;
+  }
   const claudeBinary=config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe');
   const provider=a=>a.kind==='claude'?{binary:claudeBinary,run:options.claudeExecutor||runClaude,check:options.claudeChecker||checkClaudeLogin,env:claudeEnv,loginArgs:['auth','login']}:{binary:config.codexBinary,run:executor,check:checker,env:runnerEnv,loginArgs:['login',...codexAuthArgs()]};
   const busy=new Map(),responseMembers=new Map(),queue=[],controllers=new Set(),logins=new Map(),tasks=new Set(),admittedMembers=new Set();let stopping=false;
@@ -89,7 +102,7 @@ export function createGateway(options={}) {
     return quotaFetches.get(key);
   }
   async function refreshQuota(account,force=false){
-    if(stopping||!account||account.removed_at!==null||!account.enabled||!['ready','degraded'].includes(account.state))return;
+    if(stopping||!account||usesApi(account)||account.removed_at!==null||!account.enabled||!['ready','degraded'].includes(account.state))return;
     if(account.kind==='claude'){store.run('UPDATE accounts SET quota_error=? WHERE id=?','Claude 官方 CLI 暂无已验证的额度查询；使用本地 Token 预算估算',account.id);return;}
     const quotaKey=account.id+':'+(authVersions.get(account.id)||0)+':'+account.route_epoch;
     if(quotaReads.has(quotaKey))return quotaReads.get(quotaKey);
@@ -131,7 +144,7 @@ export function createGateway(options={}) {
     return accountCapacity(account,predicted,pending);
   }
   function chooseAccount(predicted,kind='codex'){
-    const ranked=store.all("SELECT * FROM accounts WHERE kind=? AND enabled=1 AND state IN ('ready','degraded')",kind).map(a=>({a,c:capacity(a,predicted)})).filter(x=>x.c.eligible).sort((x,y)=>y.c.score-x.c.score||x.a.last_used-y.a.last_used);
+    const ranked=store.all("SELECT * FROM accounts WHERE kind=? AND auth_mode='subscription' AND enabled=1 AND state IN ('ready','degraded')",kind).map(a=>({a,c:capacity(a,predicted)})).filter(x=>x.c.eligible).sort((x,y)=>y.c.score-x.c.score||x.a.last_used-y.a.last_used);
     if(!ranked.length)throw new AppError(503,'没有预计额度足够的账号；请刷新官方额度或设置本地预算','no_account_capacity');return ranked[0].a;
   }
   const digestMessages=(seed,messages)=>messages.reduce((value,m)=>hash(value+'\n'+JSON.stringify({role:m.role,content:m.content})),seed);
@@ -159,7 +172,7 @@ export function createGateway(options={}) {
       }
       return {session,delta};
     }
-    const accounts=store.all("SELECT * FROM accounts WHERE kind=? AND enabled=1 AND state IN ('ready','degraded')",kind);
+    const accounts=store.all("SELECT * FROM accounts WHERE kind=? AND auth_mode='subscription' AND enabled=1 AND state IN ('ready','degraded')",kind);
     await Promise.all(accounts.map(a=>refreshQuota(a)));
     const session={id:id(),member_id:member.id,account_id:chooseAccount(predicted,kind).id,upstream_id:null,state:'new',message_count:0,history_digest:'',created:now(),updated:now()};
     return {session,delta:messages,isNew:true};
@@ -203,9 +216,9 @@ export function createGateway(options={}) {
     store.run('UPDATE accounts SET last_used=? WHERE id=?',now(),account.id);
     try{
       if(job.responses){
-        const result=await (job.jsonPath?responses.runJson:responses.run)({binary:config.codexBinary,home:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.upstream_thread||session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,collectOutput:job.collectOutput,onEvent:job.onEvent,onPhase:phase=>store.phase(requestId,phase)});
+        const transport=inference(account),result=await (job.jsonPath?transport.runJson:transport.run)({binary:config.codexBinary,home:usesApi(account)?account.id:account.home,path:job.jsonPath,payload:job.responses,sessionId:session.upstream_thread||session.id,signal:controller.signal,protocolHeaders:job.protocolHeaders,collectOutput:job.collectOutput,onEvent:job.onEvent,onPhase:phase=>store.phase(requestId,phase)});
         store.finish(requestId,result,()=>{
-          store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
+          store.run("UPDATE accounts SET state=CASE WHEN auth_mode='openai_api' AND route_epoch<>? THEN state ELSE 'ready' END,last_error=CASE WHEN auth_mode='openai_api' AND route_epoch<>? THEN last_error ELSE NULL END,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",account.route_epoch,account.route_epoch,result.input+result.output,result.input+result.output,account.id);
           store.run("UPDATE sessions SET state='active',updated=? WHERE id=? AND route_version=? AND account_id=?",now(),session.id,session.route_version||0,account.id);
         });
         complete(result);void refreshQuota(store.get('SELECT * FROM accounts WHERE id=?',account.id));return;
@@ -214,7 +227,7 @@ export function createGateway(options={}) {
       store.phase(requestId,'cli');
       const result=await upstream.run({binary:upstream.binary,home:account.home,workspace:join(runtime,'jobs',session.id),messages,model,sessionId:session.upstream_id,previousUsage:{input:session.cum_input||0,output:session.cum_output||0,cached:session.cum_cached||0},signal:controller.signal});
       store.finish(requestId,result,()=>{
-        store.run("UPDATE accounts SET state='ready',last_error=NULL,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",result.input+result.output,result.input+result.output,account.id);
+        store.run("UPDATE accounts SET state=CASE WHEN auth_mode='openai_api' AND route_epoch<>? THEN state ELSE 'ready' END,last_error=CASE WHEN auth_mode='openai_api' AND route_epoch<>? THEN last_error ELSE NULL END,budget_used=budget_used+?,since_check_tokens=since_check_tokens+? WHERE id=?",account.route_epoch,account.route_epoch,result.input+result.output,result.input+result.output,account.id);
         store.run("UPDATE sessions SET upstream_id=?,state='active',message_count=?,history_digest=?,updated=? WHERE id=? AND route_version=? AND account_id=?",result.threadId||session.upstream_id,session.message_count+messages.length+1,digestMessages(session.history_digest,[...messages,{role:'assistant',content:result.text}]),now(),session.id,session.route_version||0,account.id);
         const cumulative=result.cumulativeUsage||{input:(session.cum_input||0)+result.input,output:(session.cum_output||0)+result.output,cached:(session.cum_cached||0)+result.cached};
         store.run('UPDATE sessions SET cum_input=?,cum_output=?,cum_cached=? WHERE id=? AND route_version=? AND account_id=?',cumulative.input,cumulative.output,cumulative.cached,session.id,session.route_version||0,account.id);
@@ -280,6 +293,14 @@ export function createGateway(options={}) {
           const result=await balancer.preview();
           return json(res,200,{...result,moves:result.moves.map(move=>({...move,protocol:'responses',client_session_id:null,...store.get('SELECT protocol,client_session_id FROM sessions WHERE id=?',move.session_id)}))});
         }
+        if(path==='/api/admin/sessions'&&method==='POST'){
+          const b=await body(req),member=store.get('SELECT id FROM members WHERE id=? AND enabled=1 AND removed_at IS NULL',b.member_id),account=store.get("SELECT * FROM accounts WHERE id=? AND auth_mode='openai_api' AND enabled=1 AND state='ready' AND route_block IS NULL AND removed_at IS NULL",b.account_id);
+          if(!member||!account)throw new AppError(400,'请选择有效员工及已启用、检查通过的API账号');
+          const sessionId=id();balancer.atomic(()=>{
+            store.run("INSERT INTO sessions(id,member_id,account_id,protocol,nightly_enabled,created,updated) VALUES(?,?,?,'responses',0,?,?)",sessionId,member.id,account.id,now(),now());
+            store.audit('session.route',JSON.stringify({sessionId,from:null,to:account.id,reason:'manual'}));
+          });return json(res,201,{session_id:sessionId,header:'X-Harbor-Session'});
+        }
         const sessionMatch=path.match(/^\/api\/admin\/sessions\/([a-zA-Z0-9-]+)$/);
         if(sessionMatch&&method==='PATCH'){
           const b=await body(req);
@@ -287,8 +308,8 @@ export function createGateway(options={}) {
           const session=store.get('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id WHERE s.id=?',sessionMatch[1]);
           if(!session||session.member_removed)throw new AppError(404,'会话不存在');
           const enabled=b.enabled===undefined?session.enabled:bool(b.enabled);
-          const nightly=b.nightly_enabled===undefined?(b.account_id!==undefined?0:session.nightly_enabled):bool(b.nightly_enabled);
-          const nightlyExpires=nightly?null:(b.account_id!==undefined||b.nightly_enabled!==undefined?nextDailyReset((options.clock||Date.now)()):session.nightly_expires);
+          let nightly=b.nightly_enabled===undefined?(b.account_id!==undefined?0:session.nightly_enabled):bool(b.nightly_enabled);
+          let nightlyExpires=nightly?null:(b.account_id!==undefined||b.nightly_enabled!==undefined?nextDailyReset((options.clock||Date.now)()):session.nightly_expires);
           let accountId=session.account_id,upstreamThread=session.upstream_thread,version=session.route_version;
           if(b.account_id!==undefined){
             if(session.protocol!=='responses')throw new AppError(409,'旧 CLI Session 的上下文保存在原账号目录，暂不支持切换绑定账号','session_route_unsupported');
@@ -297,11 +318,12 @@ export function createGateway(options={}) {
             if(b.expected_route_version!==version)throw new AppError(409,'会话绑定已变化，请刷新后重试','session_route_conflict');
             if(b.account_id!==accountId){
               if(responsePreparing.has(session.member_id)||store.get("SELECT id FROM requests WHERE session_id=? AND status IN ('queued','running')",session.id))throw new AppError(409,'会话正在处理请求或员工有请求正在准备，请完成后再切换','session_busy');
-              const target=store.get("SELECT id FROM accounts WHERE id=? AND kind='codex' AND enabled=1 AND removed_at IS NULL AND state='ready' AND route_block IS NULL",b.account_id);
+              const target=store.get("SELECT id,auth_mode FROM accounts WHERE id=? AND kind='codex' AND enabled=1 AND removed_at IS NULL AND state='ready' AND route_block IS NULL",b.account_id);
               if(!target)throw new AppError(400,'目标账号必须是已启用且已连接的 Codex 账号','invalid_route_account');
               accountId=target.id;upstreamThread=id();version++;
             }
           }else if(b.expected_route_version!==undefined)throw new AppError(400,'路由版本必须与目标账号一起提交');
+          if(usesApi(store.get('SELECT * FROM accounts WHERE id=?',accountId))){if(b.nightly_enabled!==undefined)throw new AppError(400,'API会话由人工控制，不参与夜间调整');nightly=0;nightlyExpires=null;}
           store.db.exec('BEGIN IMMEDIATE');
           try{
             store.run('UPDATE sessions SET enabled=?,account_id=?,upstream_thread=?,route_version=?,nightly_enabled=?,nightly_expires=? WHERE id=?',enabled,accountId,upstreamThread,version,nightly,nightlyExpires,session.id);
@@ -348,8 +370,12 @@ export function createGateway(options={}) {
         }
         if(path==='/api/admin/accounts'&&method==='POST'){
           const b=await body(req),accountId=id(),home=join(runtime,'accounts',accountId);mkdirSync(home,{recursive:true});
-          const kind=b.kind||'codex';if(!['codex','claude'].includes(kind))throw new AppError(400,'不支持的账号类型');
-          store.run("INSERT INTO accounts(id,name,home,kind,state) VALUES(?,?,?,?,'offline')",accountId,name(b.name),home,kind);store.audit('account.create',accountId);return json(res,201,{id:accountId});
+          const kind=b.kind||'codex',mode=b.auth_mode||'subscription';if(!['codex','claude'].includes(kind)||!['subscription','openai_api'].includes(mode)||mode==='openai_api'&&kind!=='codex')throw new AppError(400,'不支持的账号类型');
+          const key=mode==='openai_api'?apiKeyValue(b.api_key):null,weight=mode==='openai_api'?apiWeight(accountId,b.api_weight??0):0;
+          balancer.atomic(()=>{
+            store.run("INSERT INTO accounts(id,name,home,kind,auth_mode,api_weight,state) VALUES(?,?,?,?,?,?,'offline')",accountId,name(b.name),home,kind,mode,weight);
+            if(key)store.saveUpstreamKey(accountId,key);store.audit('account.create',accountId);
+          });return json(res,201,{id:accountId});
         }
         if(path==='/api/admin/quotas/refresh'&&method==='POST'){await Promise.all(store.all('SELECT * FROM accounts WHERE enabled=1').map(a=>refreshQuota(a,true)));return json(res,200,{ok:true});}
         const accountMatch=path.match(/^\/api\/admin\/accounts\/([a-zA-Z0-9-]+)(?:\/(check|login|quota|login\/cancel))?$/);
@@ -358,12 +384,13 @@ export function createGateway(options={}) {
           if(method==='DELETE'&&!accountMatch[2]){
             if(busy.has(account.id)||queue.some(job=>job.session.account_id===account.id))throw new AppError(409,'账号有请求正在处理或排队，请完成后再移除');
             store.db.exec('BEGIN IMMEDIATE');try{
-              store.run("UPDATE accounts SET enabled=0,state='removed',removed_at=? WHERE id=?",now(),account.id);
+              store.run("UPDATE accounts SET enabled=0,state='removed',api_secret_cipher=NULL,api_secret_digest=NULL,removed_at=? WHERE id=?",now(),account.id);
               store.run("UPDATE sessions SET state='uncertain' WHERE account_id=?",account.id);store.audit('account.remove',account.id);store.db.exec('COMMIT');
             }catch(e){store.db.exec('ROLLBACK');throw e;}
             authVersions.set(account.id,(authVersions.get(account.id)||0)+1);
             logins.get(account.id)?.flow.cancel();logins.delete(account.id);pump();return json(res,200,{ok:true});
           }
+          if(usesApi(account)&&accountMatch[2]?.startsWith('login'))throw new AppError(400,'官方Key账号无需订阅登录，请更新或检查Key');
           if(method==='GET'&&accountMatch[2]==='login'){
             const pending=logins.get(account.id);
             return json(res,200,{state:account.state,message:account.last_error||'',...(pending?.challenge?{...pending.challenge,expiresAt:pending.expiresAt}:{})});
@@ -375,16 +402,32 @@ export function createGateway(options={}) {
           if(method==='PATCH'&&!accountMatch[2]){
             const b=await body(req),current=store.get('SELECT * FROM accounts WHERE id=? AND removed_at IS NULL',account.id);
             if(!current)throw new AppError(404,'账号不存在或已移除');
+            if((b.api_key!==undefined||b.api_weight!==undefined)&&!usesApi(current))throw new AppError(400,'订阅账号不能写入API Key或人工API占比');
+            const key=b.api_key===undefined?null:apiKeyValue(b.api_key),weight=b.api_weight===undefined?current.api_weight:apiWeight(current.id,b.api_weight);
             const enabled=b.enabled===undefined?current.enabled:bool(b.enabled),budget=b.token_budget===undefined?current.token_budget:integer(b.token_budget,'本地预算',{nullable:true}),perPercent=b.tokens_per_percent===undefined?current.tokens_per_percent:integer(b.tokens_per_percent,'容量换算',{min:100,max:1e7});
             const result=balancer.atomic(()=>{
               const migration=b.enabled===false?balancer.disableAccount(account.id):{moved:0,resetTextSessions:0};
-              store.run('UPDATE accounts SET enabled=?,token_budget=?,tokens_per_percent=? WHERE id=?',enabled,budget,perPercent,account.id);store.audit('account.update',account.id);return migration;
+              store.run('UPDATE accounts SET enabled=?,token_budget=?,tokens_per_percent=?,api_weight=? WHERE id=?',enabled,budget,perPercent,weight,account.id);
+              if(key){store.saveUpstreamKey(account.id,key);store.run("UPDATE accounts SET route_epoch=route_epoch+1,state='offline',route_block=NULL,last_error=NULL WHERE id=?",account.id);}
+              if(usesApi(current)&&weight!==current.api_weight)store.audit('account.api.weight',JSON.stringify({account:account.id,from:current.api_weight,to:weight}));
+              if(key)store.audit('account.api.key',account.id);store.audit('account.update',account.id);return migration;
             });
+            if(key)authVersions.set(account.id,(authVersions.get(account.id)||0)+1);
             // Queued jobs have not been dispatched; use the committed binding and reset CLI cursor.
             for(const job of queue)if(job.session.account_id===account.id){const latest=store.get('SELECT * FROM sessions WHERE id=?',job.session.id);if(latest)job.session=latest;}
             pump();return json(res,200,{ok:true,...result});
           }
           if(method==='POST'&&accountMatch[2]==='quota'){await refreshQuota(account,true);return json(res,200,{ok:true});}
+          if(method==='POST'&&accountMatch[2]==='check'&&usesApi(account)){
+            const version=authVersions.get(account.id)||0,epoch=account.route_epoch;
+            try{
+              const models=await apiResponses.models({home:account.id,force:true});
+              const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);
+              if(current.removed_at||(authVersions.get(account.id)||0)!==version||current.route_epoch!==epoch)throw new AppError(409,'Key配置已变化，请重新检查');
+              store.run("UPDATE accounts SET state='ready',last_error=NULL,route_block=NULL,route_epoch=route_epoch+1 WHERE id=?",account.id);store.audit('account.api.check',account.id);
+              return json(res,200,{ready:true,models:models.map(m=>m.slug),balance:{available:false,reason:'official_api_not_provided'}});
+            }catch(e){if((authVersions.get(account.id)||0)===version&&store.get('SELECT route_epoch FROM accounts WHERE id=?',account.id)?.route_epoch===epoch){store.run("UPDATE accounts SET state=?,last_error=? WHERE id=?",['ready','degraded'].includes(account.state)?'degraded':'offline','官方API Key检查未通过，请核对权限和配置',account.id);balancer.block(account,e.routeFailure);}throw e;}
+          }
           if(method==='POST'&&accountMatch[2]==='check'){
             if(logins.has(account.id))throw new AppError(409,'账号正在登录，请完成登录后再检查');
             const version=authVersions.get(account.id)||0,upstream=provider(account),ready=await upstream.check(upstream.binary,account.home);
@@ -441,8 +484,13 @@ export function createGateway(options={}) {
       }
       if((path==='/v1/models'||path==='/v1/codex/models')&&method==='GET'){
         employee(req);
-        const account=store.get("SELECT * FROM accounts WHERE kind='codex' AND enabled=1 AND state IN ('ready','degraded') AND removed_at IS NULL ORDER BY last_used DESC LIMIT 1");
-        const models=account?await responses.models({binary:config.codexBinary,home:account.home}):[];
+        const account=store.get("SELECT * FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND enabled=1 AND state IN ('ready','degraded') AND removed_at IS NULL ORDER BY last_used DESC LIMIT 1");
+        const catalogs=await Promise.allSettled([
+          ...(account?[responses.models({binary:config.codexBinary,home:account.home})]:[]),
+          ...store.all("SELECT id FROM accounts WHERE auth_mode='openai_api' AND enabled=1 AND state='ready' AND route_block IS NULL AND removed_at IS NULL").map(a=>apiResponses.models({home:a.id}))
+        ]);
+        const successful=catalogs.filter(x=>x.status==='fulfilled');if(!successful.length&&catalogs.length)throw catalogs[0].reason;
+        const models=[...new Map(successful.flatMap(x=>x.value).map(m=>[m.slug,m])).values()];
         if(path==='/v1/codex/models')return json(res,200,{models});
         return json(res,200,{object:'list',data:[...['codex','claude'].map(id=>({id,object:'model',owned_by:'local'})),...models.map(m=>({id:m.slug,object:'model',owned_by:'openai'}))],models});
       }
@@ -466,7 +514,11 @@ export function createGateway(options={}) {
           const clientKey=clientId?hash(clientId):null;
           // Display only a UUID-shaped client identifier; routing still uses the employee-scoped hash.
           const clientSessionId=typeof clientId==='string'&&clientId.length===36&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientId)?clientId:null;
-          let session=clientKey?store.get("SELECT * FROM sessions WHERE member_id=? AND protocol='responses' AND client_key=?",m.id,clientKey):null;
+          const fixedHeader=req.headers['x-harbor-session'];
+          if(fixedHeader!==undefined&&(typeof fixedHeader!=='string'||!/^[a-zA-Z0-9-]{1,80}$/.test(fixedHeader)))throw new AppError(400,'固定会话标识无效');
+          let session=fixedHeader?store.get("SELECT * FROM sessions WHERE id=? AND member_id=? AND protocol='responses'",fixedHeader,m.id):clientKey?store.get("SELECT * FROM sessions WHERE member_id=? AND protocol='responses' AND client_key=?",m.id,clientKey):null;
+          if(fixedHeader&&!session)throw new AppError(404,'固定会话不存在或不属于该员工');
+          if(fixedHeader&&(!clientKey||session.client_key&&session.client_key!==clientKey))throw new AppError(409,'固定绑定已用于另一条客户端对话，请创建新的固定会话','session_route_conflict');
           if(session){
             if(!session.enabled)throw new AppError(403,'该会话已被禁止访问','session_disabled');
             // Full-history calls may continue; previous unknown reservations remain held.
@@ -476,12 +528,18 @@ export function createGateway(options={}) {
           if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开');
           if(stopping)throw new AppError(503,'服务停止','service_stopping');
           const secret=(req.headers.authorization||'').replace(/^Bearer /,'');store.authenticate(secret);
-          if(session)session=balancer.route(session);
+          if(session)session=balancer.route(session,{protocol:jsonPath?'images':'responses'});
+          if(jsonPath&&session&&usesApi(store.get('SELECT * FROM accounts WHERE id=?',session.account_id)))throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');
           const requestId=balancer.atomic(()=>{
-            if(!session)session={id:id(),account_id:responseAccount().id};
+            if(!session)session={id:id(),account_id:(jsonPath?balancer.selectAccount({protocol:'images'}):responseAccount()).id};
             const requestId=store.observe(m,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model);
             if(!store.get('SELECT id FROM sessions WHERE id=?',session.id))store.run("INSERT INTO sessions(id,member_id,account_id,protocol,client_key,client_session_id,created,updated) VALUES(?,?,?,'responses',?,?,?,?)",session.id,m.id,session.account_id,clientKey,clientSessionId,now(),now());
-            else if(clientSessionId)store.run('UPDATE sessions SET client_session_id=? WHERE id=? AND client_session_id IS NULL',clientSessionId,session.id);
+            else {
+              if(fixedHeader&&!session.client_key){
+                if(store.get("SELECT id FROM sessions WHERE member_id=? AND protocol='responses' AND client_key=? AND id<>?",m.id,clientKey,session.id))throw new AppError(409,'客户端对话已有另一条绑定，请使用新对话');
+                store.run('UPDATE sessions SET client_key=?,client_session_id=? WHERE id=? AND client_key IS NULL',clientKey,clientSessionId,session.id);
+              }else if(clientSessionId)store.run('UPDATE sessions SET client_session_id=? WHERE id=? AND client_session_id IS NULL',clientSessionId,session.id);
+            }
             store.run('UPDATE requests SET session_id=?,account_id=? WHERE id=?',session.id,session.account_id,requestId);return requestId;
           });
           // Scope all upstream cache/thread identifiers to the authenticated employee.

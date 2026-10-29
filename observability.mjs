@@ -59,6 +59,7 @@ export function historyReader(store){
     if(row.action==='balancing.weights')return {...config(d),previous:config(d.previous)};
     if(row.action==='balancing.weights.expired')return {expires:number(Number(row.detail))};
     if(row.action==='account.route_block')return {account:known.has(d.account)?d.account:null,reason:reason(d.reason)};
+    if(row.action==='account.api.weight')return {account:known.has(d.account)?d.account:null,from:number(d.from),to:number(d.to)};
     if(row.action.startsWith('account.'))return {account:known.has(row.detail)?row.detail:null};
     if(row.action.startsWith('session.'))return {session:row.session_id||null,enabled:typeof d.enabled==='boolean'?d.enabled:null,expires:number(d.expires)};
     if(row.action==='balancing.settings')return {weighted:typeof d.weighted==='boolean'?d.weighted:null,nightly:typeof d.nightly==='boolean'?d.nightly:null,failover:typeof d.failover==='boolean'?d.failover:null,quietMinutes:number(d.quietMinutes)};
