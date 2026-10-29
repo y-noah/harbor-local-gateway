@@ -33,7 +33,7 @@ Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:43127/v1/codex/models' -Hea
 "model_catalog_json = '$env:USERPROFILE\.codex\harbor-models.json'"
 ```
 
-把第二行输出的配置放在 `config.toml` 的第一个表头之前（已有同名键则替换），然后重启Codex。示例默认使用 `gpt-6.1-sol`，可在 Codex 中切换其他可用模型，无需固定为它。目录文件不含Key；上游模型更新后重新下载。默认内置目录不会自动从网关刷新，单改 `model` 不保证下拉列表同步更新。
+把第二行输出的配置放在 `config.toml` 的第一个表头之前（已有同名键则替换），然后重启Codex。示例默认使用 `gpt-6.1-sol`，可在 Codex 中切换其他可用模型，无需固定为它。目录文件不含Key；上游模型或管理员对该Key的模型权限更新后重新下载，顶层`model`也须属于允许列表。默认内置目录不会自动从网关刷新，单改 `model` 不保证下拉列表同步更新。
 
 ## WSL 命令行
 
@@ -61,7 +61,7 @@ printf "model_catalog_json = '%s/.codex/harbor-models.json'\n" "$HOME"
 
 新建任务，确认客户端当前提供方为Harbor、模型为配置的实际模型。先发送短消息，再在可恢复的测试目录内读取文件、修改文件并运行断言，最后追问前一轮内容。管理员通过网关记录核对员工归属、模型路由与用量；仅收到文字不能证明工具或续聊可用。
 
-401通常表示员工Key未正确传入；403检查Key停用或到期；Responses不按员工、Key额度或单账号串行限制返回429；上游429仍由管理员通过gateway_rejection日志的code识别；`upstream_authentication`由管理员检查账号池；`upstream_not_found`检查实际可用模型。同一Key和同一上游账号支持多会话直接并行。最近7天用量可能漏计中断请求，不影响其他并发请求或当前任务继续；网关不自动重放失败请求。
+401通常表示员工Key未正确传入；403检查Key停用、到期或模型白名单（`model_not_allowed`）；Responses不按员工、Key额度或单账号串行限制返回429；上游429仍由管理员通过gateway_rejection日志的code识别；`upstream_authentication`由管理员检查账号池；`upstream_not_found`检查实际可用模型。同一Key和同一上游账号支持多会话直接并行。最近7天用量可能漏计中断请求，不影响其他并发请求或当前任务继续；网关不自动重放失败请求。
 
 本接入不依赖某台开发机或单一版本号。协议兼容与已实测版本分开记录；不将未运行过的历史或未来版本写成已验证。
 
