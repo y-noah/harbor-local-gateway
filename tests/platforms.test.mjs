@@ -88,6 +88,7 @@ test('disable migrates platform bindings and in-flight completion cannot overwri
 test('WorkBuddy browser flow, polling, model catalog and streamed chat use real HTTP protocol',async t=>{
   let polls=0;
   const app=await fixture(t,{upstream:(req,res)=>{
+    assert.equal(req.headers.accept,req.url==='/v2/chat/completions'?'text/event-stream':'application/json');
     if(req.url.includes('/auth/state'))return send(res,{code:0,data:{state:'synthetic-state',authUrl:'https://copilot.tencent.com/authorize?synthetic=1'}});
     if(req.url.includes('/auth/token?'))return send(res,++polls===1?{code:11217}:{code:0,data:{accessToken:'synthetic-access',refreshToken:'synthetic-refresh',expiresIn:3600}});
     if(req.url.includes('/login/account'))return send(res,{code:0,data:{uid:'synthetic-uid'}});
@@ -97,6 +98,15 @@ test('WorkBuddy browser flow, polling, model catalog and streamed chat use real 
   const deadline=Date.now()+3000;while(app.store.get('SELECT state FROM accounts WHERE id=?',id).state==='login'&&Date.now()<deadline)await new Promise(r=>setTimeout(r,5));assert.equal(app.store.get('SELECT state FROM accounts WHERE id=?',id).state,'ready');
   const result=await app.chat({model:'workbuddy/example-model'});assert.equal(result.status,200);assert.equal(result.body.choices[0].message.content,'流式合成回复');assert.equal(result.body.usage.total_tokens,12);
   const snapshot=JSON.stringify((await app.call('/api/admin/state')).body);assert.ok(!snapshot.includes('synthetic-access'));assert.ok(!snapshot.includes('synthetic-refresh'));assert.ok(!snapshot.includes('synthetic-state'));
+});
+test('R6 WorkBuddy refresh requests JSON while chat still requests SSE',async t=>{
+  const app=await fixture(t,{upstream:(req,res)=>{
+    if(req.url==='/v2/plugin/auth/token/refresh'){
+      assert.equal(req.headers.accept,'application/json');assert.equal(req.headers['content-type'],'application/json');assert.equal(req.headers.authorization,undefined);assert.equal(req.headers['x-refresh-token'],'synthetic-refresh');assert.equal(req.headers['x-auth-refresh-source'],'plugin');return send(res,{code:0,data:{accessToken:'synthetic-renewed',refreshToken:'synthetic-new-refresh',expiresIn:3600}});
+    }
+    if(req.url==='/v3/config'){assert.equal(req.headers.accept,'application/json');assert.equal(req.headers.authorization,'Bearer synthetic-renewed');return send(res,{code:0,data:{models:[{id:'example-model'}]}});}
+    throw Error('unexpected route');
+  }}),id=await app.create('workbuddy');app.store.saveUpstreamKey(id,JSON.stringify({accessToken:'synthetic-old',refreshToken:'synthetic-refresh',expiresAt:0}));assert.equal((await app.check(id)).status,200);assert.equal(app.calls.length,2);
 });
 test('WorkBuddy canceled authorization cannot restore removed or disabled account',async t=>{
   let challenge,release;const entered=new Promise(r=>challenge=r),gate=new Promise(r=>release=r);

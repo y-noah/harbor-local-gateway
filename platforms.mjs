@@ -77,7 +77,10 @@ export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qodercli',
     }catch(error){if(error instanceof AppError)throw error;throw fail(signal?.aborted?499:502,signal?.aborted?'平台请求已取消；用量需核对':'平台连接失败；请检查网络，用量需核对');}
   }
   async function wb(path,{credential,signal,method='GET',body,refresh}={}){
-    const headers={Accept:'application/json','User-Agent':'Harbor/1',...(body?{'Content-Type':'application/json'}:{}),...(credential?workbuddyHeaders(credential):{}),...(refresh?{'X-Refresh-Token':refresh,'X-Auth-Refresh-Source':'plugin'}:{})};
+    const auth=credential?workbuddyHeaders(credential):{};
+    // Refresh authenticates with X-Refresh-Token, not an expired access token.
+    if(refresh)delete auth.Authorization;
+    const headers={...auth,Accept:'application/json','User-Agent':'Harbor/1',...(body?{'Content-Type':'application/json'}:{}),...(refresh?{'X-Refresh-Token':refresh,'X-Auth-Refresh-Source':'plugin'}:{})};
     const response=await request(platformProviders.workbuddy.origin+path,{method,headers,signal,...(body?{body:JSON.stringify(body)}:{})});
     let value;try{value=JSON.parse(await boundedText(response,1024*1024));}catch{throw fail(502,'WorkBuddy返回无效数据');}
     return value;
