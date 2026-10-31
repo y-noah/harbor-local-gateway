@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes, randomUUID, createCipheriv, createDecipheriv } from 'node:crypto';
 import {createPricing} from './pricing.mjs';
+import {createMemberLimits} from './member-limits.mjs';
 export const hash = value => createHash('sha256').update(value).digest('hex');
 export const token = () => 'hg_' + randomBytes(30).toString('base64url');
 export const id = () => randomUUID();
@@ -52,6 +53,8 @@ export class Store {
     this.db.exec("CREATE TABLE IF NOT EXISTS gateway_settings(name TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS balance_runs(day TEXT PRIMARY KEY,started INTEGER NOT NULL,ended INTEGER,status TEXT NOT NULL,summary TEXT);");
     this.run("UPDATE balance_runs SET status='interrupted',ended=? WHERE status='running'",now());
     add('members','removed_at','INTEGER');
+    add('members','usage_limits',`TEXT NOT NULL DEFAULT '{"enabled":false,"rules":[]}'`);add('members','usage_limits_version','INTEGER NOT NULL DEFAULT 0');
+    this.db.exec('CREATE INDEX IF NOT EXISTS request_member_ended ON requests(member_id,ended)');
     add('requests','tracking_only','INTEGER NOT NULL DEFAULT 0');
     add('requests','route_version','INTEGER');
     add('requests','price_version','TEXT');add('requests','billing_model','TEXT');add('requests','manual_cost_atoms','TEXT');
@@ -90,6 +93,7 @@ export class Store {
     }catch(e){this.db.exec('ROLLBACK');throw e;}
     this.pruneUsage();
     this.pricing=createPricing(this,{windowStart:at=>usageWindow(at).start,...pricingOptions});
+    this.memberLimits=createMemberLimits(this,{clock:pricingOptions?.clock||Date.now});
   }
   encryptKey(secret,keyId) {
     if(!this.encryptionKey)return null;
@@ -231,7 +235,7 @@ export class Store {
       usageWindow:window,
       recentUsageWindow,
       sessionsPagination:{page,pageSize:sessionPageSize,total:sessionTotal,totalPages:sessionPages},
-      members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(m=>({...m,...scope('member_id',m.id)})),
+      members:this.all('SELECT * FROM members WHERE removed_at IS NULL ORDER BY created DESC').map(({usage_limits,usage_limits_version,...m})=>({...m,usage_limits:this.memberLimits.configuration(m.id),...scope('member_id',m.id)})),
       keys:this.all('SELECT * FROM keys WHERE removed_at IS NULL ORDER BY created DESC').map(k=>({id:k.id,member_id:k.member_id,prefix:k.prefix,full_key:this.revealKey(k),expires:k.expires,allowed_models:storedModelAllowlist(k.allowed_models),model_policy_version:k.model_policy_version,enabled:k.enabled,created:k.created,quota:k.quota,...scope('key_id',k.id)})),
       accounts:this.all('SELECT id,name,kind,auth_mode,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM accounts WHERE removed_at IS NULL ORDER BY rowid').map(({api_secret_digest,...a})=>({...a,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null})),
       sessions:this.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${sessionFrom} ORDER BY s.updated DESC,s.id DESC LIMIT ? OFFSET ?`,...range,sessionPageSize,(page-1)*sessionPageSize).map(s=>({...s,nightly_enabled:Number(participatesNightly(s,at)),request_count:this.get(`SELECT COUNT(*) n FROM requests WHERE session_id=? AND ${where}`,s.id,...range).n,upstream_thread:s.protocol==='responses'?(s.upstream_thread||s.id):s.upstream_id})),
