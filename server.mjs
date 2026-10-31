@@ -105,7 +105,7 @@ export function createGateway(options={}) {
     return quotaFetches.get(key);
   }
   async function refreshQuota(account,force=false){
-    if(stopping||!account||usesApi(account)||account.removed_at!==null||!account.enabled||!['ready','degraded'].includes(account.state))return;
+    if(stopping||!account||usesApi(account)||account.auth_mode==='platform'||account.removed_at!==null||!account.enabled||!['ready','degraded'].includes(account.state))return;
     if(account.kind==='claude'){store.run('UPDATE accounts SET quota_error=? WHERE id=?','Claude 官方 CLI 暂无已验证的额度查询；使用本地 Token 预算估算',account.id);return;}
     const quotaKey=account.id+':'+(authVersions.get(account.id)||0)+':'+account.route_epoch;
     if(quotaReads.has(quotaKey))return quotaReads.get(quotaKey);
@@ -182,7 +182,7 @@ export function createGateway(options={}) {
   }
   const authAdmin=req=>{const bearer=typeof config.adminToken==='string'&&config.adminToken.length>0&&equals(req.headers.authorization,'Bearer '+config.adminToken);if(!adminAuth.authenticated(req)&&!bearer)throw new AppError(401,'请先输入管理密码登录','admin_required');};
   const employee=req=>store.authenticate((req.headers.authorization||'').replace(/^Bearer /,''));
-  const platforms=createPlatformService({store,runtime,body,json,employee,transport:options.platformTransport||createPlatformTransport({qoderBinary:config.qoderBinary||'qoder'}),busy,responseMembers,preparing:responsePreparing,controllers,tasks,isStopping:()=>stopping,checkLimits:(...args)=>store.memberLimits.check(...args),clock:options.clock||Date.now});
+  const platforms=createPlatformService({store,runtime,body,json,employee,transport:options.platformTransport||createPlatformTransport({qoderBinary:config.qoderBinary||'qodercli'}),busy,responseMembers,preparing:responsePreparing,controllers,tasks,isStopping:()=>stopping,checkLimits:(...args)=>store.memberLimits.check(...args),clock:options.clock||Date.now});
   function startJob(job,account){
     busy.set(account.id,(busy.get(account.id)||0)+1);
     const task=execute(job,account);tasks.add(task);

@@ -1,19 +1,20 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import {mkdtempSync,rmSync,readFileSync,writeFileSync} from 'node:fs';
+import {mkdtempSync,rmSync,readFileSync,writeFileSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {createPlatformService} from '../platform-service.mjs';
 import {createGateway} from '../server.mjs';
-import {createPlatformTransport,platformConfiguration,platformModel,validatePlatformChat,qoderCatalog} from '../platforms.mjs';
+import {createPlatformTransport,platformConfiguration,platformModel,validatePlatformChat,qoderCatalog,qoderCounts} from '../platforms.mjs';
 
 const payload={model:'deepseek/example-model',messages:[{role:'user',content:'合成问题'}]};
-async function fixture(t,{transport,upstream,clock}={}){
+async function fixture(t,{transport,upstream,clock,rateReader}={}){
   const root=mkdtempSync(join(tmpdir(),'harbor-platform-test-')),calls=[];
   let upstreamServer,upstreamBase;
   if(upstream){upstreamServer=http.createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;calls.push({path:req.url,headers:req.headers,body:raw?JSON.parse(raw):null});try{await upstream(req,res,calls.at(-1));}catch{res.writeHead(500);res.end('{}');}});await new Promise(resolve=>upstreamServer.listen(0,'127.0.0.1',resolve));upstreamBase='http://127.0.0.1:'+upstreamServer.address().port;}
   const platformTransport=transport||createPlatformTransport({fetchImpl:(url,options)=>fetch(upstreamBase+new URL(url).pathname+new URL(url).search,options),pollMs:1,clock});
-  const app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'test-admin',codexBinary:'unused'},responsesTransport:{models:async()=>[],run:async()=>({response:{id:'synthetic-response'},usageKnown:true,input:1,output:1,cached:0})},platformTransport,clock,rateReader:async()=>null,pricingFetch:async()=>{throw Error('offline');}});
+  const app=createGateway({dataDir:join(root,'data'),runtimeDir:join(root,'runtime'),config:{adminToken:'test-admin',codexBinary:'unused'},responsesTransport:{models:async()=>[],run:async()=>({response:{id:'synthetic-response'},usageKnown:true,input:1,output:1,cached:0})},platformTransport,clock,rateReader:rateReader|| (async()=>null),pricingFetch:async()=>{throw Error('offline');}});
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));const base='http://127.0.0.1:'+app.server.address().port;
   t.after(async()=>{await app.close();if(upstreamServer)await new Promise(resolve=>upstreamServer.close(resolve));rmSync(root,{recursive:true,force:true});});
   async function call(path,method='GET',data,secret='test-admin'){
@@ -106,8 +107,56 @@ test('WorkBuddy canceled authorization cannot restore removed or disabled accoun
 test('Qoder uses official model table and isolated, tool-disabled subprocess',async t=>{
   assert.throws(()=>qoderCatalog('Not logged in'));const listed=qoderCatalog('MODEL\nPerformance\nCustom model (custom-key)\n');assert.equal(Buffer.from(listed[1].slice(5),'base64url').toString(),'Custom model');
   const root=mkdtempSync(join(tmpdir(),'harbor-qoder-fixture-'));t.after(()=>rmSync(root,{recursive:true,force:true}));const binary=join(root,'qoder');
-  writeFileSync(binary,`#!/usr/bin/env node\nconst a=process.argv.slice(2);if(!process.env.QODER_PERSONAL_ACCESS_TOKEN||!a.includes('--strict-mcp-config')||!a.includes('--setting-sources')||!process.env.HOME.startsWith('/tmp/harbor-qoder-'))process.exit(4);if(a.includes('--list-models')){console.log('MODEL\\nPerformance');process.exit(0);}if(a[a.indexOf('--tools')+1]!==''||!a.includes('--no-session-persistence')||a[a.indexOf('--model')+1]!=='Performance')process.exit(5);process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'合成Qoder回复',usage:{input_tokens:12,output_tokens:3}})));\n`,{mode:0o700});
+  writeFileSync(binary,`#!/usr/bin/env node\nconst a=process.argv.slice(2);if(!process.env.QODER_PERSONAL_ACCESS_TOKEN||process.env.QODER_EXPOSE_TOKEN_USAGE!=='1'||!a.includes('--strict-mcp-config')||!a.includes('--setting-sources')||!process.env.HOME.startsWith('/tmp/harbor-qoder-'))process.exit(4);if(a.includes('--list-models')){console.log('MODEL\\nPerformance');process.exit(0);}if(a[a.indexOf('--tools')+1]!==''||!a.includes('--no-session-persistence')||a[a.indexOf('--model')+1]!=='Performance')process.exit(5);process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'合成Qoder回复',usage:{input_tokens:12,output_tokens:3}})));\n`,{mode:0o700});
   const app=await fixture(t,{transport:createPlatformTransport({qoderBinary:binary})}),id=await app.create('qoder');assert.equal((await app.check(id)).status,200);const model=JSON.parse(app.store.get('SELECT platform_models FROM accounts WHERE id=?',id).platform_models)[0];const result=await app.chat({model:'qoder/'+model});assert.equal(result.status,200);assert.equal(result.body.usage.total_tokens,15);
+});
+test('R1 Qoder masked counters remain unknown and exposed cache reads/writes count once',()=>{
+  assert.equal(qoderCounts({input_tokens:0,output_tokens:0,cache_read_input_tokens:0,cache_creation_input_tokens:0}).usageKnown,false);
+  assert.deepEqual(qoderCounts({input_tokens:10,output_tokens:5,cache_read_input_tokens:20,cache_creation_input_tokens:30}),{input:60,output:5,cached:20,usageKnown:true});
+  assert.equal(qoderCounts({input_tokens:10,output_tokens:5,cache_read_input_tokens:-1}).usageKnown,false);
+});
+test('R1 a Qoder result with masked zero usage cannot bypass a configured USD ceiling',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'harbor-qoder-masked-'));t.after(()=>rmSync(root,{recursive:true,force:true}));const binary=join(root,'qoder');
+  writeFileSync(binary,`#!/usr/bin/env node\nif(process.argv.includes('--list-models')){console.log('MODEL\\nPerformance');process.exit(0);}process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'合成有输出但计量隐藏',usage:{input_tokens:0,output_tokens:0,cache_read_input_tokens:0,cache_creation_input_tokens:0}})));\n`,{mode:0o700});
+  const app=await fixture(t,{transport:createPlatformTransport({qoderBinary:binary})}),id=await app.create('qoder');await app.check(id);const model='qoder/'+JSON.parse(app.store.get('SELECT platform_models FROM accounts WHERE id=?',id).platform_models)[0];
+  app.store.pricing.configure({expectedVersion:app.store.pricing.status().settings.version,manualRates:{[model]:{input:'1',cached:'1',output:'1',source:'合成验收费率'}}});app.store.memberLimits.save(app.member.memberId,{expected_version:0,enabled:true,rules:[{model,hours:24,limit_usd:'1.00'}]});
+  const result=await app.chat({model});assert.equal(result.status,200);assert.equal(result.body.usage,null);assert.equal(app.store.get('SELECT usage_unknown FROM requests').usage_unknown,1);assert.notEqual(result.body.harbor_standard_usage.state,'priced');
+  const denied=await app.chat({model});assert.equal(denied.status,409);assert.equal(denied.body.error.type,'member_model_usage_unknown');
+});
+test('R3 unsupported Qoder arguments do not create unknown usage or block the next request',async t=>{
+  let runs=0;const app=await fixture(t,{transport:{models:async()=>['example-model'],run:async()=>{runs++;return {text:'done',input:1,output:1,cached:0,usageKnown:true};}}}),id=await app.create('qoder');await app.check(id);
+  app.store.pricing.configure({expectedVersion:app.store.pricing.status().settings.version,manualRates:{'qoder/example-model':{input:'1',cached:'1',output:'1',source:'合成验收费率'}}});
+  app.store.memberLimits.save(app.member.memberId,{expected_version:0,enabled:true,rules:[{model:'qoder/example-model',hours:24,limit_usd:'1.00'}]});
+  for(const args of [{temperature:1},{max_tokens:100}])assert.equal((await app.chat({model:'qoder/example-model',...args})).status,400);
+  assert.equal(app.store.get('SELECT COUNT(*) n FROM requests').n,0);assert.equal((await app.chat({model:'qoder/example-model'})).status,200);assert.equal(runs,1);
+});
+test('R4 credential CAS is checked after body read and removed accounts cannot regain secrets',async t=>{
+  const app=await fixture(t,{transport:{}}),id=await app.create(),url=new URL('http://synthetic/api/admin/platform/accounts/'+id);let first,second,third;
+  const service=createPlatformService({store:app.store,runtime:app.runtime,body:req=>new Promise(resolve=>{if(req.label===1)first=resolve;else if(req.label===2)second=resolve;else third=resolve;}),json:(res,status)=>res.status=status,isStopping:()=>false});
+  const a={},b={},c={},p1=service.admin({method:'PATCH',label:1},a,url),p2=service.admin({method:'PATCH',label:2},b,url);
+  first({expected_epoch:0,credential:'synthetic-new'});await p1;second({expected_epoch:0,credential:'synthetic-stale'});await assert.rejects(p2,error=>error.status===409);
+  assert.equal(a.status,200);assert.equal(JSON.parse(app.store.upstreamKey(app.store.get('SELECT * FROM accounts WHERE id=?',id))).token,'synthetic-new');
+  const p3=service.admin({method:'PATCH',label:3},c,url);assert.equal((await app.call('/api/admin/accounts/'+id,'DELETE')).status,200);third({expected_epoch:1,credential:'synthetic-removed'});await assert.rejects(p3,error=>error.status===404);assert.equal(app.store.get('SELECT api_secret_cipher FROM accounts WHERE id=?',id).api_secret_cipher,null);
+});
+test('R5 platform accounts never invoke the legacy Codex quota reader',async t=>{
+  let reads=0;const app=await fixture(t,{upstream:compatible,rateReader:async()=>{reads++;return null;}}),id=await app.create();await app.check(id);assert.equal((await app.call('/api/admin/quotas/refresh','POST',{})).status,200);assert.equal(reads,0);assert.equal(app.store.get('SELECT quota_error FROM accounts WHERE id=?',id).quota_error,null);
+  app.store.run("INSERT INTO accounts(id,name,home,state) VALUES('legacy','合成订阅','unused','ready')");await app.call('/api/admin/quotas/refresh','POST',{});assert.equal(reads,1);
+});
+test('R2 cancellation and timeout kill a Qoder dispatcher and its inference descendant',{skip:process.platform==='win32'},async t=>{
+  const root=mkdtempSync(join(tmpdir(),'harbor-qoder-tree-'));t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const binary=join(root,'dispatcher'),record=join(root,'record.json');
+  writeFileSync(binary,`#!/usr/bin/env node\nconst {spawnSync}=require('node:child_process');spawnSync(process.execPath,['-e',${JSON.stringify("require('node:fs').writeFileSync("+JSON.stringify(record)+",JSON.stringify({pid:process.pid,home:process.env.HOME}));process.on('SIGTERM',()=>{});setInterval(()=>{},1000)")}],{stdio:'inherit'});`,{mode:0o700});
+  async function exercise(timeout){
+    const controller=new AbortController(),transport=createPlatformTransport({qoderBinary:binary,timeoutMs:timeout?1000:10000,killGraceMs:50}),started=Date.now();
+    const pending=transport.run({kind:'qoder'},{token:'synthetic-pat'},{model:'qoder/name-'+Buffer.from('Performance').toString('base64url'),messages:payload.messages},controller.signal);const observed=pending.then(()=>({ok:true}),error=>({error}));
+    const deadline=Date.now()+3000;let value;while(Date.now()<deadline){try{value=JSON.parse(readFileSync(record));break;}catch{await new Promise(r=>setTimeout(r,5));}}
+    assert.ok(value,'inference descendant started');if(!timeout)controller.abort();const result=await observed;assert.ok(result.error);assert.ok(Date.now()-started<5000);
+    const goneDeadline=Date.now()+2000;let alive=true;while(Date.now()<goneDeadline){try{const state=readFileSync('/proc/'+value.pid+'/stat','utf8').split(' ')[2];alive=state!=='Z';}catch{alive=false;}if(!alive)break;await new Promise(r=>setTimeout(r,5));}assert.equal(alive,false);assert.equal(existsSync(value.home),false);rmSync(record,{force:true});
+  }
+  await exercise(false);await exercise(true);
+  const model='name-'+Buffer.from('Performance').toString('base64url'),app=await fixture(t,{transport:createPlatformTransport({qoderBinary:binary,killGraceMs:50})}),id=await app.create('qoder');
+  app.store.run("UPDATE accounts SET state='ready',platform_models=? WHERE id=?",JSON.stringify([model]),id);const running=app.chat({model:'qoder/'+model});
+  const deadline=Date.now()+3000;let value;while(Date.now()<deadline){try{value=JSON.parse(readFileSync(record));break;}catch{await new Promise(r=>setTimeout(r,5));}}assert.ok(value);await app.close();assert.equal((await running).status,499);assert.equal(existsSync(value.home),false);
 });
 test('WorkBuddy refresh is single-flight and revoked Key is rechecked before dispatch',async t=>{
   let release,entered,refreshes=0,runs=0;const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r);

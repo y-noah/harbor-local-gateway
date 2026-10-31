@@ -37,10 +37,11 @@ export function createPlatformService({store,runtime,body,json,employee,transpor
     const match=path.match(/^\/api\/admin\/platform\/accounts\/([a-zA-Z0-9-]+)(?:\/(check|login|login\/cancel))?$/);if(!match)return false;
     let row=account(match[1]);const action=match[2];
     if(method==='PATCH'&&!action){
-      const b=await body(req);if(Object.keys(b).some(k=>!['credential','expected_epoch'].includes(k))||!Number.isSafeInteger(b.expected_epoch)||b.expected_epoch!==row.route_epoch)throw new AppError(409,'平台配置已变化，请重新打开设置');
+      const b=await body(req);if(!b||typeof b!=='object'||Array.isArray(b)||Object.keys(b).some(k=>!['credential','expected_epoch'].includes(k))||!Number.isSafeInteger(b.expected_epoch))throw new AppError(400,'平台凭据配置字段无效');
       if(row.kind==='workbuddy')throw new AppError(400,'WorkBuddy请使用官方网页登录');
-      const value=secret(b.credential);cancel(row.id);
-      store.db.exec('BEGIN IMMEDIATE');try{saveCredential(row,value);store.run("UPDATE accounts SET route_epoch=route_epoch+1,state='offline',platform_models='[]',last_error=NULL WHERE id=?",row.id);store.audit('account.platform.credential',row.id);store.db.exec('COMMIT');}catch(error){store.db.exec('ROLLBACK');throw error;}
+      const value=secret(b.credential);
+      store.db.exec('BEGIN IMMEDIATE');try{row=account(match[1]);if(b.expected_epoch!==row.route_epoch)throw new AppError(409,'平台配置已变化，请重新打开设置');saveCredential(row,value);store.run("UPDATE accounts SET route_epoch=route_epoch+1,state='offline',platform_models='[]',last_error=NULL WHERE id=?",row.id);store.audit('account.platform.credential',row.id);store.db.exec('COMMIT');}catch(error){store.db.exec('ROLLBACK');throw error;}
+      cancel(row.id);
       json(res,200,{ok:true});return true;
     }
     if(method==='GET'&&action==='login'){

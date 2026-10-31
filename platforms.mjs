@@ -29,9 +29,12 @@ export function qoderCatalog(raw){
   if(lines.shift()!=='MODEL'||!lines.length||lines.length>1000)throw fail(502,'Qoder CLI模型目录格式无效，请核对CLI版本');
   return [...new Set(lines.map(line=>line.replace(/ \([^()]+\)$/,'').trim()).filter(Boolean).map(name=>'name-'+Buffer.from(name).toString('base64url')))];
 }
+function platformParameters(provider,body){
+  if(provider==='qoder'&&(body.temperature!==undefined||body.max_tokens!==undefined))throw fail(400,'Qoder CLI不支持本入口的temperature或max_tokens参数');
+}
 export function validatePlatformChat(body){
   if(!body||typeof body!=='object'||Array.isArray(body)||Object.keys(body).some(k=>!['model','messages','stream','session_id','max_tokens','temperature'].includes(k)))throw fail(400,'平台通道仅支持纯文本消息、模型、会话、stream、max_tokens和temperature');
-  platformModel(body.model);
+  platformParameters(platformModel(body.model).provider,body);
   if(!Array.isArray(body.messages)||!body.messages.length||body.messages.length>100||body.messages.some(m=>!m||!['system','user','assistant','developer'].includes(m.role)||typeof m.content!=='string'||Object.keys(m).some(k=>!['role','content'].includes(k))))throw fail(400,'仅支持1至100条纯文本消息，不支持附件或工具');
   if(body.stream!==undefined&&typeof body.stream!=='boolean')throw fail(400,'stream必须为布尔值');
   if(body.session_id!==undefined&&(typeof body.session_id!=='string'||!/^[a-zA-Z0-9-]{1,80}$/.test(body.session_id)))throw fail(400,'会话标识无效');
@@ -42,6 +45,14 @@ export function validatePlatformChat(body){
 function counts(usage){
   const input=usage?.prompt_tokens??usage?.input_tokens,output=usage?.completion_tokens??usage?.output_tokens,cached=usage?.prompt_cache_hit_tokens??usage?.prompt_tokens_details?.cached_tokens??usage?.cache_read_input_tokens??0;
   if([input,output,cached].some(v=>!Number.isSafeInteger(v)||v<0)||cached>input)return {input:0,output:0,cached:0,usageKnown:false};
+  return {input,output,cached,usageKnown:true};
+}
+export function qoderCounts(usage){
+  const values=['input_tokens','output_tokens','cache_read_input_tokens','cache_creation_input_tokens'].map((key,index)=>usage?.[key]??(index>1?0:undefined));
+  if(values.some(v=>!Number.isSafeInteger(v)||v<0))return {input:0,output:0,cached:0,usageKnown:false};
+  const [plain,output,cached,created]=values,input=plain+cached+created;
+  // Qoder's default serializer masks counters as zero. Never turn those into free requests.
+  if(!Number.isSafeInteger(input)||input+output===0)return {input:0,output:0,cached:0,usageKnown:false};
   return {input,output,cached,usageKnown:true};
 }
 async function boundedText(response,max=4*1024*1024){
@@ -55,7 +66,7 @@ function catalog(values){
   const models=[...new Set(values.map(m=>typeof m==='string'?m:m?.id??m?.modelId??m?.model).filter(modelId))];
   if(!models.length||models.length>1000)throw fail(502,'平台模型目录为空或过大');return models;
 }
-export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qoder',spawnProcess=spawn,clock=Date.now,pollMs=3000}={}){
+export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qodercli',spawnProcess=spawn,clock=Date.now,pollMs=3000,timeoutMs=120000,killGraceMs=2000}={}){
   async function request(url,{signal,...options}={}){
     try{
       const response=await fetchImpl(url,{...options,redirect:'error',signal:AbortSignal.any([AbortSignal.timeout(120000),...(signal?[signal]:[])])});
@@ -81,16 +92,23 @@ export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qoder',spa
     return new Promise((resolve,reject)=>{
       const home=mkdtempSync(join(tmpdir(),'harbor-qoder-')),env={};
       for(const key of ['PATH','Path','SystemRoot','WINDIR','COMSPEC','PATHEXT','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY'])if(process.env[key])env[key]=process.env[key];
-      Object.assign(env,{HOME:home,USERPROFILE:home,QODER_CONFIG_DIR:home,QODER_PERSONAL_ACCESS_TOKEN:credential.token});
-      let child;try{child=spawnProcess(qoderBinary,[...args,'--config-dir',home,'--setting-sources','','--settings','{"hooks":{},"general":{"maxAttempts":1}}','--strict-mcp-config'],{cwd:home,env,stdio:['pipe','pipe','pipe'],windowsHide:true});}catch{rmSync(home,{recursive:true,force:true});reject(fail(503,'Qoder CLI未安装或无法启动'));return;}
+      Object.assign(env,{HOME:home,USERPROFILE:home,QODER_CONFIG_DIR:home,QODER_PERSONAL_ACCESS_TOKEN:credential.token,QODER_EXPOSE_TOKEN_USAGE:'1'});
+      let child;try{child=spawnProcess(qoderBinary,[...args,'--config-dir',home,'--setting-sources','','--settings','{"hooks":{},"general":{"maxAttempts":1}}','--strict-mcp-config'],{cwd:home,env,detached:process.platform!=='win32',stdio:['pipe','pipe','pipe'],windowsHide:true});}catch{rmSync(home,{recursive:true,force:true});reject(fail(503,'Qoder CLI未安装或无法启动'));return;}
       let bytes=0,output=[],failure=null,killTimer;
-      const stop=message=>{if(failure)return;failure=message;child.kill();killTimer=setTimeout(()=>child.kill('SIGKILL'),2000);killTimer.unref();};
-      const timer=setTimeout(()=>stop('Qoder请求超时；用量需核对'),120000),abort=()=>stop('Qoder请求已取消；用量需核对');
+      const terminateTree=signal=>{
+        if(!child.pid){child.kill(signal);return;}
+        if(process.platform==='win32'){const killer=spawn('taskkill',['/PID',String(child.pid),'/T','/F'],{stdio:'ignore',windowsHide:true});killer.on('error',()=>child.kill(signal));return;}
+        try{process.kill(-child.pid,signal);}catch(error){if(error.code!=='ESRCH')child.kill(signal);}
+      };
+      const stop=message=>{if(failure)return;failure=message;terminateTree('SIGTERM');killTimer=setTimeout(()=>terminateTree('SIGKILL'),killGraceMs);killTimer.unref();};
+      const timer=setTimeout(()=>stop('Qoder请求超时；用量需核对'),timeoutMs),abort=()=>stop('Qoder请求已取消；用量需核对');
       signal?.addEventListener('abort',abort,{once:true});
       const cleanup=()=>{clearTimeout(timer);clearTimeout(killTimer);signal?.removeEventListener('abort',abort);rmSync(home,{recursive:true,force:true});};
+      // A dispatcher can exit before its descendants close inherited pipes.
+      child.on('exit',()=>terminateTree('SIGKILL'));
       child.stdout.on('data',chunk=>{bytes+=chunk.length;if(bytes>4*1024*1024)stop('Qoder响应过大');else output.push(chunk);});child.stderr.on('data',()=>{});child.stdin.on('error',()=>{});
       child.on('error',()=>{cleanup();reject(fail(503,'Qoder CLI未安装或无法启动'));});
-      child.on('close',code=>{cleanup();if(failure||code!==0){reject(fail(502,failure||'Qoder请求未通过，请检查访问令牌与CLI版本'));return;}resolve(Buffer.concat(output).toString('utf8'));});
+      child.on('close',code=>{cleanup();if(failure||code!==0){reject(fail(signal?.aborted?499:502,failure||'Qoder请求未通过，请检查访问令牌与CLI版本'));return;}resolve(Buffer.concat(output).toString('utf8'));});
       child.stdin.end(prompt||'');if(signal?.aborted)abort();
     });
   }
@@ -107,13 +125,13 @@ export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qoder',spa
   }
   async function run(account,credential,payload,signal){
     const {model}=platformModel(payload.model);
+    platformParameters(account.kind,payload);
     if(account.kind==='qoder'){
-      if(payload.temperature!==undefined||payload.max_tokens!==undefined)throw fail(400,'Qoder CLI不支持本入口的temperature或max_tokens参数');
       if(!model.startsWith('name-'))throw fail(400,'请使用Qoder目录返回的模型ID');
       const selected=Buffer.from(model.slice(5),'base64url').toString('utf8');
       let value;try{value=JSON.parse(await qoder(credential,['--print','--output-format','json','--model',selected,'--tools','','--no-session-persistence','--max-model-request-retries','0'],JSON.stringify(payload.messages),signal));}catch(error){if(error instanceof AppError)throw error;throw fail(502,'Qoder未返回有效结果；用量需核对');}
       if(value.is_error||typeof value.result!=='string')throw fail(502,'Qoder未返回成功的文本结果；用量需核对');
-      return {text:value.result,...counts(value.usage),actualModel:typeof value.model==='string'?'qoder/'+value.model:payload.model};
+      return {text:value.result,...qoderCounts(value.usage),actualModel:typeof value.model==='string'?'qoder/'+value.model:payload.model};
     }
     const isWB=account.kind==='workbuddy',messages=payload.messages.map(m=>({role:m.role==='developer'?'system':m.role,content:m.content}));
     const body={model,messages,stream:isWB,...(isWB?{stream_options:{include_usage:true}}:{}),...(payload.max_tokens===undefined?{}:{max_tokens:payload.max_tokens}),...(payload.temperature===undefined?{}:{temperature:payload.temperature})};
