@@ -189,3 +189,21 @@ API账号卡片“创建固定会话”选择所属员工，在该员工已配�
 限额开启时，请求模型须有明确费率或有证据的显式映射，未知别名及隐式图片模型工具拒绝，明确模型的图片接口仍受检查。固定版本缺失、缺计量或缺费率不当作免费：相关模型暂停新请求（409 `member_model_usage_unknown`），无法归属模型的记录会暂停该员工全部已配置限额的模型；可核对数据或等待其滚出窗口。API模型实际返回与请求不同时，完成用量按实际模型归属，准入只能根据请求时可确认的模型执行。该功能不改变账号池、夜间调度、并发转发或客户端协议。
 
 管理接口为`GET/PATCH /api/admin/members/:id/usage-limits`，修改携带`expected_version`，规则格式`{model,hours:24|168,limit_usd:"20.00"}`；员工仅能通过`/api/me.usage_limits`查看自身限额。设置由服务端读取，客户端提交额度、员工标识或开关不能覆盖；请求准备及实际派发前都复核。配置和审计同事务，旧弹窗冲突返回409。数据库兼容新增`members.usage_limits/usage_limits_version`和请求员工完成时间索引，不删除历史。旧镜像不执行此限额，存在启用规则时不得直接回滚，应使用保留准入检查的兼容修复版本，或由管理员明确关闭后处理。
+
+## 其他平台接入
+
+“添加账户 → 其他平台”支持独立添加多个 WorkBuddy、Qwen、DeepSeek、Qoder 账号，不覆盖已有订阅或 API Key。WorkBuddy 使用官方网页授权，不收集密码；授权状态只保留在内存，成功凭据加密保存。Qwen、DeepSeek 填写官方 API Key，Qoder 填写官方个人访问令牌（PAT）。Qwen 的旧免费 OAuth 入口已于2026-04-15停用，不提供失效登录方式；Qwen 须按 Key 所属区域和标准 API / Token Plan 选择入口。Key 不代表拥有网页版订阅权益或免费额度，使用费用以对应平台为准。
+
+账号需完成授权及模型目录检查，才显示“已连接”。模型目录来自对应上游，不硬编码模型名单；检查通过只证明认证和目录访问，不表示真实模型调用、余额或赠额抵扣已验证。没有真实平台凭据时，仅能完成协议、隔离与本地集成验证，不能代替真实账号验收。
+
+新平台使用独立的 OpenAI Chat Completions 纯文本通道：客户端 base URL 设为 `<Harbor地址>/v1/platform`，继续使用员工 Harbor Key，通过 `GET /v1/platform/models` 取得当前可用模型，向 `POST /v1/platform/chat/completions` 发送 `model`、`messages`、可选 `session_id/stream/max_tokens/temperature`。模型 ID 带平台前缀，如 `deepseek/<实际模型ID>`。网页“接入与测试”支持选择这些模型；员工先填写 Key 并点击用量检查，读取自身允许的模型。每次提交完整文本历史；服务端只保存绑定、请求元数据和计量，不保存平台对话正文。`stream=true` 使用 SSE 返回完整结果，不逐字实时转发。附件、工具调用及未知参数明确拒绝；这条通道不承诺 Codex Responses 编程工具兼容，不会把不兼容的平台账号加入 Codex 自动分配、夜间迁移或模型目录。
+
+新通道执行同一套员工身份校验、逐 Key 模型白名单和员工模型 USD 限额，历史用量进入既有统计链。新平台模型没有已核实费率时显示待定价，须通过“费率与口径”配置该带前缀模型的官方价格及来源，不能把未知费用当0；开启员工限额后，无法确认模型费率的请求拒绝派发。上游缺少有效用量时保留未计量状态，不补造 Token。旧 Codex、Claude、OpenAI API Key 的原有路由及权重保持原规则。
+
+Qoder 使用官方 CLI `@qoder-ai/qodercli@1.1.81`，本机须安装该 CLI 或在 settings 中指定 `qoderBinary`。CLI 使用临时独立配置和工作目录，只通过进程环境传 PAT，关闭工具、MCP、配置继承及会话持久化，不加载个人 Qoder 登录或插件。官方 `--list-models` 返回文本表；Harbor 为模型显示名生成稳定的 `qoder/name-…` ID，调用时还原，不猜测模型能力或价格。CLI 本身仍可能在临时目录写运行日志，进程结束后清理该目录。Qoder 不支持本入口的 `temperature/max_tokens` 参数。
+
+平台账号支持启停与逻辑移除。停用沿用整组迁移事务：绑定迁往同平台的其他已连接账号，无接收目标时拒绝整笔停用；在途请求继续完成并归原账号计量，不覆盖迁移后的绑定。新账号未通过检查、凭据更新后未重新检查或登录取消时不接收调用。WorkBuddy 临期刷新在账号内合并并发，凭据更新、取消、停用或移除后的旧异步结果不能写回。
+
+数据库仅兼容新增 `accounts.platform_config/platform_models`，凭据复用按账号隔离的加密字段，`auth_mode=platform` 与现有账号池隔离。回滚到不识别该模式的版本前须停用并处理平台绑定；不删除历史记录。旧版本不会自动删除数据库中的新平台账号。
+
+官方资料：[Qwen认证](https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/auth.md)、[DeepSeek API](https://api-docs.deepseek.com/)、[Qoder认证](https://docs.qoder.com/cli/authentication)、[Qoder非交互模式](https://docs.qoder.com/cli/run-in-scripts)、[WorkBuddy](https://www.workbuddy.cn/)。WorkBuddy 公开客户端协议仍可能变化，须使用真实账号完成授权和调用验收。

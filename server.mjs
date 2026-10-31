@@ -17,6 +17,8 @@ import {startCodexLogin,startLocalLogin} from './account-login.mjs';
 import {readJsonBody,responseBodyBytes} from './request-body.mjs';
 import {createResponsesTransport,validateResponses,validateCodexJson,codexJsonRoutes} from './responses.mjs';
 import {historyReader,historyQuery,requestObservation,requestsQuery,requestsReader} from './observability.mjs';
+import {createPlatformService} from './platform-service.mjs';
+import {createPlatformTransport} from './platforms.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
 function integer(value,label,{nullable=false,min=0,max=1e12}={}) {
@@ -180,6 +182,7 @@ export function createGateway(options={}) {
   }
   const authAdmin=req=>{const bearer=typeof config.adminToken==='string'&&config.adminToken.length>0&&equals(req.headers.authorization,'Bearer '+config.adminToken);if(!adminAuth.authenticated(req)&&!bearer)throw new AppError(401,'请先输入管理密码登录','admin_required');};
   const employee=req=>store.authenticate((req.headers.authorization||'').replace(/^Bearer /,''));
+  const platforms=createPlatformService({store,runtime,body,json,employee,transport:options.platformTransport||createPlatformTransport({qoderBinary:config.qoderBinary||'qoder'}),busy,responseMembers,preparing:responsePreparing,controllers,tasks,isStopping:()=>stopping,checkLimits:(...args)=>store.memberLimits.check(...args),clock:options.clock||Date.now});
   function startJob(job,account){
     busy.set(account.id,(busy.get(account.id)||0)+1);
     const task=execute(job,account);tasks.add(task);
@@ -269,6 +272,7 @@ export function createGateway(options={}) {
       if(path==='/api/auth/session'&&method==='GET')return json(res,200,{authenticated:adminAuth.authenticated(req)});
       if(path.startsWith('/api/admin/')){
         authAdmin(req);
+        if(await platforms.admin(req,res,url))return;
         if(path==='/api/admin/requests'&&method==='GET')return json(res,200,requestsReader(store,requestsQuery(url.searchParams)));
         if(path==='/api/admin/balancing/explanation'&&method==='GET')return json(res,200,balancer.explain());
         if(path==='/api/admin/history'&&method==='GET')return json(res,200,historyReader(store).list(historyQuery(url.searchParams)));
@@ -398,9 +402,11 @@ export function createGateway(options={}) {
               store.run("UPDATE sessions SET state='uncertain' WHERE account_id=?",account.id);store.audit('account.remove',account.id);store.db.exec('COMMIT');
             }catch(e){store.db.exec('ROLLBACK');throw e;}
             authVersions.set(account.id,(authVersions.get(account.id)||0)+1);
+            platforms.cancel(account.id);
             logins.get(account.id)?.flow.cancel();logins.delete(account.id);pump();return json(res,200,{ok:true});
           }
           if(usesApi(account)&&accountMatch[2]?.startsWith('login'))throw new AppError(400,'官方Key账号无需订阅登录，请更新或检查Key');
+          if(account.auth_mode==='platform'&&accountMatch[2])throw new AppError(400,'请使用该平台专用的登录或检查入口');
           if(method==='GET'&&accountMatch[2]==='login'){
             const pending=logins.get(account.id);
             return json(res,200,{state:account.state,message:account.last_error||'',...(pending?.challenge?{...pending.challenge,expiresAt:pending.expiresAt}:{})});
@@ -423,6 +429,7 @@ export function createGateway(options={}) {
               if(key)store.audit('account.api.key',account.id);store.audit('account.update',account.id);return migration;
             });
             if(key)authVersions.set(account.id,(authVersions.get(account.id)||0)+1);
+            if(account.auth_mode==='platform'&&!enabled){platforms.cancel(account.id);store.run("UPDATE accounts SET state='offline',route_epoch=route_epoch+1 WHERE id=? AND state='login'",account.id);}
             // Queued jobs have not been dispatched; use the committed binding and reset CLI cursor.
             for(const job of queue)if(job.session.account_id===account.id){const latest=store.get('SELECT * FROM sessions WHERE id=?',job.session.id);if(latest)job.session=latest;}
             pump();return json(res,200,{ok:true,...result});
@@ -489,6 +496,7 @@ export function createGateway(options={}) {
         }
         throw new AppError(404,'接口不存在');
       }
+      if(await platforms.user(req,res,url))return;
       if(path==='/v1/codex/image-mcp.mjs'&&method==='GET'){
         employee(req);
         const script=readFileSync(join(root,'clients','image-mcp.mjs'));
@@ -639,7 +647,7 @@ export function createGateway(options={}) {
   }
   const server=http.createServer(handler);
   let closePromise;
-  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;clearInterval(maintenance);const pricingClosed=store.pricing.close();for(const c of controllers)c.abort();for(const c of logins.values())c.flow.cancel();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks,...loginTasks,...quotaReads.values(),...quotaFetches.values(),balancer.pending()]);await pricingClosed;store.close();})();return closePromise;}
+  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;clearInterval(maintenance);platforms.close();const pricingClosed=store.pricing.close();for(const c of controllers)c.abort();for(const c of logins.values())c.flow.cancel();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks,...loginTasks,...quotaReads.values(),...quotaFetches.values(),balancer.pending()]);await pricingClosed;store.close();})();return closePromise;}
   return {server,store,config,close,data,runtime,network,balancer};
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
