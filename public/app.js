@@ -12,10 +12,11 @@ let sessionsPage=1,sessionsPageSize=25,sessionsLoading=false,refreshVersion=0;
 let recordView='usage',historyData=null,historyLoading=false,historyVersion=0,dialogVersion=0,requestDetailId='',requestDetailVersion=0;
 let historyFilters={kind:'audit',page:1,action:'',account:'',session:'',start:'',end:''};
 const phaseLabels={queued:'等待执行',credentials:'准备凭据',upstream:'连接上游 / 等待响应',streaming:'接收上游数据',cli:'官方 CLI 执行中',settling:'统计收尾',ok:'完成',failed:'失败',unknown:'结束 · 用量待核对',interrupted:'重启中断',cancelled:'已取消',rejected:'已拒绝'};
-const actionLabels={'account.api.check':'检查官方Key','account.api.weight':'调整API人工权重','account.api.key':'更新官方Key','session.route':'会话换绑','session.nightly':'会话自动调整设置','session.nightly.expired':'会话临时固定到期','session.nightly.deadline':'历史固定期限补全','session.enable':'恢复会话访问','session.disable':'禁止会话访问','balancing.settings':'负载均衡设置','balancing.weights':'手动调整权重','balancing.weights.auto':'系统更新权重','balancing.weights.expired':'手动权重到期','account.route_block':'账号路由受限','account.route_recover':'账号路由恢复','account.create':'添加账号','account.remove':'移除账号','account.update':'修改账号','account.login':'开始账号登录','account.login.success':'账号登录成功','account.login.failed':'账号登录失败','account.login.cancel':'取消账号登录','key.create':'创建 Key','key.remove':'删除 Key','key.update':'修改 Key','key.models':'设置Key模型权限','member.create':'创建员工','member.update':'修改员工','member.remove':'移除员工','backup.create':'创建数据库备份','request.settle':'核对请求用量','pricing.configure':'调整模型费率'};
+const actionLabels={'account.api.check':'检查官方Key','account.api.weight':'调整API人工权重','account.api.key':'更新官方Key','session.route':'会话换绑','session.nightly':'会话自动调整设置','session.nightly.expired':'会话临时固定到期','session.nightly.deadline':'历史固定期限补全','session.enable':'恢复会话访问','session.disable':'禁止会话访问','balancing.settings':'负载均衡设置','balancing.weights':'手动调整权重','balancing.weights.auto':'系统更新权重','balancing.weights.expired':'手动权重到期','account.route_block':'账号路由受限','account.route_recover':'账号路由恢复','account.create':'添加账号','account.remove':'移除账号','account.update':'修改账号','account.login':'开始账号登录','account.login.success':'账号登录成功','account.login.failed':'账号登录失败','account.login.cancel':'取消账号登录','key.create':'创建 Key','key.remove':'删除 Key','key.update':'修改 Key','key.models':'设置Key模型权限','member.create':'创建员工','member.update':'修改员工','member.limits':'设置员工模型限额','member.remove':'移除员工','backup.create':'创建数据库备份','request.settle':'核对请求用量','pricing.configure':'调整模型费率'};
 const reasonLabels={manual_binding_only:'仅人工绑定，不分配新会话',account_disabled:'账号停用',manual:'手动操作',initialize:'首次初始化',nightly:'夜间调整',quota:'额度耗尽或恢复',recovery:'账号恢复',weight_zero:'原账号权重为0',quota_exhausted:'确认订阅额度耗尽',login_expired:'确认登录失效',disabled:'账号已停用',not_ready:'账号尚未就绪',zero_weight:'生效权重为0',eligible:'可参与新会话分配',quota_unavailable:'额度快照缺失、过期或已越过重置点',incomparable_quota:'额度窗口或套餐不可比较',unknown_fixed_load:'固定会话缺少明确模型费率或历史样本，无法比较负载',unknown_workload:'缺少明确模型费率或可用的历史用量样本',busy:'会话有请求执行中',protected:'受静默期、临时固定或其他保护条件限制',no_measured_work:'没有可计量的历史负载',session_disabled:'会话不可迁移',session_busy:'会话仍有请求执行中',nightly_plan_changed:'执行前条件发生变化，本组未迁移',planning_failed:'计划计算失败',cannot_fit:'会话负载无法放入其他账号的容差范围',infeasible:'不存在满足约束的完整迁移方案',search_limited:'计算预算不足，未确认可行方案'};
 const labels={overview:'运行总览',members:'员工与密钥',accounts:'上游账号池',sessions:'会话绑定',requests:'使用记录',playground:'接入与测试'};
 sessionStorage.removeItem('harbor-admin');if(location.hash)history.replaceState(null,'',location.pathname);
+let memberLimitEditor=null;
 let toastTimer;function toast(message){$('#toast').textContent=message;$('#toast').classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.add('hidden'),5000);}
 async function api(path,method='GET',data,credential=''){
   const epoch=authEpoch;
@@ -174,6 +175,7 @@ function historyText(r){
   if(r.action.startsWith('session.'))return `${d.enabled===true?'参与自动调整':d.enabled===false?'临时固定':'会话状态变更'}${d.expires?' · 到期 '+beijingDate(d.expires):''}`;
   if(d.request)return `${d.member||'已移除员工'} · ${historyName(d.account)} · 请求 ${d.request}`;
   if(d.account)return historyName(d.account);
+  if(r.action==='member.limits')return `${d.member||'已移除员工'} · ${d.enabled?'开启':'关闭'}模型限额 · ${d.rules?.length||0}条规则`;
   if(r.action==='key.models')return `${d.member||'已移除员工'} · ${d.prefix||''}… · ${d.allowed_models===null?'模型不限制':'只允许 '+(d.allowed_models||[]).join('、')}`;
   if(d.prefix)return `${d.member||'已移除员工'} · ${d.prefix}…`;
   if(d.member)return d.member;
@@ -311,7 +313,7 @@ HARBOR_BASE_URL = ${JSON.stringify(endpoint)}`;
 function renderChat(){return chat.length?chat.map(m=>`<div class="message ${m.role==='user'?'user':''}"><span class="role">${m.role==='user'?'YOU':chatModel.toUpperCase()}</span>${esc(m.content)}</div>`).join(''):empty('从一个简单问题开始。');}
 let loginPoll,loginAccount='',loginView=0;
 function modal(html,wide=false){if(!admin)return;if($('#modal').open)close();dialogVersion++;$('#modal').classList.toggle('wide',wide);$('#modal-content').innerHTML=html;$('#modal').showModal();}
-function close(){clearTimeout(loginPoll);loginAccount='';loginView++;dialogVersion++;requestDetailId='';$('#modal').close();$('#modal-content').innerHTML='';}
+function close(){memberLimitEditor=null;clearTimeout(loginPoll);loginAccount='';loginView++;dialogVersion++;requestDetailId='';$('#modal').close();$('#modal-content').innerHTML='';}
 function validDeviceLogin(value){try{const u=new URL(value.verificationUrl);return value.type==='device'&&u.origin==='https://auth.openai.com'&&u.pathname==='/codex/device'&&!u.search&&!u.hash&&!u.username&&!u.password&&/^[A-Z0-9-]{4,32}$/.test(value.userCode);}catch{return false;}}
 function loginDialog(account,value){
   modal(`<h2>${esc(account.name)} · 官方登录</h2><p class="hint">在官方页面登录你的 ChatGPT 账号，再输入下面的一次性验证码。仅授权你刚刚发起的登录；验证码请勿分享。</p><div class="secret" id="device-code"></div><p class="hint">若新窗口未打开，可点击下方链接。设备码登录需在 ChatGPT 安全设置或工作区权限中启用。</p><div class="actions"><a class="primary" id="device-link" target="_blank" rel="noopener noreferrer">打开官方授权页面</a></div><p class="hint" id="login-status">等待官方授权，最多 10 分钟…</p><div class="dialog-actions">${button('cancel-login','取消登录','secondary',account.id)}${button('close','稍后继续','secondary')}</div>`);
@@ -357,7 +359,37 @@ function sessionDetail(identifier){
 }
 function modelPolicyFields(allowed=null,known=[]){return `<label>模型权限<select name="model_policy_mode"><option value="all" ${allowed===null?'selected':''}>不限制</option><option value="limited" ${allowed!==null?'selected':''}>只允许指定模型</option></select></label>${known.length?`<label>从已知模型添加<select id="key-model-suggestion"><option value="">选择模型加入列表</option>${known.map(model=>`<option value="${esc(model)}">${esc(model)}</option>`).join('')}</select></label>`:''}<label>允许的模型ID（每行一个）<textarea name="allowed_models" rows="3" placeholder="填写精确模型ID，如 gpt-6.1-sol">${esc((allowed||[]).join('\n'))}</textarea></label><p class="hint">选择“只允许指定模型”后必须填写；服务端精确匹配，不支持通配符或codex/claude路由别名。选择“不限制”时忽略列表。</p>`;}
 function modelPolicyValue(form){return form.get('model_policy_mode')==='limited'?String(form.get('allowed_models')||'').split(/[,，\s]+/).filter(Boolean):null;}
-function memberDetail(memberId){const m=state.members.find(x=>x.id===memberId),keys=state.keys.filter(k=>k.member_id===memberId);modal(`<h2>${esc(m.name)}</h2><div class="actions">${button('edit-member','修改名称','secondary',m.id)}${button('new-key','新增 Key','secondary',m.id)}${button('toggle-member',m.enabled?'停用员工':'启用员工','text-button',m.id)}</div>${keys.map(k=>`<div class="mini-row"><div class="mono">${esc(k.prefix)}…<small>${k.expires?'到期 '+date(k.expires):'永久有效'} · ${k.allowed_models?'只允许 '+esc(k.allowed_models.join('、')):'模型不限制'} · ${!k.enabled?'已停用':!m.enabled?'员工已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</small></div><div>${button('key-ips',fmt(k.ips)+' 个 IP','table-button',k.id)}${button('key-models','模型权限','table-button',k.id)}${button('renew-key','续期','table-button',k.id)}${button('toggle-key',k.enabled?'停用':'启用','table-button',k.id)}${button('remove-key','删除','table-button',k.id)}</div></div>`).join('')}<p class="hint">近7天用量见使用记录。换 Key 不影响其他 Key 的统计。</p><div class="dialog-actions">${button('close','完成','primary')}</div>`);}
+function memberLimitRows(form){
+  const models=form.getAll('limit_model'),windows=form.getAll('limit_hours'),amounts=form.getAll('limit_usd');
+  return models.map((model,index)=>({model:model.trim(),hours:Number(windows[index]),limit_usd:amounts[index]}));
+}
+function renderMemberLimits(){
+  const editor=memberLimitEditor;if(!editor)return;
+  const disabled=editor.enabled?'':'disabled';
+  const rows=editor.rules.map((rule,index)=>`<fieldset class="member-limit-row" ${disabled}><label>模型ID<input name="limit_model" list="member-limit-models" value="${esc(rule.model)}" maxlength="200" required></label><div class="form-grid"><label>滚动窗口<select name="limit_hours"><option value="24" ${rule.hours===24?'selected':''}>近24小时</option><option value="168" ${rule.hours===168?'selected':''}>近7天</option></select></label><label>上限（参考USD）<input name="limit_usd" type="number" min="0" max="999999999999.99" step="0.01" value="${esc(rule.limit_usd)}" required></label></div>${button('member-limit-remove','删除此规则','text-button danger',index)}</fieldset>`).join('');
+  const usage=editor.usage.length?`<div class="table-wrap"><table><thead><tr><th>模型 / 窗口</th><th>已用 / 上限USD</th><th>状态</th></tr></thead><tbody>${editor.usage.map(row=>`<tr><td>${esc(row.model)}<small>近${row.hours===168?'7天':row.hours+'小时'}</small></td><td>${referenceMoney(row.used_usd)} / ${referenceMoney(row.limit_usd)}</td><td>${!editor.savedEnabled?'限额关闭':row.invalid_model?'模型规则待修正':row.exceeded?'已达上限':row.unresolved?'计量待核对':'可用'}${row.in_flight?`<small>${row.in_flight}个请求执行中</small>`:''}</td></tr>`).join('')}</tbody></table></div>`:'';
+  formModal('员工模型用量限额','同一员工全部Key共用；滚动24小时或7×24小时，不在凌晨清零。达到上限拒绝新请求，执行中继续结算，可能超额。',`<label>限额开关<select id="member-limit-enabled" name="limits_enabled"><option value="off" ${!editor.enabled?'selected':''}>关闭</option><option value="on" ${editor.enabled?'selected':''}>开启</option></select></label><p class="hint">未配置的明确模型不受本限额限制，Key模型白名单仍生效。关闭保留上次保存规则；开启即计入窗口内已有用量。缺计量或费率会暂停相关模型请求。</p><datalist id="member-limit-models">${editor.models.map(model=>`<option value="${esc(model)}"></option>`).join('')}</datalist>${rows}${button('member-limit-add','＋ 添加模型限额','secondary','',!editor.enabled||editor.rules.length>=50)}<p class="hint">0表示暂停此模型；同一模型可分别配置24小时和7天，任一上限达到都会拒绝。用量表仅展示上次读取的已保存规则，保存后重新打开可更新；它与使用记录页的7个自然日不同。</p>${usage}`,async form=>{
+    const payload={expected_version:editor.version,enabled:form.get('limits_enabled')==='on'};
+    if(payload.enabled)payload.rules=memberLimitRows(form);
+    const epoch=authEpoch,view=dialogVersion;await api('/api/admin/members/'+editor.id+'/usage-limits','PATCH',payload);
+    if(epoch!==authEpoch||view!==dialogVersion||!admin)return;
+    memberLimitEditor=null;close();await refresh();toast('员工模型限额已保存');
+  });
+  memberLimitEditor=editor;editor.dialog=dialogVersion;
+  $('#member-limit-enabled').onchange=event=>{if(editor.enabled)editor.rules=memberLimitRows(new FormData($('#dialog-form')));editor.enabled=event.target.value==='on';if(editor.enabled&&!editor.rules.length)editor.rules=[{model:'',hours:24,limit_usd:''}];renderMemberLimits();};
+}
+async function openMemberLimits(identifier){
+  modal('<h2>员工模型用量限额</h2><p>正在读取…</p>');const version=dialogVersion,epoch=authEpoch;
+  try{
+    const [limits,pricing]=await Promise.all([api('/api/admin/members/'+identifier+'/usage-limits'),api('/api/admin/pricing')]);
+    if(version!==dialogVersion||epoch!==authEpoch||!admin||!$('#modal').open)return;
+    memberLimitEditor={id:identifier,enabled:limits.enabled,savedEnabled:limits.enabled,version:limits.version,rules:limits.rules.map(row=>({...row})),usage:limits.usage,models:pricing.rates.map(row=>row.model)};renderMemberLimits();
+  }catch(error){
+    if(version!==dialogVersion||epoch!==authEpoch||!admin||!$('#modal').open)return;
+    modal(`<h2>员工模型用量限额</h2><div class="inline-error">${esc(error.message)}</div><div class="dialog-actions">${button('close','关闭','secondary')}${button('member-limits','重试','primary',identifier)}</div>`);
+  }
+}
+function memberDetail(memberId){const m=state.members.find(x=>x.id===memberId),keys=state.keys.filter(k=>k.member_id===memberId);modal(`<h2>${esc(m.name)}</h2><div class="actions">${button('edit-member','修改名称','secondary',m.id)}${button('member-limits','模型用量限额','secondary',m.id)}${button('new-key','新增 Key','secondary',m.id)}${button('toggle-member',m.enabled?'停用员工':'启用员工','text-button',m.id)}</div>${keys.map(k=>`<div class="mini-row"><div class="mono">${esc(k.prefix)}…<small>${k.expires?'到期 '+date(k.expires):'永久有效'} · ${k.allowed_models?'只允许 '+esc(k.allowed_models.join('、')):'模型不限制'} · ${!k.enabled?'已停用':!m.enabled?'员工已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</small></div><div>${button('key-ips',fmt(k.ips)+' 个 IP','table-button',k.id)}${button('key-models','模型权限','table-button',k.id)}${button('renew-key','续期','table-button',k.id)}${button('toggle-key',k.enabled?'停用':'启用','table-button',k.id)}${button('remove-key','删除','table-button',k.id)}</div></div>`).join('')}<p class="hint">近7天用量见使用记录。换 Key 不影响其他 Key 的统计。</p><div class="dialog-actions">${button('close','完成','primary')}</div>`);}
 async function checkKey(){testKey=$('#test-key').value.trim();const key=testKey,epoch=authEpoch;try{const m=await api('/api/me','GET',undefined,key);if(epoch!==authEpoch||tab!=='playground'||$('#test-key')?.value.trim()!==key)return;$('#my-quota').textContent=`${m.name}：此 Key 近7天 ${referenceTotal(m.keyStandard)} Standard参考USD · ${referenceCoverage(m.keyStandard)}`;}catch(e){if(epoch===authEpoch)toast(e.message);}}
 async function sendChat(e){
   e.preventDefault();testKey=$('#test-key').value.trim();const content=$('#prompt').value.trim();
@@ -395,6 +427,14 @@ document.addEventListener('click',async e=>{
     if(action==='close')return close();if(action.startsWith('go-'))return setTab(action.slice(3));
     if(action==='create-member')return formModal('创建员工 Key','Key 支持 Codex 多会话并行，仅统计最近7天用量。',`<label>员工名称<input name="name" placeholder="例如：张同事" maxlength="60" required></label>${expirationFields}${modelPolicyFields()}`,async f=>{const epoch=authEpoch;const r=await api('/api/admin/members','POST',{name:f.get('name'),quota:null,expires:expiresFrom(f),allowed_models:modelPolicyValue(f)});await refresh();if(epoch===authEpoch)showSecret(r.secret);});
     if(action==='member-detail')return memberDetail(identifier);
+    if(action==='member-limits')return openMemberLimits(identifier);
+    if(action==='member-limit-add'||action==='member-limit-remove'){
+      const editor=memberLimitEditor;if(!editor||!editor.enabled||editor.dialog!==dialogVersion||!$('#modal').open)return;
+      editor.rules=memberLimitRows(new FormData($('#dialog-form')));
+      if(action==='member-limit-add'){if(editor.rules.length>=50)return toast('最多50条规则');editor.rules.push({model:'',hours:24,limit_usd:''});}
+      else {const index=Number(identifier);if(!Number.isInteger(index)||index<0||index>=editor.rules.length)return;editor.rules.splice(index,1);}
+      return renderMemberLimits();
+    }
     if(action==='edit-member'){const m=state.members.find(x=>x.id===identifier);close();return formModal('编辑员工','修改员工名称。',`<label>名称<input name="name" value="${esc(m.name)}" required maxlength="60"></label>`,async f=>{await api('/api/admin/members/'+identifier,'PATCH',{name:f.get('name')});close();await refresh();toast('已保存');});}
     if(action==='new-key'){close();return formModal('新增 Key','为此员工增加一个独立 Key。',expirationFields+modelPolicyFields(),async f=>{const epoch=authEpoch;const r=await api('/api/admin/keys','POST',{memberId:identifier,expires:expiresFrom(f),quota:null,allowed_models:modelPolicyValue(f)});await refresh();if(epoch===authEpoch)showSecret(r.secret);});}
     if(action==='toggle-member'){const m=state.members.find(x=>x.id===identifier);await api('/api/admin/members/'+identifier,'PATCH',{enabled:!m.enabled});close();await refresh();return toast('员工状态已更新');}

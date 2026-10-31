@@ -46,10 +46,16 @@ const fields=['input','output','cached','adjustment','total'];
 const empty=(state,model=null,revision=null)=>({state,model,revision,...Object.fromEntries(fields.map(k=>[k+'Atoms',null]))});
 const legacyManual=row=>row.status==='reconciled'&&row.manual_cost_atoms==null;
 export const needsReferenceReconciliation=(row,start)=>['unknown','interrupted'].includes(row.status)||legacyManual(row)&&row.ended>=start;
+export function referenceModel(chosen,at,book){
+  if(typeof chosen!=='string'||!book||!book.rates)return null;
+  if(Object.hasOwn(book.rates,chosen))return chosen;
+  const alias=(book.aliases||[]).find(a=>a.name===chosen&&at>=a.from&&(a.to===null||at<a.to));
+  return alias&&Object.hasOwn(book.rates,alias.target)?alias.target:null;
+}
 export function quoteReference(row,book={rates:seed.rates,aliases:[]},revision=null){
   const chosen=row.billing_model||row.model;
   const alias=(book.aliases||[]).find(a=>a.name===chosen&&row.started>=a.from&&(a.to===null||row.started<a.to));
-  const model=Object.hasOwn(book.rates,chosen)?chosen:alias?.target,rate=model&&Object.hasOwn(book.rates,model)?book.rates[model]:null;
+  const model=referenceModel(chosen,row.started,book),rate=model?book.rates[model]:null;
   const modelSource=!Object.hasOwn(book.rates,chosen)&&alias?'configured_alias':row.billing_model?'upstream':model?'requested':'unknown';
   if(row.manual_cost_atoms!==null&&row.manual_cost_atoms!==undefined){
     if(!/^\d+$/.test(row.manual_cost_atoms))return empty('unmetered',chosen,revision);

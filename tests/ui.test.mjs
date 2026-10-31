@@ -406,3 +406,19 @@ test('Key model selection preserves exact names, saved versions and ignores stal
  const sent=calls.find(([p,o])=>p==='/api/admin/keys/k'&&o.method==='PATCH');assert.deepEqual(JSON.parse(sent[1].body),{allowed_models:['sol','astra'],expected_model_policy_version:7});
  let release;const delayed=await ui(()=>new Promise(r=>release=()=>r(response(pricingState()))));delayed.run('admin=true;state='+JSON.stringify(state));const pending=delayed.click('key-models','k');await delayed.click('close');delayed.run("modal('<h2>new dialog</h2>')");release();await pending;assert.equal(delayed.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
 });
+
+test('member model limits use an employee-scoped endpoint, retain disabled rules and guard stale dialogs',async()=>{
+ const limits={enabled:false,version:2,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'20.00'}],usage:[]},calls=[];
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?pricingState():path.endsWith('usage-limits')?limits:snapshot());});
+ page.run('admin=true;globalThis.FormData=class{get(k){return values[k]??null;}getAll(k){return values[k]||[];}};');await page.click('member-limits','member-id');assert.match(page.node('#modal-content').innerHTML,/滚动24小时/);assert.match(page.node('#modal-content').innerHTML,/20.00/);
+ page.node('#member-limit-enabled').onchange({target:{value:'on'}});assert.equal(page.run('memberLimitEditor.enabled'),true);
+ page.run('globalThis.values={limits_enabled:"on",limit_model:["gpt-6.1-sol"],limit_hours:["168"],limit_usd:["30.00"]};');await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
+ const saved=calls.find(([p,o])=>p==='/api/admin/members/member-id/usage-limits'&&o.method==='PATCH');assert.deepEqual(JSON.parse(saved[1].body),{expected_version:2,enabled:true,rules:[{model:'gpt-6.1-sol',hours:168,limit_usd:'30.00'}]});
+ let release;const delayed=await ui(path=>path==='/api/admin/pricing'?response(pricingState()):new Promise(r=>release=()=>r(response(limits))));delayed.run('admin=true;');const pending=delayed.click('member-limits','member-id');await delayed.click('close');delayed.run("modal('<h2>other</h2>')");release();await pending;assert.equal(delayed.node('#modal-content').innerHTML,'<h2>other</h2>');
+});
+test('R2 member limit loading shows retry/close for network and HTTP errors and ignores late failures',async()=>{
+ for(const network of [true,false]){
+  const page=await ui(()=>{if(network)throw Error('synthetic offline');return response({error:{message:'synthetic unavailable'}},503);});page.run('admin=true;');await page.click('member-limits','member-id');const html=page.node('#modal-content').innerHTML;assert.match(html,/synthetic/);assert.match(html,/重试/);assert.match(html,/关闭/);assert.doesNotMatch(html,/正在读取/);
+ }
+ let reject;const page=await ui(path=>path==='/api/admin/pricing'?response(pricingState()):new Promise((_,r)=>reject=r));page.run('admin=true;');const pending=page.click('member-limits','member-id');await page.click('close');page.run("modal('<h2>new dialog</h2>')");reject(Error('late failure'));await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
+});

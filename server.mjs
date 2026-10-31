@@ -200,7 +200,7 @@ export function createGateway(options={}) {
     const authVersion=authVersions.get(account.id)||0;
     if(controller.signal.aborted){store.finish(requestId,{status:'cancelled',error:'排队期间取消'});reject(new AppError(499,'请求已取消'));return;}
     try{
-      const currentMember=store.authenticate(secret);store.checkModel(currentMember,model,job.responses?.tools);
+      const currentMember=store.authenticate(secret);store.checkModel(currentMember,model,job.responses?.tools);store.memberLimits.check(currentMember.id,model,{requestId,tools:job.responses?.tools});
       if(!job.responses){
       const held=store.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE member_id=? AND id<>?",currentMember.id,requestId).n;
       const heldKey=store.get("SELECT COALESCE(SUM(reserved),0) n FROM requests WHERE key_id=? AND id<>?",currentMember.key_id,requestId).n;
@@ -341,6 +341,9 @@ export function createGateway(options={}) {
         if(path==='/api/admin/members'&&method==='POST'){
           const b=await body(req);return json(res,201,store.createMember(name(b.name),integer(b.quota,'额度',{nullable:true}),expiry(b.expires),modelAllowlist(b.allowed_models===undefined?null:b.allowed_models)));
         }
+        const limitsMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/usage-limits$/);
+        if(limitsMatch&&method==='GET')return json(res,200,store.memberLimits.status(limitsMatch[1]));
+        if(limitsMatch&&method==='PATCH'){store.memberLimits.save(limitsMatch[1],await body(req));return json(res,200,store.memberLimits.status(limitsMatch[1]));}
         const memberMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
         if(memberMatch&&method==='DELETE'){
           const m=store.get('SELECT * FROM members WHERE id=? AND removed_at IS NULL',memberMatch[1]);if(!m)throw new AppError(404,'员工不存在或已移除');
@@ -505,7 +508,7 @@ export function createGateway(options={}) {
         return json(res,200,{object:'list',data:[...(allowed===null?['codex','claude']:[]).map(id=>({id,object:'model',owned_by:'local'})),...models.map(m=>({id:m.slug,object:'model',owned_by:'openai'}))],models});
       }
       if(path==='/api/me'&&method==='GET'){
-        const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,standard:store.pricing.inWindow('member_id',m.id),keyStandard:store.pricing.inWindow('key_id',m.key_id),expires:m.expires,allowed_models:store.allowedModels(m),usageWindow:w});
+        const m=employee(req),w=store.pruneUsage();return json(res,200,{id:m.id,name:m.name,standard:store.pricing.inWindow('member_id',m.id),keyStandard:store.pricing.inWindow('key_id',m.key_id),expires:m.expires,allowed_models:store.allowedModels(m),usage_limits:store.memberLimits.status(m.id),usageWindow:w});
       }
       if((path==='/v1/responses'||codexJsonRoutes.has(path.slice(3))&&path.startsWith('/v1/'))&&method==='POST'){
         const m=employee(req);
@@ -518,7 +521,7 @@ export function createGateway(options={}) {
           try{original=await readJsonBody(req,{maxBytes:responseBodyBytes,compressed:true});}
           finally{const remaining=responsePreparing.get(m.id)-1;if(remaining)responsePreparing.set(m.id,remaining);else responsePreparing.delete(m.id);}
           const payload=jsonPath?validateCodexJson(original,jsonPath):validateResponses(original);
-          store.checkModel(m,payload.model,payload.tools);
+          store.checkModel(m,payload.model,payload.tools);store.memberLimits.check(m.id,payload.model,{tools:payload.tools});
           if(req.aborted||res.destroyed)throw new AppError(499,'客户端已断开','client_cancelled');
           const clientId=req.headers['thread-id']||req.headers['session-id']||req.headers.session_id||req.headers['x-codex-thread-id']||payload.prompt_cache_key;
           if(clientId!==undefined&&(typeof clientId!=='string'||!clientId.length))throw new AppError(400,'客户端会话标识无效');
@@ -591,7 +594,7 @@ export function createGateway(options={}) {
         if(!Array.isArray(b.messages)||!b.messages.length||b.messages.length>100||b.messages.some(v=>!v||!['system','user','assistant','developer'].includes(v.role)||typeof v.content!=='string'))throw new AppError(400,'仅支持 1–100 条纯文本 messages');
         if(b.tools||b.functions)throw new AppError(400,'此版本是纯文本网关，不支持工具调用');
         if(b.model!==undefined&&!['codex','claude'].includes(b.model))throw new AppError(400,'本地模型名为 codex 或 claude');
-        const kind=b.model||'codex';store.checkModel(m,kind);
+        const kind=b.model||'codex';store.checkModel(m,kind);store.memberLimits.check(m.id,kind);
         if(b.max_tokens!==undefined||b.max_completion_tokens!==undefined)throw new AppError(400,'订阅 CLI 无硬输出 Token 上限，暂不支持 max_tokens 参数');
         if(b.stream!==undefined&&typeof b.stream!=='boolean')throw new AppError(400,'stream 必须为布尔值');
         if(stopping||queue.length>=5)throw new AppError(429,'队列已满，请稍后重试');
