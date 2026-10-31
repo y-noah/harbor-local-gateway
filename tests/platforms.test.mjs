@@ -110,10 +110,22 @@ test('Qoder uses official model table and isolated, tool-disabled subprocess',as
   writeFileSync(binary,`#!/usr/bin/env node\nconst a=process.argv.slice(2);if(!process.env.QODER_PERSONAL_ACCESS_TOKEN||process.env.QODER_EXPOSE_TOKEN_USAGE!=='1'||!a.includes('--strict-mcp-config')||!a.includes('--setting-sources')||!process.env.HOME.startsWith('/tmp/harbor-qoder-'))process.exit(4);if(a.includes('--list-models')){console.log('MODEL\\nPerformance');process.exit(0);}if(a[a.indexOf('--tools')+1]!==''||!a.includes('--no-session-persistence')||a[a.indexOf('--model')+1]!=='Performance')process.exit(5);process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'合成Qoder回复',usage:{input_tokens:12,output_tokens:3}})));\n`,{mode:0o700});
   const app=await fixture(t,{transport:createPlatformTransport({qoderBinary:binary})}),id=await app.create('qoder');assert.equal((await app.check(id)).status,200);const model=JSON.parse(app.store.get('SELECT platform_models FROM accounts WHERE id=?',id).platform_models)[0];const result=await app.chat({model:'qoder/'+model});assert.equal(result.status,200);assert.equal(result.body.usage.total_tokens,15);
 });
-test('R1 Qoder masked counters remain unknown and exposed cache reads/writes count once',()=>{
+test('R1 Qoder normalized total already includes cache reads and writes',()=>{
   assert.equal(qoderCounts({input_tokens:0,output_tokens:0,cache_read_input_tokens:0,cache_creation_input_tokens:0}).usageKnown,false);
-  assert.deepEqual(qoderCounts({input_tokens:10,output_tokens:5,cache_read_input_tokens:20,cache_creation_input_tokens:30}),{input:60,output:5,cached:20,usageKnown:true});
+  // Official 1.1.81 aU(): compatible prompt_tokens=100 with 30 cache hits.
+  assert.deepEqual(qoderCounts({input_tokens:100,output_tokens:5,cache_read_input_tokens:30,cache_creation_input_tokens:0}),{input:100,output:5,cached:30,usageKnown:true});
+  // Official eat() -> aU(): Anthropic plain=10, read=20, creation=30 -> total=60.
+  assert.deepEqual(qoderCounts({input_tokens:60,output_tokens:5,cache_read_input_tokens:20,cache_creation_input_tokens:30}),{input:60,output:5,cached:20,usageKnown:true});
+  assert.equal(qoderCounts({input_tokens:10,output_tokens:5,cache_read_input_tokens:20,cache_creation_input_tokens:30}).usageKnown,false);
   assert.equal(qoderCounts({input_tokens:10,output_tokens:5,cache_read_input_tokens:-1}).usageKnown,false);
+});
+test('R1 official normalized Qoder counters preserve exact USD and do not reject below the ceiling',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'harbor-qoder-inclusive-'));t.after(()=>rmSync(root,{recursive:true,force:true}));const binary=join(root,'qoder');
+  writeFileSync(binary,`#!/usr/bin/env node\nif(process.argv.includes('--list-models')){console.log('MODEL\\nPerformance');process.exit(0);}process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'合成规范化计量',usage:{input_tokens:1000000,output_tokens:10,cache_read_input_tokens:300000,cache_creation_input_tokens:100000}})));\n`,{mode:0o700});
+  const app=await fixture(t,{transport:createPlatformTransport({qoderBinary:binary})}),id=await app.create('qoder');await app.check(id);const model='qoder/'+JSON.parse(app.store.get('SELECT platform_models FROM accounts WHERE id=?',id).platform_models)[0];
+  app.store.pricing.configure({expectedVersion:app.store.pricing.status().settings.version,manualRates:{[model]:{input:'1',cached:'0.5',output:'1',source:'合成验收费率'}}});app.store.memberLimits.save(app.member.memberId,{expected_version:0,enabled:true,rules:[{model,hours:24,limit_usd:'1.00'}]});
+  const first=await app.chat({model});assert.equal(first.status,200);assert.equal(first.body.usage.prompt_tokens,1000000);assert.equal(first.body.harbor_standard_usage.total_exact,'0.85001');assert.equal(app.store.get('SELECT input FROM requests').input,1000000);
+  assert.equal(app.store.memberLimits.status(app.member.memberId).usage[0].blocked,false);assert.equal((await app.chat({model})).status,200);assert.equal((await app.chat({model})).status,429);
 });
 test('R1 a Qoder result with masked zero usage cannot bypass a configured USD ceiling',async t=>{
   const root=mkdtempSync(join(tmpdir(),'harbor-qoder-masked-'));t.after(()=>rmSync(root,{recursive:true,force:true}));const binary=join(root,'qoder');

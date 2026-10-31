@@ -50,9 +50,11 @@ function counts(usage){
 export function qoderCounts(usage){
   const values=['input_tokens','output_tokens','cache_read_input_tokens','cache_creation_input_tokens'].map((key,index)=>usage?.[key]??(index>1?0:undefined));
   if(values.some(v=>!Number.isSafeInteger(v)||v<0))return {input:0,output:0,cached:0,usageKnown:false};
-  const [plain,output,cached,created]=values,input=plain+cached+created;
+  // Qoder 1.1.81 normalizes both compatible and Anthropic providers to an
+  // inclusive input_tokens total before serializing the CLI result.
+  const [input,output,cached,created]=values;
   // Qoder's default serializer masks counters as zero. Never turn those into free requests.
-  if(!Number.isSafeInteger(input)||input+output===0)return {input:0,output:0,cached:0,usageKnown:false};
+  if(cached>input||created>input||cached+created>input||!Number.isSafeInteger(input+output)||input+output===0)return {input:0,output:0,cached:0,usageKnown:false};
   return {input,output,cached,usageKnown:true};
 }
 async function boundedText(response,max=4*1024*1024){
