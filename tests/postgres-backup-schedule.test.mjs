@@ -7,9 +7,9 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {PostgresStore} from '../postgres-store.mjs';
 import {createPrivatePostgres,startOwnedCapacityChild} from '../tools/capacity/owned-runtime.mjs';
 import {createTaskPostgresBackupContext,closePostgresBackupContext,postgresBackupContext} from '../postgres-backup-context.mjs';
-import {verifyPostgresBackup} from '../postgres-backup.mjs';
+import {verifyPostgresBackup,checkpointPostgresBackup,withPostgresBackupCheckpointLock} from '../postgres-backup.mjs';
 import {restorePostgresBackup,inspectPostgresBackupRestore} from '../postgres-backup-restore.mjs';
-import {readManifest,writeManifest} from '../migration-artifacts.mjs';
+import {readManifest,writeManifest,digestFile} from '../migration-artifacts.mjs';
 import {acquireInstance} from '../instance.mjs';
 import {postgresBackupSchedulePolicy,runPostgresBackupScheduleCycle,watchPostgresBackupSchedule} from '../postgres-backup-schedule.mjs';
 
@@ -47,6 +47,30 @@ test('periodic real base/WAL cycle resumes, pins immutable baselines and restore
   const anotherCold=await import('../postgres-backup-schedule.mjs?cold-corrupt');await assert.rejects(anotherCold.runPostgresBackupScheduleCycle(f.context,policy,options));await writeFile(payload,original);
   const saved=await readFile(f.stateFile),names=await readdir(f.directory);await writeFile(f.stateFile,Buffer.from('invalid authenticated state'),{mode:0o600});await assert.rejects(runPostgresBackupScheduleCycle(f.context,policy,options));assert.deepEqual(await readdir(f.directory),names);await writeFile(f.stateFile,saved,{mode:0o600});
   now--;await assert.rejects(runPostgresBackupScheduleCycle(f.context,policy,options),{code:'backup_schedule_clock_reversed'});assert.deepEqual(await readFile(f.stateFile),saved);
+});
+
+test('authenticated application references seal manual checkpoints and rotate the periodic base without a configured pin',real,async t=>{
+ const f=await fixture(t),first=await runPostgresBackupScheduleCycle(f.context,policy),directory=join(f.directory,first.backupId),checkpoint=await readFile(join(directory,'checkpoint.enc')),record=postgresBackupContext(f.context),proof=await verifyPostgresBackup(f.context,first.backupId);
+ const application=join(directory,'application');await mkdir(application,{mode:0o700});
+ const reference={version:1,backupId:first.backupId,configurationDigest:record.configurationDigest,keyVersion:record.keyVersion,pendingBindingDigest:randomBytes(32).toString('hex'),files:{manifestDigest:await digestFile(join(directory,'files.enc'))},materialRoots:[{id:'data',directory:'synthetic-private-data'}],materialKeys:[],checkpointDigest:await digestFile(join(directory,'checkpoint.enc'))};
+ await writeManifest(join(application,'application.enc'),reference,f.key);
+ await assert.rejects(checkpointPostgresBackup(proof),{code:'backup_checkpoint_sealed'});assert.deepEqual(await readFile(join(directory,'checkpoint.enc')),checkpoint);
+ await withPostgresBackupCheckpointLock(f.context,first.backupId,async()=>{await assert.rejects(checkpointPostgresBackup(proof),{code:'backup_operation_busy'});});
+ assert.equal(record.busy,false);await assert.rejects(checkpointPostgresBackup(proof),{code:'backup_checkpoint_sealed'});
+ const second=await runPostgresBackupScheduleCycle(f.context,policy);assert.equal(second.state,'base_and_checkpoint_created');assert.notEqual(second.backupId,first.backupId);assert.deepEqual(await readFile(join(directory,'checkpoint.enc')),checkpoint);
+ // Invalid references must fail before even a due or explicitly pinned cycle
+ // can change its state or create another base.
+ const secondDirectory=join(f.directory,second.backupId),secondApplication=join(secondDirectory,'application');await mkdir(secondApplication,{mode:0o700});
+ const state=await readFile(f.stateFile),before=await readdir(f.directory),secondProof=await verifyPostgresBackup(f.context,second.backupId),secondCheckpoint=await readFile(join(secondDirectory,'checkpoint.enc'));
+ const valid={...reference,backupId:second.backupId,files:{manifestDigest:await digestFile(join(secondDirectory,'files.enc'))},checkpointDigest:await digestFile(join(secondDirectory,'checkpoint.enc'))};
+ for(const [value,code] of [[{...valid,version:2},'backup_checkpoint_reference_invalid'],[{...valid,backupId:first.backupId},'backup_checkpoint_reference_invalid'],[{...valid,checkpointDigest:null},'backup_checkpoint_reference_unbound'],[{...valid,checkpointDigest:{...valid.checkpointDigest,sha256:'0'.repeat(64)}},'backup_checkpoint_reference_changed']]){
+  await writeManifest(join(secondApplication,'application.enc'),value,f.key,{replace:true});
+  await assert.rejects(checkpointPostgresBackup(secondProof),{code});await assert.rejects(runPostgresBackupScheduleCycle(f.context,{...policy,pinnedBackupIds:[second.backupId]}),{code});
+  assert.deepEqual(await readFile(f.stateFile),state);assert.deepEqual(await readdir(f.directory),before);assert.deepEqual(await readFile(join(secondDirectory,'checkpoint.enc')),secondCheckpoint);
+ }
+ await writeFile(join(secondApplication,'application.enc'),Buffer.from('invalid authenticated reference'),{mode:0o600});
+ await assert.rejects(checkpointPostgresBackup(secondProof),{code:'transfer_manifest_authentication_failed'});await assert.rejects(runPostgresBackupScheduleCycle(f.context,policy),{code:'transfer_manifest_authentication_failed'});
+ assert.deepEqual(await readFile(join(secondDirectory,'checkpoint.enc')),secondCheckpoint);assert.deepEqual(await readFile(f.stateFile),state);
 });
 
 test('an interrupted new cycle preserves its UUID and resumes the same authenticated backup',real,async t=>{

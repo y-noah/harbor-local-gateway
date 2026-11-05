@@ -70,7 +70,9 @@ HARBOR_TEST_PG_BIN_DIR=/private/tools/postgresql/18/bin node --test tests/postgr
 
 协调状态加密认证并绑定集群、原备份配置摘要和密钥版本；物理操作前持久化本轮UUID，取消／进程退出后仍沿同一UUID核验续跑。创建目录后、准备日志前退出留下的私有空目录可续跑，缺日志且含未知文件则拒绝。首次成功全备和真实WAL恢复点都完成后才发布活动备份；后续同一进程保留已验证的私有proof，不每5分钟重读整份大备份。进程重新启动后须完整核验活动备份才能复用；集群代次／timeline变化则另建全备，不能继续给旧代次追加恢复点。按本机规范化artifact目录互斥，不支持多主机同时写同一共享备份目录。每周期输出不含凭据的结构化状态，故障退出，由服务管理器按受限策略重试；正常SIGTERM等待本次取消收尾后退出，清理失败不当作正常停止。
 
-已绑定应用材料、接收包或恢复批准的数据库备份必须列入 `pinnedBackupIds`，协调器只会新建替代活动备份，不改其检查点或任何密文；旧手工基线不会被协调器主动接管。该入口仅完成数据库周期，不采集新的应用材料、不重放模型、不删除备份或WAL，始终返回 `applicationMaterialsVerified/restoreVerified/offhostVerified/deploymentAllowed=false` 和 `retentionApplied=false`。应用材料一致快照、引用核验后的保留清理及实际RPO／RTO仍须单独闭环，不能用定时配置值当作恢复承诺。回滚时停止本协调服务并关闭配置，可继续使用原手工CLI；不要删除认证状态来强行重置失败。
+同一备份目录中，原格式的认证 `application/application.enc` 或 `operator-final.enc` 一旦绑定检查点摘要，手工 `checkpoint` 会拒绝覆盖，协调器自动新建替代活动备份；未知格式、未完成的外来引用、认证损坏或摘要不一致均拒绝操作，不能通过手工pin或到期轮转绕过。应用摘要绑定和检查点发布使用同一备份目录锁，保留原pending流程先捕获应用、再建点、最后绑定的顺序。单纯数据库 `restore.enc` 仍保持原语义：后续检查点更新使旧恢复收据失效。
+
+外置应用材料、独立密钥加密包、接收包或恢复批准无法从当前备份目录完整发现，仍必须列入 `pinnedBackupIds`；工具不扫描任意路径或读取其他密钥。旧手工基线不会被协调器主动接管。该入口仅完成数据库周期，不采集新的应用材料、不重放模型、不删除备份或WAL，始终返回 `applicationMaterialsVerified/restoreVerified/offhostVerified/deploymentAllowed=false` 和 `retentionApplied=false`。应用材料一致快照、引用核验后的保留清理及实际RPO／RTO仍须单独闭环，不能用定时配置值当作恢复承诺。回滚时停止本协调服务并关闭配置，可继续使用原手工CLI；不要删除认证状态来强行重置失败。
 
 ## 认证包与无源接收端恢复
 

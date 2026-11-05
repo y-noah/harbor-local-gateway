@@ -4,7 +4,7 @@ import {pipeline} from 'node:stream/promises';
 import {join,resolve,dirname} from 'node:path';
 import {createHash,timingSafeEqual} from 'node:crypto';
 import {postgresBackupContext,verifyPostgresBackupPendingBinding} from './postgres-backup-context.mjs';
-import {postgresBackupRestoreSource} from './postgres-backup.mjs';
+import {postgresBackupRestoreSource,withPostgresBackupCheckpointLock} from './postgres-backup.mjs';
 import {inspectPostgresBackupRestoreSession} from './postgres-backup-restore.mjs';
 import {storageOperatorContext} from './storage-operator-context.mjs';
 import {PostgresStore} from './postgres-store.mjs';
@@ -35,7 +35,9 @@ export async function captureStorageOperatorBackupApplication({context,proof,ope
  }finally{if(!complete&&ownedDirectory)await rm(directory,{recursive:true,force:true});}
 }
 export async function bindStorageOperatorApplicationCheckpoint(context,proof){
+ return withPostgresBackupCheckpointLock(context,proof.backupId,async()=>{
  const {record,plan}=planFor(context);if(plan.proof!==proof)fail('storage_operator_application_binding_mismatch');await verifyPostgresBackupPendingBinding(context);const checkpointDigest=await digestFile(join(record.artifactDirectory,proof.backupId,'checkpoint.enc'));plan.manifest={...plan.manifest,checkpointDigest};await writeManifest(join(plan.directory,'application.enc'),plan.manifest,record.key,{replace:true});plan.checkpointDigest=checkpointDigest;await verifyPostgresBackupPendingBinding(context);return {applicationManifestDigest:await digestFile(join(plan.directory,'application.enc')),filesManifestDigest:plan.manifest.files.manifestDigest,checkpointDigest};
+ });
 }
 export async function restoreStorageOperatorBackupApplication({session,destination,signal}={}){
  const live=inspectPostgresBackupRestoreSession(session),{record,plan}=planFor(live.context);if(live.proof!==plan.proof||!plan.checkpointDigest||!sameDigest(live.checkpointDigest,plan.checkpointDigest))fail('storage_operator_application_checkpoint_mismatch');await verifyPostgresBackupPendingBinding(live.context);

@@ -4,7 +4,7 @@ import {realpath} from 'node:fs/promises';
 import {setTimeout as delay} from 'node:timers/promises';
 import {acquireInstance} from './instance.mjs';
 import {postgresBackupContext,verifyBackupCluster} from './postgres-backup-context.mjs';
-import {createPostgresBaseBackup,verifyPostgresBackup,checkpointPostgresBackup,postgresBackupRestoreSource} from './postgres-backup.mjs';
+import {createPostgresBaseBackup,verifyPostgresBackup,checkpointPostgresBackup,postgresBackupRestoreSource,inspectPostgresBackupCheckpointProtection} from './postgres-backup.mjs';
 import {readManifest,writeManifest,transferError} from './migration-artifacts.mjs';
 
 const fail=code=>{throw transferError(code);},proofCache=new WeakMap();
@@ -46,7 +46,7 @@ export async function runPostgresBackupScheduleCycle(context,configuration,{sign
     if(now()<state.updatedAt)fail('backup_schedule_clock_reversed');
     const same=row=>row&&row.postmasterStart===current.postmaster_start&&row.timeline===current.timeline;
     const save=async()=>{signal?.throwIfAborted();const at=now();if(at<state.updatedAt)fail('backup_schedule_clock_reversed');state.updatedAt=at;validateState(state,record);await writeManifest(file,state,record.key,{replace:true});};
-    const active=state.active,rotate=!same(active)||policy.pinnedBackupIds.includes(active?.backupId)||now()-active.createdAt>=policy.fullIntervalMs;
+    const active=state.active,sealed=active?(await inspectPostgresBackupCheckpointProtection(context,active.backupId,{signal})).sealed:false,rotate=!same(active)||sealed||policy.pinnedBackupIds.includes(active?.backupId)||now()-active.createdAt>=policy.fullIntervalMs;
     let proof,created=false,checkpointCreated=false;
     if(rotate||state.pending){
       if(!same(state.pending)){

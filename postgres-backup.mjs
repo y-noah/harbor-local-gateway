@@ -1,5 +1,5 @@
 import {spawn} from 'node:child_process';
-import {mkdir,readFile,rm,lstat,readdir} from 'node:fs/promises';
+import {mkdir,readFile,rm,lstat,readdir,realpath} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {randomUUID,randomBytes,createHash} from 'node:crypto';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -7,6 +7,7 @@ import {endianness} from 'node:os';
 import {publishWalCheckpointCatalog,walSegmentName} from './postgres-backup-wal-catalog.mjs';
 import {inspectArchivedWal} from './postgres-recovery.mjs';
 import {PostgresStore} from './postgres-store.mjs';
+import {acquireInstance} from './instance.mjs';
 import {postgresBackupContext,verifyBackupCluster} from './postgres-backup-context.mjs';
 import {captureFileSet,writeManifest,readManifest,digestFile,digestOpenedFile,canonical,privateDirectory,transferError} from './migration-artifacts.mjs';
 const proofs=new WeakMap(),children=new WeakMap(),fail=code=>{throw transferError(code);},hash=value=>createHash('sha256').update(canonical(value)).digest('hex');
@@ -77,6 +78,36 @@ export async function createPostgresBaseBackup(context,{backupId=randomUUID(),si
  })();record.pending=operation;try{return await operation;}finally{record.busy=false;record.pending=null;record.cancellation=null;}
 }
 const lsn=value=>{if(typeof value!=='string'||!/^([0-9A-F]+)\/([0-9A-F]+)$/.test(value))fail('backup_lsn_invalid');const [high,low]=value.split('/');return (BigInt('0x'+high)<<32n)+BigInt('0x'+low);};
+export async function withPostgresBackupCheckpointLock(context,backupId,operation){
+ const record=postgresBackupContext(context);validId(backupId);const directory=await realpath(await privateDirectory(join(record.artifactDirectory,backupId)));
+ let lease;try{lease=await acquireInstance(join(directory,'.checkpoint-publication'));}catch(error){if(error.code==='EADDRINUSE')fail('backup_operation_busy');throw error;}
+ try{return await operation();}finally{await lease.release();}
+}
+// Only authenticated references under this backup's managed directory can be
+// discovered here. External bundles still require an explicit scheduler pin.
+export async function inspectPostgresBackupCheckpointProtection(context,backupId,{signal}={}){
+ const record=postgresBackupContext(context);validId(backupId);const directory=join(record.artifactDirectory,backupId);await privateDirectory(directory);let sealed=false;
+ const sameDigest=(a,b)=>a&&b&&a.bytes===b.bytes&&a.sha256===b.sha256;
+ const validDigest=value=>Number.isSafeInteger(value?.bytes)&&value.bytes>=36&&/^[a-f0-9]{64}$/.test(value.sha256??'');
+ for(const [path,application] of [[join(directory,'application'),true],[join(directory,'operator-final.enc'),false]]){
+  let info;try{info=await lstat(path);}catch(error){if(error.code==='ENOENT')continue;throw error;}
+  if(application){await privateDirectory(path);if(!info.isDirectory())fail('backup_checkpoint_reference_invalid');}
+  const reference=await readManifest(application?join(path,'application.enc'):path,record.key,{signal});
+  if(reference?.version!==1||reference.backupId!==backupId||reference.configurationDigest!==record.configurationDigest||application&&reference.keyVersion!==record.keyVersion)fail('backup_checkpoint_reference_invalid');
+  if(application){if(!validDigest(reference.files?.manifestDigest)||!Array.isArray(reference.materialRoots)||!reference.materialRoots.some(root=>root.id==='data')||!Array.isArray(reference.materialKeys)||!/^[a-f0-9]{64}$/.test(reference.pendingBindingDigest??''))fail('backup_checkpoint_reference_invalid');}
+  else if(reference.stage!=='pending-final-copy-and-local-restore'||!validDigest(reference.applicationManifestDigest)||!sameDigest(reference.applicationManifestDigest,await digestFile(join(directory,'application','application.enc'),{signal})))fail('backup_checkpoint_reference_invalid');
+  if(application&&reference.checkpointDigest===null){
+   // The existing pending-final sequence captures files before its first
+   // checkpoint. Only that live private application plan may finish binding it.
+   if(!record.pendingBinding||record.applicationPlan?.backupId!==backupId||reference.pendingBindingDigest!==record.pendingBindingDigest)fail('backup_checkpoint_reference_unbound');
+   continue;
+  }
+  const digest=reference.checkpointDigest;if(!validDigest(digest))fail('backup_checkpoint_reference_invalid');
+  if(!sameDigest(digest,await digestFile(join(directory,'checkpoint.enc'),{signal})))fail('backup_checkpoint_reference_changed');
+  sealed=true;
+ }
+ return {sealed};
+}
 async function checkpointInner(proof,{signal,timeoutMs=30000}={}){
  const owned=proofs.get(proof);if(!owned)fail('backup_proof_required');const {context,metadata}=owned,record=postgresBackupContext(context);const initial=await verifyBackupCluster(context);if(initial.postmaster_start!==metadata.postmasterStart)fail('backup_source_restarted');if(!Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>300000)fail('backup_archive_budget_invalid');
  const store=new PostgresStore({...record.adminOptions,poolSize:1});let point;const restorePoint='harbor_backup_'+proof.backupId.replaceAll('-','')+'_'+randomBytes(6).toString('hex');try{point=await store.get('SELECT pg_create_restore_point($1)::text lsn',restorePoint);await store.get('SELECT pg_switch_wal()');}finally{await store.close();}
@@ -92,5 +123,6 @@ async function checkpointInner(proof,{signal,timeoutMs=30000}={}){
 export function postgresBackupRestoreSource(proof){const source=proofs.get(proof);if(!source)fail('backup_proof_required');return source;}
 export async function checkpointPostgresBackup(proof,{signal,timeoutMs=30000}={}){
  const {context}=postgresBackupRestoreSource(proof),record=postgresBackupContext(context);if(record.closed)fail('backup_context_closed');if(record.busy)fail('backup_operation_busy');record.busy=true;const cancellation=new AbortController();record.cancellation=cancellation;
- const operation=checkpointInner(proof,{signal:AbortSignal.any([signal,cancellation.signal].filter(Boolean)),timeoutMs});record.pending=operation;try{return await operation;}finally{record.busy=false;record.pending=null;record.cancellation=null;}
+ const combined=AbortSignal.any([signal,cancellation.signal].filter(Boolean));
+ const operation=withPostgresBackupCheckpointLock(context,proof.backupId,async()=>{combined.throwIfAborted();if((await inspectPostgresBackupCheckpointProtection(context,proof.backupId,{signal:combined})).sealed)fail('backup_checkpoint_sealed');return checkpointInner(proof,{signal:combined,timeoutMs});});record.pending=operation;try{return await operation;}finally{record.busy=false;record.pending=null;record.cancellation=null;}
 }
