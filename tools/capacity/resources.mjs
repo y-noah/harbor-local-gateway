@@ -5,6 +5,30 @@ import {isOwnedRuntime,ownedProcessProof} from './owned-runtime.mjs';
 import {effectiveQuota,parseCpuSet} from './quota-graph.mjs';
 import {targets} from './scenarios.mjs';
 const observedRoles=new WeakSet();
+export const capacityCpuPeriod=100000;
+const defaultRole=Object.freeze({cpuQuota:4,memoryLimitBytes:8*1024**3});
+const resourceFail=()=>{throw Error('capacity_resource_limits_invalid');};
+export function capacityCpuQuotaUnits(value){const units=Math.round(value*capacityCpuPeriod);if(typeof value!=='number'||!Number.isFinite(value)||!Number.isSafeInteger(units)||units<1000||units/capacityCpuPeriod!==value)resourceFail();return units;}
+// Only one relative IEEE-754 rounding unit is tolerated, never a CPU budget
+// margin. Kernel quota deficits remain much larger than this machine precision.
+export function capacityCpuQuotaAtLeast(actual,expected){return Number.isFinite(actual)&&actual>=0&&Number.isFinite(expected)&&expected>0&&(actual>=expected||expected-actual<=Number.EPSILON*Math.max(Math.abs(actual),Math.abs(expected)));}
+export function normalizeCapacityResourceLimits(value){
+ if(value===undefined)value={gatewayWorker:defaultRole,database:defaultRole};
+ if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!['gatewayWorker','database','processLimits'].includes(key)))resourceFail();
+ const role=input=>{if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).length!==2||!Object.hasOwn(input,'cpuQuota')||!Object.hasOwn(input,'memoryLimitBytes')||!Number.isSafeInteger(input.memoryLimitBytes)||input.memoryLimitBytes<=0)resourceFail();capacityCpuQuotaUnits(input.cpuQuota);return Object.freeze({cpuQuota:input.cpuQuota,memoryLimitBytes:input.memoryLimitBytes});};
+ const gatewayWorker=role(value.gatewayWorker),database=role(value.database);let leaves=value.processLimits;
+ if(leaves!==undefined&&(!leaves||typeof leaves!=='object'||Array.isArray(leaves)||Object.keys(leaves).some(key=>!['gateway','worker','database'].includes(key))||!Object.hasOwn(leaves,'gateway')||!Object.hasOwn(leaves,'worker')))resourceFail();
+ const processLimits=Object.freeze({gateway:role(leaves===undefined?gatewayWorker:leaves.gateway),worker:role(leaves===undefined?gatewayWorker:leaves.worker),database:role(leaves===undefined||!Object.hasOwn(leaves,'database')?database:leaves.database)});
+ for(const [name,leaf] of Object.entries(processLimits)){const parent=name==='database'?database:gatewayWorker;if(leaf.cpuQuota>parent.cpuQuota||leaf.memoryLimitBytes>parent.memoryLimitBytes)resourceFail();}
+ if(!Number.isSafeInteger(gatewayWorker.memoryLimitBytes+database.memoryLimitBytes)||!Number.isSafeInteger(capacityCpuQuotaUnits(gatewayWorker.cpuQuota)+capacityCpuQuotaUnits(database.cpuQuota)))resourceFail();
+ return Object.freeze({gatewayWorker,database,processLimits});
+}
+export function capacityResourceTotals(value){const limits=normalizeCapacityResourceLimits(value);return {cpuQuota:(capacityCpuQuotaUnits(limits.gatewayWorker.cpuQuota)+capacityCpuQuotaUnits(limits.database.cpuQuota))/capacityCpuPeriod,memoryLimitBytes:limits.gatewayWorker.memoryLimitBytes+limits.database.memoryLimitBytes};}
+export function assessCapacityProcessLimits(roles,resourceLimits){
+ const limits=normalizeCapacityResourceLimits(resourceLimits),missing=[];
+ for(const name of ['gatewayWorker','database'])for(const process of roles[name]?.processes??[]){const expected=limits.processLimits[process.role],node=roles[name].nodes?.find(row=>row.identity===process.cgroupIdentity);if(!expected||!node||node.cpuQuota!==expected.cpuQuota||node.memoryLimitBytes!==expected.memoryLimitBytes)missing.push('实际进程叶子配额不匹配:'+process.role);}
+ return missing;
+}
 const text=async path=>{try{return (await readFile(path,'utf8')).trim();}catch{return null;}};
 export async function collectHostEvidence({directory='/tmp',cgroupRoot='/sys/fs/cgroup'}={}){
   const [quota,memory,affinity,fs]=await Promise.all([text(cgroupRoot+'/cpu.max'),text(cgroupRoot+'/memory.max'),text(cgroupRoot+'/cpuset.cpus.effective'),statfs(directory,{bigint:true})]);
@@ -25,24 +49,24 @@ export async function collectCgroupRole(path,{processes=[]}={}){
   for(const entry of checked){if(!entry.proof){mappingVerified=false;continue;}const proof=entry.proof,[membership,status]=await Promise.all([text('/proc/'+proof.pid+'/cgroup'),text('/proc/'+proof.pid+'/status')]),actual=/^0::(.*)$/m.exec(membership??'')?.[1],relative=location.slice(root.length)||'/';if(!actual||!(relative==='/'||actual===relative||actual.startsWith(relative+'/'))){mappingVerified=false;continue;}const actualPath=await realpath(root+actual);if(!(actualPath===location||actualPath.startsWith(location+'/'))){mappingVerified=false;continue;}const measured=await chain(actualPath),affinity=/^Cpus_allowed_list:\s*(.*)$/m.exec(status??'')?.[1];ownedProcessProof(entry.runtime,entry.child);roleProofs.push(Object.freeze({pid:proof.pid,role:proof.role,cgroupIdentity:measured.first.identity,cpuIds:Object.freeze(parseCpuSet(affinity))}));}
   const proof={source:'observed-cgroup',cgroupIdentity:selected.first.identity,cpuQuota:selected.first.cpuQuota,memoryLimitBytes:selected.first.memoryLimitBytes,ancestors:Object.freeze(selected.ancestors),nodes:Object.freeze([...nodes.values()]),processes:Object.freeze(roleProofs),cpuUsageUs:Number(/^usage_usec (\d+)/m.exec(usage??'')?.[1]??NaN),memoryCurrentBytes:/^\d+$/.test(memory??'')?Number(memory):null,processCount:members?members.split('\n').length:0,mappingVerified,processRoles:Object.freeze(roleProofs.map(row=>row.role)),observedAt:Date.now()};Object.freeze(proof);observedRoles.add(proof);return proof;
 }
-export function assessCgroupHierarchy({host,roles={}}={}){
-  const missing=[],names=['gatewayWorker','database'],cpuRequired=8,memoryRequired=16*1024**3;
-  for(const name of names){const role=roles[name];if(!role)continue;for(const parent of role.ancestors??[])if(parent.cpuQuota!==null&&parent.cpuQuota<4||parent.memoryLimitBytes!==null&&parent.memoryLimitBytes<8*1024**3)missing.push('有效祖先配额不足:'+name);}
+export function assessCgroupHierarchy({host,roles={},resourceLimits}={}){
+  const limits=normalizeCapacityResourceLimits(resourceLimits),total=capacityResourceTotals(limits),missing=[],names=['gatewayWorker','database'],cpuRequired=total.cpuQuota,memoryRequired=total.memoryLimitBytes;
+  for(const name of names){const role=roles[name];if(!role)continue;for(const parent of role.ancestors??[])if(parent.cpuQuota!==null&&!capacityCpuQuotaAtLeast(parent.cpuQuota,limits[name].cpuQuota)||parent.memoryLimitBytes!==null&&parent.memoryLimitBytes<limits[name].memoryLimitBytes)missing.push('有效祖先配额不足:'+name);}
   const left=roles.gatewayWorker,right=roles.database;
-  if(left&&right){if((left.ancestors??[]).some(row=>row.identity===right.cgroupIdentity)||(right.ancestors??[]).some(row=>row.identity===left.cgroupIdentity))missing.push('角色cgroup相同或祖孙重叠');const common=(left.ancestors??[]).filter(row=>(right.ancestors??[]).some(other=>other.identity===row.identity));for(const parent of common)if(parent.cpuQuota!==null&&parent.cpuQuota<cpuRequired||parent.memoryLimitBytes!==null&&parent.memoryLimitBytes<memoryRequired)missing.push('共同祖先不足以提供4+4vCPU/8+8GiB');}
-  if(!host||host.cpuLogical<cpuRequired||host.memoryTotal<memoryRequired)missing.push('宿主总容量不足以提供独立资源');
+  if(left&&right){if((left.ancestors??[]).some(row=>row.identity===right.cgroupIdentity)||(right.ancestors??[]).some(row=>row.identity===left.cgroupIdentity))missing.push('角色cgroup相同或祖孙重叠');const common=(left.ancestors??[]).filter(row=>(right.ancestors??[]).some(other=>other.identity===row.identity));for(const parent of common)if(parent.cpuQuota!==null&&!capacityCpuQuotaAtLeast(parent.cpuQuota,cpuRequired)||parent.memoryLimitBytes!==null&&parent.memoryLimitBytes<memoryRequired)missing.push('共同祖先不足以提供声明的角色合计配额');}
+  if(!host||!capacityCpuQuotaAtLeast(host.cpuLogical,cpuRequired)||host.memoryTotal<memoryRequired)missing.push('宿主总容量不足以提供独立资源');
   const current=(left?.memoryCurrentBytes??0)+(right?.memoryCurrentBytes??0);if(!Number.isFinite(host?.memoryAvailable)||host.memoryAvailable+current<memoryRequired*targets.memoryFraction)missing.push('宿主可用内存及角色现有用量不足以覆盖正常80%预算');
   return missing;
 }
-export function resourcePreflight({host,roles={},dataset={},protocol={},operations=[]}={}){
-  const missing=[];for(const role of ['gatewayWorker','database']){const proof=roles[role];if(!proof||!observedRoles.has(proof)||proof.source!=='observed-cgroup'||!proof.cgroupIdentity||proof.cpuQuota!==4||proof.memoryLimitBytes!==8*1024**3||!proof.mappingVerified||!proof.processRoles?.includes(role==='database'?'database':'gateway')||role==='gatewayWorker'&&!proof.processRoles?.includes('worker'))missing.push('缺少'+role+'独立4vCPU/8GiB实测配额证据');}
-  missing.push(...assessCgroupHierarchy({host,roles}));
-  try{for(const name of ['gatewayWorker','database']){const quota=effectiveQuota({nodes:roles[name]?.nodes,processes:roles[name]?.processes,host});if(quota.cpuQuota<4||quota.memoryLimitBytes<8*1024**3)missing.push('实际进程子组/CPU亲和性资源不足:'+name);}const merged=new Map();for(const role of Object.values(roles))for(const node of role.nodes??[]){if(merged.has(node.identity)&&JSON.stringify(merged.get(node.identity))!==JSON.stringify(node))throw new Error('capacity_resource_graph_inconsistent');merged.set(node.identity,node);}const quota=effectiveQuota({nodes:[...merged.values()],processes:Object.values(roles).flatMap(role=>role.processes??[]),host});if(quota.cpuQuota<8||quota.memoryLimitBytes<16*1024**3)missing.push('实际进程资源共享后不足独立4+4vCPU/8+8GiB');}catch{missing.push('缺实际进程完整cgroup/CPU亲和性证据');}
+export function resourcePreflight({host,roles={},dataset={},protocol={},operations=[],resourceLimits}={}){
+  const limits=normalizeCapacityResourceLimits(resourceLimits),total=capacityResourceTotals(limits),missing=[];for(const role of ['gatewayWorker','database']){const proof=roles[role];if(!proof||!observedRoles.has(proof)||proof.source!=='observed-cgroup'||!proof.cgroupIdentity||proof.cpuQuota!==limits[role].cpuQuota||proof.memoryLimitBytes!==limits[role].memoryLimitBytes||!proof.mappingVerified||!proof.processRoles?.includes(role==='database'?'database':'gateway')||role==='gatewayWorker'&&!proof.processRoles?.includes('worker'))missing.push('缺少'+role+'声明配额的独立实测证据');}
+  missing.push(...assessCgroupHierarchy({host,roles,resourceLimits:limits}),...assessCapacityProcessLimits(roles,limits));
+  try{for(const name of ['gatewayWorker','database']){const quota=effectiveQuota({nodes:roles[name]?.nodes,processes:roles[name]?.processes,host});if(!capacityCpuQuotaAtLeast(quota.cpuQuota,limits[name].cpuQuota)||quota.memoryLimitBytes<limits[name].memoryLimitBytes)missing.push('实际进程子组/CPU亲和性资源不足:'+name);}const merged=new Map();for(const role of Object.values(roles))for(const node of role.nodes??[]){if(merged.has(node.identity)&&JSON.stringify(merged.get(node.identity))!==JSON.stringify(node))throw new Error('capacity_resource_graph_inconsistent');merged.set(node.identity,node);}const quota=effectiveQuota({nodes:[...merged.values()],processes:Object.values(roles).flatMap(role=>role.processes??[]),host});if(!capacityCpuQuotaAtLeast(quota.cpuQuota,total.cpuQuota)||quota.memoryLimitBytes<total.memoryLimitBytes)missing.push('实际进程资源共享后不足声明的角色合计配额');}catch{missing.push('缺实际进程完整cgroup/CPU亲和性证据');}
 
   if(!host||!/^v24\./.test(host.node??''))missing.push('未验证与交付一致的Node版本');if(!dataset.verified||dataset.metadata7d<targets.metadata7d||dataset.metadata30d<targets.metadata30d||!dataset.bodyRequests||!dataset.bodyBytes||!dataset.bodyDistributionVerified||!dataset.formalBodyFootprintVerified)missing.push('正式数据量或正文分布未验证');
   for(const key of ['tls','deviceEnforced','realHelper','proxyPreserved','metering','recording','worker','backgroundJobs','indexVersionVerified','databaseVersionVerified','loadClientLanBaseline'])if(protocol[key]!==true)missing.push('入口/功能证据缺失:'+key);
   for(const operation of operations)if(!operation.method||!operation.path||operation.path.includes('{'))missing.push('实际API尚未绑定:'+operation.id);
-  return {eligible:missing.length===0,status:missing.length?'blocked':'ready',missing,host,roles,dataset,protocol};
+  return {eligible:missing.length===0,status:missing.length?'blocked':'ready',missing,host,roles,dataset,protocol,resourceLimits:limits};
 }
 export async function collectDatabaseEvidence(store){
   return store.transaction(async()=>{

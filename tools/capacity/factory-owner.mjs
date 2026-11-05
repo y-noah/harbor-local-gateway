@@ -7,18 +7,19 @@ import {capacityPlan} from './scenarios.mjs';
 import {capacityRunLifetime,capacityRunBudget} from './certificate-lifetime.mjs';
 import {uiAcceptancePlan} from './ui-acceptance.mjs';
 import {verifyDataset} from './dataset.mjs';
+import {normalizeCapacityResourceLimits} from './resources.mjs';
 
 const invalid=()=>{throw Error('capacity_factory_owner_configuration');};
 const safeKeys=(value,allowed)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(key=>allowed.includes(key));
 export function validateCapacityFactoryJob(job){
- if(!safeKeys(job,['target','execution'])||!safeKeys(job.target,['profile','purpose','binDirectory','libraryDirectory','storageRoot','runLifetimeMs','windowsHelper','employeeCount','resourceDelegatedRoot','diskBudget'])||!safeKeys(job.execution??{},['executeLong','browserLauncher','uiMaxDurationMs','apiMaxDurationMs']))invalid();
- const {target,execution={}}=job;capacityPlan(target.profile??'selfcheck');if(!['run','seed','verify'].includes(target.purpose??'run'))invalid();
+ if(!safeKeys(job,['target','execution'])||!safeKeys(job.target,['profile','purpose','binDirectory','libraryDirectory','storageRoot','runLifetimeMs','windowsHelper','employeeCount','resourceDelegatedRoot','diskBudget','resourceLimits'])||!safeKeys(job.execution??{},['executeLong','browserLauncher','uiMaxDurationMs','apiMaxDurationMs']))invalid();
+ const {target,execution={}}=job;if(target.resourceLimits!==undefined){normalizeCapacityResourceLimits(target.resourceLimits);if(target.resourceDelegatedRoot===undefined)throw Error('capacity_resource_delegation_required');}capacityPlan(target.profile??'selfcheck');if(!['run','seed','verify'].includes(target.purpose??'run'))invalid();
  for(const key of ['binDirectory','libraryDirectory','storageRoot','resourceDelegatedRoot'])if(target[key]!==undefined&&(typeof target[key]!=='string'||!isAbsolute(target[key])))invalid();
  if(execution.browserLauncher!==undefined&&(typeof execution.browserLauncher!=='string'||!isAbsolute(execution.browserLauncher)))invalid();
  if(execution.executeLong!==undefined&&typeof execution.executeLong!=='boolean')invalid();
  const formal=target.profile==='formal',run=(target.purpose??'run')==='run';if(formal&&run&&execution.executeLong!==true)throw Error('capacity_formal_execution_not_authorized');
  capacityRunLifetime(target.runLifetimeMs,{required:formal&&run});if(run){if(formal&&!execution.browserLauncher)throw Error('capacity_browser_launcher_required');apiCoverageDuration(execution.apiMaxDurationMs,{required:formal});if(execution.browserLauncher)uiAcceptancePlan({profile:target.profile??'selfcheck',maxDurationMs:execution.uiMaxDurationMs});capacityRunBudget({plan:capacityPlan(target.profile??'selfcheck'),runLifetimeMs:target.runLifetimeMs,apiMaxDurationMs:execution.apiMaxDurationMs,uiMaxDurationMs:execution.browserLauncher?execution.uiMaxDurationMs:undefined});}
- return structuredClone(job);
+ const validated=structuredClone(job);if(target.resourceLimits!==undefined)validated.target.resourceLimits=normalizeCapacityResourceLimits(validated.target.resourceLimits);return validated;
 }
 async function processIdentity(pid){const raw=await readFile('/proc/'+pid+'/stat','utf8'),fields=raw.slice(raw.lastIndexOf(')')+2).split(' ');return {parent:Number(fields[1]),state:fields[0],started:fields[19]};}
 
@@ -39,7 +40,7 @@ export async function createInnerCapacityFactoryJob(input,signal,progress=()=>{}
   run:()=>{
    if(running||closed)throw Error('capacity_factory_job_already_used');phase='running';running=(async()=>{
     let result;try{
-     controller.signal.throwIfAborted();if(job.target.resourceDelegatedRoot){const {createCapacityResourceAllocator}=await import('./resource-allocator.mjs');allocator=await createCapacityResourceAllocator({delegatedRoot:job.target.resourceDelegatedRoot});}
+     controller.signal.throwIfAborted();if(job.target.resourceDelegatedRoot){const {createCapacityResourceAllocator}=await import('./resource-allocator.mjs');allocator=await createCapacityResourceAllocator({delegatedRoot:job.target.resourceDelegatedRoot,resourceLimits:job.target.resourceLimits});}
      let launchBrowser;const execution=job.execution??{};if(execution.browserLauncher){const module=await import(pathToFileURL(execution.browserLauncher).href);if(typeof module.launchBrowser!=='function')throw Error('capacity_browser_launcher_invalid');launchBrowser=module.launchBrowser;}
      const {resourceDelegatedRoot,...configuration}=job.target;target=await createTarget({...configuration,signal:controller.signal,resourceAllocator:allocator,ownerAuthority,onAllocation:async()=>{if(job.target.binDirectory)pgExecutable=await stat(join(job.target.binDirectory,'postgres'));},onProgress:event=>{controller.signal.throwIfAborted();reportProgress(event);}});
      if((job.target.purpose??'run')==='run')result=await runCapacityExecution({plan:target.plan,target,preflight:target.preflight,signal:controller.signal,executeLong:execution.executeLong,launchBrowser,uiMaxDurationMs:execution.uiMaxDurationMs,apiMaxDurationMs:execution.apiMaxDurationMs,runLifetimeMs:job.target.runLifetimeMs});

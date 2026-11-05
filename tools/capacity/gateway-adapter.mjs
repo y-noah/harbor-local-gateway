@@ -26,7 +26,7 @@ import {inspectCapacityTopologyPrerequisites} from './formal-topology-owner.mjs'
 import {createCapacityResourceAssessment} from './resource-assessment.mjs';
 import {inspectCapacityPublicEntryLease} from './formal-proxy-proof.mjs';
 import {inspectCapacityNetworkLease} from './formal-lan-proof.mjs';
-import {collectHostEvidence,resourcePreflight} from './resources.mjs';
+import {collectHostEvidence,resourcePreflight,normalizeCapacityResourceLimits} from './resources.mjs';
 import {createControlledUpstream,isOwnedUpstream} from './controlled-upstream.mjs';
 import {enrollCapacityDevice,enrollCapacityWindowsDevice} from './device-adapter.mjs';
 import {summarizeCapacityCoverage,capacityLiveWindow} from './coverage-adapter.mjs';
@@ -105,9 +105,13 @@ export function preflightCapacityTarget({profile='selfcheck',purpose='run'}={}){
 // A read-only preparation check. Allocator readiness before its children exist
 // is distinct from their required, later, observed role membership.
 export async function inspectCapacityTargetPrerequisites(options={}){return inspectTargetPrerequisites(options,datasetManifest({profile:options.profile??'formal'}));}
-async function inspectTargetPrerequisites({profile='formal',purpose='run',resourceAllocator,storageRoot,diskBudget,ownerAuthority}={},manifest){
- const baseline=preflightCapacityTarget({profile,purpose});if(profile==='selfcheck')return baseline;
- const missing=[],evidence={};
+function targetResourceLimits(resourceAllocator,declared){
+ const owned=isOwnedCapacityResourceAllocator(resourceAllocator),limits=normalizeCapacityResourceLimits(declared===undefined&&owned?resourceAllocator.limits:declared);
+ if(owned&&JSON.stringify(limits)!==JSON.stringify(resourceAllocator.limits))throw Error('capacity_resource_limits_mismatch');return limits;
+}
+async function inspectTargetPrerequisites({profile='formal',purpose='run',resourceAllocator,storageRoot,diskBudget,ownerAuthority,resourceLimits}={},manifest){
+ const limits=targetResourceLimits(resourceAllocator,resourceLimits),baseline=preflightCapacityTarget({profile,purpose});if(profile==='selfcheck')return {...baseline,resourceLimits:limits};
+ const missing=[],evidence={resourceLimits:limits};
  const ownedFactory=isOwnedCapacityFactoryOwnerAuthority(ownerAuthority);evidence.factoryOwner={scope:'private-native-factory-authority',owned:ownedFactory};if(!ownedFactory)missing.push('owned_formal_factory_owner');
  if(!isOwnedCapacityResourceAllocator(resourceAllocator))missing.push('owned_formal_resource_allocator');
  else try{const observed=await resourceAllocator.observe();evidence.allocation=observed;const pending=new Set(['owned_role_process_missing:database','owned_role_process_missing:gatewayWorker','owned_role_effective_quota_unknown:database','owned_role_effective_quota_unknown:gatewayWorker','owned_combined_effective_quota_unknown']);missing.push(...observed.missing.filter(code=>!pending.has(code)));}catch{missing.push('owned_formal_resource_allocator_unavailable');}
@@ -125,16 +129,18 @@ async function inspectTargetPrerequisites({profile='formal',purpose='run',resour
 }
 
 // The target owns a new cluster and all children; it accepts no external DB URL.
-export async function createTarget({profile='selfcheck',coverageVariants=profile==='formal'?'expanded':'steady',binDirectory,libraryDirectory,employeeCount=profile==='formal'?60:2,signal,onProgress=async()=>{},maxEvents=10000,maxLedgerDiskBytes=64*1024*1024,ledgerCheckpointPages=128,maxActiveMetadata=10000,windowsHelper=false,recordingEnabled=true,purpose='run',seedReadyTimeoutMs=profile==='formal'?600000:60000,onSetup=async()=>{},recovery=false,resourceAllocator,storageRoot,diskBudget,clientDriver='native',driverBrowser,runLifetimeMs,ownerAuthority,onAllocation=async()=>{},onRestoreDiagnostic}={}){
+export async function createTarget({profile='selfcheck',coverageVariants=profile==='formal'?'expanded':'steady',binDirectory,libraryDirectory,employeeCount=profile==='formal'?60:2,signal,onProgress=async()=>{},maxEvents=10000,maxLedgerDiskBytes=64*1024*1024,ledgerCheckpointPages=128,maxActiveMetadata=10000,windowsHelper=false,recordingEnabled=true,purpose='run',seedReadyTimeoutMs=profile==='formal'?600000:60000,onSetup=async()=>{},recovery=false,resourceAllocator,resourceLimits,storageRoot,diskBudget,clientDriver='native',driverBrowser,runLifetimeMs,ownerAuthority,onAllocation=async()=>{},onRestoreDiagnostic}={}){
   if(!['steady','expanded'].includes(coverageVariants)||profile==='formal'&&coverageVariants!=='expanded'||!['formal','selfcheck'].includes(profile)||!['run','seed','verify'].includes(purpose)||typeof windowsHelper!=='boolean'||typeof recordingEnabled!=='boolean'||profile==='formal'&&!recordingEnabled||typeof recovery!=='boolean'||recovery&&purpose!=='run'||!Number.isSafeInteger(seedReadyTimeoutMs)||seedReadyTimeoutMs<1000||seedReadyTimeoutMs>86400000||!Number.isInteger(employeeCount)||employeeCount<1||employeeCount>60||profile==='formal'&&employeeCount!==60||!Number.isSafeInteger(maxEvents)||maxEvents<1||!Number.isSafeInteger(maxLedgerDiskBytes)||maxLedgerDiskBytes<262144||!Number.isInteger(ledgerCheckpointPages)||ledgerCheckpointPages<1||ledgerCheckpointPages>4096||!Number.isSafeInteger(maxActiveMetadata)||maxActiveMetadata<1)throw new Error('capacity_adapter_configuration');
   if(driverBrowser!==undefined&&driverBrowser!==null&&(clientDriver!=='local'||typeof driverBrowser!=='object'||Array.isArray(driverBrowser)||Object.keys(driverBrowser).some(key=>!['module','binary'].includes(key))||!isAbsolute(driverBrowser.module??'')||!isAbsolute(driverBrowser.binary??'')))throw Error('capacity_driver_browser_configuration');
   if(!['native','local'].includes(clientDriver)||clientDriver==='local'&&windowsHelper)throw Error('capacity_client_driver_configuration');
   if(resourceAllocator!==undefined&&!isOwnedCapacityResourceAllocator(resourceAllocator))throw Error('capacity_resource_allocator_not_owned');
+  if(resourceLimits!==undefined&&resourceAllocator===undefined)throw Error('capacity_resource_allocator_required');
+  resourceLimits=targetResourceLimits(resourceAllocator,resourceLimits);
   if(typeof onAllocation!=='function'||ownerAuthority!==undefined&&!isOwnedCapacityFactoryOwnerAuthority(ownerAuthority))throw Error('capacity_factory_owner_not_owned');
   const runLifetime=createCapacityCertificateLifetime({runLifetimeMs,signal});signal=runLifetime.signal;
   const manifest=Object.freeze(datasetManifest({profile}));let root;
   try{
-    const preparation=await inspectTargetPrerequisites({profile,purpose,resourceAllocator,storageRoot,diskBudget,ownerAuthority},manifest);if(!preparation.eligible){const error=new Error('capacity_formal_adapter_incomplete');error.preflight=preparation;throw error;}
+    const preparation=await inspectTargetPrerequisites({profile,purpose,resourceAllocator,storageRoot,diskBudget,ownerAuthority,resourceLimits},manifest);if(!preparation.eligible){const error=new Error('capacity_formal_adapter_incomplete');error.preflight=preparation;throw error;}
     capacityRunLifetime(runLifetimeMs,{required:profile==='formal'&&purpose==='run'});signal.throwIfAborted();await onAllocation();signal.throwIfAborted();
     root=await mkdtemp(join(await capacityStorageDirectory(storageRoot),'harbor-capacity-gateway-'));
   }catch(error){runLifetime.dispose();throw error;}
@@ -212,7 +218,7 @@ export async function createTarget({profile='selfcheck',coverageVariants=profile
     const helper=windowsHelper?await factoryContext.helperExecutable():null;
     for(const [index,actor] of actors.slice(0,employeeCount).entries()){const enrolled=await auxiliary(bootstrapScope,()=>(windowsHelper?enrollCapacityWindowsDevice:enrollCapacityDevice)({directory:root,origin,ca:certificates.ca,adminHeaders:adminActors[0].headers,adminAgent,actor,signal,runtime:lab.runtime,helper,registerCleanup:cleanup=>deviceCleanups.push(cleanup),onCertificate:registerDeviceCertificate,...(windowsHelper?{observeDelivery:true,onDeliveryEvent:event=>stageFactory.observeHelper({actorIndex:index,event})}:{}),...(requestDriver&&profile!=='formal'?{createDriverAgent:plan=>requestDriver.addAgent({...plan,id:'model-'+index})}:{})}));if(windowsHelper)stageFactory.registerHelper({actorIndex:index,actor:enrolled});employeeActors.push(enrolled);}
     privateEmployees.push(...employeeActors.map(actor=>Object.freeze({...actor,headers:Object.freeze({...actor.headers})})));privateAdministrators.push(...adminActors.map(actor=>Object.freeze({...actor,headers:Object.freeze({...actor.headers})})));
-    await factoryContext.finalize({gateway,worker,configuration,certificates,helperActors:employeeActors});if(profile==='formal'){resourceAssessment=await createCapacityResourceAssessment({laboratory:lab,store:database.store,manifest,hooks:{processes:()=>({gateway,worker}),getNetworkBaselineProof:()=>factoryContext.topologyHandles()?.networkBaseline}});await resourceAssessment.sample();resourceAssessment.start();}await onProgress({kind:'final-runtime-ready',manifestHash:manifest.manifestHash});
+    await factoryContext.finalize({gateway,worker,configuration,certificates,helperActors:employeeActors});if(profile==='formal'){resourceAssessment=await createCapacityResourceAssessment({laboratory:lab,store:database.store,manifest,resourceLimits,hooks:{processes:()=>({gateway,worker}),getNetworkBaselineProof:()=>factoryContext.topologyHandles()?.networkBaseline}});await resourceAssessment.sample();resourceAssessment.start();}await onProgress({kind:'final-runtime-ready',manifestHash:manifest.manifestHash});
     let business,candidateSetupScope,directCoverageCleanup=null;const candidateSlots=[];
     const coverageFactory=createCapacityCoverageFactory({getBusiness:()=>business,getAdminActors:()=>privateAdministrators,getCandidateActors:()=>privateCandidates,getNormalActorCount:()=>privateEmployees.length,ownsScope:scope=>factoryScopes.has(scope),runOwnedOperation:(...args)=>observations.runOwnedOperation(...args),runAuxiliary:(...args)=>observations.runAuxiliary(...args),validateOwnedOperation:(...args)=>observations.assertOwnedOperation(...args),readHandlerWitness:trace=>ledgerRoot.readHandlerWitness?.(trace)??{passed:null,settled:null,reasonCodes:['handler_witness_not_connected']},readTrace:trace=>ledgerRoot.readTrace(trace),readTraceEvidence:trace=>ledgerRoot.readTraceEvidence(trace),store:database.store,isOpen:()=>!closed&&!closing,prepareCandidates:async({signal:requestSignal})=>{
       candidateSetupScope??=await observations.createAuxiliaryScope({id:'api-coverage-setup'});
@@ -285,7 +291,7 @@ export async function createTarget({profile='selfcheck',coverageVariants=profile
     }
     const faultAdapter=createOwnedFaultAdapter({runtime:lab.runtime,laboratory:lab,worker:trustedWorkerChild,gateway:trustedGatewayChild,databaseProxy:lab.proxy,upstream});target.faults=faultAdapter;
     const protocol={tls:true,deviceEnforced:true,realHelper:employeeActors.every(actor=>actor.realHelper),proxyPreserved:currentTopology().proxyPreserved,metering:true,recording:recordingEnabled,worker:true};
-    const blueprint=capacityPlan(profile),plan={...blueprint,operations:blueprint.operations.map(operation=>{const binding=business.inventory.bindings.get(operation.id);return binding?{...operation,method:binding.method,path:binding.path,workloadClass:binding.workloadClass,canonicalHttp:binding.canonicalHttp,purposeBudget:binding.purposeBudget,apiBudget:binding.apiBudget,...binding.apiBudget}:operation;})},preflight=resourcePreflight({host:await collectHostEvidence({directory:storageRoot??tmpdir()}),dataset,protocol,operations:plan.operations});
+    const blueprint=capacityPlan(profile),plan={...blueprint,operations:blueprint.operations.map(operation=>{const binding=business.inventory.bindings.get(operation.id);return binding?{...operation,method:binding.method,path:binding.path,workloadClass:binding.workloadClass,canonicalHttp:binding.canonicalHttp,purposeBudget:binding.purposeBudget,apiBudget:binding.apiBudget,...binding.apiBudget}:operation;})},preflight=resourcePreflight({host:await collectHostEvidence({directory:storageRoot??tmpdir()}),dataset,protocol,resourceLimits,operations:plan.operations});
     runLifetime.assertCoverage();
     owned={...target,plan,preflight,target,manifest,dataset,certificateAuthority:certificates.ca,store:database.store,datasetStore:database.store,datasetManifest:manifest,recordingKey,laboratory:lab,gateway,worker,upstream,events,close};Object.defineProperty(owned,'events',{get:()=>Object.freeze(events.map(event=>Object.freeze({...event}))),enumerable:true});Object.defineProperty(owned,'eventCounts',{get:eventCounts,enumerable:true});return await issueTarget();
   }catch(error){try{await close();}catch{const cleanupError=new Error('capacity_adapter_cleanup_failed');cleanupError.cleanup=close;cleanupError.recoveryDirectory=stageArtifact??ledgerDirectory;throw cleanupError;}throw error;}
