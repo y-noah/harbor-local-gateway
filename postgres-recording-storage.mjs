@@ -52,7 +52,20 @@ export function createRecordingStorageMonitor(store,{pgDataDir,appPaths,probe,mo
 export async function recordingCaptureDecision(enabled,policy=()=>true){
  if(!enabled)return {enabled:false,reason:'capture_disabled'};try{const value=await policy();if(value===true||value?.captureAllowed===true)return {enabled:true,reason:null};return {enabled:false,reason:value?.status==='low'?'storage_low':'storage_unknown'};}catch{return {enabled:false,reason:'storage_unknown'};}
 }
-export function recordingPolicyBuffer(buffer,monitor){return {directory:buffer.directory,start:(...args)=>monitor.captureAllowed()?buffer.start(...args):false,append:(...args)=>monitor.captureAllowed()?buffer.append(...args):false,finish:(...args)=>buffer.finish(...args)};}
+// Each call carries its own server-side decision; concurrent captures never
+// infer the cause from a shared last-rejection property.
+export function recordingPolicyBuffer(buffer,monitor){
+ const write=(method,args)=>{const snapshot=monitor.snapshot();if(!snapshot.captureAllowed)return Object.freeze({accepted:false,reason:snapshot.status==='low'?'storage_low':'storage_unknown'});const accepted=!!buffer[method](...args);return Object.freeze({accepted,reason:accepted?null:'queue_limit'});};
+ return {directory:buffer.directory,startResult:(...args)=>write('start',args),appendResult:(...args)=>write('append',args),start:(...args)=>write('start',args).accepted,append:(...args)=>write('append',args).accepted,finish:(...args)=>buffer.finish(...args)};
+}
+export function recordingBufferWrite(buffer,method,...args){
+ const result=typeof buffer[method+'Result']==='function'?buffer[method+'Result'](...args):{accepted:!!buffer[method](...args),reason:'queue_limit'},accepted=result?.accepted===true;
+ return {accepted,reason:accepted?null:['storage_low','storage_unknown','queue_limit'].includes(result?.reason)?result.reason:'capture_failed'};
+}
+// The primary reason is readable by old gateways replaying encrypted spool.
+// Only the new repository interprets this optional fixed server-generated cause.
+export function recordingFinishReason(reason){return ['storage_low','storage_unknown'].includes(reason)?{reason:'capture_failed',storageReason:reason}:{reason};}
+
 export function recordingStorageConfiguration(value={},env={}){return {...value,mode:value.mode??env.HARBOR_RECORDING_STORAGE_MODE??'local',reportKeyFile:value.reportKeyFile??env.HARBOR_RECORDING_STORAGE_REPORT_KEY_FILE,pgDataDir:value.pgDataDir??env.HARBOR_RECORDING_PG_DATA_DIR,minFreeBytes:value.minFreeBytes??(env.HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES===undefined?undefined:Number(env.HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES)),minFreeRatio:value.minFreeRatio??(env.HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO===undefined?undefined:Number(env.HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO))};}
 
 // Apply after pg URL normalization; a connection string cannot override this budget.

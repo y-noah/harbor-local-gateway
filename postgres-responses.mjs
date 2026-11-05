@@ -3,7 +3,7 @@ import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
 import {createPostgresTypeStatisticsAdmin} from './postgres-type-statistics-admin.mjs';
 import {createPostgresRecordingJobs} from './postgres-recording-jobs.mjs';
 import {createPostgresRecordingAdmin} from './postgres-recording-admin.mjs';
-import {recordingCaptureDecision} from './postgres-recording-storage.mjs';
+import {recordingCaptureDecision,recordingBufferWrite,recordingFinishReason} from './postgres-recording-storage.mjs';
 import {createPostgresPlatformService} from './postgres-platform-service.mjs';
 import {createPostgresChatService} from './postgres-chat-service.mjs';
 import {createPostgresDeviceAccess} from './postgres-device-access.mjs';
@@ -173,9 +173,10 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     if(active.size>=maxConcurrent||(members.get(member.id)||0)>=maxPerMember)throw new AppError(429,'请求并发已满，请稍后重试','gateway_busy');
     const controller=new AbortController();active.add(controller);members.set(member.id,(members.get(member.id)||0)+1);stage.emit('lease',{lease:'member',action:'acquire'});const observeCancel=()=>stage.emit('cancel');controller.signal.addEventListener('abort',observeCancel,{once:true});
     const close=()=>{if(!res.writableEnded)controller.abort();};res.on('close',close);
-    let output,ticket,releasePreparation,releaseExecution,requestId,routedAccount,contextReplayable=false,contextComplete=false,contextSaved=false,accountTracked=false,capture,batch=[],batchBytes=0,flushTimer,recordFailed=false,recordFailureReason='queue_limit',recordStarted=false,settlementAttempted=false,dispatched=false,extraBoundary;
-    const record=operation=>{try{return operation();}catch{capture=undefined;recordFailed=true;recordFailureReason='capture_failed';return undefined;}};
-    const flush=()=>{if(!batch.length)return;const events=batch;batch=[];batchBytes=0;if(recordStarted&&!record(()=>buffer.append(requestId,events)))recordFailed=true;};
+    let output,ticket,releasePreparation,releaseExecution,requestId,routedAccount,contextReplayable=false,contextComplete=false,contextSaved=false,accountTracked=false,capture,batch=[],batchBytes=0,flushTimer,recordFailed=false,recordFailureReason=null,recordStarted=false,settlementAttempted=false,dispatched=false,extraBoundary;
+    const record=operation=>{try{return operation();}catch{capture=undefined;recordFailed=true;recordFailureReason??='capture_failed';return undefined;}};
+    const writeRecording=(method,...args)=>record(()=>{const result=recordingBufferWrite(buffer,method,...args);if(!result.accepted){recordFailed=true;recordFailureReason??=result.reason;}return result.accepted;});
+    const flush=()=>{if(!batch.length)return;const events=batch;batch=[];batchBytes=0;if(recordStarted&&!writeRecording('append',requestId,events))recordFailed=true;};
     const ensureConnected=()=>{if(controller.signal.aborted||res.destroyed)throw controller.signal.reason instanceof AppError?controller.signal.reason:new AppError(499,'客户端已断开','request_cancelled');};
     const settle=async result=>{
       settlementAttempted=true;const at=clock();
@@ -242,7 +243,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       releasePreparation();releasePreparation=null;
       if(!identified.session)await ticket.bind(route.session.id);
       const current=captureEnabled?record(()=>jsonPath?{state:'known'}:currentInput(payload)):null;
-      if(captureEnabled){recordStarted=current?!!record(()=>buffer.start(requestId,current.state)):false;if(!recordStarted)recordFailed=true;}
+      if(captureEnabled){recordStarted=current?!!writeRecording('start',requestId,current.state):false;if(!recordStarted)recordFailed=true;}
       if(captureEnabled&&recordStarted){
         capture=record(()=>new ConversationCapture({emit:event=>{
           const bytes=Buffer.byteLength(JSON.stringify(event));if(batch.length>=128||batchBytes+bytes>64*1024)flush();
@@ -264,7 +265,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(!jsonPath){contextComplete=true;if(!replayableResponsesEvent({type:'response.completed',response:result.response}))contextReplayable=false;}
       if(jsonPath)record(()=>{if(capture)captureCodexJsonOutput(capture,jsonPath,result.response);});
       const recordingResult=record(()=>capture?.finish(jsonPath?undefined:result.response));flush();
-      if(recordStarted&&!record(()=>buffer.finish(requestId,{state:recordFailed||recordingResult?.failed?'partial':recordingResult?.truncated?'truncated':'complete',reason:recordFailed||recordingResult?.failed?recordFailureReason:recordingResult?.truncated?'size_limit':null})))recordFailed=true;
+      if(recordStarted&&!writeRecording('finish',requestId,{state:recordFailed||recordingResult?.failed?'partial':recordingResult?.truncated?'truncated':'complete',...recordingFinishReason(recordFailed||recordingResult?.failed?recordFailureReason??'capture_failed':recordingResult?.truncated?'size_limit':null)}))recordFailed=true;
       // A failure after dispatch must not cause a second model call.
       const settled=await settle(result);
       await deviceAccess.markVerified(requestId).catch(()=>{});
@@ -276,7 +277,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(requestId){
         if(onRouteFailure&&routedAccount&&error.routeFailure){try{await onRouteFailure(routedAccount,error.routeFailure);}catch{}}
         record(()=>capture?.finish());flush();
-        if(recordStarted&&!record(()=>buffer.finish(requestId,{state:'partial',reason:recordFailed?recordFailureReason:controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted'})))recordFailed=true;
+        if(recordStarted&&!writeRecording('finish',requestId,{state:'partial',...recordingFinishReason(recordFailed?recordFailureReason??'capture_failed':controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted')}))recordFailed=true;
         if(!settlementAttempted)await settle({...error,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':controller.signal.aborted?'cancelled':error.status&&error.status<500?'rejected':'failed',usageKnown:!dispatched||!extraBoundary?.status().uncertain&&error.usageKnown===true}).catch(()=>{});
         await saveContext();
       }
@@ -286,7 +287,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       releasePreparation?.();
       if(flushTimer)clearInterval(flushTimer);
       if(requestId&&!contextSaved)await saveContext();
-      if(requestId&&captureEnabled&&(!recordStarted||recordFailed))await store.run("UPDATE harbor.requests SET recording_state='partial',recording_reason=$2 WHERE id=$1 AND recording_state IN ('disabled','pending','complete')",requestId,recordFailureReason).catch(()=>{});
+      if(requestId&&captureEnabled&&(!recordStarted||recordFailed))await store.run("UPDATE harbor.requests SET recording_state='partial',recording_reason=$2 WHERE id=$1 AND recording_state IN ('disabled','pending','complete')",requestId,recordFailureReason??'capture_failed').catch(()=>{});
       if(accountTracked){const n=accounts.get(routedAccount.id)-1;if(n)accounts.set(routedAccount.id,n);else accounts.delete(routedAccount.id);void chat?.wake();}
       if(releaseExecution){releaseExecution();stage.emit('lease',{lease:'execution',action:'release'});}else stage.emit('lease',{lease:'execution',action:'not-acquired'});output?.close();if(output)stage.emit('lease',{lease:'output',action:'release'});res.off('close',close);controller.signal.removeEventListener('abort',observeCancel);active.delete(controller);const count=members.get(member.id)-1;if(count)members.set(member.id,count);else members.delete(member.id);stage.emit('lease',{lease:'member',action:'release'});ticket?.close();
     }

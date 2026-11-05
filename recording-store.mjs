@@ -94,9 +94,9 @@ export class RecordingStore{
     if(!executed)throw new AppError(503,'正文批量事务未执行','recording_buffer_invalid');
     const receipt=Object.freeze({});atomicCommits.set(receipt,{commands,repository:this});return receipt;
   }
-  async finish(requestId,{state='complete',reason=null}={}){
-    if(!states.has(state)||reason!==null&&!['upstream_interrupted','capture_failed','queue_limit','size_limit','process_interrupted'].includes(reason))throw new AppError(400,'正文完成状态无效');
-    await this.store.run(`UPDATE harbor.requests SET recording_state=CASE WHEN recording_reason IS NOT NULL AND $1='complete' THEN 'partial' ELSE $1 END,recording_reason=COALESCE($2,recording_reason) WHERE id=$3 AND recording_state='pending'`,state,reason,requestId);
+  async finish(requestId,{state='complete',reason=null,storageReason}={}){
+    if(!states.has(state)||reason!==null&&!['upstream_interrupted','capture_failed','queue_limit','size_limit','process_interrupted'].includes(reason)||storageReason!==undefined&&(reason!=='capture_failed'||state!=='partial'||!['storage_low','storage_unknown'].includes(storageReason)))throw new AppError(400,'正文完成状态无效');
+    await this.store.run(`UPDATE harbor.requests SET recording_state=CASE WHEN recording_reason IS NOT NULL AND $1='complete' THEN 'partial' ELSE $1 END,recording_reason=COALESCE($2,recording_reason) WHERE id=$3 AND recording_state='pending'`,state,storageReason??reason,requestId);
   }
   async read(requestId,{after=0,limit=32}={}){
     if(!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>100)throw new AppError(400,'正文分页无效');

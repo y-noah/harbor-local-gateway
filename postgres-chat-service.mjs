@@ -1,4 +1,4 @@
-import {recordingCaptureDecision} from './postgres-recording-storage.mjs';
+import {recordingCaptureDecision,recordingBufferWrite,recordingFinishReason} from './postgres-recording-storage.mjs';
 import {writeOutput} from './output-budget.mjs';
 import {AppError} from './store.mjs';
 import {readJsonBody} from './request-body.mjs';
@@ -45,9 +45,10 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
     const controller=new AbortController();owners.add(member.id);activity.active.add(controller);activity.members.set(member.id,(activity.members.get(member.id)||0)+1);
     const closed=()=>{if(!res.writableEnded)controller.abort();};res.on('close',closed);
     const captureDecision=await recordingCaptureDecision(recordingEnabled,recordingPolicy),captureEnabled=captureDecision.enabled;
-    let output,admission,extraBoundary,releasePreparation,releaseSlot,dispatched=false,settlementAttempted=false,capture,recordStarted=false,recordFailed=false,flushTimer,batch=[],bytes=0;
-    const record=operation=>{try{return operation();}catch{recordFailed=true;capture=undefined;return undefined;}};
-    const flush=()=>{if(!batch.length)return;const events=batch;batch=[];bytes=0;if(recordStarted&&!record(()=>buffer.append(admission.requestId,events)))recordFailed=true;};
+    let output,admission,extraBoundary,releasePreparation,releaseSlot,dispatched=false,settlementAttempted=false,capture,recordStarted=false,recordFailed=false,recordFailureReason=null,flushTimer,batch=[],bytes=0;
+    const record=operation=>{try{return operation();}catch{recordFailed=true;recordFailureReason??='capture_failed';capture=undefined;return undefined;}};
+    const writeRecording=(method,...args)=>record(()=>{const result=recordingBufferWrite(buffer,method,...args);if(!result.accepted){recordFailed=true;recordFailureReason??=result.reason;}return result.accepted;});
+    const flush=()=>{if(!batch.length)return;const events=batch;batch=[];bytes=0;if(recordStarted&&!writeRecording('append',admission.requestId,events))recordFailed=true;};
     const alive=()=>{if(controller.signal.aborted||res.destroyed)throw controller.signal.reason instanceof AppError?controller.signal.reason:fail(499,'客户端已断开','request_cancelled');};
     const settle=async result=>{
       settlementAttempted=true;const facts={...result,chat:chatSettlementFacts(admission,result,{dispatched})},at=clock();
@@ -61,13 +62,13 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
       await refreshQuotas().catch(()=>{});alive();if(activity.isStopping())throw fail(503,'服务正在排空','service_stopping');
       admission=await state.admit(secret,original,{headers:req.headers,ip:req.socket.remoteAddress||'unknown',agent:String(req.headers['user-agent']||'').slice(0,200),recordingEnabled:captureEnabled,authorizeDevice:person=>deviceAccess?.authorize(person,req,{phase:'admission'})});extraBoundary=extraRuntime?.boundary({requestId:admission.requestId,protocol:'chat',admittedExtra:admission.extraAdmission.extraReserved});releasePreparation();releasePreparation=null;
       if(!captureEnabled)await store.run('UPDATE harbor.requests SET recording_reason=$1 WHERE id=$2 AND recording_state=\'disabled\'',captureDecision.reason,admission.requestId).catch(()=>{});
-      if(captureEnabled){const input=record(()=>currentInput({input:admission.delta}));recordStarted=!!input&&!!record(()=>buffer.start(admission.requestId,input.state));if(!recordStarted)recordFailed=true;
+      if(captureEnabled){const input=record(()=>currentInput({input:admission.delta}));recordStarted=!!input&&!!writeRecording('start',admission.requestId,input.state);if(!recordStarted)recordFailed=true;
         if(recordStarted){capture=record(()=>new ConversationCapture({emit:event=>{const size=Buffer.byteLength(JSON.stringify(event));if(batch.length>=128||bytes+size>65536)flush();batch.push(event);bytes+=size;return !recordFailed;}}));record(()=>capture?.input({input:admission.delta},input));flush();flushTimer=setInterval(flush,250);flushTimer.unref();}}
       const ready=await enqueue(secret,admission.requestId,controller.signal,member.id,req);releaseSlot=ready.release;admission={...admission,account:ready.account,session:ready.session};alive();
       if(ready.contextReset)record(()=>capture?.send('boundary',{reason:'context_reset'},'gateway'));
       extraBoundary=state.dispatchBoundary(secret,admission,{isCancelled:()=>controller.signal.aborted||res.destroyed||activity.isStopping(),authorizeDevice:person=>deviceAccess?.authorize(person,req,{phase:'dispatch'})});const result=await extraBoundary.run(async()=>{alive();dispatched=true;return runChat({account:admission.account,processLease:ready.processLease,output,session:admission.session,messages:admission.delta,model:original.model,signal:controller.signal,timeoutMs,onText:text=>record(()=>capture?.delta('chat-output','assistant',{},text))});});
       const facts=chatSettlementFacts(admission,result);if(result.usageKnown!==true||!['input','output','cached'].every(name=>Number.isSafeInteger(result[name])&&result[name]>=0)||result.cached>result.input||!facts.cursor||admission.session.upstream_id&&facts.upstreamId!==admission.session.upstream_id)throw Object.assign(fail(502,'CLI未返回可核对的会话和用量，请新建会话','chat_result_invalid'),result,{status:502});
-      record(()=>capture?.complete('chat-output','assistant',{},result.text));const recording=record(()=>capture?.finish());flush();if(recordStarted&&!record(()=>buffer.finish(admission.requestId,{state:recordFailed||recording?.failed?'partial':recording?.truncated?'truncated':'complete',reason:recordFailed||recording?.failed?'capture_failed':recording?.truncated?'size_limit':null})))recordFailed=true;
+      record(()=>capture?.complete('chat-output','assistant',{},result.text));const recording=record(()=>capture?.finish());flush();if(recordStarted&&!writeRecording('finish',admission.requestId,{state:recordFailed||recording?.failed?'partial':recording?.truncated?'truncated':'complete',...recordingFinishReason(recordFailed||recording?.failed?recordFailureReason??'capture_failed':recording?.truncated?'size_limit':null)}))recordFailed=true;
       const settled=await settle(result);await deviceAccess?.markVerified(admission.requestId).catch(()=>{});if(res.destroyed)return true;
       const usage={prompt_tokens:result.input,completion_tokens:result.output,total_tokens:result.input+result.output,prompt_tokens_details:{cached_tokens:result.cached}},standard=settled.standard;
       const common={id:'chatcmpl-'+admission.requestId,created:Math.floor(clock()/1000),model:original.model,session_id:admission.session.id,harbor_standard_usage:standard,...(ready.contextReset?{context_reset:true}:{})};res.setHeader('X-Harbor-Session',admission.session.id);res.setHeader('X-Harbor-Request',admission.requestId);if(!settled.persisted)res.setHeader('X-Harbor-Usage','pending');
@@ -77,11 +78,11 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
       }else{await writeOutput(res,{...common,object:'chat.completion',choices:[{index:0,message:{role:'assistant',content:result.text},finish_reason:'stop'}],usage},{output,signal:controller.signal,headers:{'Content-Type':'application/json; charset=utf-8'}});res.end();}return true;
     }catch(error){
       dispatched||=extraBoundary?.status().dispatched===true;
-      if(admission){record(()=>capture?.finish());flush();if(recordStarted&&!record(()=>buffer.finish(admission.requestId,{state:dispatched||recordFailed?'partial':'complete',reason:recordFailed?'capture_failed':dispatched?(controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted'):null})))recordFailed=true;
+      if(admission){record(()=>capture?.finish());flush();if(recordStarted&&!writeRecording('finish',admission.requestId,{state:dispatched||recordFailed?'partial':'complete',...recordingFinishReason(recordFailed?recordFailureReason??'capture_failed':dispatched?(controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted'):null)}))recordFailed=true;
         if(!settlementAttempted)await settle({...error,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':dispatched?(error.usageKnown===true?'failed':'unknown'):controller.signal.aborted?'cancelled':'rejected',usageKnown:dispatched?error.usageKnown===true:true}).catch(()=>{});}
       if(error instanceof AppError)throw error;throw fail(502,sanitizeRecord(error.message||'CLI请求失败',{maxBytes:2048}),'upstream_error');
     }finally{
-      releasePreparation?.();await extraBoundary?.releaseUnused();if(flushTimer)clearInterval(flushTimer);if(admission&&captureEnabled&&(!recordStarted||recordFailed))await store.run("UPDATE harbor.requests SET recording_state='partial',recording_reason='capture_failed' WHERE id=$1 AND recording_state IN ('pending','complete')",admission.requestId).catch(()=>{});
+      releasePreparation?.();await extraBoundary?.releaseUnused();if(flushTimer)clearInterval(flushTimer);if(admission&&captureEnabled&&(!recordStarted||recordFailed))await store.run("UPDATE harbor.requests SET recording_state='partial',recording_reason=$2 WHERE id=$1 AND recording_state IN ('pending','complete')",admission.requestId,recordFailureReason??'capture_failed').catch(()=>{});
       releaseSlot?.();output?.close();res.off('close',closed);owners.delete(member.id);activity.active.delete(controller);const n=activity.members.get(member.id)-1;if(n)activity.members.set(member.id,n);else activity.members.delete(member.id);
     }
   }
