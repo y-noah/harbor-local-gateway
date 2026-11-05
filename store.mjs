@@ -3,6 +3,22 @@ import { createHash, randomBytes, randomUUID, createCipheriv, createDecipheriv }
 import {createPricing} from './pricing.mjs';
 import {createMemberLimits} from './member-limits.mjs';
 export const hash = value => createHash('sha256').update(value).digest('hex');
+export function encryptStoredKey(encryptionKey,secret,keyId) {
+    if(!encryptionKey)return null;
+    const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',encryptionKey,iv);
+    cipher.setAAD(Buffer.from(keyId));
+    const data=Buffer.concat([cipher.update(secret,'utf8'),cipher.final()]);
+    return Buffer.concat([iv,cipher.getAuthTag(),data]).toString('base64');
+}
+export function revealStoredKey(encryptionKey,row) {
+    if(!encryptionKey||!row.secret_cipher)return null;
+    try {
+      const data=Buffer.from(row.secret_cipher,'base64'),cipher=createDecipheriv('aes-256-gcm',encryptionKey,data.subarray(0,12));
+      cipher.setAAD(Buffer.from(row.id));cipher.setAuthTag(data.subarray(12,28));
+      const secret=Buffer.concat([cipher.update(data.subarray(28)),cipher.final()]).toString('utf8');
+      return hash(secret)===row.digest?secret:null;
+    }catch{return null;}
+}
 export const token = () => 'hg_' + randomBytes(30).toString('base64url');
 export const id = () => randomUUID();
 export const now = () => Date.now();
@@ -21,9 +37,19 @@ export function modelAllowlist(value) {
   if(!Array.isArray(value)||!value.length||value.length>50||value.some(model=>typeof model!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(model)||['codex','claude'].includes(model)))throw new AppError(400,'请选择1至50个精确模型ID；不能使用codex/claude路由别名','invalid_model_policy');
   return [...new Set(value)];
 }
-function storedModelAllowlist(value) {
+export function storedModelAllowlist(value) {
   if(value===null)return null;
   try{return modelAllowlist(JSON.parse(value));}catch{throw new AppError(403,'Key模型权限配置无效，请联系管理员','model_policy_invalid');}
+}
+export function checkAllowedModel(allowed,model,tools){
+  if(allowed===null)return;
+  if(!allowed.includes(model))throw new AppError(403,'此Key只允许使用：'+allowed.join('、'),'model_not_allowed');
+  const stack=[tools];while(stack.length){const items=stack.pop();if(!Array.isArray(items))continue;for(const tool of items){
+    if(!tool||typeof tool!=='object')continue;
+    if(tool.type==='image_generation')throw new AppError(403,'受限Key不能使用隐式图片模型工具，请使用获准模型的图片接口','model_not_allowed');
+    if(tool.model!==undefined&&!allowed.includes(tool.model))throw new AppError(403,'工具模型不在此Key允许列表中','model_not_allowed');
+    stack.push(tool.tools);
+  }}
 }
 export function usageWindow(at=now()) {
   const day=86400000, offset=8*3600000;
@@ -66,6 +92,26 @@ export class Store {
     if(missingFlag)this.db.exec("UPDATE requests SET usage_unknown=1 WHERE status IN ('unknown','interrupted')");
     add('keys','secret_cipher','TEXT');add('keys','allowed_models','TEXT');add('keys','model_policy_version','INTEGER NOT NULL DEFAULT 0');
     this.db.exec('CREATE INDEX IF NOT EXISTS request_usage_time ON requests(COALESCE(ended,started))');
+    add('requests','query_sequence','INTEGER');
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS request_stable_page ON requests(started DESC,id DESC);
+      CREATE INDEX IF NOT EXISTS request_member_page ON requests(member_id,started DESC,id DESC);
+      CREATE INDEX IF NOT EXISTS request_model_page ON requests(COALESCE(billing_model,model),started DESC,id DESC);
+      CREATE INDEX IF NOT EXISTS request_status_page ON requests(status,started DESC,id DESC);
+      CREATE TABLE IF NOT EXISTS request_query_version(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS pricing_versions(id TEXT PRIMARY KEY,created INTEGER NOT NULL,book TEXT NOT NULL);
+      INSERT OR IGNORE INTO request_query_version VALUES(1,0);
+    `);
+    // SQL-only triggers remain usable by old binaries and external maintenance tools.
+    for(const table of ['requests','members','pricing_versions'])for(const event of ['INSERT','UPDATE','DELETE'])this.db.exec(`CREATE TRIGGER IF NOT EXISTS query_version_${table}_${event.toLowerCase()} AFTER ${event} ON ${table} BEGIN UPDATE request_query_version SET version=version+1 WHERE singleton=1; END;`);
+    this.db.exec(`
+      UPDATE requests SET query_sequence=rowid WHERE query_sequence IS NULL;
+      UPDATE request_query_version SET version=MAX(version,COALESCE((SELECT MAX(query_sequence) FROM requests),0)) WHERE singleton=1;
+      CREATE INDEX IF NOT EXISTS request_insert_sequence ON requests(query_sequence);
+      CREATE TRIGGER IF NOT EXISTS request_assign_sequence AFTER INSERT ON requests WHEN NEW.query_sequence IS NULL BEGIN
+        UPDATE requests SET query_sequence=(SELECT version+1 FROM request_query_version WHERE singleton=1) WHERE id=NEW.id;
+      END;
+    `);
     add('requests','session_id','TEXT REFERENCES sessions(id)');add('requests','predicted','INTEGER NOT NULL DEFAULT 10000');
     add('sessions','cum_input','INTEGER NOT NULL DEFAULT 0');add('sessions','cum_output','INTEGER NOT NULL DEFAULT 0');add('sessions','cum_cached','INTEGER NOT NULL DEFAULT 0');
     add('sessions','protocol',"TEXT NOT NULL DEFAULT 'chat'");add('sessions','client_key','TEXT');add('sessions','client_session_id','TEXT');
@@ -97,11 +143,7 @@ export class Store {
     this.memberLimits=createMemberLimits(this,{clock:pricingOptions?.clock||Date.now});
   }
   encryptKey(secret,keyId) {
-    if(!this.encryptionKey)return null;
-    const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.encryptionKey,iv);
-    cipher.setAAD(Buffer.from(keyId));
-    const data=Buffer.concat([cipher.update(secret,'utf8'),cipher.final()]);
-    return Buffer.concat([iv,cipher.getAuthTag(),data]).toString('base64');
+    return encryptStoredKey(this.encryptionKey,secret,keyId);
   }
   saveUpstreamKey(accountId,secret) {
     const encrypted=this.encryptKey(secret,'upstream:'+accountId);
@@ -112,13 +154,7 @@ export class Store {
     return this.revealKey({id:'upstream:'+account.id,secret_cipher:account.api_secret_cipher,digest:account.api_secret_digest});
   }
   revealKey(row) {
-    if(!this.encryptionKey||!row.secret_cipher)return null;
-    try {
-      const data=Buffer.from(row.secret_cipher,'base64'),cipher=createDecipheriv('aes-256-gcm',this.encryptionKey,data.subarray(0,12));
-      cipher.setAAD(Buffer.from(row.id));cipher.setAuthTag(data.subarray(12,28));
-      const secret=Buffer.concat([cipher.update(data.subarray(28)),cipher.final()]).toString('utf8');
-      return hash(secret)===row.digest?secret:null;
-    }catch{return null;}
+    return revealStoredKey(this.encryptionKey,row);
   }
   // Compatibility entry point: compute the visible window without erasing archived measurements.
   pruneUsage(at=now()) { return usageWindow(at); }
@@ -158,15 +194,7 @@ export class Store {
     return storedModelAllowlist(key.allowed_models);
   }
   checkModel(member,model,tools) {
-    const allowed=this.allowedModels(member);if(allowed===null)return;
-    if(!allowed.includes(model))throw new AppError(403,'此Key只允许使用：'+allowed.join('、'),'model_not_allowed');
-    // Hosted image tools can choose their own model; use an explicitly checked image endpoint instead.
-    const checkTools=items=>{if(!Array.isArray(items))return;for(const tool of items){
-      if(!tool||typeof tool!=='object')continue;
-      if(tool.type==='image_generation')throw new AppError(403,'受限Key不能使用隐式图片模型工具，请使用获准模型的图片接口','model_not_allowed');
-      if(tool.model!==undefined&&!allowed.includes(tool.model))throw new AppError(403,'工具模型不在此Key允许列表中','model_not_allowed');
-      checkTools(tool.tools);
-    }};checkTools(tools);
+    checkAllowedModel(this.allowedModels(member),model,tools);
   }
   allowance(member,reserveSize) {
       const m=this.get('SELECT * FROM members WHERE id=?',member.id);

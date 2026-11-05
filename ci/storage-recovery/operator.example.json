@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "source": {
+    "uid": 1000,
+    "user": "node",
+    "supervisorUnit": "harbor-local-gateway.service",
+    "project": "harbor-local-gateway",
+    "container": "harbor-local-gateway",
+    "imageId": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "dataDirectory": "/opt/product-development/harbor-local-gateway/data"
+  },
+  "runDirectory": "/opt/product-development/harbor-local-gateway/storage-transition",
+  "fileRoots": [
+    {"id": "data", "source": "/opt/product-development/harbor-local-gateway/data"},
+    {"id": "runtime", "source": "/opt/product-development/harbor-local-gateway/runtime", "databasePrefix": "/app/runtime", "destinationPrefix": "/app/runtime"},
+    {"id": "secrets", "source": "/opt/product-development/harbor-local-gateway/secrets"}
+  ],
+  "expectedCluster": "REPLACE_WITH_OBSERVED_SYSTEM_IDENTIFIER",
+  "baselineReceiverMachine": "REPLACE_WITH_APPROVED_RECEIVER_MACHINE_IDENTITY_SHA256",
+  "registry": {
+    "database": "REPLACE_WITH_APPROVED_CONTROL_DATABASE",
+    "databaseOid": "REPLACE_WITH_OBSERVED_DATABASE_OID",
+    "schema": "harbor_operator_registry",
+    "allowMetadataWrites": true
+  },
+  "backupKeyVersion": "REPLACE_WITH_INSTALLED_BACKUP_KEY_VERSION",
+  "candidate": {
+    "image": "registry.example/harbor-local-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "imageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "network": "harbor_migration",
+    "secretsDirectory": "/opt/product-development/harbor-local-gateway/secrets",
+    "publicOrigin": "https://harbor.example",
+    "deviceOrigin": "https://harbor.example:8093"
+  },
+  "backupRequired": {"local": true, "offhost": true}
+}

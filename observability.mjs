@@ -1,9 +1,10 @@
 import {AppError,requestPhases,usageWindow} from './store.mjs';
 import {referenceMetric} from './pricing.mjs';
+import {requestList,requestStatistics} from './request-query.mjs';
 
 export const requestStatuses=new Set(['queued','running','ok','failed','unknown','interrupted','cancelled','rejected','reconciled']);
-export function requestsQuery(params){
-  const allowed=new Set(['member','model','status','page','page_size']);
+export function requestsQuery(params,{usageTypes=false}={}){
+  const allowed=new Set(['member','model','status','page','page_size','view','snapshot','cursor',...(usageTypes?['type','device','outcome','member_missing','model_missing','from','to']:[])]);
   for(const key of params.keys())if(!allowed.has(key)||params.getAll(key).length!==1)throw new AppError(400,'请求查询参数无效');
   const positive=(key,fallback,max)=>{
     const raw=params.get(key);if(raw===null||raw==='')return fallback;
@@ -11,24 +12,23 @@ export function requestsQuery(params){
     return Number(raw);
   };
   const result={member:params.get('member')||'',model:params.get('model')||'',status:params.get('status')||'',page:positive('page',1,1e7),pageSize:positive('page_size',25,100)};
+  result.view=params.get('view')||'all';result.snapshot=params.get('snapshot')||'';result.cursor=params.get('cursor')||'';
+  if(!['all','list','summary'].includes(result.view)||[result.snapshot,result.cursor].some(v=>v.length>2048)||result.cursor&&!result.snapshot)throw new AppError(400,'请求查询参数无效');
   if(result.member&&!/^[a-zA-Z0-9-]{1,100}$/.test(result.member)||result.model.length>200||/[\x00-\x1f]/.test(result.model)||result.status&&!requestStatuses.has(result.status))throw new AppError(400,'请求筛选条件无效');
+  if(usageTypes){
+    result.type=params.get('type')||'';result.device=params.get('device')||'';result.outcome=params.get('outcome')||'';
+    for(const [field,key] of [['memberMissing','member_missing'],['modelMissing','model_missing']]){const value=params.get(key);if(value!==null&&!['true','false'].includes(value))throw new AppError(400,'请求缺失身份筛选无效');result[field]=value==='true';}
+    for(const field of ['from','to']){const value=params.get(field);if(value!==null&&(!/^\d+$/.test(value)||!Number.isSafeInteger(Number(value))))throw new AppError(400,'请求时间范围无效');result[field]=value===null?null:Number(value);}
+    if(result.device&&result.device!=='unknown'&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.device))throw new AppError(400,'请求设备筛选无效');
+    if(result.type&&!/^[a-zA-Z0-9-]{1,100}$/.test(result.type)&&!['unclassified','historical_unknown'].includes(result.type)||result.outcome&&!['queued','running','ok','failed','unknown','interrupted','cancelled','rejected'].includes(result.outcome)||result.outcome&&result.status||result.memberMissing&&result.member||result.modelMissing&&result.model)throw new AppError(400,'请求类型或业务结果筛选无效');
+  }
   return result;
 }
 
 export function requestsReader(store,query,at=Date.now()){
-  const window=usageWindow(at),range=[window.start,window.end],time='COALESCE(r.ended,r.started)',base=`${time}>=? AND ${time}<?`;
-  const clauses=[base],args=[...range];
-  for(const [field,value] of [['member_id',query.member],['model',query.model],['status',query.status]])if(value){clauses.push((field==='model'?'COALESCE(r.billing_model,r.model)':`r.${field}`)+'=?');args.push(value);}
-  const where=' WHERE '+clauses.join(' AND '),from=' FROM requests r LEFT JOIN members m ON m.id=r.member_id LEFT JOIN accounts a ON a.id=r.account_id';
-  const all=store.all(`SELECT r.*,m.name member_name,a.name account_name${from}${where} ORDER BY r.started DESC,r.id DESC`,...args);
-  const aggregate=items=>{const standard=store.pricing.summary(items,at),finished=items.filter(r=>r.ended!==null&&r.ended>=r.started);return {requests:items.length,success:items.filter(r=>r.status==='ok').length,active:items.filter(r=>['queued','running'].includes(r.status)).length,average_ms:finished.length?finished.reduce((n,r)=>n+r.ended-r.started,0)/finished.length:0,unmetered:standard.unmetered,unpriced:standard.unpriced,standard};};
-  const summary=aggregate(all),totalPages=Math.max(1,Math.ceil(summary.requests/query.pageSize)),page=Math.min(query.page,totalPages);
-  const rows=all.slice((page-1)*query.pageSize,page*query.pageSize).map(r=>store.pricing.decorate(r,at));
-  const grouped=(field,meta)=>{const groups=new Map();for(const r of all){const key=field==='model'?r.billing_model||r.model:r[field];if(!groups.has(key))groups.set(key,[]);groups.get(key).push(r);}return [...groups].map(([key,items])=>({[field]:key,...(meta?{[meta]:items[0][meta]}:{}),...aggregate(items)})).sort((a,b)=>(b.standard.total??-1)-(a.standard.total??-1)||String(a[field]).localeCompare(String(b[field])));};
-  return {window,observedAt:at,summary,pagination:{page,pageSize:query.pageSize,total:summary.requests,totalPages},rows,
-    models:store.all(`SELECT DISTINCT COALESCE(r.billing_model,r.model) model FROM requests r WHERE ${base} AND COALESCE(r.billing_model,r.model) IS NOT NULL AND COALESCE(r.billing_model,r.model)<>'' ORDER BY model`,...range).map(r=>r.model),
-    members:store.all(`SELECT DISTINCT m.id,m.name,m.removed_at FROM requests r JOIN members m ON m.id=r.member_id WHERE ${base} ORDER BY m.name,m.id`,...range),
-    byModel:grouped('model'),byMember:grouped('member_id','member_name')};
+  const window=usageWindow(at),list=query.view==='summary'?{}:requestList(store,query,window,at);
+  if(query.view==='list')return list;
+  return {...list,...requestStatistics(store.db,{...query,snapshot:list.snapshot||query.snapshot},window,r=>store.pricing.rawQuote(r,{at}),at)};
 }
 
 const parse=value=>{try{return JSON.parse(value);}catch{return null;}};

@@ -72,6 +72,11 @@ test('password sessions expire and are not shared with another server instance',
   auth.login('test-password',{setHeader:(_,v)=>cookie=v});const req={headers:{cookie}};assert.equal(auth.authenticated(req),true);
   assert.equal(createAdminAuth(config).authenticated(req),false);at=12*3600000;assert.equal(auth.authenticated(req),false);
 });
+test('HTTP logins may finish concurrently without losing cookies or blocking the following request',async t=>{
+  const app=await setup(t,undefined,undefined,{config:{adminPasswordHash:passwordHash('synthetic-concurrent-login'),codexBinary:'unused',reserveTokens:100}}),post=signal=>fetch(app.base+'/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:'synthetic-concurrent-login'}),signal});
+  const replies=await Promise.all(Array.from({length:5},()=>post()));assert.ok(replies.every(row=>row.status===200));const cookies=replies.map(row=>row.headers.get('set-cookie').split(';')[0]);assert.equal(new Set(cookies).size,5);for(const value of cookies)assert.deepEqual(await(await fetch(app.base+'/api/auth/session',{headers:{cookie:value}})).json(),{authenticated:true});
+  const controller=new AbortController(),pending=post(controller.signal);pending.catch(()=>{});controller.abort();await assert.rejects(pending,{name:'AbortError'});assert.equal((await fetch(app.base+'/health')).status,200);assert.equal((await post()).status,200);
+});
 
 test('missing or empty admin token cannot become a predictable bearer credential',async t=>{
   for(const token of [undefined,null,'']){
@@ -322,6 +327,26 @@ test('successful official quota read recovers prior transient degraded status wi
  const app=await setup(t);app.store.run("UPDATE accounts SET state='degraded',last_error='old transient' WHERE id='one'");
  assert.equal((await app.call('/api/admin/accounts/one/quota','POST',{})).status,200);
  assert.equal(app.store.get('SELECT state,last_error FROM accounts').state,'ready');assert.equal(app.store.get('SELECT last_error FROM accounts').last_error,null);
+});
+test('windowless quota observations retain entitlement facts without treating unknown as exhaustion',async t=>{
+ let result={rateLimits:{},ordinaryUsageAllowed:null};const app=await setup(t,undefined,async()=>result);
+ const refresh=()=>app.call('/api/admin/accounts/one/quota','POST',{});
+ assert.equal((await refresh()).status,200);assert.equal(app.store.get('SELECT route_block FROM accounts').route_block,null);
+ result={rateLimits:{},ordinaryUsageAllowed:false,rateLimitResetCredits:{availableCount:7,credits:null}};
+ await refresh();let row=app.store.get('SELECT quota_json,route_block FROM accounts');assert.equal(row.route_block,'quota_exhausted');
+ assert.equal(JSON.parse(row.quota_json).entitlements.reset_cards.remaining,7);assert.equal(JSON.parse(row.quota_json).remaining,null);
+ result={rateLimits:{primary:{usedPercent:10,windowDurationMins:300,resetsAt:Math.floor(Date.now()/1000)+18000}},ordinaryUsageAllowed:null};
+ await refresh();row=app.store.get('SELECT quota_json,route_block FROM accounts');assert.equal(row.route_block,'quota_exhausted');assert.equal(JSON.parse(row.quota_json).officialDenial.ordinary,true);
+ result={...result,ordinaryUsageAllowed:true};await refresh();assert.equal(app.store.get('SELECT route_block FROM accounts').route_block,null);
+});
+test('windowless explicit rate refusal prevents an existing chat from using local budget',async t=>{
+ let result=rates(0),calls=0;const app=await setup(t,async()=>{calls++;return {text:'fixture',input:1,output:1,cached:0,usageKnown:true,threadId:'fixture-thread'};},async()=>result);
+ const m=app.member(null),first=await app.chat(m.secret);assert.equal(first.status,200);const initialCalls=calls;
+ app.store.run('UPDATE accounts SET token_budget=100000,budget_used=10000 WHERE id=?','one');
+ result={rateLimits:{rateLimitReachedType:'rate_limit_reached'}};await app.call('/api/admin/accounts/one/quota','POST',{});
+ assert.equal((await app.chat(m.secret,{session_id:first.body.session_id})).status,429);assert.equal(calls,initialCalls);
+ result={rateLimits:{},ordinaryUsageAllowed:null};await app.call('/api/admin/accounts/one/quota','POST',{});
+ assert.equal((await app.chat(m.secret,{session_id:first.body.session_id})).status,429);assert.equal(calls,initialCalls);
 });
 test('Key and employee removal erase encrypted secrets permanently',async t=>{
  const app=await setup(t),m=app.member(),other=app.store.createKey(m.memberId);

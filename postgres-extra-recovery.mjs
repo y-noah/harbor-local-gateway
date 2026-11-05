@@ -1,0 +1,8 @@
+import {AppError} from './store.mjs';
+export function createPostgresExtraRecovery(store,{service,jobs,intervalMs=10000,limit=100}={}){
+ if(!service||typeof service.recover!=='function'||!jobs||typeof jobs.enqueue!=='function'||!Number.isInteger(intervalMs)||intervalMs<1000||intervalMs>60000||!Number.isInteger(limit)||limit<1||limit>1000)throw new AppError(503,'额外额度恢复配置无效','extra_recovery_configuration');
+ const kind='account.extra.recover';let pending;
+ async function schedule(){if(!await store.get("SELECT 1 needed FROM harbor.account_extra_holds h JOIN harbor.requests r ON r.id=h.request_id WHERE h.state IN ('reserved','dispatched','unresolved') AND r.ended IS NOT NULL LIMIT 1"))return {idle:true};const active=await store.get("SELECT id FROM harbor.background_jobs WHERE kind=$1 AND status IN ('pending','running') LIMIT 1",kind);if(active)return {active:true};try{return await jobs.enqueue(kind,{id:kind+':'+Math.floor(await jobs.now()/intervalMs),payload:{},maxAttempts:5});}catch(error){if(error.code==='job_queue_full')return {active:true};throw error;}}
+ async function execute(job,{signal}={}){if(job.kind!==kind)throw new AppError(400,'额外额度恢复任务无效','job_payload_invalid');if(signal?.aborted)throw new AppError(503,'后台恢复正在停止','worker_stopping');if(pending)return pending;pending=service.recover({limit,signal}).then(rows=>({processed:rows.length,settled:rows.filter(row=>row.state==='settled').length,unresolved:rows.filter(row=>row.state==='unresolved').length,released:rows.filter(row=>row.released).length})).finally(()=>{pending=null;});return pending;}
+ return {schedule,handlers:{[kind]:execute}};
+}

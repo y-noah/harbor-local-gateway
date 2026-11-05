@@ -51,11 +51,11 @@ export function startCodexLogin(binary,home,{spawnProcess=spawn,startTimeoutMs=2
   return {challenge,completed,cancel:()=>finish(false,'登录已取消')};
 }
 
-export function startLocalLogin(binary,args,env) {
+export function startLocalLogin(binary,args,env,{spawnProcess=spawn}={}) {
   let child,resolveCompleted;
   const completed=new Promise(resolve=>{resolveCompleted=resolve;});
   const challenge=new Promise((resolve,reject)=>{
-    child=spawn(binary,args,{env,windowsHide:true,stdio:'ignore'});
+    child=spawnProcess(binary,args,{env,windowsHide:true,stdio:'ignore'});
     child.once('spawn',()=>resolve({type:'browser'}));
     child.once('error',()=>{reject(Error('无法启动官方登录，请检查 CLI 配置'));resolveCompleted({success:false,message:'无法启动官方登录'});});
     child.once('close',code=>resolveCompleted({success:code===0,message:code===0?'':'官方登录未完成，请重试'}));

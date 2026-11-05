@@ -1,0 +1,8 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {cleanupStorageOperatorPreflight} from '../storage-operator-preflight.mjs';
+const name='harbor-storage-preflight-'+'a'.repeat(24),imageId='sha256:'+'b'.repeat(64),token='c'.repeat(32);
+const owned=()=>({Name:'/'+name,Image:imageId,State:{Running:true},Config:{Labels:{'com.harbor.storage-operator-preflight':'true','com.harbor.storage-operator-preflight-token':token},Entrypoint:['node'],Cmd:['/app/ci/postgres-preflight.mjs']}});
+for(const reason of ['create-ack-lost','attach-timeout'])test('private preflight cleanup re-inspects and removes exact owned instance after '+reason,async()=>{let row=owned(),calls=0;const result=await cleanupStorageOperatorPreflight({name,imageId,token,inspect:async()=>row,remove:async(actual,options)=>{assert.equal(actual,name);assert.equal(options.force,true);calls++;row=null;}});assert.equal(calls,1);assert.equal(result.removed,true);});
+test('preflight cleanup never removes another image, token or command',async()=>{for(const change of [row=>row.Image='sha256:'+'d'.repeat(64),row=>row.Config.Labels['com.harbor.storage-operator-preflight-token']='e'.repeat(32),row=>row.Config.Cmd=['/app/server.mjs']]){const row=owned();change(row);let removed=false;await assert.rejects(cleanupStorageOperatorPreflight({name,imageId,token,inspect:async()=>row,remove:async()=>{removed=true;}}),{code:'storage_operator_preflight_cleanup_identity'});assert.equal(removed,false);}});
+test('an unconfirmed removal remains unknown rather than reporting cleaned credentials',async()=>{await assert.rejects(cleanupStorageOperatorPreflight({name,imageId,token,inspect:async()=>owned(),remove:async()=>{}}),{code:'storage_operator_preflight_cleanup_unknown'});});

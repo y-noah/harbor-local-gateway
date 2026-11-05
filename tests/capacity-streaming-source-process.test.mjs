@@ -1,0 +1,34 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {randomBytes,randomUUID} from 'node:crypto';
+import {PostgresStore} from '../postgres-store.mjs';
+import {createPostgresMemberAdmin} from '../postgres-member-admin.mjs';
+import {passwordHash} from '../auth.mjs';
+import {streamingStageClock} from '../streaming-stage-observer.mjs';
+import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
+import {createControlledUpstream} from '../tools/capacity/controlled-upstream.mjs';
+import {startCapacityProcess} from '../tools/capacity/process-adapter.mjs';
+import {syntheticCertificates} from '../tools/capacity/selfcheck.mjs';
+import {enrollCapacityDevice} from '../tools/capacity/device-adapter.mjs';
+import {capacityAgent,requestCapacityTarget} from '../tools/capacity/http-client.mjs';
+const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB;
+const until=async predicate=>{const end=performance.now()+15000;while(!await predicate()){assert.ok(performance.now()<end,'owned child stage condition timed out');await new Promise(resolve=>setTimeout(resolve,5));}};
+
+test('an owned gateway process injects stages into real mTLS, worker parsing, dispatch and body cleanup; disabled mode emits no stage source',{skip:!binDirectory?'需本任务私有PG18、owned child及真实mTLS；不能用Mock替代接线':false,timeout:120000},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'harbor-source-process-')),events=[];let lab,store,admin,upstream,gateway,actor,adminAgent,failSink=false;
+ try{
+  lab=await createPrivatePostgres({binDirectory,libraryDirectory});store=new PostgresStore({connection:lab.connection});await store.migrate();await store.initializePricing();const key=randomBytes(32),recordingKey=randomBytes(32),password='synthetic-stage-process-password';admin=createPostgresMemberAdmin(store,{encryptionKey:key});const member=(await admin.handle('/api/admin/members','POST',{name:'合成进程阶段员工',quota:null,expires:null,allowed_models:null})).value;await store.run("INSERT INTO harbor.accounts(id,name,kind,home,state) VALUES($1,'合成进程账号','codex','synthetic-process-home','ready')",randomUUID());const data=join(directory,'data'),runtime=join(directory,'runtime');await mkdir(data,{mode:0o700});await mkdir(runtime,{mode:0o700});await writeFile(join(data,'key-encryption.key'),key,{mode:0o600});await writeFile(join(data,'recording-encryption.key'),recordingKey,{mode:0o600});const certificates=await syntheticCertificates(directory),location=await store.get("SELECT current_setting('data_directory') directory,current_setting('unix_socket_directories') socket,current_setting('port')::int port");upstream=await createControlledUpstream({durationMs:90,firstContentMs:5,chunkIntervalMs:15});
+  const configuration={database:{connection:lab.connection},storageDatabase:{connection:{...lab.connection,host:location.socket,port:location.port}},pgDataDir:location.directory,dataDir:data,runtimeDir:runtime,certificateDirectory:directory,upstreamOrigin:upstream.origin,config:{port:8092,codexBinary:process.execPath,adminPasswordHash:passwordHash(password)}};
+  for(const enabled of [true,false]){
+   gateway=await startCapacityProcess({runtime:lab.runtime,role:'gateway',configuration:{...configuration,streamingStages:enabled},sink:event=>{events.push(event);if(failSink&&event.kind==='gateway-streaming-stage')return Promise.reject(Error('SYNTHETIC_PRIVATE_PARENT_SINK'));}});const source=gateway.stageSource;assert.equal(!!source,enabled);if(enabled){assert.equal(source.isOpen(),true);assert.ok(Object.isFrozen(source));assert.ok(Object.isFrozen(source.clock));assert.equal(source.role,'gateway');assert.equal(source.clock.kernelId,streamingStageClock().kernelId);assert.equal(source.clock.clockId,'process-'+gateway.child.pid);}
+   adminAgent=capacityAgent(gateway.ready.tlsOrigin,{ca:certificates.ca});let cookie;const login=await requestCapacityTarget({origin:gateway.ready.tlsOrigin,path:'/api/auth/login',method:'POST',agent:adminAgent,headers:{'content-type':'application/json'},body:{password},onResponseHeaders:headers=>{cookie=headers['set-cookie']?.find(value=>value.startsWith('harbor_session='))?.split(';')[0];}});assert.equal(login.success,true);assert.ok(cookie);
+   actor=await enrollCapacityDevice({directory,origin:gateway.ready.tlsOrigin,ca:certificates.ca,adminAgent,adminHeaders:{cookie},actor:member});const trace='owned-source-'+enabled,send=()=>requestCapacityTarget({origin:gateway.ready.tlsOrigin,path:'/v1/responses',method:'POST',agent:actor.agent,headers:{...actor.headers,'content-type':'application/json','x-capacity-trace':trace},body:{model:'gpt-6.1-sol',input:'SYNTHETIC_PRIVATE_PAYLOAD_'+randomBytes(76800).toString('base64'),stream:true},mode:'sse'});const result=await send();assert.equal(result.success,true,JSON.stringify(result));await until(async()=>{const status=await gateway.command('status');return status.runtime.active===0&&status.runtime.requestBodies.leases===0;});const stages=events.filter(event=>event.kind==='gateway-streaming-stage'&&event.trace===trace),status=await gateway.command('status');assert.equal(status.streamingStages.gateway.handler.enabled,enabled);assert.equal(status.streamingStages.gateway.requestBodies.enabled,enabled);assert.equal(status.streamingStages.subscription.enabled,enabled);assert.equal(status.eventDropped,0);assert.equal(status.streamingStages.gateway.handler.failures,0);
+   if(enabled){const types=new Set(stages.map(event=>event.type));for(const type of ['body-end','admission-attempt','admission-granted','accepted','dispatch','content','transport-end','lease'])assert.ok(types.has(type),type);assert.ok(stages.every(event=>JSON.stringify(event.clock)===JSON.stringify(source.clock)));for(const lease of ['body','member','output','execution'])assert.deepEqual(stages.filter(event=>event.type==='lease'&&event.lease===lease).map(event=>event.action),['acquire','release']);assert.equal(stages.find(event=>event.type==='accepted').recordingExpected,true);assert.ok(stages.filter(event=>event.type==='content').length>2);assert.equal(JSON.stringify(stages).includes('SYNTHETIC_PRIVATE_PAYLOAD'),false);failSink=true;assert.equal((await send()).success,true);await until(()=>gateway.observationStatus().parentEventDropped>0);failSink=false;}
+   else assert.equal(stages.length,0);
+   actor.close();actor=null;adminAgent.destroy();adminAgent=null;await gateway.close();if(source)assert.equal(source.isOpen(),false);gateway=null;
+  }
+ }finally{actor?.close();adminAgent?.destroy();await gateway?.close();await admin?.close();await store?.close();await upstream?.close();await lab?.close();await rm(directory,{recursive:true,force:true});}
+});

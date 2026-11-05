@@ -1,0 +1,58 @@
+Harbor PostgreSQL 发布前置（模板，不执行远程操作）
+
+默认 storage_engine=sqlite 保留原 server.mjs、旧镜像合约与目录；环境变量不能自行切换引擎。
+PG 发布由 root 所有的 /etc/harbor-gateway-deploy.json 显式选择 postgres，0600。
+forced wrapper 与同目录 postgres-deploy.py 须一起通过管理员受控入口安装，禁止员工修改。
+客户端请求仍只能指定 action/image；不接受命令、引擎、环境变量或挂载参数。
+
+先由已批准迁移/恢复工具完成外部 PostgreSQL18 的建库、schema、数据合约与来源核验。
+wrapper/preflight 不创建数据库、不运行 migration、不生成或替换密钥。
+新安装也须由受控准备过程先执行对应版本 db:migrate，准备管理员配置及独立密钥。
+迁移场景必须恢复原 key-encryption.key、recording-encryption.key、settings.json、spool 与 runtime，不能生成新钥替代原材料。
+若旧来源从未有正文密钥，须由管理员在确认无旧正文/导出/spool后单独初始化；此部署入口不代办。
+
+固定 STACK=/opt/product-development/harbor-local-gateway：
+  secrets/                   root:root 0700
+  secrets/postgres.env        root:root 0600，格式见 postgres-env.example，不得放任意环境变量
+  secrets/postgres-report.key 1000:1000 0600，独立32字节，与DB主机发布器的专用材料相同
+  secrets/postgres-ca.crt     root:root 0644，可信DB CA，容器只读
+  可选 postgres-client.crt/key 1000:1000 0600，必须成对，路径固定
+  pg-data/                   1000:1000 0700，PG网关专用；禁止存在 gateway.sqlite
+  pg-data/settings.json、key-encryption.key、recording-encryption.key 1000:1000 0600
+  pg-data/recording-spool/    1000:1000 0700
+  runtime/                   1000:1000 0700，保持原账号目录与材料
+PG还须配置独立device_tls_port/device_origin，固定secrets/device目录（1000:1000 0700）只读挂载。
+其中server.key/ca.key为1000:1000 0600，server.pem/ca.pem为1000:1000 0644；恢复原设备CA及签发材料，不生成新CA替代既有设备信任。
+发布实际开放HTTP与设备HTTPS两个受控端口，设备域名须匹配server证书SAN；缺材料/原已批准设备证书不受信任时预检拒绝。
+DB verify-full TLS和客户端设备mTLS为两条独立验收链。
+所有上述入口禁止符号链接；脚本只校验，不擅自递归改权限。
+root 0600 的 report key 不能直接交给 UID1000 容器，需受控设置专用副本正确所有者。
+
+DB主机需先安装一次性 publisher 及其全部受控源码/依赖，使用合法可读取 PGDATA/proc/control 的身份。
+最小数据库权限见正文存储报告模块交付说明；不授予 pg_read_server_files 或超级权限作为捷径。
+参照 publisher service/timer 模板，由管理员显式安装5秒周期、15秒TTL的发布任务。
+本CI/部署脚本不会安装 timer、修改 cron、SSH写DB主机或创建生产监控常驻服务。
+未配置发布器、新鲜报告过期、错key/身份/本地spool缺失时，PG预检必须失败；不能用旧报告冒充健康。
+
+默认预算：gateway 3CPU/6GiB + Worker 1CPU/2GiB；外部DB建议独立4CPU/8GiB。
+这是资源配置起点，不是60人容量、正式RPO/RTO或性能通过的证明；root可按受控配置调整。
+
+PG发布前实际inspect候选镜像能力和commit，镜像内manifest/DB schema/数据合约/原材料/报告均通过才能停旧服务。
+预检以只读快照分页验证员工与上游的全部现存凭据密文，主密钥错误、摘要不符或密文损坏均拒绝；不输出解密内容、不修改原记录。
+同镜像启动固定gateway与Worker，检查ready/health/鉴权、Worker健康及部署后自然任务进展。
+第一次PG启动前写入root所有的postgres-storage.json。此后切回sqlite配置或旧SQLite镜像均拒绝。
+失败保留PG新写入及所有持久化材料，不恢复旧SQLite备份；只有同PG合约且实际旧镜像预检同schema/DB/密钥的上一组合才允许自动回退。
+不兼容旧容器保持停止，等待管理员处理。代码提供此流程，不代表已部署或已切流。
+
+CI仅使用独立PG验证service镜像，随机测试库与临时材料，执行/app候选代码。
+CI验证镜像有ci-validation-only标签，不是可部署服务镜像；forced wrapper仓库白名单与能力门禁拒绝它。
+本机未实际运行Docker候选镜像时，不能把Python guard/源码测试写成实际镜像验证成功。
+
+PG正常发布排空合同 postgres-shutdown-v1：root配置postgres_shutdown三字段，默认gateway_drain_ms=300000、cleanup_grace_ms=30000、worker_stop_ms=30000，合法范围分别100–3600000、1000–300000、1000–3600000毫秒。修改root配置影响下次新容器，不改变当前实例的真实预算。
+停止旧组合按实际容器合同、固定入口、Image ID及其Env核验自身预算：先网关停止受理、等待实际退出与关键收尾，再停Worker。网关退出0为正常，2为已中断超时请求且关键收尾完成，1、137、OOM或缺证明均不能视为正常。
+仍运行的旧版无合同容器在写PG marker或stop前拒绝；需管理员先在维护窗口执行受控停机并核对状态，此入口不猜旧版期限。已停止旧版可切换但明确pre_stopped_unclassified，不宣称本工具无损排空，也不自动重启旧SQLite或无合同PG。
+失败候选同样先按自身合同停止并确认，再移除；未知收尾保留组合、材料和root诊断postgres-shutdown-diagnostics.json，拒绝自动回退。诊断与成功输出明确normal/interrupted_cleanup_complete/unclassified/unknown，不能将超时中断描述成无损升级。
+配置不开放员工或部署请求覆盖，不通过postgres.env添加任意环境。默认SQLite部署分支不变。此模板不代表线上已安装wrapper、切流或完成真实Docker发布演练。
+
+错误分类只允许明确legacy与unknown两条结果：旧PG完整源码/数据预检成功后，明确缺少shutdown实现或声明不支持版本，才可在旧容器已停止时记录unclassified。daemon、超时、解析或证明字段缺失、材料/存储核验失败、诊断IO等均unknown，禁止降级并继续。
+首次SQLite迁移另须root显式postgres_legacy_source_engine=sqlite；核实际已停、固定server.mjs入口、实际Image ID、同项目SHA镜像及session-metadata-only-v1合约，不能通过PG预检失败猜它是SQLite。该分支无需旧SQLite具PG预检文件，永不自动回退旧SQLite；未知Cmd/合约/镜像身份仍拒绝。正常PG更新使用自身PG证明，不由此首切字段降低要求。正式operator source/activation fence接入时须保留该区分。

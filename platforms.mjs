@@ -1,4 +1,5 @@
 import {AppError} from './store.mjs';
+import {readOutputJson} from './output-budget.mjs';
 import {spawn} from 'node:child_process';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
@@ -68,7 +69,7 @@ function catalog(values){
   const models=[...new Set(values.map(m=>typeof m==='string'?m:m?.id??m?.modelId??m?.model).filter(modelId))];
   if(!models.length||models.length>1000)throw fail(502,'平台模型目录为空或过大');return models;
 }
-export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qodercli',spawnProcess=spawn,clock=Date.now,pollMs=3000,timeoutMs=120000,killGraceMs=2000}={}){
+export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qodercli',spawnProcess=spawn,spawnForAccount,clock=Date.now,pollMs=3000,timeoutMs=120000,killGraceMs=2000}={}){
   async function request(url,{signal,...options}={}){
     try{
       const response=await fetchImpl(url,{...options,redirect:'error',signal:AbortSignal.any([AbortSignal.timeout(120000),...(signal?[signal]:[])])});
@@ -92,14 +93,14 @@ export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qodercli',
     if(typeof credential.domain==='string'&&credential.domain)headers['X-Domain']=credential.domain;
     return headers;
   }
-  function qoder(credential,args,prompt,signal){
+  function qoder(credential,args,prompt,signal,account,resources){
     if(signal?.aborted)return Promise.reject(fail(499,'请求已取消'));
     return new Promise((resolve,reject)=>{
       const home=mkdtempSync(join(tmpdir(),'harbor-qoder-')),env={};
       for(const key of ['PATH','Path','SystemRoot','WINDIR','COMSPEC','PATHEXT','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY'])if(process.env[key])env[key]=process.env[key];
       Object.assign(env,{HOME:home,USERPROFILE:home,QODER_CONFIG_DIR:home,QODER_PERSONAL_ACCESS_TOKEN:credential.token,QODER_EXPOSE_TOKEN_USAGE:'1'});
-      let child;try{child=spawnProcess(qoderBinary,[...args,'--config-dir',home,'--setting-sources','','--settings','{"hooks":{},"general":{"maxAttempts":1}}','--strict-mcp-config'],{cwd:home,env,detached:process.platform!=='win32',stdio:['pipe','pipe','pipe'],windowsHide:true});}catch{rmSync(home,{recursive:true,force:true});reject(fail(503,'Qoder CLI未安装或无法启动'));return;}
-      let bytes=0,output=[],failure=null,killTimer;
+      let child;try{child=(spawnForAccount?spawnForAccount(account,{signal,kind:prompt===null?'maintenance':'model'}):spawnProcess)(qoderBinary,[...args,'--config-dir',home,'--setting-sources','','--settings','{"hooks":{},"general":{"maxAttempts":1}}','--strict-mcp-config'],{cwd:home,env,detached:process.platform!=='win32',stdio:['pipe','pipe','pipe'],windowsHide:true});}catch(error){rmSync(home,{recursive:true,force:true});reject(error instanceof AppError?error:fail(503,'Qoder CLI未安装或无法启动'));return;}
+      let bytes=0,output=[],failure=null,killTimer,bufferFailure;
       const terminateTree=signal=>{
         if(!child.pid){child.kill(signal);return;}
         if(process.platform==='win32'){const killer=spawn('taskkill',['/PID',String(child.pid),'/T','/F'],{stdio:'ignore',windowsHide:true});killer.on('error',()=>child.kill(signal));return;}
@@ -111,16 +112,16 @@ export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qodercli',
       const cleanup=()=>{clearTimeout(timer);clearTimeout(killTimer);signal?.removeEventListener('abort',abort);rmSync(home,{recursive:true,force:true});};
       // A dispatcher can exit before its descendants close inherited pipes.
       child.on('exit',()=>terminateTree('SIGKILL'));
-      child.stdout.on('data',chunk=>{bytes+=chunk.length;if(bytes>4*1024*1024)stop('Qoder响应过大');else output.push(chunk);});child.stderr.on('data',()=>{});child.stdin.on('error',()=>{});
+      child.stdout.on('data',chunk=>{if(failure)return;bytes+=chunk.length;if(bytes>4*1024*1024)stop('Qoder响应过大');else try{resources?.resize('qoder:raw',bytes);output.push(chunk);}catch(error){bufferFailure=error;stop('Qoder输出缓冲繁忙；用量需核对');}});child.stderr.on('data',()=>{});child.stdin.on('error',()=>{});
       child.on('error',()=>{cleanup();reject(fail(503,'Qoder CLI未安装或无法启动'));});
-      child.on('close',code=>{cleanup();if(failure||code!==0){reject(fail(signal?.aborted?499:502,failure||'Qoder请求未通过，请检查访问令牌与CLI版本'));return;}resolve(Buffer.concat(output).toString('utf8'));});
+      child.on('close',code=>{cleanup();if(bufferFailure){reject(bufferFailure);return;}if(failure||code!==0){reject(fail(signal?.aborted?499:502,failure||'Qoder请求未通过，请检查访问令牌与CLI版本'));return;}try{resources?.resize('qoder:concat',bytes);resources?.resize('qoder:text',bytes*2);const text=Buffer.concat(output).toString('utf8');output=[];resources?.resize('qoder:raw',0);resources?.resize('qoder:concat',0);resources?.resize('qoder:text',text.length*2);resolve(text);}catch(error){reject(error);}});
       child.stdin.end(prompt||'');if(signal?.aborted)abort();
     });
   }
   function origin(account){return account.kind==='qwen'?platformProviders.qwen.regions[JSON.parse(account.platform_config).region]:platformProviders[account.kind].origin;}
   async function models(account,credential,signal){
     if(account.kind==='qoder'){
-      const raw=await qoder(credential,['--list-models'],null,signal);
+      const raw=await qoder(credential,['--list-models'],null,signal,account);
       // Qoder 1.1.81 prints a MODEL table even with JSON output selected.
       return qoderCatalog(raw);
     }
@@ -128,36 +129,44 @@ export function createPlatformTransport({fetchImpl=fetch,qoderBinary='qodercli',
     const response=await request(origin(account)+'/models',{headers:{Authorization:'Bearer '+credential.token},signal});
     let value;try{value=JSON.parse(await boundedText(response,1024*1024));}catch{throw fail(502,'平台模型目录格式无效');}return catalog(value.data);
   }
-  async function run(account,credential,payload,signal){
+  async function run(account,credential,payload,signal,{onText=()=>{},output}={}){
+    const observed=text=>{try{onText(text);}catch{}};
     const {model}=platformModel(payload.model);
     platformParameters(account.kind,payload);
     if(account.kind==='qoder'){
       if(!model.startsWith('name-'))throw fail(400,'请使用Qoder目录返回的模型ID');
       const selected=Buffer.from(model.slice(5),'base64url').toString('utf8');
-      let value;try{value=JSON.parse(await qoder(credential,['--print','--output-format','json','--model',selected,'--tools','','--no-session-persistence','--max-model-request-retries','0'],JSON.stringify(payload.messages),signal));}catch(error){if(error instanceof AppError)throw error;throw fail(502,'Qoder未返回有效结果；用量需核对');}
+      let value;try{const raw=await qoder(credential,['--print','--output-format','json','--model',selected,'--tools','','--no-session-persistence','--max-model-request-retries','0'],JSON.stringify(payload.messages),signal,account,output);output?.resize('qoder:payload',Buffer.byteLength(raw));value=JSON.parse(raw);output?.resize('qoder:text',0);}catch(error){if(error instanceof AppError)throw error;throw fail(502,'Qoder未返回有效结果；用量需核对');}
       if(value.is_error||typeof value.result!=='string')throw fail(502,'Qoder未返回成功的文本结果；用量需核对');
-      return {text:value.result,...qoderCounts(value.usage),actualModel:typeof value.model==='string'?'qoder/'+value.model:payload.model};
+      observed(value.result);return {text:value.result,...qoderCounts(value.usage),actualModel:typeof value.model==='string'?'qoder/'+value.model:payload.model};
     }
     const isWB=account.kind==='workbuddy',messages=payload.messages.map(m=>({role:m.role==='developer'?'system':m.role,content:m.content}));
     const body={model,messages,stream:isWB,...(isWB?{stream_options:{include_usage:true}}:{}),...(payload.max_tokens===undefined?{}:{max_tokens:payload.max_tokens}),...(payload.temperature===undefined?{}:{temperature:payload.temperature})};
     const response=await request(isWB?platformProviders.workbuddy.origin+'/v2/chat/completions':origin(account)+'/chat/completions',{method:'POST',headers:isWB?workbuddyHeaders(credential):{Authorization:'Bearer '+credential.token,'Content-Type':'application/json'},body:JSON.stringify(body),signal});
-    const raw=await boundedText(response);let text='',usage,actualModel,finish;
-    if(isWB){
-      let done=false;
-      for(const line of raw.split(/\r?\n/)){
-        if(!line.startsWith('data:'))continue;const rawData=line.slice(5).trim();if(rawData==='[DONE]'){done=true;continue;}
-        let event;try{event=JSON.parse(rawData);}catch{throw fail(502,'WorkBuddy流格式无效；用量需核对');}
+    let text='',usage,actualModel,finish,knownUsage,usageFinal=false;
+    try{if(isWB){
+      let done=false,size=0,pending='';const decoder=new TextDecoder();
+      const line=value=>{
+        if(!value.startsWith('data:'))return;const rawData=value.slice(5).trim();if(rawData==='[DONE]'){done=true;return;}
+        output?.resize('wb:event',Buffer.byteLength(rawData));let event;try{event=JSON.parse(rawData);}catch{throw fail(502,'WorkBuddy流格式无效；用量需核对');}
         if(event.error)throw fail(502,'WorkBuddy返回错误；用量需核对');
-        if(event.usage)usage=event.usage;if(event.model)actualModel=event.model;
-        for(const choice of event.choices||[]){if(choice.index!==0)continue;if(typeof choice.delta?.content==='string')text+=choice.delta.content;if(choice.finish_reason)finish=choice.finish_reason;}
-      }
+        // Snapshot final metering before optional text buffering can fail.
+        // This flag qualifies recovery facts without changing successful completion.
+        const choices=event.choices||[];if(choices.some(choice=>choice.index===0&&typeof choice.delta?.content==='string'&&choice.delta.content.length>0)&&finish){knownUsage=undefined;usageFinal=false;}
+        if(event.model)actualModel=event.model;for(const choice of choices)if(choice.index===0&&choice.finish_reason){finish=choice.finish_reason;usageFinal=typeof finish==='string'&&!!finish;}
+        if(event.usage){usage=event.usage;const measured=counts(usage);knownUsage=usageFinal&&measured.usageKnown?{...measured,actualModel:modelId(actualModel)?account.kind+'/'+actualModel:payload.model}:undefined;}
+        for(const choice of event.choices||[]){if(choice.index!==0)continue;if(typeof choice.delta?.content==='string'){output?.resize('wb:text-copy',(text.length+choice.delta.content.length)*2);text+=choice.delta.content;output?.resize('wb:text',text.length*2);output?.resize('wb:text-copy',0);observed(choice.delta.content);}if(choice.finish_reason)finish=choice.finish_reason;}output?.resize('wb:event',0);
+      };
+      for await(const chunk of response.body||[]){size+=chunk.length;if(size>4*1024*1024)throw fail(502,'平台响应过大；用量需核对');output?.resize('wb:scratch',chunk.length*3+(pending.length+chunk.length)*2);pending+=decoder.decode(chunk,{stream:true});output?.resize('wb:pending',pending.length*2);output?.resize('wb:scratch',0);let end;while((end=pending.indexOf('\n'))!==-1){output?.resize('wb:parse',end*6);line(pending.slice(0,end).replace(/\r$/,''));output?.resize('wb:parse',0);output?.resize('wb:scratch',(pending.length-end-1)*2);pending=pending.slice(end+1);output?.resize('wb:scratch',0);output?.resize('wb:pending',pending.length*2);}}
+      output?.resize('wb:scratch',pending.length*2+8);pending+=decoder.decode();output?.resize('wb:pending',pending.length*2);output?.resize('wb:scratch',0);if(pending){output?.resize('wb:parse',pending.length*6);line(pending.replace(/\r$/,''));output?.resize('wb:parse',0);}pending='';output?.resize('wb:pending',0);
       if(!done||!finish)throw fail(502,'WorkBuddy响应中断；用量需核对');
     }else{
-      let value;try{value=JSON.parse(raw);}catch{throw fail(502,'平台响应无效；用量需核对');}
+      let value;try{value=await readOutputJson(response,{maxBytes:4*1024*1024,output,prefix:'platform'});}catch(error){if(error instanceof AppError)throw error;throw fail(502,'平台响应无效；用量需核对');}
       const choice=value.choices?.[0];if(typeof choice?.message?.content!=='string'||!choice.finish_reason||choice.message.tool_calls?.length)throw fail(502,'平台未返回纯文本完成结果；用量需核对');
-      text=choice.message.content;usage=value.usage;actualModel=value.model;finish=choice.finish_reason;
+      text=choice.message.content;usage=value.usage;actualModel=value.model;finish=choice.finish_reason;observed(text);
     }
     return {text,...counts(usage),actualModel:modelId(actualModel)?account.kind+'/'+actualModel:payload.model,finishReason:finish};
+    }catch(error){if(knownUsage)Object.assign(error,knownUsage);throw error;}
   }
   async function login({signal,onChallenge}){
     const start=data(await wb('/v2/plugin/auth/state?platform=workbuddy',{method:'POST',body:{},signal}));

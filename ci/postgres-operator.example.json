@@ -1,0 +1,27 @@
+{
+  "storage_engine": "postgres",
+  "image_prefix": "registry.example/harbor-local-gateway/harbor-local-gateway",
+  "port": 8092,
+  "origin": "https://harbor.example",
+  "image_transport": "ssh_archive",
+  "postgres_resources": {
+    "gateway": {
+      "cpus": 3,
+      "memory_mib": 6144,
+      "pids": 256
+    },
+    "worker": {
+      "cpus": 1,
+      "memory_mib": 2048,
+      "pids": 256
+    }
+  },
+  "device_tls_port": 8093,
+  "device_origin": "https://harbor.example:8093",
+  "postgres_shutdown": {
+    "gateway_drain_ms": 300000,
+    "cleanup_grace_ms": 30000,
+    "worker_stop_ms": 30000
+  },
+  "postgres_legacy_source_engine": "sqlite"
+}

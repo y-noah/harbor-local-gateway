@@ -49,3 +49,12 @@ test('MCP protocol reports malformed requests, lists tool and propagates cancell
  const deadline=Date.now()+2000;while(!buffer.includes('cancelled')){assert.ok(Date.now()<deadline);await new Promise(r=>setImmediate(r));}input.end();
  const messages=buffer.trim().split('\n').map(JSON.parse);assert.equal(messages[0].error.code,-32700);assert.equal(messages[1].error.code,-32600);assert.equal(messages.find(m=>m.id===2).result.tools[0].name,'image_generate');assert.equal(messages.find(m=>m.id===3).result.isError,true);
 });
+
+test('MCP sends an explicit device local token only to a literal loopback helper and keeps it out of model payloads',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'harbor-image-device-'));t.after(()=>rm(root,{recursive:true,force:true}));const token='synthetic_device_local_token_12345678901234567890',calls=[];
+ const generate=await createImageTool({root,baseUrl:'http://127.0.0.1:43128/v1',key:'synthetic-member-key',localToken:token,fetchImpl:async(url,options)=>{calls.push({url,options});return Response.json({data:[{b64_json:png}]});}});await generate({prompt:'合成设备图像',output_path:'generated.png'});await generate({prompt:'合成改图',output_path:'edited.png',reference_paths:['generated.png']});assert.equal(calls.length,2);for(const call of calls){assert.equal(call.options.headers['X-Harbor-Local-Token'],token);assert.equal(call.options.headers.Authorization,'Bearer synthetic-member-key');assert.ok(!call.options.body.includes(token));assert.equal(call.options.redirect,'error');}assert.deepEqual(await readFile(join(root,'edited.png')),Buffer.from(png,'base64'));
+});
+test('MCP refuses to send a local device token to a remote host, hostname, credentials URL or malformed token',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'harbor-image-device-invalid-'));t.after(()=>rm(root,{recursive:true,force:true}));let calls=0;const token='synthetic_device_local_token_12345678901234567890';
+ for(const baseUrl of ['https://example.invalid/v1','http://example.invalid/v1','http://localhost:43128/v1','http://user:password@127.0.0.1:43128/v1','https://127.0.0.1/v1'])await assert.rejects(createImageTool({root,baseUrl,key:'synthetic-key',localToken:token,fetchImpl:async()=>{calls++;}}));for(const localToken of ['',123,'short',token+'\r\nInjected: yes'])await assert.rejects(createImageTool({root,baseUrl:'http://127.0.0.1:43128/v1',key:'synthetic-key',localToken}));assert.equal(calls,0);assert.deepEqual(await readdir(root),[]);
+});

@@ -1,0 +1,9 @@
+import {monitorEventLoopDelay,performance} from 'node:perf_hooks';
+import {collectProcessEvidence} from './resources.mjs';
+
+// Attach in the benchmark wrapper process, never infer p95/p99 from status.mean.
+export function startRuntimeMetrics({sink,status=()=>({}),intervalMs=1000,windowMs=300000}={}){
+  if(typeof sink!=='function'||typeof status!=='function'||!Number.isSafeInteger(intervalMs)||intervalMs<10||!Number.isSafeInteger(windowMs)||windowMs<intervalMs)throw new Error('capacity_runtime_metrics_invalid');const loop=monitorEventLoopDelay({resolution:10});loop.enable();let lastCpu=process.cpuUsage(),lastTime=performance.now(),windowStart=Date.now(),busy=false,dropped=0,closePromise;const pending=new Set();
+  async function sample(final=false){if(busy){dropped++;return;}busy=true;try{const cpu=process.cpuUsage(),now=performance.now(),processEvidence=await collectProcessEvidence(process.pid),state=status();await sink({kind:'runtime',at:Date.now(),elapsedMs:now-lastTime,cpuUserUs:cpu.user-lastCpu.user,cpuSystemUs:cpu.system-lastCpu.system,memory:process.memoryUsage(),process:processEvidence,state,dropped});lastTime=now;lastCpu=cpu;if(final||Date.now()-windowStart>=windowMs){await sink({kind:'event-loop-window',start:windowStart,end:Date.now(),samples:loop.count,p95:loop.count?loop.percentile(95)/1e6:null,p99:loop.count?loop.percentile(99)/1e6:null,max:loop.count?loop.max/1e6:null});windowStart=Date.now();loop.reset();}}finally{busy=false;}}
+  const timer=setInterval(()=>{const task=sample().finally(()=>pending.delete(task));pending.add(task);task.catch(()=>{dropped++;});},intervalMs);timer.unref();return {stop:()=>closePromise??=(async()=>{clearInterval(timer);try{await Promise.allSettled([...pending]);await sample(true);}finally{loop.disable();}})(),status:()=>({dropped,busy})};
+}

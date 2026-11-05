@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "tlsHost": "REPLACE_WITH_ORIGINAL_TLS_HOSTNAME",
+  "timeoutMs": 120000,
+  "tmpfsBytes": 2147483648,
+  "business": {
+    "layout": "/opt/harbor-storage/approved-business/oci",
+    "revision": "REPLACE_WITH_APPROVED_FULL_COMMIT_SHA",
+    "manifestDigest": "sha256:REPLACE_WITH_APPROVED_BUSINESS_DIGEST",
+    "ci": {
+      "project": 101,
+      "pipeline": 0,
+      "buildJob": 0,
+      "bridgeJob": 0,
+      "verificationPipeline": 0,
+      "verificationJob": 0,
+      "repository": "REPLACE_WITH_APPROVED_BUSINESS_REPOSITORY",
+      "manifestFile": "/opt/harbor-storage/approved-business/ci-producer.manifest",
+      "manifestSha256": "REPLACE_WITH_APPROVED_SHA256",
+      "bridgeFile": "/opt/harbor-storage/approved-business/candidate-bridge.json",
+      "bridgeSha256": "REPLACE_WITH_APPROVED_SHA256",
+      "verificationFile": "/opt/harbor-storage/approved-business/candidate-verification.json",
+      "verificationSha256": "REPLACE_WITH_APPROVED_SHA256"
+    }
+  },
+  "tools": {
+    "launcher": {
+      "file": "/opt/harbor-storage/native/entry",
+      "sha256": "REPLACE_WITH_APPROVED_SHA256",
+      "manifestFile": "/opt/harbor-storage/native/manifest.json",
+      "manifestSha256": "REPLACE_WITH_APPROVED_SHA256"
+    },
+    "python": {
+      "file": "/usr/bin/python3.11",
+      "sha256": "REPLACE_WITH_APPROVED_SHA256"
+    },
+    "extractor": {
+      "file": "/opt/harbor-storage/tools/capacity/runtime-extract.py",
+      "sha256": "REPLACE_WITH_APPROVED_SHA256"
+    }
+  },
+  "harness": {
+    "directory": "/opt/harbor-storage/harness",
+    "manifestFile": "/opt/harbor-storage/harness-manifest.json",
+    "manifestSha256": "REPLACE_WITH_APPROVED_SHA256"
+  },
+  "publisher": {
+    "nodeFile": "/usr/local/bin/node",
+    "nodeSha256": "REPLACE_WITH_APPROVED_SHA256",
+    "sourceDirectory": "/opt/harbor-storage/controller",
+    "entryFile": "/opt/harbor-storage/controller/storage-receiver-candidate-publisher.mjs",
+    "manifestFile": "/opt/harbor-storage/publisher-source-manifest.json",
+    "manifestSha256": "REPLACE_WITH_APPROVED_SHA256"
+  }
+}

@@ -1,0 +1,24 @@
+import {open,lstat,readdir,realpath} from 'node:fs/promises';
+import {constants} from 'node:fs';
+import {join,resolve} from 'node:path';
+import {createHash} from 'node:crypto';
+import {readManifest,digestFile,canonical,transferError} from './migration-artifacts.mjs';
+const fail=()=>{throw transferError('storage_activation_material_catalog_changed');},hash=value=>createHash('sha256').update(value).digest('hex');
+const relative=value=>typeof value==='string'&&value.length>0&&value.length<=4096&&!value.includes('\\')&&!value.includes('\0')&&!value.startsWith('/')&&value.split('/').every(part=>part&&part!=='.'&&part!=='..');
+const mutable=(root,name)=>root==='secrets'&&name==='postgres.env';
+const identity=(a,b)=>['dev','ino','size','mtimeNs','ctimeNs'].every(key=>a[key]===b[key]);
+async function verifyEntry(path,entry){
+ if(await realpath(path)!==path)fail();const before=await lstat(path,{bigint:true});if(before.isSymbolicLink()||(before.mode&0o777n)!==BigInt(entry.mode)||entry.kind==='directory'&&!before.isDirectory()||entry.kind==='file'&&!before.isFile())fail();if(entry.kind==='directory')return;
+ const fd=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);try{if(!identity(before,await fd.stat({bigint:true}))||before.size!==BigInt(entry.content.bytes))fail();const digest=createHash('sha256'),buffer=Buffer.alloc(65536);let total=0;for(;;){const {bytesRead}=await fd.read(buffer,0,buffer.length,null);if(!bytesRead)break;total+=bytesRead;if(total>entry.content.bytes)fail();digest.update(buffer.subarray(0,bytesRead));}if(total!==entry.content.bytes||digest.digest('hex')!==entry.content.sha256||!identity(before,await fd.stat({bigint:true}))||!identity(before,await lstat(path,{bigint:true})))fail();}finally{await fd.close();}
+}
+async function* walk(root,at='',operationalRegistry=false){
+ for(const item of await readdir(at?join(root,...at.split('/')):root,{withFileTypes:true})){const name=at?at+'/'+item.name:item.name;if(!relative(name)||item.isSymbolicLink()||!item.isDirectory()&&!item.isFile())fail();if(operationalRegistry&&name==='registry'){const path=join(root,name),info=await lstat(path);if(!info.isDirectory()||info.uid!==0||(info.mode&0o777)!==0o700||await realpath(path)!==path)fail();continue;}yield name;if(item.isDirectory())yield* walk(root,name,operationalRegistry);}
+}
+// This checks bytes against a previously authenticated catalog; it never creates
+// activation authority. Only postgres.env is intentionally generated anew.
+export async function verifyStorageActivationMaterialCatalog({directory,backupKey,materialDigest,roots,operationalRegistryDirectory}={}){
+ if(operationalRegistryDirectory!==undefined&&operationalRegistryDirectory!==join(roots?.secrets??'', 'registry'))fail();const path=join(directory,'files.enc');if(hash(canonical(await digestFile(path)))!==materialDigest)fail();const manifest=await readManifest(path,backupKey);if(manifest.version!==1||!Number.isSafeInteger(manifest.files)||manifest.files<0||manifest.files>1000000||!Array.isArray(manifest.roots)||!Array.isArray(manifest.catalog))fail();
+ const known=new Set(manifest.roots.map(row=>row.id)),expected=new Map(),seen=new Set();for(const name of ['data','runtime','secrets']){if(!known.has(name)||typeof roots?.[name]!=='string'||resolve(roots[name])!==roots[name]||await realpath(roots[name])!==roots[name]||!(await lstat(roots[name])).isDirectory())fail();expected.set(name,new Set());}
+ let count=0;for(const chunk of manifest.catalog){if(!/^file-catalog-[0-9]+\.enc$/.test(chunk.name??'')||canonical(await digestFile(join(directory,chunk.name)))!==canonical(chunk.digest))fail();const catalog=await readManifest(join(directory,chunk.name),backupKey);if(catalog.version!==1||!Array.isArray(catalog.entries)||catalog.entries.length!==chunk.entries)fail();for(const entry of catalog.entries){if(++count>manifest.files||!known.has(entry.root)||!relative(entry.relative)||!['file','directory'].includes(entry.kind)||!Number.isInteger(entry.mode)||entry.mode<0||entry.mode>511||entry.kind==='file'&&(!Number.isSafeInteger(entry.content?.bytes)||entry.content.bytes<0||!/^[a-f0-9]{64}$/.test(entry.content?.sha256??'')))fail();const id=entry.root+'\0'+entry.relative;if(seen.has(id))fail();seen.add(id);if(!expected.has(entry.root)||mutable(entry.root,entry.relative))continue;expected.get(entry.root).add(entry.relative);await verifyEntry(join(roots[entry.root],...entry.relative.split('/')),entry);}}
+ if(count!==manifest.files)fail();for(const [root,entries] of expected){let actual=0;for await(const name of walk(roots[root],'',root==='secrets'&&operationalRegistryDirectory!==undefined&&!entries.has('registry'))){if(mutable(root,name))continue;if(++actual>entries.size||!entries.has(name))fail();}if(actual!==entries.size)fail();}return {originalMaterialCatalogVerified:true};
+}

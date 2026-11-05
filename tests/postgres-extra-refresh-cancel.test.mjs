@@ -1,0 +1,37 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import {PostgresStore} from '../postgres-store.mjs';
+import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
+import {createPostgresAccountExtraUsage} from '../postgres-account-extra-usage.mjs';
+const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB,integration={skip:!binDirectory?'需独占私有PG18，不访问线上':false};
+const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{const timer=setTimeout(()=>no(Error('synthetic barrier timed out')),5000);timer.unref();resolve=value=>{clearTimeout(timer);yes(value);};reject=error=>{clearTimeout(timer);no(error);};});return {promise,resolve,reject};};
+const response=owner=>({capability:{supported:true,platform:owner.kind,auth_mode:owner.auth_mode},entitlement:{state:'verified',source:'official',remaining_atoms:'100',unit:'credits',models:['gpt-6.1-sol'],protocols:['responses'],verified_at:Date.now(),valid_until:Date.now()+60000,expires_at:null}});
+const cancelResult={refreshed:false,reason:'extra_refresh_cancelled'};
+test('refresh passes cancellation and waits for real adapter settlement before releasing or writing',{...integration,timeout:20000},async t=>{
+ const lab=await createPrivatePostgres({binDirectory,libraryDirectory}),store=new PostgresStore({connection:lab.connection}),other=new PostgresStore({connection:lab.connection});try{
+  await store.migrate();const accountId=randomUUID();await store.run("INSERT INTO harbor.accounts(id,name,home,state) VALUES($1,'合成取消账号','synthetic-refresh','ready')",accountId);const initial=createPostgresAccountExtraUsage(store,{readEntitlement:async owner=>response(owner)});assert.equal((await initial.refresh(accountId)).refreshed,true);
+  const snapshot=()=>store.get('SELECT * FROM harbor.account_extra_entitlements WHERE account_id=$1',accountId),auditCount=()=>store.get('SELECT COUNT(*) n FROM harbor.audit');
+  await t.test('pre-abort does no SQL or adapter work and validates signal shape',async()=>{
+   const controller=new AbortController();controller.abort();let calls=0;const original=store.query.bind(store),service=createPostgresAccountExtraUsage(store,{readEntitlement:async()=>{calls++;throw Error('must not call');}});try{store.query=()=>{throw Error('must not query');};assert.deepEqual(await service.refresh(accountId,{signal:controller.signal}),cancelResult);assert.equal(calls,0);await assert.rejects(service.refresh(accountId,{signal:{aborted:false}}),error=>error.code==='extra_refresh_signal_invalid');}finally{store.query=original;}
+  });
+  await t.test('signal reaches adapter; abort cannot release an adapter that ignores it until its real success settles',async()=>{
+   const entered=deferred(),finish=deferred(),controller=new AbortController(),before=await snapshot();let completed=false;const service=createPostgresAccountExtraUsage(store,{readEntitlement:async(owner,{signal})=>{assert.equal(signal,controller.signal);entered.resolve();await finish.promise;return response(owner);}});const pending=service.refresh(accountId,{signal:controller.signal}).finally(()=>{completed=true;});await entered.promise;controller.abort();await new Promise(resolve=>setImmediate(resolve));assert.equal(completed,false);finish.resolve();assert.deepEqual(await pending,cancelResult);assert.deepEqual(await snapshot(),before);
+  });
+  await t.test('late rejected adapter after abort does not write failure or extend the prior validity',async()=>{
+   const entered=deferred(),finish=deferred(),controller=new AbortController(),before=await snapshot(),service=createPostgresAccountExtraUsage(store,{readEntitlement:async()=>{entered.resolve();await finish.promise;throw Error('private upstream cancellation detail');}});const pending=service.refresh(accountId,{signal:controller.signal});await entered.promise;controller.abort();finish.resolve();assert.deepEqual(await pending,cancelResult);assert.deepEqual(await snapshot(),before);
+  });
+  await t.test('abort while account write lock is held rolls back after the real lock wait, never succeeds',async()=>{
+   const held=deferred(),release=deferred(),queried=deferred(),controller=new AbortController(),before=await snapshot(),original=store.get.bind(store),blocking=other.transaction(async()=>{await other.get('SELECT id FROM harbor.accounts WHERE id=$1 FOR UPDATE',accountId);held.resolve();await release.promise;});await held.promise;try{store.get=async(sql,...args)=>{if(sql.includes('FROM harbor.accounts')&&sql.endsWith('FOR UPDATE'))queried.resolve();return original(sql,...args);};const service=createPostgresAccountExtraUsage(store,{readEntitlement:async owner=>response(owner)});let completed=false;const pending=service.refresh(accountId,{signal:controller.signal}).finally(()=>{completed=true;});await queried.promise;controller.abort();await new Promise(resolve=>setImmediate(resolve));assert.equal(completed,false);release.resolve();await blocking;assert.deepEqual(await pending,cancelResult);assert.deepEqual(await snapshot(),before);}finally{release.resolve();await blocking;store.get=original;}
+  });
+  await t.test('abort after the snapshot write and audit write rolls back both',async()=>{
+   for(const boundary of ['snapshot','audit']){const controller=new AbortController(),before=await snapshot(),beforeAudit=await auditCount(),original=store.run.bind(store),service=createPostgresAccountExtraUsage(store,{readEntitlement:async owner=>response(owner)});try{store.run=async(sql,...args)=>{const value=await original(sql,...args);if(boundary==='snapshot'&&sql.startsWith('INSERT INTO harbor.account_extra_entitlements VALUES')||boundary==='audit'&&sql.startsWith('INSERT INTO harbor.audit'))controller.abort();return value;};assert.deepEqual(await service.refresh(accountId,{signal:controller.signal}),cancelResult);}finally{store.run=original;}assert.deepEqual(await snapshot(),before);assert.deepEqual(await auditCount(),beforeAudit);}
+  });
+  await t.test('abort during ordinary failure bookkeeping rolls that write back',async()=>{
+   const controller=new AbortController(),before=await snapshot(),original=store.run.bind(store),service=createPostgresAccountExtraUsage(store,{readEntitlement:async()=>{throw Error('synthetic read failure');}});try{store.run=async(sql,...args)=>{const result=await original(sql,...args);if(sql.startsWith('INSERT INTO harbor.account_extra_entitlements('))controller.abort();return result;};assert.deepEqual(await service.refresh(accountId,{signal:controller.signal}),cancelResult);}finally{store.run=original;}assert.deepEqual(await snapshot(),before);
+  });
+  await t.test('actual committed success wins a later abort; old single-argument adapters still work',async()=>{
+   const controller=new AbortController(),original=store.transaction.bind(store),service=createPostgresAccountExtraUsage(store,{readEntitlement:async owner=>response(owner)});try{store.transaction=async(...args)=>{const value=await original(...args);controller.abort();return value;};const before=(await snapshot()).version;const result=await service.refresh(accountId,{signal:controller.signal});assert.equal(result.refreshed,true);assert.equal(result.version,before+1);assert.equal((await snapshot()).version,before+1);}finally{store.transaction=original;}
+  });
+ }finally{await other.close();await store.close();await lab.close();}
+});

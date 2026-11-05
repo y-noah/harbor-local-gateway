@@ -1,0 +1,65 @@
+import {streamingStageClock} from '../../streaming-stage-observer.mjs';
+import {fileURLToPath} from 'node:url';
+import {resolve,join} from 'node:path';
+import {readFile,open,realpath} from 'node:fs/promises';
+import {constants} from 'node:fs';
+import {isOwnedRuntime} from './owned-runtime.mjs';
+import {launchCapacityRuntimeProcess,bindCapacityRuntimeProcess} from './formal-runtime-proof.mjs';
+
+// Configuration crosses the owned IPC channel, never argv, environment or logs.
+export async function startCapacityProcess({runtime,role,configuration,sink=()=>{},timeoutMs=30000,resourceAllocator,runtimeLaunch,signal}={}){
+  if(!isOwnedRuntime(runtime)||!['gateway','worker'].includes(role)||typeof sink!=='function')throw new Error('capacity_process_configuration');
+  if(resourceAllocator!==undefined&&!(await import('./resource-allocator.mjs')).isOwnedCapacityResourceAllocator(resourceAllocator))throw new Error('capacity_resource_allocator_not_owned');
+  const args=[fileURLToPath(import.meta.url),'--owned-capacity-child'],spawnOptions={role,cwd:fileURLToPath(new URL('../..',import.meta.url)),stdio:['ignore','pipe','pipe','ipc']},launch=runtimeLaunch===undefined?null:await launchCapacityRuntimeProcess(runtimeLaunch,{runtime,resourceAllocator,role,configuration,signal}),child=launch?.child??(resourceAllocator?await resourceAllocator.start(runtime,process.execPath,args,spawnOptions):runtime.start(process.execPath,args,spawnOptions));if(launch)configuration=launch.configuration;
+  let sequence=0,closed=false,storagePending=false,parentEventDropped=0,pendingCallbacks=0;const pending=new Map();
+  const rejectAll=()=>{closed=true;for(const row of pending.values()){clearTimeout(row.timer);row.reject(new Error('capacity_process_exited'));}pending.clear();};
+  child.once('exit',rejectAll);child.once('error',rejectAll);
+  child.on('message',message=>{if(message?.kind==='capacity-runtime-storage-probe'&&launch&&Number.isSafeInteger(message.id)&&message.id>0){if(storagePending)return;storagePending=true;void launch.storageReceipt().then(value=>{if(child.connected)child.send({kind:'capacity-runtime-storage-reply',id:message.id,ok:true,value});},()=>{if(child.connected)child.send({kind:'capacity-runtime-storage-reply',id:message.id,ok:false});}).catch(()=>{}).finally(()=>{storagePending=false;});return;}if(message?.kind==='event'){try{const result=sink(message.event);if(result===false)parentEventDropped++;else if(result&&typeof result.then==='function'){pendingCallbacks++;void Promise.resolve(result).then(value=>{pendingCallbacks--;if(value===false)parentEventDropped++;},()=>{pendingCallbacks--;parentEventDropped++;});}}catch{parentEventDropped++;}return;}const row=pending.get(message?.id);if(!row)return;clearTimeout(row.timer);pending.delete(message.id);message.ok?row.resolve(message.value):row.reject(new Error('capacity_process_command_failed'));});
+  const command=(operation,payload={})=>new Promise((resolve,reject)=>{if(closed||!child.connected){reject(new Error('capacity_process_closed'));return;}const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('capacity_process_command_timeout'));},timeoutMs);pending.set(id,{resolve,reject,timer});child.send({id,operation,payload},error=>{if(!error)return;clearTimeout(timer);pending.delete(id);reject(new Error('capacity_process_send_failed'));});});
+  try{const ready=await command('initialize',{...configuration,role});let stageSource=null;if(ready.streamingStages?.enabled){const value=ready.streamingStages.clock,local=streamingStageClock();if(value?.kind!=='linux-hrtime-ns'||value.kernelId!==local.kernelId||value.clockId!=='process-'+child.pid||typeof value.epoch!=='string'||!/^[-a-f0-9]{36}$/.test(value.epoch))throw new Error('capacity_stage_source_identity_unproven');stageSource=Object.freeze({role:'gateway',clock:Object.freeze({...value}),isOpen:()=>!closed&&child.connected&&child.exitCode===null&&child.signalCode===null});}const result={child,ready,stageSource,observationStatus:()=>({parentEventDropped,pendingCallbacks,closed}),command,close:async()=>{if(child.exitCode!==null||child.signalCode!==null)return;try{await command('shutdown');}finally{if(child.exitCode===null&&child.signalCode===null)await runtime.stop(child);}}};if(runtimeLaunch!==undefined)bindCapacityRuntimeProcess(runtimeLaunch,result);return result;}catch(error){if(child.pid&&child.exitCode===null&&child.signalCode===null)await runtime.stop(child);throw error;}
+}
+
+async function childPublicOrigins(values,runtimeSourceObservation){
+  if(!Array.isArray(values)||values.length>4||values.some(value=>{try{const url=new URL(value);return url.protocol!=='https:'||url.username||url.password||url.origin!==value;}catch{return true;}}))throw Error('capacity_public_origins_invalid');
+  if(values.every(value=>new URL(value).hostname==='127.0.0.1'))return values;
+  if(typeof runtimeSourceObservation!=='function')throw Error('capacity_public_origins_invalid');
+  // The fixed native launcher creates this reserved file from a root-owned FD
+  // opened before user namespaces; neither IPC payloads nor OCI can supply it.
+  const path='/capacity-public-origins.json';let file;try{if(await realpath(path)!==path)throw Error();file=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);const info=await file.stat();if(!info.isFile()||info.size>65536||info.mode&0o222)throw Error();const permit=JSON.parse(await file.readFile('utf8'));if(permit.schema!=='capacity-native-public-origins-v1'||!Array.isArray(permit.origins)||JSON.stringify(permit.origins)!==JSON.stringify(values)||!/^[a-f0-9]{64}$/.test(permit.rootTrustHash??'')||!/^[a-f0-9]{64}$/.test(permit.topologyHash??''))throw Error();return values;}catch{throw Error('capacity_public_origins_invalid');}finally{await file?.close();}
+}
+async function childMain(){
+  const [{createPostgresGateway},{createPostgresWorker},{createDeviceCertificateAuthority},{createControlledResponsesTransport},{createGatewayProbe},{createCapacityStageProbe}]=await Promise.all([import('../../postgres-gateway.mjs'),import('../../postgres-worker.mjs'),import('../../device-certificates.mjs'),import('./controlled-upstream.mjs'),import('./gateway-probe.mjs'),import('./stage-probe.mjs')]);
+  let runtimeSourceObservation=null;if(process.execArgv.includes('--import=/app/tools/capacity/runtime-source-loader.mjs'))runtimeSourceObservation=(await import('./runtime-source-loader.mjs')).capacityRuntimeSourceObservation;
+  let app,probe,stageProbe,issuer,runtimeStorageProbe,runtimeAccountHome,recordingStorageStore,resourceMetrics,closing,eventPending=0,eventDropped=0;const send=value=>{if(process.connected)process.send(value);},event=row=>{if(!process.connected||eventPending>=256){eventDropped++;return false;}eventPending++;try{process.send({kind:'event',event:row},error=>{eventPending--;if(error)eventDropped++;});return true;}catch{eventPending--;eventDropped++;return false;}};
+  const close=()=>closing??=(async()=>{try{await app?.close();}finally{stageProbe?.close();try{await probe?.close();}finally{try{await resourceMetrics?.close();}finally{issuer?.close();runtimeStorageProbe?.close();await recordingStorageStore?.close();}}}})();
+  process.on('message',message=>{void(async()=>{
+    if(message?.kind!==undefined||!Number.isSafeInteger(message?.id))return;let value;
+    try{
+      const payload=message.payload??{};
+      if(message.operation==='initialize'){
+        if(app)throw new Error('already_initialized');const recordingEnabled=payload.recordingEnabled??true;if(typeof recordingEnabled!=='boolean')throw new Error('capacity_recording_configuration');
+        const [{PostgresStore},{createLocalRecordingStorageProbe}]=await Promise.all([import('../../postgres-store.mjs'),import('../../postgres-recording-storage.mjs')]);
+        recordingStorageStore=new PostgresStore({...payload.storageDatabase,poolSize:1});const storageProbe=runtimeSourceObservation?(runtimeStorageProbe=(await import('./runtime-recording-storage.mjs')).createCapacityRuntimeStorageProbe({store:recordingStorageStore,pgDataDir:payload.pgDataDir,appPaths:[payload.dataDir],binding:payload.runtimeStorageBinding})):createLocalRecordingStorageProbe(recordingStorageStore,{pgDataDir:payload.pgDataDir,appPaths:[payload.dataDir]});
+        if(runtimeSourceObservation&&payload.loadAccountMaterials===true)runtimeAccountHome=(await import('./runtime-recording-storage.mjs')).createCapacityRuntimeAccountHomeMapper(payload.runtimeStorageBinding);
+        const publicOrigins=await childPublicOrigins(payload.publicOrigins??[],runtimeSourceObservation);const common={env:publicOrigins.length?{HARBOR_PUBLIC_ORIGINS:publicOrigins.join(',')}:{},database:payload.database,dataDir:payload.dataDir,recording:{enabled:recordingEnabled,storage:{probe:storageProbe}},runtimeDir:payload.runtimeDir};
+        if(payload.role==='worker'){app=await createPostgresWorker(common);app.start();value={role:'worker'};}
+        else{
+          issuer=createDeviceCertificateAuthority({certificateFile:join(payload.certificateDirectory,'ca.pem'),keyFile:join(payload.certificateDirectory,'ca.key'),days:payload.certificateDays??1});
+          probe=createGatewayProbe({sink:event});const streamingStages=payload.streamingStages??false;if(typeof streamingStages!=='boolean')throw new Error('capacity_streaming_stage_configuration');const stageObserver=streamingStages?{context:()=>{const current=probe.context();return current?.trace?{trace:current.trace}:null;},observe:row=>event({kind:'gateway-streaming-stage',...row})}:undefined;
+          app=await createPostgresGateway({...common,stageObserver,config:payload.config,responsesTransport:createControlledResponsesTransport({stageObserver,origin:payload.upstreamOrigin,loadAccountMaterials:payload.loadAccountMaterials??false,...(runtimeAccountHome?{accountHome:runtimeAccountHome}:{}),context:()=>probe.context(),sink:event}),apiResponsesTransport:createControlledResponsesTransport({stageObserver,origin:payload.upstreamOrigin,context:()=>probe.context(),sink:event}),rateReader:async(_binary,_home,{signal}={})=>{const response=await fetch(new URL('/quota',payload.upstreamOrigin),{signal,redirect:'error'});if(!response.ok)throw new Error('capacity_quota_http_failed');return response.json();},devices:{issuer,tls:{key:await readFile(join(payload.certificateDirectory,'server.key')),cert:await readFile(join(payload.certificateDirectory,'server.pem')),ca:await readFile(join(payload.certificateDirectory,'ca.pem')),port:payload.tlsPort??0,maxConnections:10000}},drainTimeoutMs:5000});
+          probe.attach(app);stageProbe=createCapacityStageProbe({context:()=>probe.context(),sink:event});stageProbe.attach(app);await new Promise((resolve,reject)=>{app.server.once('error',reject);app.server.listen(payload.port??0,'127.0.0.1',resolve);});const tls=await app.deviceTls.listen();value={role:'gateway',streamingStages:{enabled:streamingStages,...(streamingStages?{clock:streamingStageClock()}:{})},origin:'http://127.0.0.1:'+app.server.address().port,tlsOrigin:'https://127.0.0.1:'+tls.port};
+        }
+        const {startCapacityChildResourceMetrics}=await import('./resource-assessment.mjs');resourceMetrics=startCapacityChildResourceMetrics();
+      }else if(message.operation==='runtime-storage'){if(!runtimeStorageProbe)value={scope:'not-installed',verified:false};else{const samples=await runtimeStorageProbe();value={scope:'owned-capacity-namespace-storage',verified:true,volumes:samples.length,status:runtimeStorageProbe.status()};}}
+      else if(message.operation==='runtime-sources'){value=runtimeSourceObservation?runtimeSourceObservation(payload):{schema:'capacity-runtime-source-observation-v1',scope:'not-installed',formalQualified:false};}
+      else if(message.operation==='status'){if(!app)throw new Error('not_initialized');value={runtime:app.status(),probe:probe?.status()??null,stageProbe:stageProbe?.status()??null,streamingStages:app.stageObserverStatus?.()??null,eventDropped};}
+      else if(message.operation==='resource-metrics'){if(!app||!resourceMetrics)throw new Error('not_initialized');value=await resourceMetrics.drain();}
+      else if(message.operation==='shutdown'){await close();value={closed:true};}
+      else throw new Error('unknown_command');
+      send({id:message.id,ok:true,value});
+    }catch(error){const candidate=typeof error?.code==='string'?error.code:error?.message,code=typeof candidate==='string'&&/^(?:[A-Z0-9_]{2,30}|capacity_[a-z_]+|recording_[a-z_]+|database_[a-z_]+)$/.test(candidate)?candidate:'capacity_process_command_failed';send({id:message.id,ok:false,code});}
+  })();});
+  for(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>{void close().finally(()=>{process.disconnect?.();process.exitCode=0;});});
+  process.on('disconnect',()=>{void close().finally(()=>{process.exitCode=0;});});
+}
+if(process.argv[2]==='--owned-capacity-child'&&process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)&&process.send)await childMain();

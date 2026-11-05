@@ -30,3 +30,7 @@ test('disconnect rejects the upload without parsing or retaining a partial reque
  const source=req((async function*(){yield Buffer.from('{"input":"');throw Object.assign(Error('disconnected'),{code:'ECONNRESET'});})());
  await assert.rejects(readJsonBody(source),/disconnected/);
 });
+
+test('R34 cancellation during zstd expansion is cancellation rather than invalid compressed JSON',async()=>{
+ const controller=new AbortController(),value={input:randomBytes(65536).toString('hex')},packed=zstdCompressSync(Buffer.from(JSON.stringify(value)));let expanded=false;const accounting={start(){},resize(kind){if(kind==='expanded'&&!expanded){expanded=true;controller.abort();}}};await assert.rejects(readJsonBody(req([packed],{'content-encoding':'zstd'}),{maxBytes:200000,compressed:true,signal:controller.signal,accounting}),status(499,'request_cancelled'));assert.equal(expanded,true);
+});

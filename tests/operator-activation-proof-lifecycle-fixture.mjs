@@ -1,0 +1,53 @@
+// External root/filesystem/PG producers are synthetic here. The actual module's
+// private qualification lifetime, Ed25519 verifier and facts validator run as-is.
+// This is not a real root, Docker or off-host qualification.
+import vm from 'node:vm';
+import {readFile} from 'node:fs/promises';
+import {constants} from 'node:fs';
+import {join} from 'node:path';
+import {createHash,createPublicKey,generateKeyPairSync,sign,randomUUID} from 'node:crypto';
+import assert from 'node:assert/strict';
+import {canonical,transferError} from '../migration-artifacts.mjs';
+import {verifyStorageReceiverApplicationAttestation} from '../storage-receiver-application-attestation.mjs';
+import {validateStorageActivationFacts} from '../storage-activation-receipt.mjs';
+
+const scenario=process.argv[2];assert.ok(['valid','late-inspection','changed-material','nonempty-devices'].includes(scenario));
+const hash=value=>createHash('sha256').update(canonical(value)).digest('hex'),digest=sha256=>({bytes:128,sha256:sha256.repeat(64)}),contextHandle={},pendingHandle={},backupHandle={},baselineHandle={};
+const nonce='a'.repeat(24),id=randomUUID(),runId=randomUUID(),sourceMachine='1'.repeat(64),receiverMachine='2'.repeat(64),publicOrigin='http://gateway.example.invalid:8092',deviceOrigin='https://gateway.example.invalid:8093',candidate={manifestDigest:'sha256:'+'3'.repeat(64),configDigest:'sha256:'+'4'.repeat(64),revision:'5'.repeat(40),schemaDigest:'',sourceDigest:'6'.repeat(64)},schemaChecksums=[{version:1,sha256:'7'.repeat(64)}];candidate.schemaDigest=createHash('sha256').update(JSON.stringify(schemaChecksums)).digest('hex');
+const roles=[{name:'harbor_migration_'+nonce,oid:'16400',superuser:false,replication:false,can_login:false},{name:'harbor_owner_'+nonce,oid:'16401',superuser:false,replication:false,can_login:false},{name:'harbor_runtime_'+nonce,oid:'16402',superuser:false,replication:false,can_login:false}];
+const binding={scope:'docker-systemd',runId,configurationDigest:'8'.repeat(64),bindingDigest:'9'.repeat(64),targetDigest:'a'.repeat(64),cluster:'123456789',database:{name:'harbor_rehearsal_'+nonce,oid:'16403'},roles,roleGenerations:{migrationOid:'16400',ownerOid:'16401',runtimeOid:'16402'},materialRoots:[{id:'secrets',directory:'/private/material/secrets'}],materialManifestDigest:digest('b'),materialKeys:[{name:'key-encryption.key',...digest('c')}]};
+const baselineSummary={scope:'synthetic-external-baseline',baselineVerified:true},configuration={runDirectory:'/private/run',expectedCluster:binding.cluster,baselineReceiverMachine:receiverMachine,candidate:{imageDigest:candidate.manifestDigest,publicOrigin,deviceOrigin}},trusted={scope:'docker-systemd',configurationDigest:binding.configurationDigest,configuration},backup={configurationDigest:'d'.repeat(64),artifactDirectory:'/private/backups'};
+const checkpoint=digest('e'),handoffDigest=digest('f'),applicationDigest=digest('0'),caDigest=digest('1'),directory=join(backup.artifactDirectory,id);
+const state={phase:'pending',baseline:baselineSummary,preflight:{candidateVerified:true,scope:'docker-candidate',imageDigest:candidate.manifestDigest,sourceDigest:candidate.sourceDigest}};
+const application={backupId:id,configurationDigest:backup.configurationDigest,pendingBindingDigest:hash(binding),runId,targetDigest:binding.targetDigest,database:structuredClone(binding.database),roles:structuredClone(roles),roleGenerations:structuredClone(binding.roleGenerations),checkpointDigest:checkpoint,sourceMaterialManifestDigest:structuredClone(binding.materialManifestDigest),materialKeys:structuredClone(binding.materialKeys)};
+const handoff={kind:'pending-final',backupId:id,configurationDigest:backup.configurationDigest,pendingBindingDigest:hash(binding),checkpointDigest:checkpoint,applicationManifestDigest:applicationDigest,sourceMachine};
+const appFacts={runId,bindingDigest:binding.bindingDigest,targetDigest:binding.targetDigest,database:binding.database,roles:{owner:{name:roles[1].name,oid:roles[1].oid},runtime:{name:roles[2].name,oid:roles[2].oid}},materialDigest:hash(binding.materialManifestDigest),keyMaterialDigest:hash(binding.materialKeys),deviceCaDigest:caDigest.sha256,deviceInventory:{count:0,sha256:hash({devices:0,credentials:0}),mode:'authenticated-empty'},candidate,tlsHost:'gateway.example.invalid'};
+const restore={version:1,purpose:'harbor-storage-receiver-result-v1',scope:'root-profile-receiver',kind:'pending-final',backupId:id,sourceMachine,receiverMachine,configurationDigest:backup.configurationDigest,clusterDigest:hash(binding.cluster),handoffDigest,checkpointDigest:checkpoint,resultDigest:'2'.repeat(64),checks:Object.fromEntries(['sourceFreeRestoreVerified','receiverRestoreVerified','recoveryExitedVerified','inventoryVerified','writeReadbackVerified','offhostDatabaseVerified','offhostDatabaseAndFilesVerified','applicationMaterialsVerified','deploymentAllowed'].map(key=>[key,!['applicationMaterialsVerified','deploymentAllowed'].includes(key)]))};
+const pair=generateKeyPairSync('ed25519'),payload={version:1,purpose:'harbor-storage-receiver-application-v1',restore,application:appFacts},attestation={payload,signature:sign(null,Buffer.from('harbor-storage-receiver-application-attestation-v1\0'+canonical(payload)),pair.privateKey).toString('base64')};
+const expected={...appFacts};delete expected.tlsHost;Object.assign(expected,{configurationDigest:binding.configurationDigest,cluster:binding.cluster,backupId:id,checkpointDigest:checkpoint.sha256,receiverResultDigest:restore.resultDigest,sourceMachine,receiverMachine,publicOrigin,deviceOrigin,stack:'/opt/product-development/harbor-local-gateway'});
+let backupClosed=0,pendingClosed=0,handle,lateInspection,counts=scenario==='nonempty-devices'?{devices:'1',credentials:'1'}:{devices:'0',credentials:'0'};
+class PostgresStore{constructor(){this.pool={options:{host:'synthetic-owned-socket',port:5432,user:'synthetic-admin'}};}async get(){return counts;}async close(){}}
+const dependencies={constants,join,createHash,createPublicKey,canonical,transferError,PostgresStore,validateStorageActivationFacts,verifyStorageReceiverApplicationAttestation,
+ open:async path=>{let bytes;if(path==='/private/run/final-receiver-application-attestation.json')bytes=Buffer.from(JSON.stringify(attestation));else if(path==='/etc/harbor-storage-receiver.pub')bytes=Buffer.from(pair.publicKey.export({type:'spki',format:'pem'}));else assert.fail('unapproved root file');return {stat:async()=>({isFile:()=>true,uid:0,mode:0o100600,size:bytes.length}),readFile:async()=>bytes,close:async()=>{}};},
+ storageOperatorContext:value=>{assert.equal(value,contextHandle);return trusted;},storageOperatorBaselineMode:value=>{assert.equal(value,baselineHandle);return 'resume';},
+ withVerifiedStorageOperatorBaseline:async(value,options,consume)=>{assert.equal(value,baselineHandle);return consume({verification:baselineSummary,backupContext:{},backupProof:{},backupRestore:{}});},revalidateStorageOperatorBaseline:async()=>baselineSummary,
+ withPendingStorageOperatorBackup:async(options,consume)=>{try{return await consume(pendingHandle);}finally{pendingClosed++;}},inspectPendingStorageOperatorBackup:async value=>{assert.equal(value,pendingHandle);return {binding:structuredClone(binding),adminOptions:{}};},
+ createPendingPostgresBackupContext:async()=>backupHandle,closePostgresBackupContext:async value=>{assert.equal(value,backupHandle);backupClosed++;},postgresBackupContext:value=>{assert.equal(value,backupHandle);return backup;},verifyPostgresBackupPendingBinding:async()=>binding,verifyPostgresBackup:async()=>({}),backupMachineIdentity:async()=>sourceMachine,
+ readManifest:async path=>{if(path==='/private/run/operator.enc')return structuredClone(state);if(path===join(directory,'handoff','handoff.enc'))return structuredClone(handoff);if(path===join(directory,'application','application.enc'))return structuredClone(application);if(path==='/private/run/artifacts/target.enc')return {schemaChecksums};assert.fail('unexpected manifest');},
+ digestFile:async path=>{if(path===join(directory,'checkpoint.enc'))return checkpoint;if(path===join(directory,'handoff','handoff.enc'))return handoffDigest;if(path===join(directory,'application','application.enc'))return applicationDigest;if(path==='/private/material/secrets/device/ca.pem')return caDigest;assert.fail('unexpected digest');}
+};
+const context=vm.createContext({Buffer,structuredClone,process:{platform:'linux',getuid:()=>0},URL}),module=new vm.SourceTextModule(await readFile(new URL('../storage-operator-activation-proof.mjs',import.meta.url),'utf8'),{context});
+await module.link(()=>new vm.SyntheticModule(Object.keys(dependencies),function(){for(const [key,value] of Object.entries(dependencies))this.setExport(key,value);},{context}));await module.evaluate();
+const api=module.namespace,options={context:contextHandle,baselineVerification:baselineHandle,backupKey:Buffer.alloc(32,1)};
+if(scenario==='nonempty-devices')await assert.rejects(api.withVerifiedStorageOperatorActivationProof(options,()=>assert.fail('nonempty inventory qualified')),{code:'storage_operator_activation_existing_client_challenge_required'});
+else await api.withVerifiedStorageOperatorActivationProof(options,async value=>{
+ handle=value;
+ if(scenario==='late-inspection'){lateInspection=api.inspectStorageOperatorActivationProof(handle,{context:contextHandle});lateInspection.catch(()=>{});return;}
+ const facts=await api.inspectStorageOperatorActivationProof(handle,{context:contextHandle});assert.deepEqual(JSON.parse(JSON.stringify(facts)),expected);assert.ok(Object.isFrozen(facts)&&Object.isFrozen(facts.candidate));
+ await assert.rejects(api.inspectStorageOperatorActivationProof({...handle},{context:contextHandle}),{code:'storage_operator_activation_proof_required'});
+ await assert.rejects(api.inspectStorageOperatorActivationProof(handle,{context:{}}),{code:'storage_operator_activation_context_mismatch'});
+ if(scenario==='changed-material'){binding.materialKeys[0].sha256='0'.repeat(64);await assert.rejects(api.inspectStorageOperatorActivationProof(handle,{context:contextHandle}),{code:'storage_operator_activation_final_backup_binding'});}
+});
+if(lateInspection)await assert.rejects(lateInspection,{code:'storage_operator_activation_proof_required'});
+if(handle)await assert.rejects(api.inspectStorageOperatorActivationProof(handle,{context:contextHandle}),{code:'storage_operator_activation_proof_required'});
+assert.equal(backupClosed,1);assert.equal(pendingClosed,1);process.stdout.write(JSON.stringify({scenario,privateLifetimeVerified:true,externalIoSynthetic:true,formalPassed:false})+'\n');

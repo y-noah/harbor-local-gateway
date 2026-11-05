@@ -14,6 +14,7 @@ function rules(value){
     const atoms=amount(row.limit_usd),cents=atoms/(scale/100n);return {model:row.model,hours:row.hours,limit_usd:(cents/100n)+'.'+String(cents%100n).padStart(2,'0')};
   });
 }
+export {amount as memberLimitAtoms,rules as normalizeMemberLimitRules};
 export function createMemberLimits(store,{clock=Date.now}={}){
   function configuration(memberId){
     const row=store.get('SELECT usage_limits,usage_limits_version FROM members WHERE id=? AND removed_at IS NULL',memberId);if(!row)failure(404,'员工不存在或已移除');
