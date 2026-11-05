@@ -33,6 +33,10 @@ export async function verifyBackupBaselineCluster(context,{signal}={}){
 async function protectedJson(path,{root=true,mode=0o600}={}){
  const file=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);try{const info=await file.stat();if(!info.isFile()||(root&&info.uid!==0)||(info.mode&0o777)!==mode||info.size>1048576)fail('backup_profile_not_trusted');return JSON.parse(await file.readFile('utf8'));}finally{await file.close();}
 }
+export async function loadPostgresBackupScheduleProfile(){
+ const {postgresBackupSchedulePolicy}=await import('./postgres-backup-schedule.mjs');
+ return postgresBackupSchedulePolicy(await protectedJson('/etc/harbor-storage-schedule.json'));
+}
 function inventory(profile){
  if(profile.dedicatedCluster!==true||!/^\d{1,20}$/.test(profile.expectedCluster??'')||!Array.isArray(profile.databases)||!profile.databases.length||!Array.isArray(profile.roles)||!profile.roles.length||!Array.isArray(profile.memberships))fail('backup_cluster_scope_required');
  for(const rows of [profile.databases,profile.roles]){if(rows.some(row=>!row||typeof row.name!=='string'||!row.name||!/^[1-9]\d*$/.test(row.oid??''))||new Set(rows.map(row=>row.name)).size!==rows.length)fail('backup_cluster_scope_required');}

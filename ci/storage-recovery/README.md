@@ -66,6 +66,12 @@ HARBOR_TEST_PG_BIN_DIR=/private/tools/postgresql/18/bin node --test tests/postgr
 
 `restore` 到新的私有目录执行实际 PITR：达到认证恢复点后退出 recovery，核对读写状态并完成临时写入读回；恢复后的角色、数据库、schema 和业务行计数重新读取。恢复收据绑定本次 checkpoint 摘要，后续 checkpoint 更新会使旧收据失效。取消传入实际解密流和恢复进程，停止并回收本次资源后才清密钥。该链仍明确为数据库范围，不代表原应用文件／设备材料、异机恢复、正式规模 RPO／RTO 或部署激活通过；这些须继续完成独立验收，不能仅凭 `backup` 或本机 `restore` 放行。
 
+`node storage-backup.mjs schedule` 是默认关闭的周期数据库备份协调器。它只读 root 拥有、0600 的固定 `/etc/harbor-storage-schedule.json`，模板见 `schedule.example.json`；不接受调用方配置路径，不修改原备份／归档 profile。默认全备周期24小时、恢复点周期5分钟、检查周期1分钟，均可在该独立配置内调整，重启协调器生效；关闭后不再新增备份／恢复点，已有密文和WAL保留。缺少配置或非法参数会失败，不自动安装或启用服务。`schedule.service.example` 提供常驻进程入口，安装前核对实际工具路径、独立资源预算及原 profile 的 `maxRateKb`，不要与每日全备 timer 重复启用。
+
+协调状态加密认证并绑定集群、原备份配置摘要和密钥版本；物理操作前持久化本轮UUID，取消／进程退出后仍沿同一UUID核验续跑。创建目录后、准备日志前退出留下的私有空目录可续跑，缺日志且含未知文件则拒绝。首次成功全备和真实WAL恢复点都完成后才发布活动备份；后续同一进程保留已验证的私有proof，不每5分钟重读整份大备份。进程重新启动后须完整核验活动备份才能复用；集群代次／timeline变化则另建全备，不能继续给旧代次追加恢复点。按本机规范化artifact目录互斥，不支持多主机同时写同一共享备份目录。每周期输出不含凭据的结构化状态，故障退出，由服务管理器按受限策略重试；正常SIGTERM等待本次取消收尾后退出，清理失败不当作正常停止。
+
+已绑定应用材料、接收包或恢复批准的数据库备份必须列入 `pinnedBackupIds`，协调器只会新建替代活动备份，不改其检查点或任何密文；旧手工基线不会被协调器主动接管。该入口仅完成数据库周期，不采集新的应用材料、不重放模型、不删除备份或WAL，始终返回 `applicationMaterialsVerified/restoreVerified/offhostVerified/deploymentAllowed=false` 和 `retentionApplied=false`。应用材料一致快照、引用核验后的保留清理及实际RPO／RTO仍须单独闭环，不能用定时配置值当作恢复承诺。回滚时停止本协调服务并关闭配置，可继续使用原手工CLI；不要删除认证状态来强行重置失败。
+
 ## 认证包与无源接收端恢复
 
 最终 pending 备份默认不制作传输副本。调用 `createStorageOperatorBackup()` 时显式开启 `prepareReceiverBundle: true`，才会在同一受控写锁回调内，于本次备份的 `handoff/` 子目录生成认证包。必须先完成真实本机 PITR；包只包含当前备份实际引用的数据库、应用文件、检查点清单、WAL 及所需 timeline history 密文，不复制整个持续增长的归档目录。分页清单逐文件绑定长度与摘要；`handoff.enc` 另绑定源机器身份摘要、system_identifier、密钥版本、原 pending 绑定、恢复凭据与最终材料摘要。恢复凭据只在该加密文件内，不含源连接地址；归档密钥须在接收端独立配置，不能随包明文传输。开启后会额外占用密文包空间，应为传输副本、WAL 与实际恢复预留空间。

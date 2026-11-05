@@ -8,7 +8,7 @@ test('backup and WAL proofs cannot be supplied as JSON or copied contexts',async
  await assert.rejects(checkpointPostgresBackup({scope:'existing-cluster',passed:true}),{code:'backup_proof_required'});await assert.rejects(createPostgresBaseBackup({}),{code:'backup_context_required'});await assert.rejects(createTaskPostgresBackupContext({laboratory:{recovery:true}}),{code:'backup_task_ownership_required'});
 });
 test('management entry rejects arbitrary URLs, commands, profile paths and WAL traversal before connection',async()=>{
- for(const args of [['backup','postgresql://synthetic'],['run','shell'],['archive-wal','../../file'],['archive-wal','000000010000000000000001','extra'],['baseline-handoff'],['baseline-handoff','postgresql://synthetic'],['baseline-handoff','../../file']])await assert.rejects(storageBackupCommand(args));
+ for(const args of [['backup','postgresql://synthetic'],['run','shell'],['archive-wal','../../file'],['archive-wal','000000010000000000000001','extra'],['baseline-handoff'],['baseline-handoff','postgresql://synthetic'],['baseline-handoff','../../file'],['schedule','/tmp/caller-profile.json'],['schedule','backup-id']])await assert.rejects(storageBackupCommand(args));
  await assert.rejects(createPostgresBackupContext('/tmp/caller-profile.json'),{code:'backup_root_profile_required'});
 });
 

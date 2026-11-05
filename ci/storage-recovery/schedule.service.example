@@ -1,0 +1,20 @@
+[Unit]
+Description=Harbor periodic encrypted PostgreSQL backups and WAL checkpoints
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/lib/harbor/node/bin/node /usr/local/lib/harbor/storage-backup.mjs schedule
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+# 管理员显式安装并核验固定root配置后启用；不自动修改现有服务或部署。

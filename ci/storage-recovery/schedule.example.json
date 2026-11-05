@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "enabled": false,
+  "fullIntervalMs": 86400000,
+  "checkpointIntervalMs": 300000,
+  "pollIntervalMs": 60000,
+  "pinnedBackupIds": []
+}

@@ -129,7 +129,7 @@ export async function runApiCoveragePhase({plan,employees=60,openScope,prepareBa
 
  try{
   main=await addScope('background');
-  drivers=Promise.allSettled([[10,true],[5,false]].map(([qps,model])=>runOpenLoop({durationMs:plan.maxDurationMs,segments:[{startMs:0,endMs:plan.maxDurationMs,qps}],send:backgroundSend(model),metrics,signal:arrivals})));
+  drivers=Promise.allSettled([[10,true],[5,false]].map(([qps,model])=>runOpenLoop({durationMs:plan.maxDurationMs,segments:[{startMs:0,endMs:plan.maxDurationMs,qps}],send:backgroundSend(model),diagnosticScenario:model?'api-coverage-model':'api-coverage-admin',metrics,signal:arrivals})));
   preparationScope=await addScope('preparation');measurementScope=await addScope('measurement');
   for(const definition of plan.groups){
    await beforeBoundary({kind:'group',signal:runSignal});
@@ -140,7 +140,7 @@ export async function runApiCoveragePhase({plan,employees=60,openScope,prepareBa
     const preparedHandles=handles,lease=getPreparedCoverageLease(preparedHandles);let executableCount=count;if(lease){for(;;){const remaining=getPreparedCoverageLease(preparedHandles);executableCount=apiCoverageExecutableCount({count:handles.length,remainingMs:remaining.remainingMs,probeQps:plan.probeQps});if(executableCount===handles.length)break;const excess=handles.slice(executableCount);handles=handles.slice(0,executableCount);try{await releaseHandles({handles:excess});for(const handle of excess)pendingHandles.delete(handle);}catch(error){cleanupError(error);}if(!handles.length)break;}if(!executableCount){missing.push('api_coverage_prepared_lease_too_short:'+group.id);break;}}
     const batchHandles=[...handles],measurement=measurementScope,batchStart=performance.now();let completed=0;
     try{
-     await runOpenLoop({durationMs:Math.max(1,Math.ceil((executableCount-0.5)/plan.probeQps*1000)),segments:[{startMs:0,endMs:Math.max(1,Math.ceil((executableCount-0.5)/plan.probeQps*1000)),qps:plan.probeQps}],scenario:scene.id,signal:runSignal,metrics,send:async event=>{
+     await runOpenLoop({durationMs:Math.max(1,Math.ceil((executableCount-0.5)/plan.probeQps*1000)),segments:[{startMs:0,endMs:Math.max(1,Math.ceil((executableCount-0.5)/plan.probeQps*1000)),qps:plan.probeQps}],scenario:scene.id,diagnosticScenario:'api-coverage-probe',signal:runSignal,metrics,send:async event=>{
       if(lease&&getPreparedCoverageLease(preparedHandles).remainingMs<=0){group.skippedExpired=(group.skippedExpired??0)+1;missing.push('api_coverage_prepared_lease_expired:'+group.id);return;}if(event.sequence>=handles.length)fail('capacity_api_coverage_handle_missing');const handle=handles[event.sequence],actorIndex=sequence++%5;handles[event.sequence]=undefined;
       let recorded=false;try{const result=await executeHandle({scope:measurement.scope,handle,group:definition,actorIndex,signal:runSignal});await record({row:measurement,result,event:{...event,actorIndex},group,onRecorded:()=>{recorded=true;}});completed++;}catch(error){if(cancelled(error,runSignal)){if(!recorded){group.attempts++;group.cancelled++;}interruptions.push('api_coverage_probe_cancelled');}else{if(!recorded){group.attempts++;group.failed++;}group.errors.tool_failed=(group.errors.tool_failed??0)+1;failures.push('api_coverage_probe_failed:'+group.id);executionError??={completed:false,cancelled:false,code:'capacity_api_coverage_probe_failed'};throw new Error('capacity_api_coverage_probe_failed');}}
      }});await delay(Math.max(0,executableCount/plan.probeQps*1000-(performance.now()-batchStart)),undefined,{signal:runSignal});
