@@ -27,7 +27,7 @@ before(async()=>{
 after(async()=>{await rm(directory,{recursive:true,force:true});});
 
 async function until(read,predicate=value=>!!value,timeoutMs=5000){const deadline=Date.now()+timeoutMs;for(;;){const value=await read();if(predicate(value))return value;if(Date.now()>deadline)throw Error('condition timeout');await delay(10);}}
-const alive=async pid=>{try{const raw=await readFile('/proc/'+pid+'/stat','utf8');return raw.slice(raw.lastIndexOf(')')+2).split(' ')[0]!=='Z';}catch(error){if(error.code==='ENOENT')return false;throw error;}};
+const alive=async(pid,readStat=readFile)=>{try{const raw=await readStat('/proc/'+pid+'/stat','utf8');return raw.slice(raw.lastIndexOf(')')+2).split(' ')[0]!=='Z';}catch(error){if(['ENOENT','ESRCH'].includes(error.code))return false;throw error;}};
 
 async function fixture(options={}){
  const runtime=createOwnedRuntime(),sockets=new Set(),requests=[];let server,launcher,transport;
@@ -107,6 +107,12 @@ test('TLS client without a certificate is rejected before handshake session',{ti
  const f=await fixture({connect:false});let socket;try{
   socket=tls.connect({ca:certificates.ca,host:'127.0.0.1',port:Number(new URL(f.launcher.origin).port),rejectUnauthorized:true});socket.on('error',()=>{});await new Promise(resolve=>socket.once('close',resolve));assert.equal((await f.inspect()).sessionUsed,false);assert.deepEqual(f.requests,[]);await f.connect();assert.equal((await f.request().result).success,true);
  }finally{socket?.destroy();await f.close();}
+});
+
+test('process exit observer accepts vanished proc entries but preserves permission and I/O uncertainty',async()=>{
+ assert.equal(await alive(process.pid),true);
+ for(const code of ['ENOENT','ESRCH'])assert.equal(await alive(process.pid,async()=>{throw Object.assign(Error('synthetic_proc_exit'),{code});}),false);
+ for(const code of ['EACCES','EIO'])await assert.rejects(alive(process.pid,async()=>{throw Object.assign(Error('synthetic_proc_unknown'),{code});}),{code});
 });
 
 test('launcher parent death closes real IPC descendants and their listener',{timeout:30000},async()=>{
