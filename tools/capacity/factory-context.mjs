@@ -59,7 +59,8 @@ export async function createCapacityFactoryContext({manifest,laboratory,store,re
   await assertContext();for(const [index,[child,role]] of [[laboratory.process,'database'],[gateway.child,'gateway'],[worker.child,'worker']].entries()){
    if(ownedProcessProof(laboratory.runtime,child).role!==role)fail('capacity_factory_runtime_not_owned');const actual=await identity(child);if(!running(actual)||actual.started!==expected[index].started)fail('capacity_factory_runtime_epoch_lost');
   }
-  const [listening]=await guarded(Promise.all([ownsListener(gateway.child,gateway.ready.tlsOrigin),gateway.command('status'),worker.command('status'),store.get('SELECT 1 AS alive')]));if(!listening)fail('capacity_factory_listener_not_owned');
+  const listener=async()=>await topologyOwner?.inspectDirectListener(binding,gateway)??ownsListener(gateway.child,gateway.ready.tlsOrigin);
+  const [listening]=await guarded(Promise.all([listener(),gateway.command('status'),worker.command('status'),store.get('SELECT 1 AS alive')]));if(!listening)fail('capacity_factory_listener_not_owned');
   // Last kernel check follows all IPC/SQL waits; an old reply cannot hide a
   // role stopped while a slower endpoint/worker was still replying.
   await assertContext();

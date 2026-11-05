@@ -22,6 +22,24 @@ export function sensitiveRecordField(key){
 const credentialWord=/sk-|[/.\\-]sk_|hg_|github_pat_|gh[pousr]_|xox[baprs]-|AIza|AKIA|eyJ/;
 const wordCharacter=/[a-zA-Z0-9_+/.\\-]/;
 const quoteCharacter=c=>c==='"'||c==="'";
+// A credential match can first appear only when its final literal arrives.
+// Derive those literals from the unchanged rules. Unsupported regex syntax
+// disables the optimization, retaining the ordinary character state machine.
+function credentialTerminals(){
+  const ends=new Set();
+  for(const alternative of credentialWord.source.split('|')){
+    let inClass=false,escaped=false,last=null;
+    for(const c of alternative){
+      if(inClass){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c===']')inClass=false;continue;}
+      if(c==='['){inClass=true;last=null;continue;}
+      if(!/[A-Za-z0-9_-]/.test(c))return null;last=c;
+    }
+    if(inClass||!last)return null;ends.add(last.charCodeAt(0));
+  }
+  return ends;
+}
+const credentialTerminalCodes=credentialTerminals();
+const plainWordCode=code=>credentialTerminalCodes&&!credentialTerminalCodes.has(code)&&((code>=48&&code<=57)||(code>=65&&code<=90)||(code>=97&&code<=122)||code===43||code===46||code===47);
 
 // Raw text is retained only inside this bounded filter, before any recording queue or file.
 export class RecordRedactor{
@@ -85,8 +103,21 @@ export class RecordRedactor{
     const last=text.charCodeAt(text.length-1);if(last>=0xd800&&last<=0xdbff){this.high=text.slice(-1);this.highSource=source;text=text.slice(0,-1);}
     this.recentBase=this.recent;this.recentText=text;this.recentStart=0;this.recentPosition=0;
     let first=true;
-    try{for(const c of text){
+    try{for(let position=0;position<text.length;){
+      const code=text.codePointAt(position),c=String.fromCodePoint(code);position+=c.length;
       this.source=first&&previousHigh?previousSource:source;first=false;
+      if(!this.jsonSkip&&!this.privateBlock&&!this.binary&&!this.quoted&&!this.unquoted&&!this.valuePending&&!this.hiddenWord&&plainWordCode(code)){
+        const start=position-1,limit=Math.min(text.length,start+8193-this.word.length);let end=position;
+        while(end<limit&&plainWordCode(text.charCodeAt(end)))end++;
+        // Copy this bounded ASCII run, so a retained word cannot pin a whole
+        // raw input chunk through V8 sliced-string backing storage.
+        const run=text.slice(start,end).split('').join('');position=end;
+        const escaped=this.quoteEscape%2===1;this.quoteEscape=0;this.recentPosition+=run.length;this.trackContext(c,escaped);
+        this.word+=run;this.wordHead=(this.wordHead+run).slice(0,3);this.wordTail=(this.wordTail+run).slice(-16);
+        const part=this.wordParts.at(-1);if(part?.source===this.source)part.text+=run;else this.wordParts.push({source:this.source,text:run});
+        if(this.word.length>8192){const length=this.word.length-64;this.wordPrefix(length);this.wordOffset+=length;this.word=this.word.slice(-64);}
+        continue;
+      }
       const escaped=this.quoteEscape%2===1;this.quoteEscape=c==='\\'?this.quoteEscape+1:0;
       if(c==='\n'||c==='\r'){this.enclosingQuote=null;this.keyQuote=false;this.closedKey=false;this.jsonValuePending=false;}
       this.recentPosition+=c.length;

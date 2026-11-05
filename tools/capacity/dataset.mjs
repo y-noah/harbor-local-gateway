@@ -43,7 +43,28 @@ export async function bootstrapActors(store,manifest,encryptionKey){
 }
 export function fixtureTimestamp(manifest,index){const visible=usageWindow(manifest.anchor),oldStart=visible.start-23*86400000;if(index<manifest.metadata7d)return visible.start+Math.floor(index*(manifest.anchor-visible.start)/manifest.metadata7d);return oldStart+Math.floor((index-manifest.metadata7d)*(visible.start-oldStart)/(manifest.metadata30d-manifest.metadata7d));}
 function bodyBytes(manifest,index){const point=index*37%100;let sum=0;for(const bin of manifest.bodyDistribution){sum+=bin.percent;if(point<sum)return bin.bytes;}throw new Error('capacity_body_distribution_invalid');}
-function syntheticText(bytes,index,part){const head=Buffer.from('容量合成正文 request_'+index+' part_'+part+'\nfunction capacityScenario(){ return "合成代码与工具输出"; }\n'),result=Buffer.alloc(bytes,32);head.copy(result,0,0,Math.min(head.length,bytes));let offset=Math.min(head.length,bytes),sequence=0;while(offset<bytes){const block=Buffer.from(digest(index+':'+part+':'+sequence++)+'\n');offset+=block.copy(result,offset,0,Math.min(block.length,bytes-offset));}return result.toString('utf8');}
+function syntheticText(bytes,index,part){const head=Buffer.from('容量合成正文 request_'+index+' part_'+part+'\nfunction capacityScenario(){ return "合成代码与工具输出"; }\n'),result=Buffer.alloc(bytes,32);head.copy(result,0,0,Math.min(head.length,bytes));const offset=Math.min(head.length,bytes),remaining=bytes-offset;if(remaining){const text=createHash('shake256',{outputLength:Math.ceil(remaining/2)}).update(index+':'+part).digest('hex').replace(/.{64}/g,'$&\n');Buffer.from(text).copy(result,offset,0,remaining);}return result.toString('utf8');}
+function fixtureBody(manifest,index){
+  const requestId=fixtureId(manifest.runId,'request',index),size=bodyBytes(manifest,index),at=fixtureTimestamp(manifest,index),events=[];
+  for(let offset=0,part=0;offset<size;offset+=32768,part++)events.push({sourceKey:'capacity-body-'+part,kind:part===0?'user':part%3===0?'tool_result':'assistant',provenance:part===0?'client':'upstream',content:{text:syntheticText(Math.min(32768,size-offset),index,part)}});
+  return {requestId,index,size,at,events,encodedBytes:events.reduce((n,event)=>n+Buffer.byteLength(JSON.stringify(event.content)),0),contentHash:digest(JSON.stringify(events.map(event=>[event.kind,event.provenance,event.sourceKey,event.content]))),state:index%1000>=990?'partial':'complete'};
+}
+async function seedNewBodyBatch(store,manifest,first,until,recordingKey,signal){
+  const recordings=new RecordingStore(store,{encryptionKey:recordingKey,maxBytes:2*1024*1024}),bodies=[],events=[];
+  for(let index=first;index<until;index++){
+    signal?.throwIfAborted();const body=fixtureBody(manifest,index);body.preview=recordings.seal({text:body.events[0].content.text.slice(0,200)},body.requestId+':preview');bodies.push(body);
+    for(const [offset,event] of body.events.entries()){const sequence=offset+1;events.push({requestId:body.requestId,sequence,sourceKey:event.sourceKey,kind:event.kind,provenance:event.provenance,at:body.at,cipher:recordings.seal(event.content,body.requestId+':'+sequence+':'+event.sourceKey)});}
+  }
+  signal?.throwIfAborted();
+  await store.run(`INSERT INTO harbor.recordings(request_id,turn_state,bytes,next_sequence,persisted_sequence,preview_cipher,updated,expires_at)
+    SELECT v.id,'known',v.bytes,v.events+1,v.events,v.preview,v.at,v.expires FROM unnest($1::text[],$2::bigint[],$3::bigint[],$4::bytea[],$5::bigint[],$6::bigint[]) AS v(id,bytes,events,preview,at,expires)`,bodies.map(b=>b.requestId),bodies.map(b=>b.encodedBytes),bodies.map(b=>b.events.length),bodies.map(b=>b.preview),bodies.map(b=>b.at),bodies.map(b=>b.at+recordings.retentionDays*86400000));
+  await store.run(`INSERT INTO harbor.conversation_events(request_id,sequence,source_key,kind,provenance,created,content_cipher)
+    SELECT * FROM unnest($1::text[],$2::bigint[],$3::text[],$4::text[],$5::text[],$6::bigint[],$7::bytea[])`,events.map(e=>e.requestId),events.map(e=>e.sequence),events.map(e=>e.sourceKey),events.map(e=>e.kind),events.map(e=>e.provenance),events.map(e=>e.at),events.map(e=>e.cipher));
+  const metadata=JSON.stringify(bodies.map(b=>({id:b.requestId,index:b.index,size:b.size,bytes:b.encodedBytes,events:b.events.length,hash:b.contentHash,state:b.state})));
+  await store.run(`UPDATE harbor.requests r SET recording_state=v.state,recording_reason=NULL FROM jsonb_to_recordset($1::jsonb) AS v(id text,state text) WHERE r.id=v.id`,metadata);
+  await store.run(`INSERT INTO harbor_capacity.body_receipts SELECT v.id,v.index,v.size,v.bytes,v.events,v.hash,md5(string_agg(md5(e.content_cipher),'' ORDER BY e.sequence))
+    FROM jsonb_to_recordset($1::jsonb) AS v(id text,index bigint,size bigint,bytes bigint,events integer,hash text) JOIN harbor.conversation_events e ON e.request_id=v.id GROUP BY v.id,v.index,v.size,v.bytes,v.events,v.hash`,metadata);
+}
 export async function seedDataset(store,manifest,{recordingKey,signal,onProgress=async()=>{}}={}){
   let cursor=await owned(store,manifest);if(!Buffer.isBuffer(recordingKey)||recordingKey.length!==32||cursor.recording_key_digest!==digest(recordingKey))throw new Error('capacity_dataset_recording_key_invalid');const active=cursor.pricing_revision,book=await store.pricingBook(active);if(!book||digest(JSON.stringify(book))!==cursor.pricing_book_hash)throw new Error('capacity_dataset_pricing_changed');
   for(let first=cursor.metadata_cursor;first<manifest.metadata30d;first+=manifest.batchSize){signal?.throwIfAborted();const until=Math.min(first+manifest.batchSize,manifest.metadata30d),rows=[];
@@ -54,10 +75,21 @@ export async function seedDataset(store,manifest,{recordingKey,signal,onProgress
       await store.run('UPDATE harbor_capacity.fixture SET metadata_cursor=GREATEST(metadata_cursor,$1) WHERE singleton=1',until);});await onProgress({kind:'metadata',completed:until,total:manifest.metadata30d});
   }
   cursor=await owned(store,manifest);
-  for(let index=cursor.body_cursor;index<manifest.bodyRequests;index++){signal?.throwIfAborted();const requestId=fixtureId(manifest.runId,'request',index),size=bodyBytes(manifest,index),at=fixtureTimestamp(manifest,index),recordings=new RecordingStore(store,{encryptionKey:recordingKey,maxBytes:2*1024*1024,clock:()=>at}),events=[];
-    for(let offset=0,part=0;offset<size;offset+=32768,part++)events.push({sourceKey:'capacity-body-'+part,kind:part===0?'user':part%3===0?'tool_result':'assistant',provenance:part===0?'client':'upstream',content:{text:syntheticText(Math.min(32768,size-offset),index,part)}});
-    await recordings.start(requestId,{turnState:'known'});await recordings.append(requestId,events);await recordings.finish(requestId,{state:index%1000>=990?'partial':'complete'});await store.transaction(async()=>{const cipher=await store.get("SELECT md5(string_agg(md5(content_cipher),'' ORDER BY sequence)) checksum FROM harbor.conversation_events WHERE request_id=$1",requestId);await store.run('INSERT INTO harbor_capacity.body_receipts VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(request_id) DO NOTHING',requestId,index,size,events.reduce((n,event)=>n+Buffer.byteLength(JSON.stringify(event.content)),0),events.length,digest(JSON.stringify(events.map(event=>[event.kind,event.provenance,event.sourceKey,event.content]))),cipher.checksum);await store.run('UPDATE harbor_capacity.fixture SET body_cursor=GREATEST(body_cursor,$1) WHERE singleton=1',index+1);});
-    if(index%manifest.batchSize===0||index+1===manifest.bodyRequests)await onProgress({kind:'body',completed:index+1,total:manifest.bodyRequests});
+  for(let first=cursor.body_cursor;first<manifest.bodyRequests;first+=manifest.batchSize){
+    signal?.throwIfAborted();const until=Math.min(first+manifest.batchSize,manifest.bodyRequests);
+    await store.transaction(async()=>{
+      await owned(store,manifest);await store.get('SELECT singleton FROM harbor_capacity.fixture WHERE singleton=1 FOR UPDATE');
+      const ids=Array.from({length:until-first},(_,offset)=>fixtureId(manifest.runId,'request',first+offset)),existing=await store.get('SELECT request_id FROM harbor.recordings WHERE request_id=ANY($1::text[]) LIMIT 1',ids);
+      if(!existing)await seedNewBodyBatch(store,manifest,first,until,recordingKey,signal);
+      else for(let index=first;index<until;index++){
+        signal?.throwIfAborted();const body=fixtureBody(manifest,index),{requestId,size,at,events}=body,recordings=new RecordingStore(store,{encryptionKey:recordingKey,maxBytes:2*1024*1024,clock:()=>at});
+        await recordings.start(requestId,{turnState:'known'});await recordings.append(requestId,events);await recordings.finish(requestId,{state:body.state});
+        const cipher=await store.get("SELECT md5(string_agg(md5(content_cipher),'' ORDER BY sequence)) checksum FROM harbor.conversation_events WHERE request_id=$1",requestId);
+        await store.run('INSERT INTO harbor_capacity.body_receipts VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(request_id) DO NOTHING',requestId,index,size,body.encodedBytes,events.length,body.contentHash,cipher.checksum);
+      }
+      signal?.throwIfAborted();await store.run('UPDATE harbor_capacity.fixture SET body_cursor=GREATEST(body_cursor,$1) WHERE singleton=1',until);
+    });
+    await onProgress({kind:'body',completed:until,total:manifest.bodyRequests});
   }
   return verifyDataset(store,manifest,{recordingKey});
 }
