@@ -2,18 +2,18 @@ import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import https from 'node:https';
 import tls from 'node:tls';
-import {mkdtemp,rm,readFile,lstat} from 'node:fs/promises';
+import {mkdtemp,rm,readFile,writeFile,lstat} from 'node:fs/promises';
 import {spawn} from 'node:child_process';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {randomUUID,X509Certificate} from 'node:crypto';
+import {randomUUID,X509Certificate,createHash} from 'node:crypto';
 import {setTimeout as delay} from 'node:timers/promises';
 import {syntheticCertificates} from '../tools/capacity/selfcheck.mjs';
 import {createOwnedRuntime,ownedProcessProof} from '../tools/capacity/owned-runtime.mjs';
 import {createCapacityRemoteLauncher,capacityRemoteLauncherBinding} from '../tools/capacity/remote-launcher.mjs';
 import {createCapacityRemoteEndpoint} from '../tools/capacity/remote-endpoint.mjs';
 import {connectCapacityRemoteTransport,capacityRemoteTransportBinding} from '../tools/capacity/remote-transport.mjs';
-import {createCapacityRequestDriver,capacityRequestDriverAgent,isOwnedCapacityRequestDriver} from '../tools/capacity/request-driver.mjs';
+import {createCapacityRequestDriver,capacityRequestDriverAgent,isOwnedCapacityRequestDriver,capacityRequestDriverRemoteSourceBinding} from '../tools/capacity/request-driver.mjs';
 import {requestCapacityTarget,createCapacityClientStageObserver} from '../tools/capacity/http-client.mjs';
 import {createCapacityRemoteFrames,remoteHash} from '../tools/capacity/remote-protocol.mjs';
 
@@ -35,7 +35,10 @@ async function fixture(options={}){
   server=https.createServer({...certificates.server,ca:certificates.ca,requestCert:true,rejectUnauthorized:true},(req,res)=>{requests.push(req.url);if(options.handler)return options.handler(req,res);req.resume();if(req.url==='/wait'){res.writeHead(200,{'content-type':'text/event-stream'});res.write(': alive\n\n');return;}res.setHeader('content-type','application/json');res.end(JSON.stringify({ok:true}));});
   server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const target='https://127.0.0.1:'+server.address().port,agents=[{id:'test',origin:target,tls:{caFile:clientTls.caFile,certFile:clientTls.certFile,keyFile:clientTls.keyFile},routes:options.routes??[{method:'GET',path:'/health'},{method:'POST',path:'/wait'}]}];
-  launcher=await createCapacityRemoteLauncher({runtime,tls:serverTls,agents,...options.launcher});
+  // This test activates metadata only; it never launches a browser. Use owned
+  // private material so checkout ownership/umask cannot affect executor trust.
+  const browserModule=options.activationTemplate?join(directory,'metadata-only-browser-'+randomUUID()+'.mjs'):null;if(browserModule)await writeFile(browserModule,'export const chromium={launchServer(){throw Error("unexpected_metadata_only_browser_launch");}};',{mode:0o600,flag:'wx'});
+  launcher=await createCapacityRemoteLauncher({runtime,tls:serverTls,agents,...(options.activationTemplate?{browser:{module:browserModule,binary:process.execPath,maxBrowsers:1,activationTemplate:{id:'epoch',origin:target,serverSpkiHash:createHash('sha256').update(new X509Certificate(certificates.server.cert).publicKey.export({type:'spki',format:'der'})).digest('base64')}}}:{}),...options.launcher});
   const connect=async configuration=>transport=await connectCapacityRemoteTransport({origin:launcher.origin,runId:launcher.runId,tls:clientTls,...configuration});
   if(options.connect!==false)await connect(options.transport);
   return {launcher,runtime,target,requests,connect,get transport(){return transport;},inspect:()=>capacityRemoteLauncherBinding(launcher).inspect(),request:(overrides={})=>transport.request({agentId:'test',path:'/health',method:'GET',mode:'json',timeoutMs:5000,...overrides}),close:async()=>{if(transport&&!transport.status().closed)await transport.close().catch(()=>{});let cleanupError;try{await launcher.close();}catch(error){cleanupError=error;}for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));await runtime.close();if(cleanupError)throw cleanupError;}};
@@ -375,7 +378,7 @@ test('legacy normal stage reserves its complete private envelope against the ret
 test('initial and dynamic aliases that shadow object prototypes retain accurate numeric request statistics',{timeout:30000},async()=>{
  const f=await fixture({routes:[{method:'GET',path:'/health'},{method:'POST',path:'/v1/responses'}],handler:(req,res)=>{req.resume();if(req.url==='/v1/responses'){res.setHeader('content-type','text/event-stream');res.end('data: '+JSON.stringify({type:'response.output_text.delta',delta:'content'})+'\n\ndata: '+JSON.stringify({type:'response.completed',response:{status:'completed',id:'alias'}})+'\n\n');}else res.end(JSON.stringify({ok:true}));}});let driver;try{
   driver=await createCapacityRequestDriver({remote:{transport:f.transport},agentPlans:[{id:'__proto__',slot:'test',origin:f.target},{id:'constructor',slot:'test',origin:f.target}]});const agents=new Map([['__proto__',capacityRequestDriverAgent(driver,'__proto__')],['constructor',capacityRequestDriverAgent(driver,'constructor')],['toString',await driver.addAgent({id:'toString',slot:'test',origin:f.target})]]);
-  for(const [alias,agent] of agents){for(let index=0;index<2;index++)assert.equal((await requestCapacityTarget({origin:f.target,agent,path:'/health'})).success,true);assert.equal((await requestCapacityTarget({origin:f.target,agent,path:'/v1/responses',method:'POST',mode:'sse'})).success,true);const status=driver.status();assert.equal(Object.hasOwn(status.executedRequestsByAgent,alias),true);assert.equal(status.executedRequestsByAgent[alias],3);assert.equal(status.executedModelRequestsByAgent[alias],1);}
+  for(const [alias,agent] of agents){for(let index=0;index<2;index++)assert.equal((await requestCapacityTarget({origin:f.target,agent,path:'/health'})).success,true);assert.equal((await requestCapacityTarget({origin:f.target,agent,path:'/v1/responses',method:'POST',mode:'sse'})).success,true);const status=driver.status();assert.equal(Object.hasOwn(status.executedRequestsByAgent,alias),true);assert.equal(status.executedRequestsByAgent[alias],3);assert.equal(status.executedModelRequestsByAgent[alias],1);}assert.equal(capacityRequestDriverRemoteSourceBinding(driver).executionSnapshot().successfulModels,agents.size);
  }finally{await driver?.close().catch(()=>{});await f.close();}
 });
 
@@ -385,4 +388,14 @@ test('remote private response headers never enter result DTO and invalid callbac
   const result=await requestCapacityTarget({origin:f.target,agent,path:'/health',onResponseHeaders:headers=>{captured=headers['set-cookie'][0];}});assert.ok(captured.includes(secret));assert.equal(JSON.stringify(result).includes(secret),false);assert.equal(JSON.stringify(result).includes('set-cookie'),false);assert.ok(result.remoteObservations.some(event=>event.kind==='headers'&&!Object.hasOwn(event,'value')));
   for(const mutation of [{onResponseHeaders:'invalid'},{onRemoteStage:'invalid'}])await assert.rejects(requestCapacityTarget({origin:f.target,agent,path:'/health',...mutation}),/http_configuration/);assert.deepEqual(f.requests,['/health']);
  }finally{await driver?.close().catch(()=>{});await f.close();}
+});
+
+test('model receipt settles async observations once and never carries successful or in-flight requests into a new browser epoch',{timeout:30000},async()=>{
+ let holdResponse=false,finishResponse;const f=await fixture({activationTemplate:true,routes:[{method:'POST',path:'/v1/responses'}],handler:(req,res)=>{req.resume();res.setHeader('content-type','text/event-stream');res.write('data: '+JSON.stringify({type:'response.output_text.delta',delta:'content'})+'\n\n');const finish=()=>res.end('data: '+JSON.stringify({type:'response.completed',response:{status:'completed',id:'epoch'}})+'\n\n');if(holdResponse)finishResponse=finish;else finish();}});let driver,release;
+ try{
+  driver=await createCapacityRequestDriver({remote:{transport:f.transport},agentPlans:[{id:'model',slot:'test',origin:f.target}]});const source=capacityRequestDriverRemoteSourceBinding(driver),agent=capacityRequestDriverAgent(driver,'model'),profile=epoch=>({bindingTag:'epoch-'+epoch,epoch,cookies:Array.from({length:5},(_,n)=>({name:'harbor_session',value:'epoch-'+epoch+'-actor-'+n}))});await source.activateBrowserProfile(profile(0));
+  const held=new Promise(resolve=>{release=resolve;});const result=await requestCapacityTarget({origin:f.target,agent,path:'/v1/responses',method:'POST',mode:'sse',onResponseHeaders:()=>held});assert.equal(result.success,true);assert.equal(source.executionSnapshot().successfulModels,0);release();await until(()=>source.executionSnapshot().successfulModels,value=>value===1);assert.equal(driver.status().pendingCallbacks,0);
+  holdResponse=true;const pending=requestCapacityTarget({origin:f.target,agent,path:'/v1/responses',method:'POST',mode:'sse'});await until(()=>finishResponse);await source.activateBrowserProfile(profile(1));assert.equal(source.executionSnapshot().successfulModels,0);finishResponse();assert.equal((await pending).success,true);assert.equal(source.executionSnapshot().successfulModels,0,'old in-flight request cannot prove the new epoch');
+  holdResponse=false;assert.equal((await requestCapacityTarget({origin:f.target,agent,path:'/v1/responses',method:'POST',mode:'sse'})).success,true);assert.equal(source.executionSnapshot().successfulModels,1);await source.activateBrowserProfile(profile(1));assert.equal(source.executionSnapshot().successfulModels,1,'idempotent activation keeps the same evidence epoch');
+ }finally{release?.();finishResponse?.();await driver?.close().catch(()=>{});await f.close();}
 });

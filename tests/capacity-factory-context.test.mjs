@@ -5,9 +5,12 @@ import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {createTarget,inspectCapacityTargetPrerequisites} from '../tools/capacity/gateway-adapter.mjs';
+import {createTarget,ownedCapacityTarget,inspectCapacityTargetPrerequisites,inspectCapacityBrowserPublication,collectCapacityTargetRemoteConsumption,inspectCapacityTargetRemoteConsumption} from '../tools/capacity/gateway-adapter.mjs';
 import {capacityFormalProofRequirements,inspectCapacityFormalSoftware,createCapacityFormalProofConsumer,collectCapacityFormalProofs,recheckCapacityFormalProofs} from '../tools/capacity/formal-proof-catalogue.mjs';
 import {buildCapacityPreparationEntry,runCapacityOwnedFactory} from '../tools/capacity/preparation-context.mjs';
+import {inspectCapacityRemotePrerequisites} from '../tools/capacity/formal-remote-proof.mjs';
+import {inspectCapacityHelperWorkload} from '../tools/capacity/scope-stage-factory.mjs';
+import {createNormalExecution} from '../tools/capacity/normal-execution.mjs';
 import {validateCapacityFactoryJob} from '../tools/capacity/factory-owner.mjs';
 
 const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB,real={skip:!binDirectory?'需独立PG18工具路径':false,timeout:120000};let entryDirectory;
@@ -16,13 +19,47 @@ after(async()=>{if(entryDirectory)await rm(entryDirectory,{recursive:true,force:
 
 test('formal software gaps name fixed producers, phases and concrete consumer bridges',async()=>{
  const contracts=capacityFormalProofRequirements();assert.deepEqual(contracts.map(row=>row.id),['runtime','remote','lan','proxy','clock','helperClock','helper']);assert.ok(contracts.every(row=>row.phases.join(',')==='allocation,pre-seed,final,restore'));const report=await inspectCapacityFormalSoftware();assert.deepEqual(report.softwareMissing,[]);
- const readiness=await inspectCapacityTargetPrerequisites({profile:'formal'});assert.equal(readiness.allocationEligible,false);assert.equal(readiness.seedEligible,false);assert.equal(readiness.softwareMissing.includes('formal_process_launch_bridge_consumer_not_implemented'),false);assert.ok(readiness.softwareMissing.includes('formal_remote_driver_browser_consumer_not_implemented'));
+ const readiness=await inspectCapacityTargetPrerequisites({profile:'formal'});assert.equal(readiness.allocationEligible,false);assert.equal(readiness.seedEligible,false);assert.equal(readiness.softwareMissing.includes('formal_process_launch_bridge_consumer_not_implemented'),false);const remote=await inspectCapacityRemotePrerequisites();assert.deepEqual(readiness.evidence.remoteConsumers,remote.evidence);assert.ok(remote.softwareMissing.every(code=>readiness.softwareMissing.includes(code)));assert.equal(readiness.softwareMissing.includes('formal_remote_driver_browser_consumer_not_implemented'),false);assert.equal(readiness.softwareMissing.includes('formal_remote_clock_mapping_consumer_not_implemented'),false);assert.ok(readiness.missing.includes('owned_formal_factory_owner'));
 });
 test('proof DTO, copied consumer and phase claims never authorize a seed',async()=>{
  for(const claim of [{passed:true,phase:'pre-seed'},{formalDataAllowed:true},{},Object.freeze({nonce:'known'})]){await assert.rejects(collectCapacityFormalProofs(claim,'pre-seed'),/proof_not_owned/);await assert.rejects(recheckCapacityFormalProofs(claim,'pre-seed'),/proof_not_owned/);}
  const spoofed=createCapacityFormalProofConsumer({isOpen:()=>true,getBinding:()=>Object.freeze({phase:'pre-seed',nonce:'fake',manifest:{profile:'formal'}})});await assert.rejects(collectCapacityFormalProofs(spoofed,'pre-seed'),/proof_not_owned/);await assert.rejects(createTarget({ownerAuthority:Object.freeze({})}),/owner_not_owned/);
  for(const extra of [{manifest:{profile:'formal'}},{target:{profile:'formal'}},{receipt:{passed:true}},{resourceAllocator:{observe:()=>({passed:true})}},{onSetup:()=>{}}])assert.throws(()=>validateCapacityFactoryJob({target:{profile:'selfcheck'},execution:{},...extra}),/configuration|not_authorized/);
 });
+test('browser publication never accepts a caller snapshot or capability DTO',async()=>{
+ for(const value of [undefined,null,{},Object.freeze({}),{target:{},snapshot:{requestDriver:{},adminActors:[]}},JSON.parse('{"passed":true,"publicationPending":false}')]){assert.throws(()=>inspectCapacityBrowserPublication(value),/publication_not_owned/);assert.throws(()=>inspectCapacityTargetRemoteConsumption(value),/consumption_not_owned/);await assert.rejects(inspectCapacityHelperWorkload(value,{gateway:{}}),/source_not_owned/);await assert.rejects(collectCapacityTargetRemoteConsumption(value),/target_not_owned/);}
+});
+
+test('private publication blocks ordinary consumers and expires after a real actor epoch and close',real,async()=>{
+ // Only the test module exports the private lifecycle helpers. The production
+ // API has no mint or finish method and still rejects every caller DTO.
+ const source=(await readFile(new URL('../tools/capacity/gateway-adapter.mjs',import.meta.url),'utf8')).replace(/from '([^']+)'/g,(full,path)=>path.startsWith('.')?"from '"+new URL('../tools/capacity/'+path,import.meta.url).href+"'":full)+'\nexport {beginCapacityBrowserPublication,finishCapacityBrowserPublication};';
+ const adapter=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));let target;
+ try{
+  target=await adapter.createTarget({employeeCount:1,binDirectory,libraryDirectory});await assert.rejects(adapter.collectCapacityTargetRemoteConsumption(target),/profile/);const snapshot=adapter.ownedCapacityTarget(target),publication=adapter.beginCapacityBrowserPublication(target);
+  assert.throws(()=>adapter.ownedCapacityTarget(target),/target_not_owned/);assert.equal(adapter.inspectCapacityBrowserPublication(publication).snapshot,snapshot);assert.equal(adapter.inspectCapacityBrowserPublication(publication).target,target);
+  const helperSource=adapter.inspectCapacityBrowserPublication(publication).snapshot.helperWorkloadSource;await assert.rejects(inspectCapacityHelperWorkload(helperSource,{gateway:snapshot.gatewayChild}),/normal.*not_owned|run.*not_owned/);
+  adapter.finishCapacityBrowserPublication(publication);assert.equal(adapter.ownedCapacityTarget(target),snapshot);
+  await target.prepareActorEpoch({phase:'normal-scenario'});assert.notEqual(adapter.ownedCapacityTarget(target),snapshot);assert.equal(adapter.ownedCapacityTarget(target).helperWorkloadSource,helperSource);assert.throws(()=>adapter.inspectCapacityBrowserPublication(publication),/publication_not_owned/);
+  const next=adapter.beginCapacityBrowserPublication(target);await target.close();assert.throws(()=>adapter.inspectCapacityBrowserPublication(next),/publication_not_owned|target_not_owned/);await assert.rejects(inspectCapacityHelperWorkload(helperSource,{gateway:snapshot.gatewayChild}),/run_not_owned/);target=null;
+ }finally{await target?.close();}
+});
+
+
+test('helper workload run survives UI refresh but expires for another normal run, runtime or close',real,async()=>{
+ let target,first,second;
+ try{
+  target=await createTarget({employeeCount:1,binDirectory,libraryDirectory});const snapshot=ownedCapacityTarget(target),source=snapshot.helperWorkloadSource;
+  first=await createNormalExecution({target});await first.close();const options={gateway:snapshot.gatewayChild,run:first.helperWorkload};
+  const before=await inspectCapacityHelperWorkload(source,options);assert.equal(before.passed,null);assert.ok(before.missing.includes('helper_workload_actual_model_unproven'));
+  await target.prepareActorEpoch({phase:'ui-additional-load'});const after=await inspectCapacityHelperWorkload(source,options);assert.equal(after.passed,null);assert.deepEqual(after.evidence,before.evidence);
+  await assert.rejects(inspectCapacityHelperWorkload(source,{...options,gateway:{}}),/run_not_owned/);
+  second=await createNormalExecution({target});await second.close();await assert.rejects(inspectCapacityHelperWorkload(source,options),/not_owned|revoked|current|binding/);
+  const next={gateway:snapshot.gatewayChild,run:second.helperWorkload};assert.equal((await inspectCapacityHelperWorkload(source,next)).passed,null);
+  await target.close();target=null;await assert.rejects(inspectCapacityHelperWorkload(source,next),/epoch_changed|not_owned|closed/);
+ }finally{await first?.close();await second?.close();await target?.close();}
+});
+
 test('real factory prepares empty DB then seeds same manifest and verifies a fresh final epoch',real,async()=>{
  let target;const order=[];try{
   target=await createTarget({profile:'selfcheck',binDirectory,libraryDirectory,employeeCount:1,onProgress:event=>order.push({...event})});
@@ -75,8 +112,8 @@ test('builtin CLI uses fixed owner and reports software gaps without paths or fo
  const execute=promisify(execFile),storageRoot=await mkdtemp(join(tmpdir(),'harbor-factory-cli-'));const common=['tools/capacity/cli.mjs','verify','--adapter','tools/capacity/gateway-adapter.mjs','--owner-entry',entryDirectory,'--pg-bin',binDirectory,'--storage-root',storageRoot,...(libraryDirectory?['--pg-lib',libraryDirectory]:[])];
  try{
   const result=await execute(process.execPath,[...common,'--profile','selfcheck'],{timeout:90000,maxBuffer:1048576});assert.equal(JSON.parse(result.stdout).verified,true);assert.deepEqual(await readdir(storageRoot),[]);
-  await assert.rejects(execute(process.execPath,[...common,'--profile','formal'],{timeout:30000,maxBuffer:1048576}),error=>{const report=JSON.parse(error.stderr);assert.equal(report.error.code,'capacity_formal_adapter_incomplete');assert.ok(report.preflight.softwareMissing.includes('formal_remote_driver_browser_consumer_not_implemented'));assert.equal(report.preflight.seedEligible,false);assert.equal(error.stderr.includes(storageRoot),false);return true;});
-  const invalidBinary=[...common];invalidBinary[invalidBinary.indexOf('--pg-bin')+1]='/nonexistent/postgresql/18/bin';await assert.rejects(execute(process.execPath,[...invalidBinary,'--profile','formal'],{timeout:30000,maxBuffer:1048576}),error=>{const report=JSON.parse(error.stderr);assert.equal(report.error.code,'capacity_formal_adapter_incomplete');assert.ok(report.preflight.softwareMissing.includes('formal_remote_driver_browser_consumer_not_implemented'));return true;});assert.deepEqual(await readdir(storageRoot),[]);
+  await assert.rejects(execute(process.execPath,[...common,'--profile','formal'],{timeout:30000,maxBuffer:1048576}),error=>{const report=JSON.parse(error.stderr);assert.equal(report.error.code,'capacity_formal_adapter_incomplete');assert.equal(report.preflight.softwareMissing.includes('formal_remote_driver_browser_consumer_not_implemented'),false);assert.ok(report.preflight.missing.includes('owned_formal_resource_allocator'));assert.equal(report.preflight.seedEligible,false);assert.equal(error.stderr.includes(storageRoot),false);return true;});
+  const invalidBinary=[...common];invalidBinary[invalidBinary.indexOf('--pg-bin')+1]='/nonexistent/postgresql/18/bin';await assert.rejects(execute(process.execPath,[...invalidBinary,'--profile','formal'],{timeout:30000,maxBuffer:1048576}),error=>{const report=JSON.parse(error.stderr);assert.equal(report.error.code,'capacity_formal_adapter_incomplete');assert.equal(report.preflight.softwareMissing.includes('formal_remote_driver_browser_consumer_not_implemented'),false);assert.ok(report.preflight.missing.includes('owned_formal_resource_allocator'));return true;});assert.deepEqual(await readdir(storageRoot),[]);
  }finally{await rm(storageRoot,{recursive:true,force:true});}
 });
 

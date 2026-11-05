@@ -100,8 +100,13 @@ export async function createPostgresGateway(options={}){
   const drainTimeoutMs=options.drainTimeoutMs??300000;
   if(!Number.isInteger(drainTimeoutMs)||drainTimeoutMs<100||drainTimeoutMs>3600000)throw new AppError(503,'排空等待配置无效','gateway_configuration');
   let workspaceLock,guardStore,guardClient,store,queryStore,recordingStore,buffer,meteringRecovery,handler,accountAdmin,extraUsageAdmin,nightly,server,deviceTls,deviceSettings,ownedDeviceIssuer,config,closing=false,releasingOwnership=false,lostOwnership=false,closePromise,quotaTimer,nightlyTimer,recordingTimer,recordingMonitor,recordingProbeStore;
-  const inflight=new Set(),loop=monitorEventLoopDelay({resolution:20});
+  const inflight=new Set(),loop=monitorEventLoopDelay({resolution:20}),ownership=new AbortController();
   const requireOwnership=()=>{if(lostOwnership)throw new AppError(503,'数据库单实例锁已丢失','gateway_ownership_lost');};
+  const loseOwnership=()=>{
+    if(releasingOwnership||lostOwnership)return;
+    lostOwnership=true;clearInterval(quotaTimer);clearInterval(nightlyTimer);clearInterval(recordingTimer);void recordingMonitor?.close({timeoutMs:0});handler?.abort();accountAdmin?.stop();cliProcesses.stop();
+    ownership.abort();
+  };
   const cleanup=async()=>{
     clearInterval(quotaTimer);clearInterval(recordingTimer);
     await deviceTls?.close({force:true});
@@ -121,8 +126,8 @@ export async function createPostgresGateway(options={}){
     if(!await missing(join(data,'gateway.sqlite')))throw new AppError(503,'该目录仍有SQLite来源数据，请先完成正式迁移核验','database_migration_required');
     await mkdir(runtime,{recursive:true,mode:0o700});
     guardStore=new PostgresStore({...database,poolSize:1});guardClient=await guardStore.pool.connect();
-    guardClient.on('error',()=>{if(!releasingOwnership){lostOwnership=true;clearInterval(quotaTimer);clearInterval(nightlyTimer);clearInterval(recordingTimer);void recordingMonitor?.close({timeoutMs:0});handler?.abort();accountAdmin?.stop();cliProcesses.stop();}});
-    guardClient.on('end',()=>{if(!releasingOwnership){lostOwnership=true;clearInterval(quotaTimer);clearInterval(nightlyTimer);clearInterval(recordingTimer);void recordingMonitor?.close({timeoutMs:0});handler?.abort();accountAdmin?.stop();cliProcesses.stop();}});
+    guardClient.on('error',loseOwnership);
+    guardClient.on('end',loseOwnership);
     if(!(await guardClient.query('SELECT pg_try_advisory_lock($1) acquired',[gatewayLock])).rows[0].acquired)throw new AppError(503,'此数据库已有活动网关，暂不支持多实例','gateway_already_running');
     store=new PostgresStore({...database,poolSize:resources.corePoolSize});
     queryStore=new PostgresStore({...database,poolSize:resources.queryPoolSize});recordingStore=new PostgresStore({...database,poolSize:resources.recordingPoolSize});
@@ -231,7 +236,7 @@ export async function createPostgresGateway(options={}){
         if(error)throw error;return {forced,ownershipLost:lostOwnership,...result};
       })();return closePromise;
     }
-    return {server,deviceTls,stageObserverStatus:()=>({gateway:handler.stageObserverStatus(),subscription:responses.stageObserverStatus?.()??{enabled:false},api:apiResponses.stageObserverStatus?.()??{enabled:false}}),deviceAccess:handler.deviceAccess,network,config,store,queryStore,recordingStore,buffer,meteringRecovery,extraUsage,recordingBackend:handler.recordingBackend,recordingStorage:recordingMonitor,preparation:handler.preparation,sessionHandoffs:handler.sessionHandoffs,handoffAdmin:handler.handoffAdmin,nightly,status,close};
+    return {server,deviceTls,ownershipSignal:ownership.signal,stageObserverStatus:()=>({gateway:handler.stageObserverStatus(),subscription:responses.stageObserverStatus?.()??{enabled:false},api:apiResponses.stageObserverStatus?.()??{enabled:false}}),deviceAccess:handler.deviceAccess,network,config,store,queryStore,recordingStore,buffer,meteringRecovery,extraUsage,recordingBackend:handler.recordingBackend,recordingStorage:recordingMonitor,preparation:handler.preparation,sessionHandoffs:handler.sessionHandoffs,handoffAdmin:handler.handoffAdmin,nightly,status,close};
   }catch(error){closing=true;await handler?.closeQueries();await cleanup();throw error;}
 }
 

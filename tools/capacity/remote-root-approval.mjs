@@ -1,3 +1,4 @@
+import {capacityRemoteBrowserActivationTemplate} from './remote-browser-profile.mjs';
 import {createHash,createPublicKey,createPrivateKey} from 'node:crypto';
 import {lstat,realpath} from 'node:fs/promises';
 import {isAbsolute} from 'node:path';
@@ -25,6 +26,7 @@ export async function loadCapacityRemoteRootApproval({artifact,side}={}){
   publicKey=createPublicKey(await pinnedFile(plan.publicKey,65536));if(publicKey.asymmetricKeyType!=='ed25519')fail('signer_type');if(!Number.isSafeInteger(plan.closeTimeoutMs)||plan.closeTimeoutMs<1000||plan.closeTimeoutMs>60000||typeof plan.browserRequired!=='boolean'||!Array.isArray(plan.agentSlots)||!plan.agentSlots.length||plan.agentSlots.length>256||plan.agentSlots.some(id=>!remoteId(id))||new Set(plan.agentSlots).size!==plan.agentSlots.length)fail('slots');
  }else{
   if(!keys(plan,['approvalId','listen','controlListen','tls','signingKey','machineHash','bootHash','publicOrigin','proxyAddress','caSha256','serverCertificateHash','agents','browser','remoteTools','certificateDirectory','runtimeDirectory','shutdownMs','limits','frames']))fail('configuration');if(!keys(plan.controlListen,['host','port'])||typeof plan.controlListen.host!=='string'||!Number.isInteger(plan.controlListen.port)||plan.controlListen.port<1||plan.controlListen.port>65535||!keys(plan.listen,['host','port'])||typeof plan.listen.host!=='string'||!Number.isInteger(plan.listen.port)||plan.listen.port<1||plan.listen.port>65535||!Number.isSafeInteger(plan.shutdownMs)||plan.shutdownMs<1000||plan.shutdownMs>30000)fail('listen');
+  const browserActivation=capacityRemoteBrowserActivationTemplate(plan.browser?.activationTemplate);if(browserActivation&&browserActivation.origin!==plan.publicOrigin)fail('browser_activation_origin');
   signingKey=createPrivateKey(await pinnedFile(plan.signingKey,65536,true));if(signingKey.asymmetricKeyType!=='ed25519')fail('signer_type');publicKey=createPublicKey(signingKey);
   for(const directory of [plan.runtimeDirectory,plan.certificateDirectory]){if(typeof directory!=='string'||!isAbsolute(directory)||await realpath(directory)!==directory)fail('directory');const info=await lstat(directory);if(!info.isDirectory()||info.uid!==0||info.mode&0o077)fail('directory');}
   if(plan.signingKey.file===plan.certificateDirectory||plan.signingKey.file.startsWith(plan.certificateDirectory+'/'))fail('signer_boundary');

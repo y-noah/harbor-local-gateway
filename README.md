@@ -16,6 +16,8 @@ Harbor 提供员工 Key、订阅账号池、Responses 转发、用量查询与�
 
 `npm run start:postgres`、`npm run worker:postgres` 与 `npm run db:migrate` 使用显式 PostgreSQL 配置；参考 [存储恢复说明](ci/storage-recovery/README.md)与 [PG 配置示例](ci/postgres-env.example)。迁移／恢复工具只接受受控来源和固定批准材料，不会自动安装主机配置或发起服务切换。设备访问参考 [设备辅助程序](clients/harbor-device/README.md)。
 
+CLI在数据库所有权丢失后停止接纳、完成必要持久化并退出，由部署者的进程监督器重建连接；不会自动重发结果不明的模型请求。嵌入式调用保留调用方控制关闭的行为。
+
 正文采集记录客户端实际上传的本轮内容及工具交互，不把整段历史重复记为本轮，也不声称记录客户端未上传的操作。部署者应按实际需求配置采集、访问控制和保留周期。
 
 ## 远程配置

@@ -1,5 +1,5 @@
 import {capacityRunBudget} from './certificate-lifetime.mjs';
-import {capacityTargetRunLifetime} from './gateway-adapter.mjs';
+import {capacityTargetRunLifetime,collectCapacityTargetRemoteConsumption,inspectCapacityTargetRemoteConsumption} from './gateway-adapter.mjs';
 import {runCapacitySuite} from './runner.mjs';
 import {runIndependentUiAcceptance,uiAcceptancePlan,getUiFailureReport} from './ui-acceptance.mjs';
 import {createNormalExecution} from './normal-execution.mjs';
@@ -10,7 +10,7 @@ const browserKeys=['browserLists','browserStatistics'];
 
 // Preserve the original API report. Only its missing browser facets may be
 // satisfied by the separate UI phase; an API failure must never disappear.
-export function combineCapacityReports(normal,ui,apiCoverage){
+export function combineCapacityReports(normal,ui,apiCoverage,remoteReceipt){
   if(!normal?.verdict||!Array.isArray(normal.verdict.failures)||!Array.isArray(normal.verdict.incomplete))throw new Error('capacity_execution_report_invalid');
   const failures=[...normal.verdict.failures],incomplete=[...normal.verdict.incomplete];
   const independent=ui?.scope==='independent-ui-additional-load'&&ui.normalMixReplaced===false&&ui.plan?.profile==='formal'&&ui.phase?.window?.finished===true&&ui.phase.window.declaredMs===ui.plan.durationMs&&ui.phase.window.observedMs>=ui.plan.durationMs;
@@ -24,10 +24,15 @@ export function combineCapacityReports(normal,ui,apiCoverage){
   const api=combineApiCoverageEvidence(normal,apiCoverage);failures.push(...api.failures);
   for(const value of api.resolved){const index=incomplete.indexOf(value);if(index!==-1)incomplete.splice(index,1);}
   incomplete.push(...api.incomplete);
+  let remoteConsumption=null;
+  if(normal.profile==='formal'){
+    try{remoteConsumption=inspectCapacityTargetRemoteConsumption(remoteReceipt);}catch{remoteConsumption={passed:null,missing:['formal_remote_consumption_unavailable'],failures:[],evidence:null};}
+    if(remoteConsumption.passed===false)failures.push('远端实际执行验收失败');else if(remoteConsumption.passed!==true)incomplete.push('缺少验收证据:remoteConsumption');
+  }
   if(normal.profile!=='formal')incomplete.push('仅为小规模工具自验');
   if(normal.verdict.status==='failed'&&!failures.length)failures.push('原API验收失败');
   if(normal.verdict.status==='incomplete'&&!incomplete.length&&normal.verdict.incomplete.length===0)incomplete.push('原API验收未完整通过');
-  return {schema:'harbor-capacity-execution-v1',profile:normal.profile,startedAt:normal.startedAt,endedAt:Date.now(),phases:{normal,ui:ui??null,...(apiCoverage?{apiCoverage}:{})},verdict:{status:failures.length?'failed':incomplete.length?'incomplete':'passed',failures:[...new Set(failures)],incomplete:[...new Set(incomplete)],observations:[...(normal.verdict.observations??[]),'浏览器为独立附加载荷阶段，时长与请求不计入原API混合场景。']}};
+  return {schema:'harbor-capacity-execution-v1',profile:normal.profile,startedAt:normal.startedAt,endedAt:Date.now(),phases:{normal,ui:ui??null,...(apiCoverage?{apiCoverage}:{}),...(remoteConsumption?{remoteConsumption}:{})},verdict:{status:failures.length?'failed':incomplete.length?'incomplete':'passed',failures:[...new Set(failures)],incomplete:[...new Set(incomplete)],observations:[...(normal.verdict.observations??[]),'浏览器为独立附加载荷阶段，时长与请求不计入原API混合场景。']}};
 }
 
 // Coverage may fill only suite-wide API omissions, never per-scene/model gates
@@ -81,7 +86,8 @@ async function runCapacityExecutionPhases({launchBrowser,uiMaxDurationMs,apiMaxD
     const cancelled=typeof partial?.execution?.cancelled==='boolean'?partial.execution.cancelled:options.signal?.aborted===true&&(error===options.signal.reason||error?.name==='AbortError'||error?.cause===options.signal.reason),code=cancelled?'capacity_ui_phase_cancelled':/^capacity_[a-z0-9_]{1,100}$/.test(error?.message??'')?error.message:'capacity_ui_phase_failed';
     ui={...ui,scope:'independent-ui-additional-load',normalMixReplaced:false,execution:{...ui?.execution,completed:false,cancelled,code},...Object.fromEntries(browserKeys.map(key=>[key,{...ui?.[key],passed:ui?.[key]?.passed===false?false:cancelled?null:false,missing:[...(ui?.[key]?.missing??[]),code]}]))};
   }
-  return combineCapacityReports(normal,ui,apiCoverage);
+  let remoteReceipt;if(options.plan.profile==='formal'){try{remoteReceipt=await collectCapacityTargetRemoteConsumption(options.target,{helperWorkload:observation.helperWorkload});}catch{ /* A missing or revoked source remains incomplete; prior failures stay. */ }}
+  return combineCapacityReports(normal,ui,apiCoverage,remoteReceipt);
 }
 
 export async function runCapacityExecution(options={}){

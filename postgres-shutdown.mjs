@@ -10,7 +10,10 @@ export function postgresGatewayShutdownExitCode(result){
 }
 export function installPostgresGatewayShutdown(app,{runtime=process}={}){
  let stopping=false;
- const stop=()=>{if(stopping)return;stopping=true;void Promise.resolve().then(()=>app.close()).then(result=>{runtime.exitCode=postgresGatewayShutdownExitCode(result);},()=>{runtime.exitCode=1;});};
+ const remove=()=>{for(const signal of ['SIGINT','SIGTERM'])runtime.off(signal,stop);app.ownershipSignal?.removeEventListener('abort',stop);};
+ const stop=()=>{if(stopping)return;stopping=true;void Promise.resolve().then(()=>app.close()).then(result=>{runtime.exitCode=app.ownershipSignal?.aborted?1:postgresGatewayShutdownExitCode(result);},()=>{runtime.exitCode=1;}).finally(remove);};
  for(const signal of ['SIGINT','SIGTERM'])runtime.on(signal,stop);
- return ()=>{for(const signal of ['SIGINT','SIGTERM'])runtime.off(signal,stop);};
+ app.ownershipSignal?.addEventListener('abort',stop,{once:true});
+ if(app.ownershipSignal?.aborted)stop();
+ return remove;
 }

@@ -15,7 +15,7 @@ const ui=()=>({scope:'independent-ui-additional-load',normalMixReplaced:false,pl
 
 test('independent UI only fills its missing facets and preserves the full API report',()=>{
   const source=normal(),snapshot=structuredClone(source),browser=ui();const report=combineCapacityReports(source,browser);
-  assert.equal(report.verdict.status,'passed');assert.strictEqual(report.phases.normal,source);assert.strictEqual(report.phases.ui,browser);assert.deepEqual(source,snapshot);
+  assert.equal(report.verdict.status,'incomplete');assert.deepEqual(report.verdict.incomplete,['缺少验收证据:remoteConsumption']);assert.strictEqual(report.phases.normal,source);assert.strictEqual(report.phases.ui,browser);assert.deepEqual(source,snapshot);
   source.verdict.incomplete.push('缺少验收证据:hostRestoreRpo');assert.equal(combineCapacityReports(source,browser).verdict.status,'incomplete');
 });
 
@@ -116,5 +116,30 @@ test('real API setup cancellation wrapper retains private cancellation provenanc
  globalThis[key]={source,owned:{getApiCoverageInventory(){},prepareApiCoverageBatch(){},executeApiCoverageHandle(){},releaseApiCoverageHandles(){},createObservationScope(){},configureScenario(){},modelActorCount:1,adminActors:Array.from({length:5},()=>({})),prepareActorEpoch:async({signal})=>{controller.abort();signal.throwIfAborted();}}};
  const hooks=registerHooks({resolve(specifier,context,nextResolve){if(context.parentURL===entry&&specifier==='./runner.mjs')return {url:'data:text/javascript,'+encodeURIComponent('export async function runCapacitySuite(){return globalThis['+JSON.stringify(key)+'].source;}'),shortCircuit:true};if(context.parentURL===entry&&specifier==='./api-coverage.mjs')return {url:api,shortCircuit:true};if(context.parentURL===api&&specifier==='./gateway-adapter.mjs')return {url:'data:text/javascript,'+encodeURIComponent('export const ownedCapacityTarget=()=>globalThis['+JSON.stringify(key)+'].owned;'),shortCircuit:true};return nextResolve(specifier,context);}});
  try{const {runCapacityExecution:run}=await import(entry),report=await run({plan:{profile:'selfcheck'},target:{},observeNormal:false,apiMaxDurationMs:1000,signal:controller.signal});assert.equal(report.phases.apiCoverage.execution.cancelled,true);assert.equal(report.phases.apiCoverage.execution.code,'capacity_api_phase_cancelled');assert.equal(report.phases.apiCoverage.qualification.passed,null);assert.ok(report.phases.apiCoverage.qualification.missing.includes('api_coverage_cancelled'));assert.strictEqual(report.phases.normal,source);}
+ finally{hooks.deregister();delete globalThis[key];}
+});
+
+
+test('plain remote execution DTO cannot complete a formal combined report',()=>{
+ for(const dto of [undefined,null,{passed:true,missing:[],failures:[],evidence:{actualExecutionVerified:true}},Object.freeze({})]){
+  const report=combineCapacityReports(normal(),ui(),undefined,dto);assert.equal(report.verdict.status,'incomplete');assert.ok(report.verdict.incomplete.includes('缺少验收证据:remoteConsumption'));assert.equal(report.phases.remoteConsumption.passed,null);
+ }
+});
+
+for(const outcome of ['passed','pending','failed'])test('final remote consumption is collected after UI cleanup and preserves '+outcome+' facts',async()=>{
+ // Only the owned-source and phase boundaries are mocked. This executes the
+ // real orchestration/combiner and never claims actual remote/formal proof.
+ const entry=new URL('../tools/capacity/execution.mjs?remote-final-'+outcome,import.meta.url).href,key='__harborFinalRemote'+outcome,source=normal(),browser=ui(),result={passed:outcome==='passed'?true:outcome==='failed'?false:null,missing:outcome==='pending'?['actual_browser_not_measured']:[],failures:outcome==='failed'?['actual_remote_observation_failed']:[],evidence:{scope:'mocked-source-boundary-only'}};
+ if(outcome==='failed'){source.verdict.status='failed';source.verdict.failures.push('正常组成功率:model/steady');}
+ const state={normal:source,ui:browser,coverage:apiCoverage(),result,helperWorkload:Object.freeze({}),order:[],uiClosed:false,lifetime:{runLifetimeMs:100000,signal:new AbortController().signal,assertCoverage(){},evidence:()=>({deadlineReached:false})}};globalThis[key]=state;
+ const prefix='const state=globalThis['+JSON.stringify(key)+'];',modules={
+  './gateway-adapter.mjs':prefix+`const receipts=new WeakMap();export function capacityTargetRunLifetime(){return state.lifetime;}export async function collectCapacityTargetRemoteConsumption(target,{helperWorkload}={}){if(helperWorkload!==state.helperWorkload)throw Error('wrong_normal_run');if(!state.uiClosed)throw Error('collected_before_ui_cleanup');state.order.push('remote');const handle=Object.freeze({});receipts.set(handle,state.result);return handle;}export function inspectCapacityTargetRemoteConsumption(handle){const row=receipts.get(handle);if(!row)throw Error('not_owned');return row;}`,
+  './runner.mjs':prefix+`export async function runCapacitySuite(){state.order.push('normal');return state.normal;}`,
+  './normal-execution.mjs':prefix+`export async function createNormalExecution({target}){return {target,helperWorkload:state.helperWorkload,close:async()=>state.order.push('normalClosed')};}`,
+  './api-coverage.mjs':prefix+`export async function runIndependentApiCoverage(){state.order.push('api');return state.coverage;}export function getApiCoverageFailureReport(){return undefined;}`,
+  './ui-acceptance.mjs':prefix+`export function uiAcceptancePlan(){return {};}export function getUiFailureReport(){return undefined;}export async function runIndependentUiAcceptance(){state.uiClosed=true;state.order.push('uiClosed');return state.ui;}`
+ };
+ const hooks=registerHooks({resolve(specifier,context,nextResolve){if(context.parentURL===entry&&modules[specifier])return {url:'data:text/javascript,'+encodeURIComponent(modules[specifier]),shortCircuit:true};return nextResolve(specifier,context);}});
+ try{const {runCapacityExecution:run}=await import(entry),before=structuredClone(source),report=await run({plan:{profile:'formal',scenarios:[]},target:{},launchBrowser:()=>{},apiMaxDurationMs:1,uiMaxDurationMs:1});assert.deepEqual(state.order,['normal','normalClosed','api','uiClosed','remote']);assert.equal(report.verdict.status,outcome==='passed'?'passed':outcome==='pending'?'incomplete':'failed');assert.deepEqual(report.phases.normal,source);assert.deepEqual(source,before);assert.equal(report.phases.remoteConsumption.passed,result.passed);assert.equal(report.verdict.incomplete.includes('缺少验收证据:sources'),false);if(outcome==='failed'){assert.ok(report.verdict.failures.includes('正常组成功率:model/steady'));assert.ok(report.verdict.failures.includes('远端实际执行验收失败'));}}
  finally{hooks.deregister();delete globalThis[key];}
 });

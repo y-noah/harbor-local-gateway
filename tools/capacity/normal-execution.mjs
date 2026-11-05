@@ -3,6 +3,9 @@ import {randomUUID} from 'node:crypto';
 import {ownedCapacityTarget} from './gateway-adapter.mjs';
 import {isOwnedObservationScope} from './observation-adapter.mjs';
 
+const helperRuns=new WeakMap(),latestHelperRuns=new WeakMap();
+export function inspectCapacityNormalHelperWorkload(run,{source,gateway}={}){const row=helperRuns.get(run);if(!row||latestHelperRuns.get(row.target)!==run||!row.isClosed()||row.source!==source||row.gateway!==gateway||ownedCapacityTarget(row.target).gatewayChild!==gateway)throw Error('capacity_helper_workload_run_not_owned');return Object.freeze(row.scenes.map(scene=>scene.scope.id));}
+
 const verdict=values=>values.some(value=>value===false)?false:values.length&&values.every(value=>value===true)?true:null;
 
 // Every scene gets a new scope after real authentication. Qualification runs
@@ -38,5 +41,5 @@ export async function createNormalExecution({target,profile='selfcheck',enabled=
       return {...base,streamingStages,...Object.fromEntries(['requestStages','streamRelay','cancelRelease','bodyVisibility'].map(key=>[key,streamingStages[key]])),dataReconciliation:{passed:verdict([...data.map(row=>row.passed),knownCounts?true:null]),counts:knownCounts?counts:null,scenarios:rows.map((row,index)=>({id:row.id,...data[index]}))},dataReadiness:{passed:verdict(readiness),scope:'per-scene-normal',provesFormalTimeliness:false,scenarios:rows.map((row,index)=>({id:row.id,...scopes[index].dataReadiness}))},metricIntegrity:{...base.metricIntegrity,passed:integrity},serverArrivals:{passed:arrivals,scope:'per-scene-normal',scenarios:rows.map((row,index)=>({id:row.id,epoch:row.epoch,...transport[index]}))},normalObservation:{passed:verdict([integrity,arrivals,knownCounts?true:null,...data.map(row=>row.passed),...readiness,profile==='formal'?streamingStages.passed:streamingStages.passed===false?false:true]),scenarios:rows.map(row=>({id:row.id,epoch:row.epoch,scopeEpoch:row.evidence.scopeEpoch})),qualificationOutsideNormalScopes:true}};
     }
   };
-  return {target:observed,close:async()=>{if(closed)return;closed=true;const results=await Promise.allSettled(scenes.map(row=>row.scope.close()));active=null;if(results.some(row=>row.status==='rejected'))throw new Error('capacity_normal_scope_cleanup_failed');}};
+  let finished=false;const run={target:observed,get helperWorkload(){return run;},close:async()=>{if(finished)return;closed=true;const results=await Promise.allSettled(scenes.map(row=>row.scope.close()));active=null;if(results.some(row=>row.status==='rejected'))throw new Error('capacity_normal_scope_cleanup_failed');finished=true;}};helperRuns.set(run,{target,source:initial.helperWorkloadSource,gateway:initial.gatewayChild,scenes,isClosed:()=>finished});latestHelperRuns.set(target,run);return run;
 }

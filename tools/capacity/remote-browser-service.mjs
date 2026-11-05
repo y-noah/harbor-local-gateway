@@ -1,4 +1,5 @@
 import {randomUUID,createHash} from 'node:crypto';
+import {capacityRemoteBrowserActivationTemplate,capacityRemoteBrowserActivation} from './remote-browser-profile.mjs';
 import {createCapacityBrowserScenarioCore} from './browser-assessment.mjs';
 import {remoteFailure,remoteInteger,remoteId} from './remote-protocol.mjs';
 
@@ -6,11 +7,12 @@ const hash=value=>createHash('sha256').update(value).digest('hex');
 const keys=(value,allowed)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(key=>allowed.includes(key));
 const stages=new Set(['beforeRequest','response','requestFinished','requestFailed','upstreamActive']);
 
-// Profiles are supplied only by the endpoint's trusted initialization, never
-// by an authenticated scenario command. No RPC accepts a URL, script or path.
-export function createCapacityRemoteBrowserService({profiles=[],launchBrowser,emitChallenge,emitState,clockEpoch,frames,maxSessions=1,maxActions=16,maxCallbacks=256,callbackTimeoutMs=10000}={}){
+// Root initialization fixes profiles or an explicit bounded activation template.
+// Activation never accepts a URL, executable, script, path or measurement policy.
+export function createCapacityRemoteBrowserService({profiles=[],activationTemplate=null,launchBrowser,emitChallenge,emitState,clockEpoch,frames,maxSessions=1,maxActions=16,maxCallbacks=256,callbackTimeoutMs=10000}={}){
  if(!Array.isArray(profiles)||profiles.length>8||typeof launchBrowser!=='function'||typeof emitChallenge!=='function'||typeof emitState!=='function'||!remoteId(clockEpoch))throw remoteFailure('capacity_remote_browser_configuration');
  remoteInteger(maxSessions,1,8);remoteInteger(maxActions,1,256);remoteInteger(maxCallbacks,1,256);remoteInteger(callbackTimeoutMs,100,30000);
+ const template=capacityRemoteBrowserActivationTemplate(activationTemplate);if(template&&(profiles.length>=8||profiles.some(row=>row.id===template.id)))throw remoteFailure('capacity_remote_browser_configuration');let activating=false,activationFault=false;
  const approved=new Map(),sessions=new Map(),callbacks=new Map(),actions=new Map();let callbackBytes=0,peakCallbackBytes=0,sequence=0,closing=false,aborting=false,closePromise;
  for(const input of profiles){
   if(!keys(input,['id','origin','bindingTag','epoch','cookies','serverSpkiHash','deepPages','sampleIntervalMs','timeoutMs','maxSeries','searchTerm','maxActionMs'])||!remoteId(input.id)||approved.has(input.id)||!remoteId(input.bindingTag))throw remoteFailure('capacity_remote_browser_configuration');
@@ -52,8 +54,17 @@ export function createCapacityRemoteBrowserService({profiles=[],launchBrowser,em
    await row.assessment.close();rejectCallbacks(sessionId);const finalSnapshot=snapshot(sessionId,row);sessions.delete(sessionId);return {resourcesReleased:true,snapshot:finalSnapshot};
   })();return row.closing;
  };
+ const activate=async payload=>{
+  if(!template||closing||activating||activationFault)throw remoteFailure('capacity_remote_browser_activation_unavailable');const selected=capacityRemoteBrowserActivation(payload),previous=approved.get(template.id);
+  if(previous){if(previous.bindingTag===selected.bindingTag&&previous.epoch===selected.epoch&&JSON.stringify(previous.cookies)===JSON.stringify(selected.cookies))return {profile:summary().find(row=>row.id===template.id),resourcesReleased:true,retiredBrowserSessions:[]};if(selected.epoch<=previous.epoch)throw remoteFailure('capacity_remote_browser_activation_stale');}
+  activating=true;try{
+   const old=[...sessions.entries()].filter(([,row])=>row.plan.id===template.id);const outcomes=await Promise.allSettled(old.map(([id])=>closeSession(id)));
+   if(outcomes.some(row=>row.status==='rejected')||closing){activationFault=true;throw remoteFailure('capacity_remote_browser_cleanup_unknown');}
+   approved.set(template.id,{...template,...selected});return {profile:summary().find(row=>row.id===template.id),resourcesReleased:true,retiredBrowserSessions:old.map(([id])=>id)};
+  }finally{activating=false;}
+ };
  const command=async(operation,payload={},actionId)=>{
-  if(closing)throw remoteFailure('capacity_remote_browser_closed');
+  if(closing||activating||activationFault)throw remoteFailure('capacity_remote_browser_closed');
   if(operation==='open'){
    if(!keys(payload,['profileId'])||Object.keys(payload).length!==1||sessions.size>=maxSessions)throw remoteFailure('capacity_remote_browser_command');const plan=approved.get(payload.profileId);if(!plan)throw remoteFailure('capacity_remote_browser_profile');
    // Reserve the slot before an asynchronous browser launch can overlap.
@@ -79,5 +90,5 @@ export function createCapacityRemoteBrowserService({profiles=[],launchBrowser,em
  const cancel=actionId=>{const row=actions.get(actionId);row?.controller.abort();return {acknowledged:true,active:!!row};};
  const abort=()=>{aborting=true;rejectCallbacks();for(const row of actions.values())row.controller.abort();};
  const close=({drain=false}={})=>{if(!drain)abort();return closePromise??=(async()=>{closing=true;const outcomes=await Promise.allSettled([...sessions.keys()].map(id=>closeSession(id,{drain})));if(outcomes.some(row=>row.status==='rejected'))throw remoteFailure('capacity_remote_browser_cleanup_unknown');return {resourcesReleased:true};})();};
- return Object.freeze({summary,command,acknowledge,stateDeliveryFailed,cancel,abort,close,status:()=>({sessions:sessions.size,actions:actions.size,pendingCallbacks:callbacks.size,callbackBytes,peakCallbackBytes,snapshotDropped:[...sessions.values()].reduce((sum,row)=>sum+row.snapshotDropped,0),closing})});
+ return Object.freeze({summary,activationTemplate:template,activate,command,acknowledge,stateDeliveryFailed,cancel,abort,close,status:()=>({sessions:sessions.size,actions:actions.size,pendingCallbacks:callbacks.size,callbackBytes,peakCallbackBytes,snapshotDropped:[...sessions.values()].reduce((sum,row)=>sum+row.snapshotDropped,0),closing})});
 }

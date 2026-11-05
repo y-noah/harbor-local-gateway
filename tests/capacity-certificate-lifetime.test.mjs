@@ -14,6 +14,8 @@ import {capacityPlan} from '../tools/capacity/scenarios.mjs';
 import {createTarget,capacityTargetRunLifetime,ownedCapacityTarget} from '../tools/capacity/gateway-adapter.mjs';
 import {runCapacityExecution} from '../tools/capacity/execution.mjs';
 const exec=promisify(execFile),day=86400000;
+// Override only the lifetime source; keep the real adapter's other ESM exports.
+const lifetimeGatewayMock=key=>'data:text/javascript,'+encodeURIComponent('export * from '+JSON.stringify(new URL('../tools/capacity/gateway-adapter.mjs',import.meta.url).href)+';export function capacityTargetRunLifetime(){return globalThis['+JSON.stringify(key)+'];}');
 
 test('formal lifetime is explicit, bounded and greater than all serial declared phases',()=>{
   assert.throws(()=>capacityRunLifetime(undefined,{required:true}),/capacity_run_lifetime_required/);
@@ -85,7 +87,7 @@ test('execution waits for actual callback return after deadline and cannot keep 
     // Start a fresh short lifetime after certificate preparation.
     lifetime.dispose();const active=createCapacityCertificateLifetime({runLifetimeMs:80});active.registerAuthority(certificates.ca);active.registerCertificate('server',certificates.server.cert);
     const key='__harborLifetimeTest_'+Date.now();globalThis[key]=active;
-    hooks=registerHooks({resolve(specifier,context,next){if(context.parentURL===entry&&specifier==='./gateway-adapter.mjs')return {shortCircuit:true,url:'data:text/javascript,'+encodeURIComponent('export function capacityTargetRunLifetime(){return globalThis['+JSON.stringify(key)+'];}')};if(context.parentURL===entry&&specifier==='./runner.mjs')return {shortCircuit:true,url:'data:text/javascript,'+encodeURIComponent('export async function runCapacitySuite(options){await options.onProgress({kind:"synthetic-lifetime-callback"});return {profile:"formal",verdict:{status:"passed",failures:[],incomplete:[]}};}')};return next(specifier,context);}});
+    hooks=registerHooks({resolve(specifier,context,next){if(context.parentURL===entry&&specifier==='./gateway-adapter.mjs')return {shortCircuit:true,url:lifetimeGatewayMock(key)};if(context.parentURL===entry&&specifier==='./runner.mjs')return {shortCircuit:true,url:'data:text/javascript,'+encodeURIComponent('export async function runCapacitySuite(options){await options.onProgress({kind:"synthetic-lifetime-callback"});return {profile:"formal",verdict:{status:"passed",failures:[],incomplete:[]}};}')};return next(specifier,context);}});
     try{
       const {runCapacityExecution:run}=await import(entry);const report=await run({observeNormal:false,plan:{profile:'selfcheck',scenarios:[]},onProgress:async()=>{await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('deadline not delivered')),1000);active.signal.addEventListener('abort',()=>{clearTimeout(timer);resolve();},{once:true});});assert.equal(done,false);await new Promise(resolve=>setTimeout(resolve,5));done=true;}});
       assert.equal(done,true);assert.equal(report.verdict.status,'incomplete');assert.ok(report.verdict.incomplete.includes('capacity_run_lifetime_exhausted'));assert.equal(report.runLifetime.deadlineReached,true);
@@ -107,7 +109,7 @@ test('real normal runner retains cutoff reports before first scene, between scen
     const certificates=await syntheticCertificates(directory);
     for(const mode of ['before-first','between','in-flight','prior-failure','missing-collection','unknown-start-error','unknown-progress-error'])await t.test(mode,async()=>{
       const entry=new URL('../tools/capacity/execution.mjs?real-cutoff-'+mode,import.meta.url).href,key='__harborRealCutoff_'+mode;let lifetime,hooks,callbackExited=false,probes=0,sends=0;
-      hooks=registerHooks({resolve(specifier,context,next){if(context.parentURL===entry&&specifier==='./gateway-adapter.mjs')return {shortCircuit:true,url:'data:text/javascript,'+encodeURIComponent('export function capacityTargetRunLifetime(){return globalThis['+JSON.stringify(key)+'];}')};return next(specifier,context);}});
+      hooks=registerHooks({resolve(specifier,context,next){if(context.parentURL===entry&&specifier==='./gateway-adapter.mjs')return {shortCircuit:true,url:lifetimeGatewayMock(key)};return next(specifier,context);}});
       try{
         const {runCapacityExecution:run}=await import(entry);lifetime=createCapacityCertificateLifetime({runLifetimeMs:500});globalThis[key]=lifetime;lifetime.registerAuthority(certificates.ca);lifetime.registerCertificate('server',certificates.server.cert);
         const plan=structuredClone(capacityPlan('selfcheck'));plan.scenarios=['first','second'].map(id=>({id,durationMs:200,modelQps:5,adminQps:5,employees:1,administrators:1}));
