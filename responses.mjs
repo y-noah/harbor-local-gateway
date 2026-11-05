@@ -1,3 +1,4 @@
+import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
 import {readFileSync,lstatSync} from 'node:fs';
 import {join} from 'node:path';
 import {spawn,execFile} from 'node:child_process';
@@ -5,7 +6,9 @@ import {promisify} from 'node:util';
 import {StringDecoder} from 'node:string_decoder';
 import {randomUUID} from 'node:crypto';
 import {runnerEnv,codexAuthArgs} from './codex.mjs';
+import {responseBodyBytes} from './request-body.mjs';
 import {AppError} from './store.mjs';
+import {readOutputJson} from './output-budget.mjs';
 
 const upstreamOrigin='https://chatgpt.com/backend-api/codex';
 const authError=(confirmed=false)=>Object.assign(new AppError(503,'订阅凭据不可用，请检查账号登录','upstream_authentication'),confirmed?{routeFailure:'login_expired'}:{});
@@ -24,11 +27,14 @@ async function errorPayload(response){
   catch{return null;}finally{clearTimeout(timer);void reader.cancel().catch(()=>{});}
 }
 const versions=new Map();
-async function installedVersion(binary){
+export async function installedVersion(binary,{spawnProcess}={}){
   if(!versions.has(binary)){
-    let stdout;try{({stdout}=await promisify(execFile)(binary,['--version'],{timeout:5000,maxBuffer:4096,windowsHide:true}));}catch{throw new AppError(503,'无法读取官方 CLI 版本','upstream_configuration');}
-    const value=stdout.match(/codex-cli (\d+\.\d+\.\d+(?:[-.][a-zA-Z0-9.-]+)?)/)?.[1];
-    if(!value)throw new AppError(503,'无法读取官方 CLI 版本','upstream_configuration');versions.set(binary,value);
+    const pending=spawnProcess?new Promise((resolve,reject)=>{
+      const env=runnerEnv('');delete env.CODEX_HOME;const child=spawnProcess(binary,['--version'],{env,windowsHide:true,stdio:['ignore','pipe','pipe']});let output='',size=0,failed=false;
+      const timer=setTimeout(()=>{failed=true;child.kill();},5000);
+      child.stdout.on('data',chunk=>{size+=chunk.length;if(size>4096){failed=true;child.kill();}else output+=chunk;});child.stderr.on('data',()=>{});
+      child.on('error',()=>{failed=true;});child.on('close',code=>{clearTimeout(timer);const value=output.match(/codex-cli (\d+\.\d+\.\d+(?:[-.][a-zA-Z0-9.-]+)?)/)?.[1];if(failed||code!==0||!value)reject(new AppError(503,'无法读取官方 CLI 版本','upstream_configuration'));else resolve(value);});
+    }):promisify(execFile)(binary,['--version'],{timeout:5000,maxBuffer:4096,windowsHide:true}).then(({stdout})=>{const value=stdout.match(/codex-cli (\d+\.\d+\.\d+(?:[-.][a-zA-Z0-9.-]+)?)/)?.[1];if(!value)throw new AppError(503,'无法读取官方 CLI 版本','upstream_configuration');return value;},()=>{throw new AppError(503,'无法读取官方 CLI 版本','upstream_configuration');});versions.set(binary,pending);void pending.catch(()=>{if(versions.get(binary)===pending)versions.delete(binary);});
   }
   return versions.get(binary);
 }
@@ -51,7 +57,7 @@ export function refreshCredentials(binary,home,{spawnProcess=spawn,timeoutMs=150
   });
 }
 const refreshing=new Map();
-export async function accountCredentials(binary,home,{force=false}={}){
+export async function accountCredentials(binary,home,{force=false,refresh=refreshCredentials}={}){
   const load=()=>{
     try{
       const file=join(home,'auth.json'),stat=lstatSync(file);
@@ -64,7 +70,7 @@ export async function accountCredentials(binary,home,{force=false}={}){
   let credentials=load(),expires=Infinity;
   try{const value=JSON.parse(Buffer.from(credentials.token.split('.')[1],'base64url'));if(Number.isFinite(value.exp))expires=value.exp*1000;}catch{}
   if(force||expires<Date.now()+60000){
-    if(!refreshing.has(home)){const pending=refreshCredentials(binary,home).finally(()=>refreshing.delete(home));refreshing.set(home,pending);}
+    if(!refreshing.has(home)){const pending=refresh(binary,home).finally(()=>refreshing.delete(home));refreshing.set(home,pending);}
     await refreshing.get(home);credentials=load();
   }
   return credentials;
@@ -105,9 +111,20 @@ export function responseUsage(response){
   if(!Number.isSafeInteger(cached)||cached<0||cached>usage.input_tokens)return null;
   return {input:usage.input_tokens,output:usage.output_tokens,cached};
 }
-export function createResponsesTransport({fetchImpl=fetch,credentials=accountCredentials,version=installedVersion,apiKeyMode=false}={}){
+const dispatchSources=new WeakMap();
+export function isResponsesDispatchSource(transport){const proof=dispatchSources.get(transport);return !!proof&&transport.supportsDispatchAuthorization===true&&transport.run===proof.run&&transport.runJson===proof.runJson;}
+
+export function createResponsesTransport({fetchImpl=fetch,credentials=accountCredentials,version=installedVersion,apiKeyMode=false,maxJsonResponseBytes=responseBodyBytes,maxCatalogResponseBytes=4*1024*1024,maxCatalogEntries=8,outputBudget,stageObserver}={}){
+  if(!Number.isSafeInteger(maxJsonResponseBytes)||maxJsonResponseBytes<256||maxJsonResponseBytes>512*1024*1024)throw new AppError(503,'JSON响应读取上限无效','upstream_configuration');
+  if(!Number.isSafeInteger(maxCatalogResponseBytes)||maxCatalogResponseBytes<256||maxCatalogResponseBytes>128*1024*1024||!Number.isInteger(maxCatalogEntries)||maxCatalogEntries<1||maxCatalogEntries>256)throw new AppError(503,'模型目录资源配置无效','upstream_configuration');
+  async function jsonResponse(response,output){
+    if(!response.body)throw new AppError(502,'上游工具响应为空','upstream_protocol');
+    try{return await readOutputJson(response,{maxBytes:maxJsonResponseBytes,output,prefix:'json'});}
+    catch(error){if(error instanceof AppError)throw error;throw new AppError(502,'上游工具返回了无效或中断的JSON','upstream_protocol');}
+  }
+  const stages=createStreamingStageObserver(stageObserver);
   const catalogs=new Map();
-  async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={},accept='text/event-stream',onPhase=()=>{}}={}){
+  async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={},accept='text/event-stream',onPhase=()=>{},beforeDispatch=async()=>{},onDispatch=()=>{},stage}={}){
     onPhase('credentials');
     let auth;try{auth=await credentials(binary,home);}catch(error){throw Object.assign(error,{usageKnown:true});}
     const headers={'Authorization':'Bearer '+auth.token,'Accept':accept,'Content-Type':'application/json'};
@@ -119,20 +136,23 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
       const value=protocolHeaders[name];if(typeof value==='string'&&/^[\x20-\x7e]*$/.test(value))headers[name]=value;
     }
     let result;
+    const body=payload?JSON.stringify(payload):undefined;
+    signal?.throwIfAborted();await beforeDispatch();signal?.throwIfAborted();
     onPhase('upstream');
-    try{result=await fetchImpl((apiKeyMode?'https://api.openai.com/v1':upstreamOrigin)+path,{method:payload?'POST':'GET',headers,body:payload?JSON.stringify(payload):undefined,signal,redirect:'error'});}
+    onDispatch();stage?.emit('dispatch');
+    try{result=await fetchImpl((apiKeyMode?'https://api.openai.com/v1':upstreamOrigin)+path,{method:payload?'POST':'GET',headers,body,signal,redirect:'error'});}
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
     if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?Object.assign(new AppError(429,'官方API额度不足，请在官方账单后台核对','upstream_quota_exhausted'),{routeFailure:'quota_exhausted'}):[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
   }
-  async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,onPhase=()=>{}}){
+  async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,output,onPhase=()=>{},beforeDispatch,onDispatch=()=>{}}){
     if(apiKeyMode)throw Object.assign(new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route'),{usageKnown:true});
     if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
-    let usage=null,actualModel;
+    const stage=stages.capture();let usage=null,actualModel,dispatched=false;
     try{
-      const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json',onPhase});
+      const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json',onPhase,beforeDispatch,stage,onDispatch:()=>{dispatched=true;onDispatch();}});
       onPhase('streaming');
-      let response;try{response=await result.json();}catch{throw new AppError(502,'上游工具返回了无效 JSON','upstream_protocol');}
+      const response=await jsonResponse(result,output);
       if(!response||typeof response!=='object'||Array.isArray(response))throw new AppError(502,'上游工具响应无效','upstream_protocol');
       usage=responseUsage(response);
       actualModel=typeof response.model==='string'?response.model:undefined;
@@ -141,61 +161,65 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     }catch(error){
       if(signal?.aborted)error=new AppError(499,'客户端已取消或服务停止','request_cancelled');
       if(!(error instanceof AppError))error=new AppError(502,'上游工具连接中断','upstream_connection');
-      throw Object.assign(error,usage||{},{actualModel,usageKnown:!!usage||error.usageKnown===true});
-    }
+      throw Object.assign(error,usage||{},{actualModel,usageKnown:!!usage||error.usageKnown===true||!dispatched});
+    }finally{stage.emit('transport-end');}
   }
   async function models({binary,home,signal,force=false}){
-    const cached=catalogs.get(home);if(!force&&cached?.expires>Date.now())return cached.models;
+    const cached=catalogs.get(home);if(!force&&cached?.expires>Date.now()){catalogs.delete(home);catalogs.set(home,cached);return cached.models;}const output=outputBudget?.open('internal:models');try{
     const result=await request(binary,home,apiKeyMode?'/models':'/models?client_version='+encodeURIComponent(await version(binary)),{signal:signal||AbortSignal.timeout(15000),accept:'application/json'});
-    let value;try{value=await result.json();}catch{throw new AppError(502,'模型目录响应无效','upstream_protocol');}
+    let value;try{value=await readOutputJson(result,{maxBytes:maxCatalogResponseBytes,output,prefix:'catalog',allowBom:true});}catch(error){if(error instanceof AppError)throw error;throw new AppError(502,'模型目录响应无效','upstream_protocol');}
     if(apiKeyMode&&Array.isArray(value.data))value.models=value.data.map(m=>({slug:m.id,display_name:m.id}));
     if(!Array.isArray(value.models)||!value.models.length||value.models.some(m=>typeof m.slug!=='string'))throw new AppError(502,'模型目录响应无效','upstream_protocol');
-    catalogs.set(home,{expires:Date.now()+60000,models:value.models});return value.models;
+    catalogs.delete(home);while(catalogs.size>=maxCatalogEntries)catalogs.delete(catalogs.keys().next().value);catalogs.set(home,{expires:Date.now()+60000,models:value.models});return value.models;
+    }finally{output?.close();}
   }
-  async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,onEvent=async()=>{},onPhase=()=>{}}){
-    const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
+  async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,output,onEvent=async()=>{},onPhase=()=>{},beforeDispatch,onDispatch=()=>{}}){
+    const stage=stages.capture(),controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
     let completed=null,knownUsage=null,dispatched=false,actualModel;
-    const finishedItems=new Map();
+    const finishedItems=new Map();let retainedItems=0;
     try{
-      dispatched=true;const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal,onPhase});
+      const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal,onPhase,beforeDispatch,stage,onDispatch:()=>{dispatched=true;onDispatch();}});
       // Some Codex subscription responses omit Content-Type; validate their SSE frames below.
       const contentType=response.headers.get('content-type');
       if(contentType&&!contentType.includes('text/event-stream')){await response.body?.cancel();throw new AppError(502,'上游未返回 Responses 事件流','upstream_protocol');}
       const decoder=new TextDecoder();let buffer='';
       const consume=async frame=>{
-        const data=frame.split('\n').filter(l=>l.startsWith('data:')).map(l=>l.slice(5).trimStart()).join('\n');if(!data||data==='[DONE]')return;
+        output?.resize('sse:parse',frame.length*8);const data=frame.split('\n').filter(l=>l.startsWith('data:')).map(l=>l.slice(5).trimStart()).join('\n');if(!data||data==='[DONE]'){output?.resize('sse:parse',0);return;}
+        const eventBytes=Buffer.byteLength(data);output?.resize('sse:event',eventBytes);
         let event;try{event=JSON.parse(data);}catch{throw new AppError(502,'上游事件格式无效','upstream_protocol');}
         if(typeof event.type!=='string'||!/^[-a-zA-Z0-9_.]+$/.test(event.type))throw new AppError(502,'上游事件缺少类型','upstream_protocol');
         if(typeof event.response?.model==='string')actualModel=event.response.model;
+        stage.content(event);
         if(event.type==='response.completed'){
           if(completed)throw new AppError(502,'上游重复结束事件','upstream_protocol');
           knownUsage=responseUsage(event.response);
-          completed=event;return;
+          completed=event;output?.move('sse:event','sse:terminal');output?.resize('sse:parse',0);return;
         }
         if(['response.failed','response.incomplete','error'].includes(event.type)){
           knownUsage=responseUsage(event.response);throw structuredFailure(event.response?.error||event.error||event)||new AppError(502,'上游响应失败或未完整结束','upstream_incomplete');
         }
         if(completed)throw new AppError(502,'上游结束后仍返回事件','upstream_protocol');
-        if(collectOutput&&event.type==='response.output_item.done'&&Number.isSafeInteger(event.output_index)&&event.output_index>=0&&event.item)finishedItems.set(event.output_index,event.item);
-        await onEvent(event,controller.signal);
+        if(collectOutput&&event.type==='response.output_item.done'&&Number.isSafeInteger(event.output_index)&&event.output_index>=0&&event.item){const previous=finishedItems.get(event.output_index)?.bytes||0;const next=retainedItems-previous+eventBytes;output?.resize('sse:items',next);retainedItems=next;finishedItems.set(event.output_index,{item:event.item,bytes:eventBytes});}
+        await onEvent(event,controller.signal);output?.resize('sse:event',0);output?.resize('sse:parse',0);
       };
       let receiving=false;
       for await(const chunk of response.body){
         if(!receiving){receiving=true;onPhase('streaming');}
-        buffer=(buffer+decoder.decode(chunk,{stream:true})).replaceAll('\r\n','\n');
-        let at;while((at=buffer.indexOf('\n\n'))!==-1){await consume(buffer.slice(0,at));buffer=buffer.slice(at+2);}
+        output?.resize('sse:chunk',chunk.byteLength);output?.resize('sse:scratch',chunk.byteLength*2+(buffer.length+chunk.byteLength)*4);buffer=(buffer+decoder.decode(chunk,{stream:true})).replaceAll('\r\n','\n');output?.resize('sse:buffer',buffer.length*2);output?.resize('sse:scratch',0);
+        let at;while((at=buffer.indexOf('\n\n'))!==-1){await consume(buffer.slice(0,at));output?.resize('sse:scratch',(buffer.length-at-2)*2);buffer=buffer.slice(at+2);output?.resize('sse:buffer',buffer.length*2);output?.resize('sse:scratch',0);}output?.resize('sse:chunk',0);
       }
-      buffer+=decoder.decode();if(buffer.trim())await consume(buffer);
+      output?.resize('sse:scratch',buffer.length*2+8);buffer+=decoder.decode();output?.resize('sse:buffer',buffer.length*2);output?.resize('sse:scratch',0);if(buffer.trim())await consume(buffer);buffer='';output?.resize('sse:buffer',0);
       if(!completed)throw new AppError(502,'上游连接提前结束，本次用量可能未计入累计','upstream_incomplete');
       // Keep streamed events intact; non-streaming clients also need items from done events.
       const responseBody=(!completed.response?.output?.length&&finishedItems.size)
-        ?{...completed.response,output:[...finishedItems].sort(([a],[b])=>a-b).map(([,item])=>item)}:completed.response;
+        ?{...completed.response,output:[...finishedItems].sort(([a],[b])=>a-b).map(([,entry])=>entry.item)}:completed.response;
+      if(completed.response?.output?.length){finishedItems.clear();output?.resize('sse:items',0);}
       return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,...(actualModel?{actualModel}:{}),terminal:completed,response:responseBody};
     }catch(error){
       if(controller.signal.aborted)error=signal?.aborted?new AppError(499,'客户端已取消或服务停止','request_cancelled'):controller.signal.reason;
       if(!(error instanceof AppError))error=new AppError(502,'上游连接中断','upstream_connection');
       throw Object.assign(error,knownUsage||{},{actualModel,usageKnown:!!knownUsage||error.usageKnown===true||!dispatched});
-    }finally{signal?.removeEventListener('abort',abort);}
+    }finally{stage.emit('transport-end');signal?.removeEventListener('abort',abort);}
   }
-  return {run,runJson,models};
+  const transport={run,runJson,models,supportsDispatchAuthorization:true,stageObserverStatus:stages.status};dispatchSources.set(transport,{run,runJson});return transport;
 }

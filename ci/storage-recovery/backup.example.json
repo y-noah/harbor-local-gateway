@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "dedicatedCluster": true,
+  "expectedCluster": "REPLACE_WITH_OBSERVED_SYSTEM_IDENTIFIER",
+  "databases": [
+    {
+      "name": "postgres",
+      "oid": "5"
+    },
+    {
+      "name": "template0",
+      "oid": "4"
+    },
+    {
+      "name": "template1",
+      "oid": "1"
+    }
+  ],
+  "roles": [
+    {
+      "name": "REPLACE_WITH_AUTHORIZED_CLUSTER_ROLE",
+      "oid": "REPLACE_WITH_OBSERVED_OID",
+      "superuser": false,
+      "replication": true,
+      "can_login": true,
+      "create_database": false,
+      "create_role": false,
+      "inherit": true,
+      "bypass_rls": false,
+      "connection_limit": -1,
+      "valid_until": null,
+      "configuration": null
+    }
+  ],
+  "artifactDirectory": "/var/lib/harbor-backup/artifacts",
+  "pgBinDirectory": "/usr/lib/postgresql/18/bin",
+  "archiveProfile": "/etc/harbor-storage-archive.json",
+  "processTimeoutMs": 7200000,
+  "maxBackupBytes": 2199023255552,
+  "maxWalSegments": 65536,
+  "checkpointMode": "spread",
+  "restoreDirectory": "/var/lib/harbor-restore",
+  "memberships": []
+}

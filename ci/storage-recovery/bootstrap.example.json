@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "businessImage": "registry.example/harbor-local-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "infrastructureImage": "registry.example/harbor-postgres-infra@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "sourceImageId": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "publicOrigin": "http://harbor.example:8092",
+  "deviceOrigin": "https://harbor.example:8093",
+  "databasePort": 55432,
+  "publisherDatabase": null
+}

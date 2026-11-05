@@ -44,6 +44,7 @@ export const exactUsd=atoms=>{
 };
 const fields=['input','output','cached','adjustment','total'];
 const empty=(state,model=null,revision=null)=>({state,model,revision,...Object.fromEntries(fields.map(k=>[k+'Atoms',null]))});
+export {empty as emptyReferenceQuote};
 const legacyManual=row=>row.status==='reconciled'&&row.manual_cost_atoms==null;
 export const needsReferenceReconciliation=(row,start)=>['unknown','interrupted'].includes(row.status)||legacyManual(row)&&row.ended>=start;
 export function referenceModel(chosen,at,book){
@@ -75,6 +76,27 @@ export function quoteReference(row,book={rates:seed.rates,aliases:[]},revision=n
 export function publicUsage(value){
   return {metric:referenceMetric,currency:'USD',state:value.state,model:value.model,model_source:value.modelSource||null,revision:value.revision,
     ...Object.fromEntries(fields.flatMap(k=>[[k,value[k+'Atoms']===null?null:Number(value[k+'Atoms'])/Number(scale)],[k+'_exact',value[k+'Atoms']===null?null:exactUsd(value[k+'Atoms'])]]))};
+}
+export function decorateReferenceRequest(row,standard,start){
+  const {input,output,cached,reserved,predicted,price_version,manual_cost_atoms,billing_model,query_sequence,inserted_xid,...meta}=row;
+  return {...meta,has_legacy_reservation:Number(reserved)>0,can_reconcile:needsReferenceReconciliation(row,start),requested_model:row.model,model:billing_model||row.model,standard};
+}
+// A bounded accumulator shared by live and background queries. Amounts remain integers.
+export function referenceAccumulator(){
+  const sums=Object.fromEntries(fields.map(k=>[k+'Atoms',0n])),revisions=new Set();
+  let requests=0,known=0,unmetered=0,unpriced=0,pending=0,expired=0;
+  return {
+    add(q){
+      requests++;
+      if(q.totalAtoms===null){if(q.state==='unpriced')unpriced++;else if(q.state==='pending')pending++;else if(q.state==='expired')expired++;else unmetered++;return;}
+      known++;for(const k of fields)sums[k+'Atoms']+=q[k+'Atoms'];if(q.revision)revisions.add(q.revision);
+    },
+    value(){
+      const value={...sums,state:unmetered+unpriced+expired?'partial':pending?'pending':'priced',model:null,revision:null};
+      if(requests&&known===0)for(const k of fields)value[k+'Atoms']=null;
+      return {...publicUsage(value),requests,known,unmetered,unpriced,pending,expired,revisions:[...revisions].sort()};
+    }
+  };
 }
 export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=()=>0}={}){
   store.db.exec('CREATE TABLE IF NOT EXISTS pricing_versions(id TEXT PRIMARY KEY,created INTEGER NOT NULL,book TEXT NOT NULL);');
@@ -119,18 +141,10 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
   }
   backfill();
   function summary(rows,at=clock(),quotes){
-    const sums=Object.fromEntries(fields.map(k=>[k+'Atoms',0n])),revisions=new Set();let known=0,unmetered=0,unpriced=0,pendingCount=0,expired=0;
-    for(const row of rows){const q=quotes?.get(row.id)||rawQuote(row,{at});
-      if(q.totalAtoms===null){if(q.state==='unpriced')unpriced++;else if(q.state==='pending')pendingCount++;else if(q.state==='expired')expired++;else unmetered++;continue;}
-      known++;for(const k of fields)sums[k+'Atoms']+=q[k+'Atoms'];if(q.revision)revisions.add(q.revision);
-    }
-    const absent=rows.length>0&&known===0;
-    const value={...sums,state:unmetered+unpriced+expired?'partial':pendingCount?'pending':'priced',model:null,revision:null};if(absent)for(const k of fields)value[k+'Atoms']=null;
-    return {...publicUsage(value),requests:rows.length,known,unmetered,unpriced,pending:pendingCount,expired,revisions:[...revisions].sort()};
+    const result=referenceAccumulator();for(const row of rows)result.add(quotes?.get(row.id)||rawQuote(row,{at}));return result.value();
   }
   function decorate(row,at=clock()){
-    const {input,output,cached,reserved,predicted,price_version,manual_cost_atoms,billing_model,...meta}=row;
-    return {...meta,has_legacy_reservation:Number(reserved)>0,can_reconcile:needsReferenceReconciliation(row,windowStart(at)),requested_model:row.model,model:billing_model||row.model,standard:usage(row,at)};
+    return decorateReferenceRequest(row,usage(row,at),windowStart(at));
   }
   function inWindow(column,value,at=clock()){
     if(!['member_id','key_id','account_id','session_id'].includes(column))fail('用量维度无效');

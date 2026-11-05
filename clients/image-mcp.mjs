@@ -19,10 +19,11 @@ function imageMime(data){
   if(data.toString('ascii',0,4)==='RIFF'&&data.toString('ascii',8,12)==='WEBP')return 'image/webp';
   throw Error('文件不是支持的 PNG、JPEG 或 WebP 图片');
 }
-export async function createImageTool({root,baseUrl,key,fetchImpl=fetch}){
+export async function createImageTool({root,baseUrl,key,localToken,fetchImpl=fetch}){
   if(!key)throw Error('未加载 HARBOR_API_KEY');
   const workspace=await realpath(root),base=new URL(baseUrl);
   if(!['https:','http:'].includes(base.protocol)||base.username||base.password||base.search||base.hash)throw Error('HARBOR_BASE_URL 无效');
+  if(localToken!==undefined&&(typeof localToken!=='string'||!/^[A-Za-z0-9_-]{32,512}$/.test(localToken)||base.protocol!=='http:'||!['127.0.0.1','[::1]'].includes(base.hostname)))throw Error('设备本机令牌仅能用于固定回环HTTP辅助入口');
   const within=path=>{const rel=relative(workspace,path);if(rel==='..'||rel.startsWith('..'+(process.platform==='win32'?'\\':'/'))||isAbsolute(rel))throw Error('图片路径必须位于配置的工作区内');return path;};
   const session=randomUUID();
   return async function generate(args,signal){
@@ -49,7 +50,7 @@ export async function createImageTool({root,baseUrl,key,fetchImpl=fetch}){
       const body=JSON.stringify(payload);if(Buffer.byteLength(body)>maxBytes)throw Error('图片请求超过网关传输上限');
       signal?.throwIfAborted();
       let response;
-      try{response=await fetchImpl(base.href.replace(/\/$/,'')+(images.length?'/images/edits':'/images/generations'),{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json','thread-id':session},body,signal,redirect:'error'});}catch{throw Error(signal?.aborted?'图片请求已取消，可能已消耗订阅额度，请勿自动重试':'图片连接中断，可能已消耗订阅额度，请勿自动重试');}
+      try{response=await fetchImpl(base.href.replace(/\/$/,'')+(images.length?'/images/edits':'/images/generations'),{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json','thread-id':session,...(localToken===undefined?{}:{'X-Harbor-Local-Token':localToken})},body,signal,redirect:'error'});}catch{throw Error(signal?.aborted?'图片请求已取消，可能已消耗订阅额度，请勿自动重试':'图片连接中断，可能已消耗订阅额度，请勿自动重试');}
       if(!response.ok){await response.body?.cancel();throw Error(`网关图片请求失败（HTTP ${response.status}），请检查账号状态或网关记录；未自动重试`);}
       let value;try{value=await response.json();}catch{throw Error('网关图片响应格式无效；未自动重试');}
       if(!Array.isArray(value.data)||value.data.length!==1||typeof value.data[0]?.b64_json!=='string'||!value.data[0].b64_json||!/^[A-Za-z0-9+/]+={0,2}$/.test(value.data[0].b64_json))throw Error('网关未返回有效图片；未自动重试');
@@ -86,7 +87,7 @@ if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).hr
   try{
     const root=process.argv[2];if(!root)throw Error('请在 MCP args 中指定允许读写图片的工作区绝对路径');
     if(!isAbsolute(root))throw Error('工作区必须为绝对路径');
-    const generate=await createImageTool({root,baseUrl:process.env.HARBOR_BASE_URL||'',key:process.env.HARBOR_API_KEY});
+    const generate=await createImageTool({root,baseUrl:process.env.HARBOR_BASE_URL||'',key:process.env.HARBOR_API_KEY,localToken:process.env.HARBOR_DEVICE_LOCAL_TOKEN});
     await serve({generate});
-  }catch{process.stderr.write('Harbor 图片 MCP 启动失败：请检查 Node 版本、工作区路径和 HARBOR_BASE_URL / HARBOR_API_KEY 配置。\n');process.exitCode=1;}
+  }catch{process.stderr.write('Harbor 图片 MCP 启动失败：请检查 Node 版本、工作区路径和 HARBOR_BASE_URL / HARBOR_API_KEY 配置；设备接入另检查本机令牌与回环地址。\n');process.exitCode=1;}
 }

@@ -8,8 +8,8 @@ export function claudeArgs(sessionId){
   const args=['--print','--output-format','json','--safe-mode','--restricted','--tools','','--disallowedTools','*','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--settings','{"disableAllHooks":true}','--disable-slash-commands','--no-chrome'];
   if(sessionId)args.push('--resume',sessionId);return args;
 }
-export function checkClaudeLogin(binary,home){return new Promise(resolve=>{
-  const child=spawn(binary,['auth','status'],{env:claudeEnv(home),windowsHide:true});let output='';
+export function checkClaudeLogin(binary,home,{spawnProcess=spawn}={}){return new Promise(resolve=>{
+  const child=spawnProcess(binary,['auth','status'],{env:claudeEnv(home),windowsHide:true});let output='';
   const timer=setTimeout(()=>child.kill(),10000);
   child.stdout.on('data',b=>{if(output.length<32768)output+=b.toString();});child.stderr.on('data',()=>{});
   child.on('error',()=>{clearTimeout(timer);resolve(false);});child.on('close',code=>{clearTimeout(timer);try{const info=JSON.parse(output);resolve(code===0&&info.loggedIn===true&&info.authMethod!=='api_key');}catch{resolve(false);}});
@@ -32,18 +32,18 @@ export function parseClaudeResult(value,previousUsage={input:0,output:0,cached:0
   if(typeof value.result!=='string'||typeof value.session_id!=='string')throw Object.assign(Error('Claude 响应缺少文本或 session'),{...counts,usageKnown:true});
   return {text:value.result,threadId:value.session_id,...counts,usageKnown:true};
 }
-export function runClaude({binary,home,workspace,messages,sessionId,previousUsage,signal,timeoutMs=120000,spawnProcess=spawn}){
+export function runClaude({binary,home,workspace,messages,sessionId,previousUsage,signal,timeoutMs=120000,onText=()=>{},output:resources,spawnProcess=spawn}){
   mkdirSync(workspace,{recursive:true});
   return new Promise((resolve,reject)=>{
     const child=spawnProcess(binary,claudeArgs(sessionId),{cwd:workspace,env:claudeEnv(home),windowsHide:true,stdio:['pipe','pipe','pipe']});
-    const decoder=new StringDecoder('utf8');let output='',failure='',bytes=0;
+    const decoder=new StringDecoder('utf8');let output='',failure='',bytes=0,bufferFailure,spawnFailed=false;
     const stop=message=>{failure=message;child.kill();};const timer=setTimeout(()=>stop('Claude 请求超时；用量待核对'),timeoutMs);
     const abort=()=>stop('Claude 请求已取消；用量待核对');signal?.addEventListener('abort',abort,{once:true});
     const cleanup=()=>{clearTimeout(timer);signal?.removeEventListener('abort',abort);};
-    child.stdout.on('data',b=>{bytes+=b.length;if(bytes>2*1024*1024)return stop('Claude 响应过大');output+=decoder.write(b);});
+    child.stdout.on('data',b=>{bytes+=b.length;if(bytes>2*1024*1024)return stop('Claude 响应过大');if(bufferFailure||spawnFailed)return;try{resources?.resize('claude:scratch',b.length*3+(output.length+b.length)*2);output+=decoder.write(b);resources?.resize('claude:text',output.length*2);resources?.resize('claude:scratch',0);}catch(error){bufferFailure=error;stop('Claude输出缓冲繁忙；用量需核对');}});
     child.stderr.on('data',()=>{});child.stdin.on('error',()=>{});
-    child.on('error',()=>{cleanup();reject(Object.assign(Error('Claude CLI 无法启动'),{usageKnown:true}));});
-    child.on('close',code=>{cleanup();output+=decoder.end();if(failure)return reject(Object.assign(Error(failure),{usageKnown:false}));let value;try{value=JSON.parse(output);}catch{return reject(Object.assign(Error('Claude 未返回有效 JSON；用量待核对'),{usageKnown:false}));}if(sessionId&&value.session_id!==sessionId)return reject(Object.assign(Error('Claude 返回了不同的会话，已停止续聊并保留用量待核对'),{usageKnown:false}));try{const result=parseClaudeResult(value,previousUsage);if(code!==0)return reject(Object.assign(Error('Claude 进程异常退出；请检查订阅状态'),result));resolve(result);}catch(e){reject(Object.assign(e,{usageKnown:e.usageKnown===true}));}});
+    child.on('error',()=>{spawnFailed=true;cleanup();reject(Object.assign(Error('Claude CLI 无法启动'),{usageKnown:true}));});
+    child.on('close',code=>{cleanup();if(spawnFailed)return;if(bufferFailure)return reject(Object.assign(bufferFailure,{usageKnown:false}));try{resources?.resize('claude:scratch',output.length*2+8);output+=decoder.end();resources?.resize('claude:text',output.length*2);resources?.resize('claude:scratch',0);}catch(error){return reject(Object.assign(error,{usageKnown:false}));}if(failure)return reject(Object.assign(Error(failure),{usageKnown:false}));let value;try{resources?.resize('claude:payload',Buffer.byteLength(output));value=JSON.parse(output);output='';resources?.resize('claude:text',0);}catch(error){return reject(Object.assign(error.code==='upstream_buffer_busy'?error:Error('Claude 未返回有效 JSON；用量待核对'),{usageKnown:false}));}if(sessionId&&value.session_id!==sessionId)return reject(Object.assign(Error('Claude 返回了不同的会话，已停止续聊并保留用量待核对'),{usageKnown:false}));if(value?.type==='result'&&typeof value.result==='string')try{onText(value.result);}catch{}try{const result=parseClaudeResult(value,previousUsage);if(code!==0)return reject(Object.assign(Error('Claude 进程异常退出；请检查订阅状态'),result));resolve(result);}catch(e){reject(Object.assign(e,{usageKnown:e.usageKnown===true}));}});
     child.stdin.end('Respond to the following '+(sessionId?'NEW messages in the existing conversation':'conversation')+'. Do not use tools.\n'+JSON.stringify(messages));
     if(signal?.aborted)abort();
   });

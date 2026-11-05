@@ -1,0 +1,15 @@
+# Install only through an authorized DB-host maintenance change; this file does not install anything.
+[Unit]
+Description=Publish verified Harbor database storage report once
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+UMask=0077
+EnvironmentFile=/etc/harbor/storage-report.env
+ExecStart=/usr/bin/node /opt/harbor-storage-report/postgres-storage-report.mjs
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# The EnvironmentFile supplies the protected Unix-socket database URL, actual PGDATA,
+# independent postgres-owned 0600 report-key file, and HARBOR_STORAGE_REPORT_TTL_MS=15000.

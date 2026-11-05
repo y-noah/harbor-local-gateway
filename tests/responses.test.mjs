@@ -272,3 +272,13 @@ test('non-streaming output retains ordered done items when the terminal response
  const full=complete([message]);const {transport}=fixtureTransport(()=>eventStream([...events.slice(0,-1),full]));const normal=await transport.run({payload:{model,input:[],stream:true}});assert.deepEqual(normal.response,full.response);
  const streamedOnly=fixtureTransport(()=>eventStream(events));const uncollected=await streamedOnly.transport.run({payload:{model,input:[],stream:true},collectOutput:false});assert.deepEqual(uncollected.response.output,[]);
 });
+
+for(const declared of [true,false])test('JSON image response bounds cancel '+(declared?'declared':'chunked')+' oversized bodies without retry',async()=>{
+ let calls=0,cancelled=false;const transport=createResponsesTransport({maxJsonResponseBytes:256,credentials:async()=>({token:'synthetic',accountId:'synthetic'}),version:async()=>'test',fetchImpl:async()=>{calls++;return new Response(new ReadableStream({start(c){c.enqueue(new Uint8Array(300));},cancel(){cancelled=true;}}),{headers:declared?{'content-length':'300'}:{}});}});
+ await assert.rejects(transport.runJson({path:'/images/generations',payload:imagePayload}),error=>error.code==='upstream_response_too_large'&&error.usageKnown===false);assert.equal(calls,1);assert.equal(cancelled,true);
+});
+
+test('JSON response resource configuration rejects invalid bounds and keeps exact-boundary JSON responses usable',async()=>{
+ for(const maxJsonResponseBytes of [0,255,1.5,512*1024*1024+1])assert.throws(()=>createResponsesTransport({maxJsonResponseBytes}),{code:'upstream_configuration'});
+ const body=JSON.stringify({data:[{b64_json:'x'.repeat(500)}],usage:{input_tokens:1,output_tokens:0}}),transport=createResponsesTransport({maxJsonResponseBytes:Buffer.byteLength(body),credentials:async()=>({token:'synthetic',accountId:'synthetic'}),version:async()=>'test',fetchImpl:async()=>new Response(body)});const result=await transport.runJson({path:'/images/generations',payload:imagePayload});assert.equal(result.input,1);assert.equal(result.usageKnown,true);
+});

@@ -1,0 +1,58 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import https from 'node:https';
+import {createHash} from 'node:crypto';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createGatewayProbe,capacityWireSignature} from '../tools/capacity/gateway-probe.mjs';
+import {syntheticCertificates} from '../tools/capacity/selfcheck.mjs';
+import {capacityAgent,requestCapacityTarget} from '../tools/capacity/http-client.mjs';
+import {createUiTrafficLedger,uiTrafficCategory} from '../tools/capacity/ui-traffic-ledger.mjs';
+const until=async predicate=>{const deadline=Date.now()+5000;while(!predicate()){assert.ok(Date.now()<deadline,'wire event timed out');await new Promise(resolve=>setTimeout(resolve,5));}};
+test('request-local capture witnesses preserve append/replace hashes without emitting filtered text',async()=>{
+  const events=[],buffer={append:()=>true,finish:()=>true};let app;
+  const server=http.createServer(async(request,response)=>{request.resume();await app.store.observe({id:'synthetic-member',key_id:'synthetic-key'},'local','fixture','gpt-6.1-sol',{device:{deviceId:'synthetic-device'}});buffer.append('synthetic-request',[{kind:'assistant',content:{field:'synthetic-private-field',mode:'append',text:'old'}}]);buffer.append('synthetic-request',[{kind:'assistant',content:{field:'synthetic-private-field',mode:'replace',text:'synthetic-private-output'}}]);buffer.finish('synthetic-request',{});buffer.finish('synthetic-request',{state:'partial'});response.end('ok');});
+  app={server,buffer,store:{observe:async()=> 'synthetic-request',finish:async()=>({settled:true})},sessionHandoffs:{arrive:()=>({bind:async()=>{}})},status:()=>({})};const append=buffer.append,finish=buffer.finish,probe=createGatewayProbe({sink:row=>events.push(row)});probe.attach(app);await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  try{await requestCapacityTarget({origin:'http://127.0.0.1:'+server.address().port,path:'/health',headers:{'x-capacity-trace':'capture-proof'}});await until(()=>events.some(row=>row.kind==='gateway-captured-output'));assert.equal(events.filter(row=>row.kind==='gateway-captured-output').length,1);const captured=events.find(row=>row.kind==='gateway-captured-output');assert.equal(captured.verified,true);assert.deepEqual(captured.fields,[{field:createHash('sha256').update('synthetic-private-field').digest('hex'),hash:createHash('sha256').update('synthetic-private-output').digest('hex'),bytes:Buffer.byteLength('synthetic-private-output')}]);assert.equal(JSON.stringify(events).includes('synthetic-private-output'),false);assert.equal(JSON.stringify(events).includes('synthetic-private-field'),false);}
+  finally{await probe.close();assert.equal(buffer.append,append);assert.equal(buffer.finish,finish);server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+test('wire route DTOs retain operation identity without arbitrary query or path contents',()=>{
+ const path='/api/admin/members/123e4567-e89b-12d3-a456-426614174000';assert.equal(capacityWireSignature('GET',path),'GET /api/admin/members/:id');assert.equal(capacityWireSignature('GET','/api/admin/requests?view=list&q=synthetic-text'),'GET /api/admin/requests?view=list');assert.equal(capacityWireSignature('GET','/api/admin/requests?view=synthetic-secret'),'GET /api/admin/requests?view=invalid');const unknown=capacityWireSignature('GET','/synthetic-private-name?q=synthetic-private-content');assert.match(unknown,/^GET \/:other-[a-f0-9]{16}$/);assert.equal(capacityWireSignature('GET',unknown.slice(4)),unknown);assert.match(capacityWireSignature('GET','/api/admin/synthetic-private-name'),/^GET \/api\/:other-[a-f0-9]{16}$/);
+});
+test('known business routes retain their API class after the privacy DTO conversion',()=>{const id='123e4567-e89b-12d3-a456-426614174000';for(const [route,category] of [['/api/admin/type-statistics','summary'],['/api/admin/members/'+id+'/device-policy','configuration'],['/api/admin/requests/'+id+'/recording','recording'],['/v1/codex/models','self'],['/api/admin/recordings/exports/recording.export:'+id,'task'],['/api/admin/sessions/'+id+'/handoffs','task']]){const signature=capacityWireSignature('GET',route);assert.ok(!signature.includes(':other-'),route);assert.equal(uiTrafficCategory('GET',signature.slice(4)),category,route);}});
+
+test('HTTP and verified TLS report actual start, complete, abort and untraced arrivals without changing handlers',{timeout:30000},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'harbor-wire-')),events=[],agents=[],servers=[],sockets=new Set();let probe,activeLedger;
+ try{
+  const certificates=await syntheticCertificates(directory),cookie='harbor_session=synthetic-wire-cookie',hash=createHash('sha256').update(cookie).digest('hex');
+  const handler=(request,response)=>{request.resume();if(request.url.startsWith('/abort')){response.writeHead(200,{'content-type':'application/json'});response.write('{');return;}response.writeHead(200,{'content-type':'application/json'});response.end('{"ok":true}');};
+  const plain=http.createServer(handler),secure=https.createServer(certificates.server,handler);servers.push(plain,secure);for(const server of servers){server.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));}
+  const observe=async()=>1,finish=async()=>({settled:true}),arrive=()=>({bind:async()=>{}}),app={server:plain,deviceTls:{server:secure},store:{observe,finish},sessionHandoffs:{arrive},status:()=>({})};probe=createGatewayProbe({sink:event=>{events.push(event);activeLedger?.server(event);}});probe.attach(app);
+  for(const [index,server] of servers.entries()){
+   const origin=(index?'https':'http')+'://127.0.0.1:'+server.address().port,agent=capacityAgent(origin,{...(index?{ca:certificates.ca}:{}),connection:'reuse-tls'});agents.push(agent);const trace='synthetic-wire-'+index;
+   const result=await requestCapacityTarget({origin,path:'/api/admin/requests?view=list&q=synthetic-query',agent,headers:{cookie,'x-capacity-trace':trace}});assert.equal(result.success,true);
+   await requestCapacityTarget({origin,path:'/api/admin/state',agent,headers:{cookie}});
+   await new Promise((resolve,reject)=>{const request=(index?https:http).get(new URL('/abort',origin),{agent,headers:{cookie,'x-capacity-trace':trace+'-abort'}},response=>{response.once('data',()=>response.destroy());response.once('close',resolve);});request.on('error',reject);});
+   await until(()=>events.some(event=>event.kind==='gateway-response-abort'&&event.trace===trace+'-abort'));
+   const starts=events.filter(event=>event.kind==='gateway-request-start'&&event.trace===trace),ends=events.filter(event=>event.kind==='gateway-response-end'&&event.trace===trace);assert.equal(starts.length,1);assert.equal(ends.length,1);assert.equal(starts[0].credentials.cookie,hash);assert.equal(starts[0].signature,'GET /api/admin/requests?view=list');assert.equal(starts[0].wireId,ends[0].wireId);assert.equal(ends[0].status,200);assert.ok(!events.some(event=>event.kind==='gateway-response-end'&&event.trace===trace+'-abort'));
+  }
+  assert.equal(events.filter(event=>event.kind==='gateway-request-start'&&event.trace===null).length,2);assert.ok(!JSON.stringify(events).includes(cookie));assert.ok(!JSON.stringify(events).includes('synthetic-query'));
+  // These are real transport qualifications, not a substitute for the owned
+  // gateway's device/authentication/metering/recording acceptance.
+  for(const [index,server] of servers.entries()){
+   const origin=(index?'https':'http')+'://127.0.0.1:'+server.address().port,agent=agents[index],ledger=createUiTrafficLedger({origin,adminFingerprints:[hash]});activeLedger=ledger;
+   const send=async(source,path,id)=>{const requestId='qualification-'+index+'-'+id,headers=await ledger.observer.beforeRequest({requestId,source,actorIndex:0,method:'GET',route:capacityWireSignature('GET',path).slice(4),credentials:{cookie:hash}}),result=await requestCapacityTarget({origin,path,agent,headers:{cookie,...headers}});assert.equal(result.wireSent,true);ledger.observer.response({requestId,status:result.status});ledger.observer.requestFinished({requestId});};
+   await send('browser','/api/auth/session','preparation');ledger.beginMeasurement();await send('browser','/api/admin/members','browser');await send('baseline','/api/admin/state','baseline');ledger.endMeasurement();
+   const requestId='qualification-'+index+'-abort',headers=await ledger.observer.beforeRequest({requestId,source:'browser',actorIndex:0,method:'GET',route:capacityWireSignature('GET','/abort').slice(4),credentials:{cookie:hash}});
+   await new Promise((resolve,reject)=>{const request=(index?https:http).get(new URL('/abort',origin),{agent,headers:{cookie,...headers}},response=>{response.once('data',()=>response.destroy());response.once('close',resolve);});request.once('error',reject);});ledger.observer.requestFailed({requestId,cancelled:true});await until(()=>ledger.collect().pending===0);
+   const report=ledger.collect();assert.equal(report.passed,true);assert.equal(report.matched,4);assert.equal(report.unattributed.length,0);assert.equal(report.counts.reduce((sum,row)=>sum+row.serverAborted,0),1);assert.ok(report.counts.some(row=>row.phase==='measurement'&&row.source==='baseline'&&row.category==='summary'));activeLedger=null;ledger.close();
+  }
+  await probe.close();assert.equal(plain.listeners('request')[0],handler);assert.equal(secure.listeners('request')[0],handler);assert.equal(app.store.observe,observe);assert.equal(app.store.finish,finish);assert.equal(app.sessionHandoffs.arrive,arrive);
+ }finally{await probe?.close();for(const agent of agents)agent.destroy();for(const socket of sockets)socket.destroy();await Promise.all(servers.map(server=>new Promise(resolve=>server.close(resolve))));await rm(directory,{recursive:true,force:true});}
+});
+
+test('rejection diagnostics retain only a validated code and leave the actual HTTP error body unchanged',async()=>{
+ const events=[],body={error:{code:'gateway_busy',message:'SYNTHETIC_PRIVATE_ERROR_CONTENT'}};const server=http.createServer((request,response)=>{request.resume();response.writeHead(429,{'content-type':'application/json'});response.end(JSON.stringify(body));}),app={server,store:{observe:async()=>1,finish:async()=>({settled:true})},sessionHandoffs:{arrive:()=>({bind:async()=>{}})},status:()=>({})},probe=createGatewayProbe({sink:event=>events.push(event)});probe.attach(app);await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));try{const result=await requestCapacityTarget({origin:'http://127.0.0.1:'+server.address().port,path:'/v1/responses',headers:{'x-capacity-trace':'synthetic-rejection'}});assert.equal(result.status,429);assert.deepEqual(result.json,body);const diagnostics=events.filter(event=>event.kind==='gateway-rejection');assert.equal(diagnostics.length,1);assert.equal(diagnostics[0].code,'gateway_busy');assert.equal(JSON.stringify(events).includes('SYNTHETIC_PRIVATE_ERROR_CONTENT'),false);body.error.code='synthetic_private_code';await requestCapacityTarget({origin:'http://127.0.0.1:'+server.address().port,path:'/v1/responses',headers:{'x-capacity-trace':'synthetic-unknown-rejection'}});assert.equal(events.filter(event=>event.kind==='gateway-rejection').at(-1).code,'unknown');assert.equal(JSON.stringify(events).includes('synthetic_private_code'),false);}finally{await probe.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});

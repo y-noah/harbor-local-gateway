@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "expectedCluster": "REPLACE_WITH_OBSERVED_SYSTEM_IDENTIFIER",
+  "uid": 999,
+  "pgDataDirectory": "/var/lib/postgresql/data",
+  "archiveDirectory": "/var/lib/harbor-backup/wal",
+  "keyFile": "/etc/harbor-storage-archive.key",
+  "keyVersion": "archive-v1"
+}

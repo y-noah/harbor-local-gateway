@@ -1,0 +1,10 @@
+# Explicit operator installation required; no remote cron or service is changed by deployment.
+[Unit]
+Description=Schedule the one-shot Harbor database storage report
+[Timer]
+OnBootSec=1s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=postgres-report-publisher.service
+[Install]
+WantedBy=timers.target

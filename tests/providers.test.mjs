@@ -54,3 +54,16 @@ test('quota subprocess handles initialize/read exchange and contains malformed o
   assert.equal((await call('ok')).rateLimits.primary.usedPercent,25);
   for(const scenario of ['error','oversize','hang'])await assert.rejects(call(scenario),e=>!e.message.includes('private'));
 });
+
+test('quota subprocess cancellation skips pre-aborted spawn and stops a running official protocol exchange',async()=>{
+  const before=new AbortController();before.abort();let spawned=false;
+  await assert.rejects(readRateLimits('unused',scratch,{signal:before.signal,spawnProcess:()=>{spawned=true;}}),/已取消/);assert.equal(spawned,false);
+  const controller=new AbortController();let child;
+  const pending=readRateLimits('unused',scratch,{signal:controller.signal,spawnProcess:(_,args,options)=>child=spawn(process.execPath,[childFile,'rates','hang'],options)});
+  const ended=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('cancelled quota child did not exit')),3000);child.once('close',()=>{clearTimeout(timer);resolve();});});
+  controller.abort();await assert.rejects(pending,/已取消/);await ended;
+});
+
+for(const provider of ['codex','claude'])test(provider+' optional text observer sees parsed Unicode and cannot turn a successful model call into a failure',async t=>{
+ const seen=[],result=await fixture(t,provider,'ok').call({onText:text=>{seen.push(text);throw Error('synthetic observer unavailable');}});assert.deepEqual(seen,['中文测试 🍋 Unicode']);assert.equal(result.text,'中文测试 🍋 Unicode');assert.equal(result.usageKnown,true);
+});

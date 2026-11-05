@@ -1,0 +1,6 @@
+# Root-owned 0600: STACK/secrets/postgres.env. These are placeholders, not working credentials.
+HARBOR_DATABASE_URL=postgresql://harbor_runtime:REPLACE@database.example/harbor?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.crt
+HARBOR_RECORDING_STORAGE_MODE=report
+# Optional storage reserve values; source and publisher freshness remain mandatory.
+HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES=1073741824
+HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO=0.1

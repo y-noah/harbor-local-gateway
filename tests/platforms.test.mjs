@@ -189,3 +189,7 @@ test('WorkBuddy refresh is single-flight and revoked Key is rechecked before dis
   try{assert.equal(app.store.get('SELECT COUNT(*) n FROM requests').n,2);app.store.run('UPDATE keys SET enabled=0 WHERE id=?',app.member.keyId);}finally{release();}
   const results=await Promise.all([first,second]);assert.deepEqual(results.map(r=>r.status),[403,403]);assert.equal(refreshes,1);assert.equal(runs,0);assert.ok(app.store.all('SELECT status FROM requests').every(r=>r.status==='rejected'));
 });
+
+test('WorkBuddy incremental text observation preserves Unicode across byte splits and observer failures do not affect usage',async()=>{
+ const frame=value=>'data: '+JSON.stringify(value)+'\r\n\r\n',raw=Buffer.from(frame({choices:[{index:0,delta:{content:'中文 🍋'}}]})+frame({model:'example-model',choices:[{index:0,finish_reason:'stop'}],usage:{prompt_tokens:100,completion_tokens:20}})+'data: [DONE]\r\n\r\n'),seen=[],transport=createPlatformTransport({fetchImpl:async()=>new Response(new ReadableStream({start(controller){for(let at=0;at<raw.length;at+=2)controller.enqueue(raw.subarray(at,at+2));controller.close();}}))});const result=await transport.run({kind:'workbuddy'},{accessToken:'synthetic'},{model:'workbuddy/example-model',messages:payload.messages},undefined,{onText:text=>{seen.push(text);throw Error('synthetic observer failure');}});assert.deepEqual(seen,['中文 🍋']);assert.equal(result.text,'中文 🍋');assert.equal(result.input,100);assert.equal(result.usageKnown,true);
+});

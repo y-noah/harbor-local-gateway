@@ -1,0 +1,11 @@
+[Unit]
+Description=Harbor scheduled encrypted cluster backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=harbor-postgres-backup.service
+
+[Install]
+WantedBy=timers.target
+# 模板不自动启用；此周期不能单独证明RPO，须结合连续WAL与材料恢复点实际验收。

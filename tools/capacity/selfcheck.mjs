@@ -1,0 +1,30 @@
+import https from 'node:https';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {mkdtemp,writeFile,readFile,chmod,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {randomBytes,randomUUID} from 'node:crypto';
+import {capacityPlan} from './scenarios.mjs';
+import {collectHostEvidence,resourcePreflight} from './resources.mjs';
+import {capacityAgent,requestCapacityTarget} from './http-client.mjs';
+import {runCapacitySuite} from './runner.mjs';
+import {createPrivatePostgres} from './owned-runtime.mjs';
+import {datasetManifest,createDatasetDatabase,seedDataset} from './dataset.mjs';
+import {PostgresStore} from '../../postgres-store.mjs';
+const exec=promisify(execFile);
+export async function syntheticCertificates(directory,{days=1}={}){
+  if(!Number.isInteger(days)||days<1||days>365)throw new Error('capacity_certificate_days_invalid');
+  const ca=join(directory,'ca.pem'),caKey=join(directory,'ca.key');await exec('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',caKey,'-out',ca,'-subj','/CN=Harbor Capacity Synthetic CA','-days',String(days)],{maxBuffer:32768});await chmod(caKey,0o600);
+  const make=async(role,serial)=>{const key=join(directory,role+'.key'),csr=join(directory,role+'.csr'),cert=join(directory,role+'.pem'),extensions=join(directory,role+'.ext');await exec('openssl',['req','-newkey','rsa:2048','-nodes','-keyout',key,'-out',csr,'-subj','/CN='+role],{maxBuffer:32768});await chmod(key,0o600);await writeFile(extensions,role==='server'?'subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\n':'extendedKeyUsage=clientAuth\n',{mode:0o600});await exec('openssl',['x509','-req','-in',csr,'-CA',ca,'-CAkey',caKey,'-set_serial',String(serial),'-days',String(days),'-extfile',extensions,'-out',cert],{maxBuffer:32768});return {key:await readFile(key),cert:await readFile(cert)};};return {ca:await readFile(ca),server:await make('server',1),client:await make('client',2)};
+}
+export async function runCapacitySelfcheck({privatePg=false,binDirectory,libraryDirectory}={}){
+  const directory=await mkdtemp(join(tmpdir(),'harbor-capacity-http-')),agents=[],sockets=new Set();let server,lab,admin,database;
+  try{
+    const certificates=await syntheticCertificates(directory);server=https.createServer({...certificates.server,ca:certificates.ca,requestCert:true,rejectUnauthorized:true},(req,res)=>{void(async()=>{let bytes=0;for await(const chunk of req){bytes+=chunk.length;if(bytes>16384){res.writeHead(413);res.end();return;}}if(req.url==='/health'){res.writeHead(200,{'content-type':'application/json'});res.end('{"ok":true}');return;}if(req.url!=='/v1/responses'||!['Bearer synthetic-capacity-key-0','Bearer synthetic-capacity-key-1'].includes(req.headers.authorization)){res.writeHead(403);res.end();return;}res.writeHead(200,{'content-type':'text/event-stream'});res.write(': heartbeat\n\n');res.write('data: {"type":"response.output_text.delta","delta":"合成有效内容"}\n\n');await new Promise(resolve=>setTimeout(resolve,20));res.end('data: {"type":"response.completed","response":{"id":"synthetic-capacity-response","status":"completed"}}\n\n');})().catch(()=>res.destroy());});server.on('connection',socket=>{sockets.add(socket);socket.once('close',()=>sockets.delete(socket));});await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});const origin='https://127.0.0.1:'+server.address().port;
+    const reused=capacityAgent(origin,{ca:certificates.ca,...certificates.client}),fresh=capacityAgent(origin,{ca:certificates.ca,...certificates.client,connection:'new-tls'});agents.push(reused,fresh);const checks={tls:true,sse:true,received:0,newConnections:0,reusedConnections:0};
+    let dataset={verified:false};if(privatePg){lab=await createPrivatePostgres({binDirectory,libraryDirectory});admin=new PostgresStore({connection:lab.connection});const manifest=datasetManifest({profile:'selfcheck',metadata30d:50,metadata7d:20,bodyRequests:32,batchSize:7}),encryptionKey=randomBytes(32),recordingKey=randomBytes(32);database=await createDatasetDatabase(admin,manifest,{connectionFor:name=>({connection:{...lab.connection,database:name}}),encryptionKey,recordingKey,laboratory:lab});dataset=await seedDataset(database.store,manifest,{recordingKey});}
+    const host=await collectHostEvidence(),preflight=resourcePreflight({host,dataset,protocol:{tls:true,deviceEnforced:false,realHelper:false}}),send=async(event,model)=>{const mode=event.sequence%2?'new-tls':'reuse-tls',value=await requestCapacityTarget({origin,path:model?'/v1/responses':'/health',method:model?'POST':'GET',body:model?{model:'gpt-6.1-sol',input:'仅用于工具自验的合成输入'}:undefined,headers:model?{authorization:'Bearer '+event.actor.secret,'content-type':'application/json'}:event.actor.headers,mode:model?'sse':'json',agent:mode==='new-tls'?fresh:reused,timeoutMs:10000});checks.received++;if(value.reusedSocket)checks.reusedConnections++;else checks.newConnections++;checks.sse&&=!model||value.complete===true;return {...value,operation:model?'model':'health',method:model?'POST':'GET',variant:mode};};
+    const report=await runCapacitySuite({plan:capacityPlan('selfcheck'),preflight,target:{employeeActors:[0,1].map(index=>({secret:'synthetic-capacity-key-'+index})),adminActors:[{headers:{cookie:'capacity_admin=synthetic-cookie'}}],sendModel:event=>send(event,true),sendAdmin:event=>send(event,false)}});report.toolCheck={passed:checks.received===15&&checks.sse&&report.metrics.series.filter(row=>row.group==='normal').every(row=>row.successRate===1)&&(!privatePg||dataset.verified),...checks,datasetVerified:dataset.verified,privateDatabase:privatePg,scope:'仅证明工具与小规模合成TLS/PG链路工作，未验证Harbor正式容量'};return report;
+  }finally{for(const agent of agents)agent.destroy();for(const socket of sockets)socket.destroy();if(server)await new Promise(resolve=>server.close(resolve));await database?.destroy();await admin?.close();await lab?.close();await rm(directory,{recursive:true,force:true});}
+}

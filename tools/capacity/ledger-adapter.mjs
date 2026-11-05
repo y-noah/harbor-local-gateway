@@ -1,0 +1,71 @@
+import {createHash} from 'node:crypto';
+import {createWindowedCapacityLedger} from './windowed-ledger.mjs';
+import {performance} from 'node:perf_hooks';
+import {setTimeout as delay} from 'node:timers/promises';
+import {capacityDataReadinessSql,classifyCapacityDataReadiness,throwCapacityReadinessAborted} from './data-readiness.mjs';
+import {formalScenarios,targets} from './scenarios.mjs';
+import {quoteReference} from '../../pricing.mjs';
+import {RecordingStore} from '../../recording-store.mjs';
+import {reconcileCapacityLedger} from './assessments.mjs';
+const hash=value=>createHash('sha256').update(value).digest('hex');
+
+export async function createCapacityLedgerAdapter({store,events,recordingKey,maxEntries=1000000}={}){
+  const faultScenes=new Set(formalScenarios.filter(scene=>scene.fault).map(scene=>scene.id));let faultClients=0,dropped=0,readinessDropped=0;
+  const state=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='pricing.state'"),revision=JSON.parse(state.value).active,book=await store.pricingBook(revision),clients=[],readinessClients=[],inputs=new Map(),recordings=new RecordingStore(store,{encryptionKey:recordingKey});
+  const planInput=({trace,input})=>{if(inputs.size>=maxEntries){dropped++;return;}inputs.set(trace,{hash:hash(input),bytes:Buffer.byteLength(input)});};
+  const rebindTrace=(previous,next)=>{if(typeof previous!=='string'||typeof next!=='string'||!inputs.has(previous)||inputs.has(next))throw new Error('capacity_ledger_trace_rebind_invalid');const planned=inputs.get(previous);inputs.delete(previous);inputs.set(next,planned);};
+  const onResult=async row=>{if(row.kind!=='model')return;if(readinessClients.length>=maxEntries)readinessDropped++;else readinessClients.push(row);if(faultScenes.has(row.scenario)){faultClients++;return;}if(clients.length>=maxEntries){dropped++;return;}clients.push(row);};
+  const waitForDataReadiness=async({signal}={})=>{
+    throwCapacityReadinessAborted(signal);
+    const counts={total:readinessClients.length+readinessDropped,eligible:0,ready:0,partial:0,expired:0,failed:0,timedOut:0,unknownFinishedAt:readinessDropped,notDispatched:0,cancelled:0,failedClients:0,faultExcluded:0,pending:0},pending=new Map(),observations={clock:'controller-performance-now',firstObservedAt:null,firstReadyObservedAt:null,lastReadyObservedAt:null,timelyReadyObservations:0,unknownTimeliness:0,timelinessUnknown:false};let databaseErrors=0;
+    const dispatched=new Set(events.filter(event=>event.kind==='upstream-dispatch').map(event=>event.trace));
+    for(const row of readinessClients){if(!row.result.validatedSuccess){if(row.result.error==='client_cancelled')counts.cancelled++;else if(!dispatched.has(row.result.trace))counts.notDispatched++;else counts.failedClients++;continue;}counts.eligible++;if(pending.has(row.result.trace)){counts.failed++;continue;}pending.set(row.result.trace,row.result.finishedAt);}
+    while(pending.size){throwCapacityReadinessAborted(signal);const admitted=new Map(events.filter(event=>event.kind==='gateway-admitted').map(event=>[event.trace,event.requestId])),ids=[...pending.keys()].map(trace=>admitted.get(trace)).filter(Boolean),rows=new Map();
+      for(let offset=0;offset<ids.length;offset+=1000){try{for(const row of await store.all(capacityDataReadinessSql,ids.slice(offset,offset+1000)))rows.set(row.request_id,row);}catch{databaseErrors++;}throwCapacityReadinessAborted(signal);}
+      let nearest=Infinity;const observedAt=performance.now();for(const [trace,finishedAt] of pending){observations.firstObservedAt??=observedAt;const state=classifyCapacityDataReadiness({row:rows.get(admitted.get(trace)),finishedAt,observedAt});if(state.state==='ready'){observations.firstReadyObservedAt??=state.readyObservedAt;observations.lastReadyObservedAt=state.readyObservedAt;if(state.timelinessUnknown)observations.unknownTimeliness++;else observations.timelyReadyObservations++;}if(state.state==='pending')nearest=Math.min(nearest,state.deadline);else{counts[state.state]++;pending.delete(trace);}}
+      if(pending.size)await delay(Math.max(1,Math.min(20,nearest-performance.now())),undefined,{signal});
+    }
+    const failed=counts.partial+counts.expired+counts.failed+counts.timedOut,unknown=counts.unknownFinishedAt+counts.faultExcluded;
+    throwCapacityReadinessAborted(signal);return Object.freeze({passed:failed?false:unknown||!counts.eligible?null:true,policy:'per-client-finish-plus-body-p99',limitMs:targets.bodyVisibility.p99,counts:Object.freeze(counts),observations:Object.freeze({...observations,timelinessUnknown:observations.unknownTimeliness>0}),databaseErrors});
+  };
+  const collect=async()=>{
+    const admitted=events.filter(row=>row.kind==='gateway-admitted'&&typeof row.trace==='string'),byTrace=new Map(clients.map(row=>[row.result.trace,row])),completed=new Map(events.filter(row=>row.kind==='upstream-complete').map(row=>[row.trace,row])),accepted=[],contentIssues=[];let missingSources=0,unclassifiedStatuses=0;
+    const issue=(code,id)=>{if(contentIssues.length<100)contentIssues.push({code,reference:hash(String(id)).slice(0,16)});};
+    for(const event of admitted){const client=byTrace.get(event.trace);if(!client)continue;const expected=quoteReference({model:client.event.sequence%2?'gpt-6-astra':'gpt-6.1-sol',started:Date.now(),ended:Date.now(),input:1000,output:200,cached:500,usage_unknown:0,status:'ok'},book,revision);
+      accepted.push({requestId:event.requestId,trace:event.trace,memberId:event.memberId,keyId:event.keyId,deviceId:event.deviceId,expectedMemberId:client.event.expectedMemberId,expectedKeyId:client.event.expectedKeyId,expectedDeviceId:client.event.expectedDeviceId,group:'normal',recordingExpected:true,expectedAtoms:expected.totalAtoms===null?null:String(expected.totalAtoms),expectedStatus:client.result.validatedSuccess?'ok':null});
+    }
+    const ids=accepted.map(row=>row.requestId),persisted=[];for(let offset=0;offset<ids.length;offset+=1000){const rows=await store.all(`SELECT r.id request_id,r.member_id,r.key_id,r.device_id,r.status,r.usage_unknown,p.state price_state,p.total_atoms::text total_atoms,r.recording_state,(SELECT COUNT(*) FROM harbor.conversation_events e WHERE e.request_id=r.id) recording_events FROM harbor.requests r LEFT JOIN harbor.request_prices p ON p.request_id=r.id WHERE r.id=ANY($1::text[])`,ids.slice(offset,offset+1000));persisted.push(...rows.map(row=>({requestId:row.request_id,memberId:row.member_id,keyId:row.key_id,deviceId:row.device_id,status:row.status,usageUnknown:!!row.usage_unknown,pricePresent:row.price_state==='priced',totalAtoms:row.total_atoms,recordingState:row.recording_state,recordingEvents:row.recording_events})));}
+    const persistedById=new Map(persisted.map(row=>[row.requestId,row]));
+    for(const entry of accepted){
+      const actual=persistedById.get(entry.requestId);if(!entry.expectedStatus){unclassifiedStatuses++;continue;}if(actual?.status!==entry.expectedStatus)issue('client_database_status_mismatch',entry.requestId);
+      const input=inputs.get(entry.trace),output=completed.get(entry.trace);if(!input||typeof output?.outputHash!=='string'||!Number.isSafeInteger(output.outputBytes)){missingSources++;continue;}
+      const envelope=await store.get('SELECT persisted_sequence FROM harbor.recordings WHERE request_id=$1',entry.requestId),fragments=await store.all('SELECT sequence,source_key,kind,content_cipher FROM harbor.conversation_events WHERE request_id=$1 ORDER BY sequence LIMIT 8193',entry.requestId),fields=new Map();
+      if(fragments.length>8192){missingSources++;continue;}if(!fragments.length||!envelope||envelope.persisted_sequence!==fragments.length||fragments.some((row,index)=>row.sequence!==index+1))issue('recording_fragment_gap',entry.requestId);
+      try{
+        for(const fragment of fragments){const content=recordings.open(fragment.content_cipher,entry.requestId+':'+fragment.sequence+':'+fragment.source_key);if(!['user','assistant'].includes(fragment.kind))continue;if(typeof content.text!=='string'||typeof content.field!=='string'||!['append','replace'].includes(content.mode)){issue('recording_fragment_shape',entry.requestId);continue;}const key=fragment.kind+':'+content.field;let field=fields.get(key);if(!field||content.mode==='replace'){field={kind:fragment.kind,hash:createHash('sha256'),bytes:0};fields.set(key,field);}field.hash.update(content.text);field.bytes+=Buffer.byteLength(content.text);}
+        for(const [kind,expectedBody] of [['user',input],['assistant',{hash:output.outputHash,bytes:output.outputBytes}]]){const matches=[...fields.values()].filter(field=>field.kind===kind);if(matches.length!==1||matches[0].bytes!==expectedBody.bytes||matches[0].hash.digest('hex')!==expectedBody.hash)issue('recording_content_mismatch',entry.requestId);}
+      }catch{issue('recording_decryption_failed',entry.requestId);}
+    }
+    const traces=new Set(accepted.map(row=>row.trace)),dispatches=events.filter(row=>row.kind==='upstream-dispatch'&&traces.has(row.trace)),base=await reconcileCapacityLedger({accepted,dispatches,persisted,expectedCounts:{accepted:clients.length,dispatched:clients.filter(row=>row.result.validatedSuccess).length,persisted:clients.length},maxEntries}),issues=[...base.issues,...contentIssues],incomplete=base.incomplete||!!(dropped||faultClients||missingSources||unclassifiedStatuses);
+    return {...base,passed:issues.length?false:incomplete?null:true,issues,incomplete,clientEvidenceDropped:dropped,faultRequestsNotReconciled:faultClients,missingBodySourceEvidence:missingSources,unclassifiedClientStatuses:unclassifiedStatuses};
+  };
+  return {planInput,rebindTrace,onResult,waitForDataReadiness,collect};
+}
+
+
+// Storage failures invalidate evidence, never the already authorized model call.
+// A missing controller keeps the same private capability shape; it is not an
+// in-memory replacement and cannot turn an unknown count into zero.
+export async function createCapacityLedgerController(options){
+  let root;const failures=new Set();try{root=await createWindowedCapacityLedger(options);}catch(error){if(['capacity_windowed_configuration','capacity_windowed_directory_not_private'].includes(error?.message))throw error;failures.add('ledger_initialization_unavailable');}
+  const missing=()=>({passed:null,counts:null,incomplete:true,missing:[...failures],issues:[],issueCount:0});
+  const call=(object,name,args,fallback)=>{try{if(typeof object?.[name]!=='function'){failures.add('ledger_capability_unavailable');return fallback;}return object[name](...args);}catch{failures.add('ledger_operation_unavailable');return fallback;}};
+  const health=()=>{const observed=call(root,'health',[],null);return observed?{...observed,incomplete:observed.incomplete||failures.size>0,reasonCodes:[...new Set([...observed.reasonCodes,...failures])]}:{available:false,incomplete:true,writeFailures:failures.size,confirmedConflicts:0,reasonCodes:[...failures]};};
+  const unreliableCounts=observed=>observed.databaseErrors>0||observed.missing?.some(reason=>['source_database_unavailable','ledger_or_source_unavailable','ledger_storage_budget','evidence_changed_during_collection'].includes(reason));
+  const view=(scope,raw)=>{
+    const stageHistory=Object.freeze(Object.fromEntries(['lookup','begin','finalize'].map(name=>[name,trace=>call(raw?.stageHistory,name,[trace],'unavailable')])));
+    const result={scope,health,stageHistory,planInput:value=>call(raw,'planInput',[value],false),rebindTrace:(previous,next)=>call(raw,'rebindTrace',[previous,next],false),registerTrace:value=>call(raw,'registerTrace',[value],false),claimResult:value=>call(raw,'claimResult',[value],false),markNotSent:trace=>call(raw,'markNotSent',[trace],false),markWireSettled:trace=>call(raw,'markWireSettled',[trace],false),readTrace:trace=>call(root,'readTrace',[trace],null),readWireIdentity:id=>call(root,'readWireIdentity',[id],null),readTraceEvidence:trace=>call(root,'readTraceEvidence',[trace],null),readStageExpectations:trace=>call(raw,'readStageExpectations',[trace],{available:false,complete:false,passed:health().confirmedConflicts?false:null,reasonCodes:['stage_expectations_unavailable']}),readHandlerWitness:trace=>call(raw,'readHandlerWitness',[trace],{passed:health().confirmedConflicts?false:null,settled:null,outcome:null,scope:null,reasonCodes:['handler_storage_unavailable']}),sourceIntegrity:()=>call(root,'sourceIntegrity',[],{passed:null,health:health()}),onResult:async row=>{try{return await raw?.onResult(row)??false;}catch{failures.add('ledger_result_unavailable');return false;}},waitForDataReadiness:async options=>{throwCapacityReadinessAborted(options?.signal);try{if(raw){const observed=await raw.waitForDataReadiness(options),state=health(),uncertain=state.incomplete||failures.size>0||unreliableCounts(observed);return {...observed,passed:observed.passed===false||state.confirmedConflicts?false:uncertain?null:observed.passed,...(uncertain?{counts:null,observedCounts:observed.counts,incomplete:true}: {})};}}catch{throwCapacityReadinessAborted(options?.signal);failures.add('ledger_readiness_unavailable');}throwCapacityReadinessAborted(options?.signal);return {...missing(),policy:'per-client-finish-plus-body-p99',limitMs:targets.bodyVisibility.p99,observations:{clock:'controller-performance-now',timelinessUnknown:true}};},collect:async()=>{try{if(raw){const observed=await raw.collect(),state=health(),uncertain=state.incomplete||failures.size>0||unreliableCounts(observed);return {...observed,passed:observed.passed===false||state.confirmedConflicts?false:uncertain?null:observed.passed,...(uncertain?{counts:null,observedCounts:observed.counts}:{}),incomplete:observed.incomplete||state.incomplete||failures.size>0,missing:[...new Set([...observed.missing,...failures])]};}}catch{failures.add('ledger_collection_unavailable');}return {...missing(),passed:health().confirmedConflicts?false:null};},flush:async()=>{try{return await raw?.flush()??{incomplete:true};}catch{failures.add('ledger_flush_unavailable');return {incomplete:true};}},close:async()=>{}};
+    return Object.freeze(result);
+  };
+  const base=view('base',root);return Object.freeze({...base,recordEvent:event=>call(root,'recordEvent',[event],false),createScope:id=>view(id,call(root,'createScope',[id],null)),close:async()=>{await root?.close();}});
+}

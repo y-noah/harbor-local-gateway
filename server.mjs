@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {integer,name,expiry,bool,apiKeyValue,apiWeightValue} from './admin-input.mjs';
 import {homedir} from 'node:os';
 import {acquireInstance} from './instance.mjs';
 import {passwordHash,createAdminAuth} from './auth.mjs';
@@ -9,6 +10,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { Store, AppError, id, now, hash, usageWindow, nextDailyReset, modelAllowlist } from './store.mjs';
 import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
+import {retainCodexQuotaDenials,codexQuotaDenials} from './codex-entitlements.mjs';
 import {createBalancer} from './balancing.mjs';
 import {needsReferenceReconciliation} from './pricing.mjs';
 import {runClaude,checkClaudeLogin,claudeEnv} from './claude.mjs';
@@ -16,18 +18,12 @@ import {networkConfig,acceptsRequest} from './network.mjs';
 import {startCodexLogin,startLocalLogin} from './account-login.mjs';
 import {readJsonBody,responseBodyBytes} from './request-body.mjs';
 import {createResponsesTransport,validateResponses,validateCodexJson,codexJsonRoutes} from './responses.mjs';
-import {historyReader,historyQuery,requestObservation,requestsQuery,requestsReader} from './observability.mjs';
+import {historyReader,historyQuery,requestObservation,requestsQuery} from './observability.mjs';
 import {createPlatformService} from './platform-service.mjs';
 import {createPlatformTransport} from './platforms.mjs';
+import {createQueryService} from './query-service.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
-function integer(value,label,{nullable=false,min=0,max=1e12}={}) {
-  if(nullable && (value===null || value===''))return null;
-  if(!Number.isSafeInteger(value)||value<min||value>max)throw new AppError(400,label+' 必须是有效整数');return value;
-}
-function name(value){if(typeof value!=='string'||!value.trim()||value.trim().length>60)throw new AppError(400,'名称需为 1–60 字');return value.trim();}
-function expiry(value){return integer(value,'到期时间',{nullable:true,max:9e15});}
-function bool(value){if(typeof value!=='boolean')throw new AppError(400,'状态无效');return value?1:0;}
 function equals(a,b){const x=Buffer.from(a||''),y=Buffer.from(b||'');return x.length===y.length&&timingSafeEqual(x,y);}
 const json=(res,status,body)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(body));};
 const body=req=>readJsonBody(req);
@@ -70,6 +66,7 @@ export function createGateway(options={}) {
   const encryptionKey=readFileSync(encryptionPath);
   if(encryptionKey.length!==32)throw Error('Key encryption key invalid');
   const store=new Store(join(data,'gateway.sqlite'),{encryptionKey,pricingOptions:{clock:options.clock||Date.now,fetchImpl:options.pricingFetch||fetch}});
+  const queries=createQueryService(join(data,'gateway.sqlite'));
   const executor=options.executor||runCodex, checker=options.checker||checkLogin,rateReader=options.rateReader||readRateLimits;
   const responses=options.responsesTransport||createResponsesTransport();
   const apiResponses=options.apiResponsesTransport||createResponsesTransport({apiKeyMode:true,credentials:async(_binary,accountId)=>{
@@ -79,11 +76,8 @@ export function createGateway(options={}) {
   }});
   const usesApi=account=>account?.auth_mode==='openai_api';
   const inference=account=>usesApi(account)?apiResponses:responses;
-  const apiKeyValue=value=>{if(typeof value!=='string'||!value.trim()||value.length>4096||/\s/.test(value.trim()))throw new AppError(400,'请填写有效的官方API Key');return value.trim();};
   function apiWeight(accountId,value){
-    if(!Number.isFinite(value)||value<0||value>100||Math.abs(value*100-Math.round(value*100))>1e-8)throw new AppError(400,'API分配占比须为0至100，最多两位小数');
-    const other=store.get("SELECT COALESCE(SUM(api_weight),0) n FROM accounts WHERE auth_mode='openai_api' AND removed_at IS NULL AND id<>?",accountId).n;
-    if(other+value>100+1e-8)throw new AppError(400,'所有API账号的人工占比总和不能超过100%');return value;
+    return apiWeightValue(value,store.get("SELECT COALESCE(SUM(api_weight),0) n FROM accounts WHERE auth_mode='openai_api' AND removed_at IS NULL AND id<>?",accountId).n);
   }
   const claudeBinary=config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe');
   const provider=a=>a.kind==='claude'?{binary:claudeBinary,run:options.claudeExecutor||runClaude,check:options.claudeChecker||checkClaudeLogin,env:claudeEnv,loginArgs:['auth','login']}:{binary:config.codexBinary,run:executor,check:checker,env:runnerEnv,loginArgs:['login',...codexAuthArgs()]};
@@ -119,18 +113,23 @@ export function createGateway(options={}) {
         const data=await readQuota(account);
         if(stopping||(authVersions.get(account.id)||0)!==authVersion)return;
         const current=store.get('SELECT * FROM accounts WHERE id=?',account.id);if(current.route_epoch!==account.route_epoch)return;
+        let priorQuota=null;try{priorQuota=JSON.parse(current.quota_json);}catch{}
+        Object.assign(data,retainCodexQuotaDenials(priorQuota,data));
         let perPercent=current.tokens_per_percent;
         const windowId=data.windows.map(w=>w.reset).join(',');
         let baseline=null;try{baseline=JSON.parse(current.quota_calibration);}catch{}
-        if(!baseline||baseline.windowId!==windowId||data.remaining>baseline.remaining){baseline={windowId,remaining:data.remaining,used:beforeUsed};}
-        else if(baseline.remaining-data.remaining>=1){
-          const spend=beforeUsed-baseline.used;
-          if(spend>0)perPercent=Math.max(100,Math.min(1e7,spend/(baseline.remaining-data.remaining)));
-          baseline={windowId,remaining:data.remaining,used:beforeUsed};
+        if(data.windows.length&&Number.isFinite(data.remaining)){
+          if(!baseline||baseline.windowId!==windowId||data.remaining>baseline.remaining){baseline={windowId,remaining:data.remaining,used:beforeUsed};}
+          else if(baseline.remaining-data.remaining>=1){
+            const spend=beforeUsed-baseline.used;
+            if(spend>0)perPercent=Math.max(100,Math.min(1e7,spend/(baseline.remaining-data.remaining)));
+            baseline={windowId,remaining:data.remaining,used:beforeUsed};
+          }
         }
         store.run("UPDATE accounts SET state='ready',last_error=NULL,quota_json=?,quota_error=NULL,since_check_tokens=?,tokens_per_percent=?,quota_calibration=? WHERE id=?",JSON.stringify(data),Math.max(0,current.budget_used-beforeUsed),perPercent,JSON.stringify(baseline),account.id);
-        if(balancer.recover(account,data)&&account.route_block==='login_expired')authVersions.set(account.id,authVersion+1);
-        if(data.limitReached||data.remaining<=0)balancer.block(store.get('SELECT * FROM accounts WHERE id=?',account.id),'quota_exhausted',{quotaRefresh:true});
+        const denied=Object.values(codexQuotaDenials(data)).some(Boolean);
+        if(!denied&&balancer.recover(account,data)&&account.route_block==='login_expired')authVersions.set(account.id,authVersion+1);
+        if(denied||data.limitReached||data.remaining!==null&&data.remaining<=0)balancer.block(store.get('SELECT * FROM accounts WHERE id=?',account.id),'quota_exhausted',{quotaRefresh:true});
         if(balancer.settings().weighted)balancer.syncWeights();
         return data;
       }catch(e){if(!stopping&&(authVersions.get(account.id)||0)===authVersion&&store.get('SELECT route_epoch FROM accounts WHERE id=?',account.id)?.route_epoch===account.route_epoch)store.run('UPDATE accounts SET quota_error=? WHERE id=?',e.message,account.id);}
@@ -267,13 +266,19 @@ export function createGateway(options={}) {
         const file=path==='/'?'index.html':path.slice(1);res.setHeader('Content-Type',file.endsWith('html')?'text/html; charset=utf-8':file.endsWith('js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8');return res.end(readFileSync(join(root,'public',file)));
       }
       if(path==='/health'&&method==='GET')return json(res,200,{ok:true,service:'harbor',version:'1.0.0'});
-      if(path==='/api/auth/login'&&method==='POST'){const b=await body(req);adminAuth.login(b.password,res);return json(res,200,{ok:true});}
+      if(path==='/api/auth/login'&&method==='POST'){const b=await body(req);await adminAuth.loginAsync(b.password,res);return json(res,200,{ok:true});}
       if(path==='/api/auth/logout'&&method==='POST'){adminAuth.logout(req,res);return json(res,200,{ok:true});}
       if(path==='/api/auth/session'&&method==='GET')return json(res,200,{authenticated:adminAuth.authenticated(req)});
       if(path.startsWith('/api/admin/')){
         authAdmin(req);
         if(await platforms.admin(req,res,url))return;
-        if(path==='/api/admin/requests'&&method==='GET')return json(res,200,requestsReader(store,requestsQuery(url.searchParams)));
+        if(path==='/api/admin/requests'&&method==='GET'){
+          const query=requestsQuery(url.searchParams),at=now();
+          if(query.view==='list')return json(res,200,await queries.list(query,at));
+          const list=query.view==='summary'?{}:await queries.list({...query,view:'list'},at);
+          const statistics=await queries.statistics({...query,snapshot:list.snapshot||query.snapshot},at);
+          return json(res,200,{...list,...statistics,...(list.watermark!==undefined?{listWatermark:list.watermark}:{} )});
+        }
         if(path==='/api/admin/balancing/explanation'&&method==='GET')return json(res,200,balancer.explain());
         if(path==='/api/admin/history'&&method==='GET')return json(res,200,historyReader(store).list(historyQuery(url.searchParams)));
         const batch=path.match(/^\/api\/admin\/history\/nightly\/(\d{4}-\d{2}-\d{2})$/);
@@ -647,7 +652,7 @@ export function createGateway(options={}) {
   }
   const server=http.createServer(handler);
   let closePromise;
-  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;clearInterval(maintenance);platforms.close();const pricingClosed=store.pricing.close();for(const c of controllers)c.abort();for(const c of logins.values())c.flow.cancel();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks,...loginTasks,...quotaReads.values(),...quotaFetches.values(),balancer.pending()]);await pricingClosed;store.close();})();return closePromise;}
+  function close(){if(closePromise)return closePromise;closePromise=(async()=>{stopping=true;clearInterval(maintenance);platforms.close();const queryClosed=queries.close(),pricingClosed=store.pricing.close();for(const c of controllers)c.abort();for(const c of logins.values())c.flow.cancel();while(queue.length){const job=queue.shift();clearTimeout(job.queueTimer);store.finish(job.requestId,{status:'cancelled',error:'服务停止'});job.reject(new AppError(503,'服务停止'));}await new Promise(resolve=>server.close(resolve));await Promise.allSettled([...tasks,...loginTasks,...quotaReads.values(),...quotaFetches.values(),balancer.pending()]);await pricingClosed;await queryClosed;store.close();})();return closePromise;}
   return {server,store,config,close,data,runtime,network,balancer};
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){

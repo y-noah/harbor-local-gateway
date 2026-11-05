@@ -1,0 +1,14 @@
+[Unit]
+Description=Harbor PostgreSQL encrypted cluster backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/lib/harbor/node/bin/node /usr/local/lib/harbor/storage-backup.mjs backup
+TimeoutStartSec=7500
+# 只签数据库密文副本，不隐含材料一致性、实际恢复、offhost或上线许可。
+# 管理员安装前核对本地路径、权限、PG18与固定root profile；工具不会安装此unit。

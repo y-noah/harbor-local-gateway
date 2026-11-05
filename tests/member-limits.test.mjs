@@ -4,7 +4,9 @@ import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import
 import {Store,usageWindow} from '../store.mjs';import {createGateway} from '../server.mjs';import {createResponsesTransport} from '../responses.mjs';
 const sol='gpt-6.1-sol',astra='gpt-6-astra';
 async function setup(t){
- const root=mkdtempSync(join(tmpdir(),'harbor-member-limit-'));let at=Date.now()+1000,hold=null,known=true;const calls=[];
+ const root=mkdtempSync(join(tmpdir(),'harbor-member-limit-'));let at=Date.now(),hold=null,known=true;const calls=[];
+ // Persisted timestamps and limit windows must share the same controlled clock.
+ t.mock.method(Date,'now',()=>at);
  const transport=createResponsesTransport({credentials:async()=>({token:'synthetic-upstream',accountId:'fixture'}),version:async()=>'fixture',fetchImpl:async(url,options)=>{
   const body=JSON.parse(options.body);calls.push(body);if(hold)await hold();
   return new Response('data: '+JSON.stringify({type:'response.completed',response:{id:'fixture',model:body.model,status:'completed',output:[],...(known?{usage:{input_tokens:1000000,output_tokens:0}}:{})}})+'\n\n',{headers:{'Content-Type':'text/event-stream'}});
@@ -30,7 +32,7 @@ test('administrators configure a per-member switch with exact amounts, strict ru
  const before=a.store.memberLimits.configuration(a.member.memberId),audit=a.store.audit.bind(a.store);a.store.audit=()=>{throw Error('synthetic transaction failure');};assert.throws(()=>a.store.memberLimits.save(a.member.memberId,{enabled:true,expected_version:before.version}),/transaction/);a.store.audit=audit;assert.deepEqual(a.store.memberLimits.configuration(a.member.memberId),before);
 });
 test('all Keys for the same employee share limits, while other employees and unconfigured models stay independent',{timeout:10000},async t=>{
- const a=await setup(t);await a.configure([rule()]);assert.equal((await a.send()).status,200);assert.equal((await a.send(sol,a.key2)).status,429);assert.equal(a.calls.length,1);
+ const a=await setup(t);await a.configure([rule()]);assert.equal((await a.send()).status,200);assert.equal(a.store.get('SELECT ended FROM requests').ended,a.now());assert.equal((await a.send(sol,a.key2)).status,429);assert.equal(a.calls.length,1);
  assert.equal((await a.send(astra)).status,200);const other=a.store.createMember('Other',null,null);assert.equal((await a.send(sol,other)).status,200);
  const own=(await a.call('/api/me','GET',undefined,a.key2.secret)).body.usage_limits;assert.equal(own.usage[0].used_usd,'2');
  await a.configure([rule()],false);assert.equal((await a.send(sol,a.key2)).status,200);
@@ -56,7 +58,7 @@ test('unknown usage blocks relevant models until reconciled; unknown aliases and
 });
 test('concurrent requests admitted below a limit complete, then subsequent requests are rejected',{timeout:10000},async t=>{
  const a=await setup(t);await a.configure([rule()]);let release;const held=new Promise(r=>release=r);a.hold(()=>held);const first=a.send(),second=a.send(sol,a.key2);
- const until=Date.now()+3000;while(a.calls.length<2){assert.ok(Date.now()<until);await new Promise(r=>setTimeout(r,5));}
+ const until=performance.now()+3000;while(a.calls.length<2){assert.ok(performance.now()<until);await new Promise(r=>setTimeout(r,5));}
  release();assert.equal((await first).status,200);assert.equal((await second).status,200);assert.equal(a.store.memberLimits.status(a.member.memberId).usage[0].used_usd,'4');assert.equal((await a.send()).status,429);assert.equal(a.calls.length,2);
 });
 test('old sessions, fixed headers and spoofed employee/config fields cannot bypass the current policy',{timeout:10000},async t=>{

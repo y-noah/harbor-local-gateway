@@ -1,8 +1,10 @@
 import {AppError,id,nextDailyReset,participatesNightly,usageWindow} from './store.mjs';
 import {planNightly} from './nightly-plan.mjs';
+import {accountPackageBudget,packageBudget,packageFingerprint} from './account-package-budget.mjs';
 import {quoteReference,referenceMetric} from './pricing.mjs';
 
 const minute=60000,day=24*60*minute;
+export const quotaFreshnessMs=5*minute;
 export const balanceDefaults=Object.freeze({failover:false,nightly:false,quietMinutes:30,weighted:false});
 export function balanceSettings(value={}){
   if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!Object.hasOwn(balanceDefaults,k)))throw new AppError(400,'负载均衡设置无效');
@@ -17,13 +19,13 @@ export function nightlyWindow(at){
 export function quotaSnapshot(account,at){
   if(!account)return null;
   let q;try{q=JSON.parse(account.quota_json);}catch{return null;}
-  if(!q||!Number.isFinite(q.checked)||q.checked>at||at-q.checked>5*minute||!q.plan||!Array.isArray(q.windows)||!q.windows.length)return null;
+  if(!q||!Number.isFinite(q.checked)||q.checked>at||at-q.checked>quotaFreshnessMs||!q.plan||!Array.isArray(q.windows)||!q.windows.length)return null;
   if(q.windows.some(w=>!Number.isFinite(w.used)||w.used<0||w.used>100||!Number.isFinite(w.minutes)||w.minutes<=0||!Number.isFinite(w.reset)||w.reset<=at))return null;
   return {...q,remaining:q.limitReached||account.route_block==='quota_exhausted'?0:Math.min(...q.windows.map(w=>100-w.used)),group:JSON.stringify([q.plan,q.windows.map(w=>w.minutes).sort((a,b)=>a-b)])};
 }
 const isApi=a=>a?.auth_mode==='openai_api';
 const available=a=>a.enabled&&!a.removed_at&&a.kind==='codex'&&['ready','degraded'].includes(a.state)&&(!a.route_block||a.route_block==='quota_exhausted');
-export function automaticWeights(accounts,at){
+function legacyAutomaticWeights(accounts,at){
   const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)]));
   const eligible=accounts.filter(a=>!isApi(a)&&available(a)&&a.route_block!=='quota_exhausted'&&!(snapshots.get(a.id)?.limitReached||snapshots.get(a.id)?.remaining===0));
   let reason=null;
@@ -38,13 +40,20 @@ export function automaticWeights(accounts,at){
   })};
   return {eligible,snapshots,reason,weights,basis};
 }
+// Capacity and compatibility modes share this source in routing and planning.
+export function automaticWeights(accounts,at,options={}){
+  if(!options.packagePolicy?.enabled)return legacyAutomaticWeights(accounts,at);
+  const assessment=packageBudget(accounts,{at,enabled:true,protocol:options.protocol,model:options.model}),byId=new Map(assessment.items.map(row=>[row.id,row])),usable=accounts.filter(a=>!isApi(a)&&available(a)),legacy=usable.filter(a=>byId.get(a.id).mode==='legacy'),capacity=usable.filter(a=>byId.get(a.id).eligible),mixed=legacy.length&&capacity.length;
+  if(legacy.length&&!capacity.length){const old=legacyAutomaticWeights(legacy,at);return {...old,packageEnabled:true,legacyCompatibility:true,weights:new Map(accounts.map(a=>[a.id,old.weights.get(a.id)??0])),packages:assessment,strict:false,basis:{...old.basis,package_policy:options.packagePolicy,compatibility:'legacy'}};}
+  const comparable=!mixed&&assessment.groups.length===1,eligible=comparable?capacity:[],group=comparable?assessment.groups[0]:null,reason=mixed||assessment.groups.length>1?'incomparable_package_budget':!capacity.length?'package_budget_unavailable':null;
+  const weights=new Map(accounts.map(a=>[a.id,eligible.includes(a)?group.weights[a.id]:byId.get(a.id)?.mode==='excluded'?0:null]));
+  return {eligible,weights,reason,packageEnabled:true,legacyCompatibility:false,strict:true,packages:assessment,snapshots:new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)])),basis:{at,formula:'converted_remaining_capacity / max(hours_to_reset, 24); min(converted_window_budgets)',package_policy:options.packagePolicy,accounts:assessment.items}};
+}
 export const nextWeightReset=nextDailyReset;
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
 // Workload is a relative estimate, never a quota admission check.
 export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false,quoteUsage=row=>quoteReference(row)}){
-  const window=nightlyWindow(at),eligible=accounts.filter(a=>available(a)&&!isApi(a));
-  const snapshots=new Map(eligible.map(a=>[a.id,quotaSnapshot(a,at)]));
-  const active=new Map(),bySession=new Map(),latest=new Map();
+  const window=nightlyWindow(at),bySession=new Map(),latest=new Map();
   for(const r of requests){
     if(!r.session_id)continue;
     latest.set(r.session_id,Math.max(latest.get(r.session_id)||0,r.started,r.ended||r.started));
@@ -59,7 +68,7 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     const value=quoteUsage(r);if(value.state!=='priced'||value.totalAtoms===null||value.totalAtoms===0n)continue;
     const key=value.model||r.billing_model||r.model||'';if(!samples.has(key))samples.set(key,[]);samples.get(key).push(r);
   }
-  const uncertainAccounts=new Set(),skipped=[];
+  const workloads=[];
   for(const s of sessions){
     const rows=bySession.get(s.id);if(!rows)continue;
     let measuredAtoms=0n,estimatedAtoms=0,unknown=false;
@@ -72,28 +81,55 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
       const estimate=median(comparable);
       if(estimate===null)unknown=true;else estimatedAtoms+=estimate;
     }
-    const weight=(Number(measuredAtoms)+estimatedAtoms)/1e12;
+    workloads.push({...s,measuredAtoms,estimatedAtoms,unknown,running:rows.some(r=>['queued','running'].includes(r.status)),last:latest.get(s.id),afterBoundary:rows.some(r=>r.started>=window.end)});
+  }
+  return planBalanceWorkloads({accounts,workloads,at,quietMinutes,preparing,weighted,priceRevisions:[...new Set(requests.map(r=>r.price_version).filter(Boolean))]});
+}
+
+// This is the existing quota comparison boundary; extra dispatch metadata
+// must not invent a quota or silently merge unrelated package groups.
+export function planningAccountGroup(account,{at,packagePolicy={enabled:false}}={}){
+ const item=packagePolicy.enabled?accountPackageBudget(account,{at,enabled:true,protocol:'responses'}):null;
+ if(packagePolicy.enabled&&item.mode!=='legacy')return item.eligible||item.reason==='quota_exhausted'&&item.comparison_key?{key:'capacity:'+item.comparison_key,reason:null}:{key:null,reason:item.reason};
+ const snapshot=quotaSnapshot(account,at);return snapshot?{key:'legacy:'+snapshot.group,reason:null}:{key:null,reason:'quota_unavailable'};
+}
+
+// Both the legacy reader and PostgreSQL aggregates feed this unchanged policy.
+export function planBalanceWorkloads({accounts,workloads,at,quietMinutes=30,preparing=new Set(),weighted=false,packagePolicy={enabled:false},configuredWeights=null,priceRevisions=[],window=nightlyWindow(at),requestBoundary=false}){
+  if(typeof requestBoundary!=='boolean')throw new AppError(503,'请求边界规划模式无效','planning_configuration');
+  if(configuredWeights?.mode==='manual'&&configuredWeights.expires>at)return {metric:referenceMetric,priceRevisions,window,moves:[],skipped:[{reason:'manual_weights_active',accounts:accounts.filter(a=>!isApi(a)).map(a=>a.id),version:configuredWeights.version,expires:configuredWeights.expires}],summaries:[]};
+  const eligible=accounts.filter(a=>available(a)&&!isApi(a)),snapshots=new Map(eligible.map(a=>[a.id,quotaSnapshot(a,at)]));
+  const accountById=new Map(accounts.map(account=>[account.id,account])),active=new Map(),uncertainAccounts=new Set(),skipped=[];
+  for(const s of workloads){
+    const {measuredAtoms,estimatedAtoms,unknown,running,last,afterBoundary}=s,weight=(Number(measuredAtoms)+estimatedAtoms)/1e12;
     if(weight===0&&!unknown){skipped.push({session_id:s.id,reason:'no_measured_work'});continue;}
-    const running=rows.some(r=>['queued','running'].includes(r.status));
-    const last=latest.get(s.id);
-    const fixed=running||rows.some(r=>r.started>=window.end)||preparing.has(s.member_id)||at-last<quietMinutes*minute||!participatesNightly(s,at)||!s.enabled||!s.member_enabled||s.member_removed!==null||s.protocol!=='responses'||unknown;
+    const ordinaryActivity=running||afterBoundary||preparing.has(s.member_id)||at-last<quietMinutes*minute;
+    const packageScopeUnsupported=packagePolicy.enabled&&accountById.has(s.account_id)&&accountPackageBudget(accountById.get(s.account_id),{at,enabled:true,protocol:'responses',model:s.contextModel}).reason==='package_scope_mismatch';
+    const contextUnsupported=requestBoundary&&s.contextReplayable===false,permissionsChanged=requestBoundary&&s.sourcePermissionAvailable===false;
+    const fixed=requestBoundary&&(s.pendingManual||s.transferredInSlot)||(!requestBoundary&&ordinaryActivity)||contextUnsupported||permissionsChanged||packageScopeUnsupported||!participatesNightly(s,at)||!s.enabled||!s.member_enabled||s.member_removed!==null||s.protocol!=='responses'||unknown;
     if(unknown)uncertainAccounts.add(s.account_id);
     active.set(s.id,{...s,weight,fixed,unknown});
-    if(fixed)skipped.push({session_id:s.id,reason:unknown?'unknown_workload':running?'busy':'protected'});
+    if(fixed)skipped.push({session_id:s.id,reason:unknown?'unknown_workload':packageScopeUnsupported?'package_scope_mismatch':requestBoundary&&s.pendingManual?'manual_handoff_pending':requestBoundary&&s.transferredInSlot?'already_transferred_in_slot':contextUnsupported?'session_context_unsupported':permissionsChanged?'session_permissions_changed':running?'busy':'protected'});
   }
   const moves=[],groups=new Map();
-  for(const a of eligible){const q=snapshots.get(a.id);if(!q){skipped.push({account_id:a.id,reason:'quota_unavailable'});continue;}if(!groups.has(q.group))groups.set(q.group,[]);groups.get(q.group).push(a);}
+  const packageAssessment=packagePolicy.enabled?packageBudget(eligible,{at,enabled:true,protocol:'responses'}):null,packageItems=new Map((packageAssessment?.items??[]).map(row=>[row.id,row]));
+  for(const a of eligible){const group=planningAccountGroup(a,{at,packagePolicy});if(!group.key){skipped.push({account_id:a.id,reason:group.reason});continue;}if(!groups.has(group.key))groups.set(group.key,[]);groups.get(group.key).push(a);}
   const summaries=[];
   for(const pool of groups.values()){
     if(pool.length<2){skipped.push({reason:'incomparable_quota',accounts:pool.map(a=>a.id)});continue;}
     const ids=new Set(pool.map(a=>a.id)),work=[...active.values()].filter(s=>ids.has(s.account_id));
     // With no sample for an in-flight task, no defensible comparative plan exists.
     if(pool.some(a=>uncertainAccounts.has(a.id))){skipped.push({reason:'unknown_fixed_load',accounts:pool.map(a=>a.id)});continue;}
-    const calculated=weighted?automaticWeights(pool,at):null;
+    const dispatchAware=pool.every(account=>account.dispatch_planning),normalTargets=dispatchAware?pool.filter(account=>['package','package_compatibility'].includes(account.dispatch_planning.mode)):pool,extraTargets=dispatchAware?pool.filter(account=>account.dispatch_planning.mode==='extra'&&account.dispatch_planning.allowed):[],extraMode=dispatchAware&&!normalTargets.length&&extraTargets.length>0,targets=extraMode?extraTargets:normalTargets,targetIds=new Set(targets.map(account=>account.id));
+    if(dispatchAware)for(const account of pool)if(!targetIds.has(account.id))skipped.push({account_id:account.id,reason:account.dispatch_planning.reason??'extra_package_tier_preferred',target_only:true});
+    if(!targets.length){skipped.push({reason:'no_dispatchable_planning_target',accounts:pool.map(account=>account.id)});continue;}
+    if(extraMode&&targets.length>1&&targets.some(account=>{const value=account.dispatch_planning.allocation;return value?.basis!=='reference_estimate'||value.unit!=='reference_usd_atoms';})){skipped.push({reason:'extra_budget_incomparable',accounts:pool.map(account=>account.id)});continue;}
+    const capacityMode=packagePolicy.enabled&&packageItems.get(pool[0].id)?.mode!=='legacy',calculated=!extraMode&&(weighted||capacityMode)?automaticWeights(pool,at,{packagePolicy:capacityMode?packagePolicy:{enabled:false},protocol:'responses'}):null;
     if(calculated?.reason){skipped.push({reason:calculated.reason,accounts:pool.map(a=>a.id)});continue;}
-    const total=work.reduce((n,s)=>n+s.weight,0),remaining=pool.reduce((n,a)=>n+snapshots.get(a.id).remaining,0);
+    const total=work.reduce((n,s)=>n+s.weight,0),desired=account=>!targetIds.has(account.id)?0:extraMode?Number(account.dispatch_planning.allocation.available_atoms):weighted||capacityMode?calculated.weights.get(account.id):snapshots.get(account.id).remaining,remaining=pool.reduce((sum,account)=>sum+desired(account),0);
     if(!total||!remaining)continue;
-    const shares=new Map(pool.map(a=>[a.id,weighted?calculated.weights.get(a.id)/100:snapshots.get(a.id).remaining/remaining]));
+    const scale=!extraMode&&(weighted||capacityMode)&&targets.length===pool.length?100:remaining,shares=new Map(pool.map(account=>[account.id,desired(account)/scale]));
+
     const loads=new Map(pool.map(a=>[a.id,0])),target=new Map(pool.map(a=>[a.id,total*shares.get(a.id)]));
     for(const s of work)loads.set(s.account_id,loads.get(s.account_id)+s.weight);
     const before=Object.fromEntries(loads);
@@ -102,9 +138,55 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     for(const a of pool)loads.set(a.id,before[a.id]);
     for(const m of selected){loads.set(m.from,loads.get(m.from)-m.weight);loads.set(m.to,loads.get(m.to)+m.weight);}
     for(const m of selected)moves.push(m);
-    summaries.push({planning,accounts:pool.map(a=>a.id),weights:Object.fromEntries(shares),before,after:Object.fromEntries(loads),target:Object.fromEntries(target),fixed:work.filter(s=>s.fixed).map(s=>s.id),fixedLoad:Object.fromEntries(pool.map(a=>[a.id,work.filter(s=>s.fixed&&s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0)]))});
+    summaries.push({planning,...(extraMode?{dispatchTier:'extra'}:{}),budget:extraMode?{basis:'extra_dispatch_budget',accounts:targets.map(account=>({id:account.id,...account.dispatch_planning.allocation}))}:calculated?.basis??null,accounts:pool.map(a=>a.id),weights:Object.fromEntries(shares),before,after:Object.fromEntries(loads),target:Object.fromEntries(target),fixed:work.filter(s=>s.fixed).map(s=>s.id),fixedLoad:Object.fromEntries(pool.map(a=>[a.id,work.filter(s=>s.fixed&&s.account_id===a.id).reduce((sum,s)=>sum+s.weight,0)]))});
   }
-  return {metric:referenceMetric,priceRevisions:[...new Set(requests.map(r=>r.price_version).filter(Boolean))],window,moves,skipped,summaries};
+  return {metric:referenceMetric,priceRevisions,window,moves,skipped,summaries};
+}
+
+export function routingAutoState(accounts,at,previous=null,force=false,options={}){
+  accounts=accounts.filter(a=>!isApi(a));
+  const cycle=nextWeightReset(at)-day;
+  const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)])),assessment=packageBudget(accounts,{at,enabled:!!options.packagePolicy?.enabled,protocol:options.protocol,model:options.model}),identities=Object.fromEntries(assessment.items.map(row=>[row.id,packageFingerprint({identity:row.identity,available:available(accounts.find(account=>account.id===row.id))})])),scope=packageFingerprint({policy:{enabled:!!options.packagePolicy?.enabled,version:options.packagePolicy?.enabled?options.packagePolicy.version??0:0,smoothing_hours:24},compatibility:assessment.items.map(row=>[row.id,row.reason==='package_scope_mismatch'?'incompatible':'compatible'])}),identityChanged=!previous||previous.scope!==scope||JSON.stringify(previous.identities)!==JSON.stringify(identities);
+  const assessed=new Map(assessment.items.map(item=>[item.id,item])),states=Object.fromEntries(accounts.map(a=>{const item=assessed.get(a.id),capacity=options.packagePolicy?.enabled&&item.mode!=='legacy';return [a.id,a.route_block==='quota_exhausted'||item.exhausted?0:capacity?item.eligible?1:previous?.states[a.id]??null:snapshots.get(a.id)?snapshots.get(a.id).remaining>0?1:0:previous?.states[a.id]??null];}));
+  const changed=!previous||previous.cycle!==cycle||identityChanged||accounts.some(a=>states[a.id]!==null&&states[a.id]!==previous.states[a.id]);
+  const calculated=force||changed||previous?.pending?automaticWeights(accounts.map(a=>states[a.id]===0?{...a,route_block:'quota_exhausted'}:a),at,options):null;
+  let saved=previous,audit=null;
+  if(force||changed||previous?.pending&&!calculated.reason){
+    // A failed refresh cannot erase the last known allocation or resurrect an exhausted account.
+    const retain=calculated.reason&&previous&&!identityChanged&&Object.values(previous.weights).every(Number.isFinite)&&Object.values(previous.weights).some(weight=>weight>0);
+    const weights=retain?Object.fromEntries(accounts.map(a=>[a.id,states[a.id]===0?0:previous.weights[a.id]??0])):Object.fromEntries(calculated.weights);
+    const trigger=force||(!previous?'initialize':previous.cycle!==cycle?'nightly':'quota');
+    saved={cycle,states,identities,scope,weights,reason:calculated.reason,pending:!!calculated.reason,basis:retain?previous.basis??null:calculated.basis,updated:at,trigger};
+    audit={cycle,reason:trigger,weights,previous:previous?.weights??null,basis:saved.basis,retained:!!retain};
+  }
+  const current=options.packagePolicy?.enabled?automaticWeights(accounts,at,options):null;
+  return {packageEnabled:!!options.packagePolicy?.enabled,legacyCompatibility:current?.legacyCompatibility??false,strict:current?.strict??false,packages:current?.packages??assessment,save:saved!==previous?saved:null,audit,eligible:current?current.eligible.filter(a=>states[a.id]!==0):accounts.filter(a=>available(a)&&states[a.id]!==0),snapshots,reason:saved.reason,basis:saved.basis??null,updated:saved.updated??null,trigger:saved.trigger??null,weights:new Map(accounts.map(a=>[a.id,!available(a)||states[a.id]===0?0:Object.hasOwn(saved.weights,a.id)?saved.weights[a.id]:0]))};
+}
+
+export function routingDistribution(accounts,{at,weighted,system,configured}){
+  const subscriptions=accounts.filter(a=>!isApi(a)),active=configured.mode==='manual'&&configured.expires>at;
+  const subscriptionMode=!weighted?'legacy':active?'manual':system.strict?'capacity':system.eligible.some(a=>system.weights.get(a.id)===null)?'fallback':'auto';
+  const subEligible=subscriptionMode==='manual'?subscriptions.filter(a=>available(a)&&!system.packages?.items.some(item=>item.id===a.id&&item.reason==='package_scope_mismatch')):subscriptionMode==='legacy'&&!system.packageEnabled?subscriptions.filter(available):system.eligible;
+  const desired=a=>['legacy','fallback'].includes(subscriptionMode)?1:subscriptionMode==='manual'?configured.weights[a.id]||0:system.weights.get(a.id)||0;
+  const sum=subEligible.reduce((n,a)=>n+desired(a),0),apis=accounts.filter(a=>isApi(a)&&available(a)&&!a.route_block&&a.api_weight>0),apiShare=apis.reduce((n,a)=>n+a.api_weight,0);
+  const weights=new Map(accounts.map(a=>[a.id,apis.includes(a)?a.api_weight:subEligible.includes(a)&&sum>0?Math.max(0,100-apiShare)*desired(a)/sum:0]));
+  const eligible=[...subEligible,...apis],total=eligible.reduce((n,a)=>n+weights.get(a.id),0);
+  if(total>0)for(const a of eligible)weights.set(a.id,weights.get(a.id)/total*100);
+  const mode=apis.length?'api_mixed':subscriptionMode;
+  return {mode,subscriptionMode,reason:system.reason,eligible,weights,system,configuration:{...configured,...(!active?{mode:'auto',expires:null}:{})},accounts:accounts.map(a=>({id:a.id,automatic:isApi(a)?null:system.weights.get(a.id),effective:isApi(a)?weights.get(a.id):['legacy','fallback'].includes(mode)||system.strict&&subscriptionMode!=='manual'&&(system.reason||system.packages?.items.some(item=>item.id===a.id&&['unknown','legacy'].includes(item.mode)))?null:weights.get(a.id),configured:isApi(a)?a.api_weight:active?configured.weights[a.id]??0:null,manualApi:isApi(a),package:system.packages?.items.find(item=>item.id===a.id)??null}))};
+}
+
+export function routingAllocation(state,previous={}){
+  const pool=state.eligible;
+  if(['legacy','fallback'].includes(state.mode))return {selected:[...pool].sort((a,b)=>a.last_used-b.last_used||a.id.localeCompare(b.id))[0]};
+  const signature=JSON.stringify([state.mode,state.mode==='manual'?state.configuration.version:0,pool.map(a=>a.id).sort()]);
+  const credits=Object.fromEntries(pool.map(a=>[a.id,previous.signature===signature?previous.credits?.[a.id]||0:0]));
+  const mean=Object.values(credits).reduce((n,v)=>n+v,0)/pool.length;
+  for(const a of pool)credits[a.id]=credits[a.id]-mean+state.weights.get(a.id)/100;
+  const candidates=pool.filter(a=>state.weights.get(a.id)>0).sort((a,b)=>credits[b.id]-credits[a.id]||a.id.localeCompare(b.id));
+  const selected=candidates[0];
+  if(selected)credits[selected.id]-=1;
+  return {selected,schedule:{signature,credits}};
 }
 
 export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>null,clock=Date.now,stopping=()=>false}){
@@ -116,22 +198,9 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   const manual=()=>readSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:0});
   const atomic=fn=>{if(store.db.isTransaction)return fn();store.db.exec('BEGIN IMMEDIATE');try{const result=fn();store.db.exec('COMMIT');return result;}catch(e){store.db.exec('ROLLBACK');throw e;}};
   function syncWeights(accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL"),at=clock(),force=false){
-    accounts=accounts.filter(a=>!isApi(a));
-    const previous=readSetting('routing_auto',null),cycle=nextWeightReset(at)-day;
-    const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)]));
-    const states=Object.fromEntries(accounts.map(a=>[a.id,a.route_block==='quota_exhausted'?0:snapshots.get(a.id)?snapshots.get(a.id).remaining>0?1:0:previous?.states[a.id]??null]));
-    const changed=!previous||previous.cycle!==cycle||accounts.some(a=>states[a.id]!==null&&states[a.id]!==previous.states[a.id]);
-    const calculated=force||changed||previous?.pending?automaticWeights(accounts.map(a=>states[a.id]===0?{...a,route_block:'quota_exhausted'}:a),at):null;
-    let saved=previous;
-    if(force||changed||previous?.pending&&!calculated.reason){
-      // A failed refresh cannot erase the last known allocation or resurrect an exhausted account.
-      const retain=calculated.reason&&previous&&Object.values(previous.weights).every(Number.isFinite)&&Object.values(previous.weights).some(weight=>weight>0);
-      const weights=retain?Object.fromEntries(accounts.map(a=>[a.id,states[a.id]===0?0:previous.weights[a.id]??0])):Object.fromEntries(calculated.weights);
-      const trigger=force||(!previous?'initialize':previous.cycle!==cycle?'nightly':'quota');
-      saved={cycle,states,weights,reason:calculated.reason,pending:!!calculated.reason,basis:retain?previous.basis??null:calculated.basis,updated:at,trigger};
-      atomic(()=>{writeSetting('routing_auto',saved);store.audit('balancing.weights.auto',JSON.stringify({cycle,reason:trigger,weights,previous:previous?.weights??null,basis:saved.basis,retained:!!retain}));});
-    }
-    return {eligible:accounts.filter(a=>available(a)&&states[a.id]!==0),snapshots,reason:saved.reason,basis:saved.basis??null,updated:saved.updated??null,trigger:saved.trigger??null,weights:new Map(accounts.map(a=>[a.id,!available(a)||states[a.id]===0?0:Object.hasOwn(saved.weights,a.id)?saved.weights[a.id]:0]))};
+    const {save,audit,...system}=routingAutoState(accounts,at,readSetting('routing_auto',null),force);
+    if(save)atomic(()=>{writeSetting('routing_auto',save);store.audit('balancing.weights.auto',JSON.stringify(audit));});
+    return system;
   }
   const previousSettings=readSetting('balancing',{});
   // Older manual routes had no deadline. Recover only human actions, not automatic moves.
@@ -161,29 +230,9 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
   }
   function distribution(accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND removed_at IS NULL")){
     const subscriptions=accounts.filter(a=>!isApi(a)),at=clock(),weighted=settings().weighted;
-    const system=weighted?syncWeights(subscriptions,at):automaticWeights(subscriptions,at),configured=manual(),active=configured.mode==='manual'&&configured.expires>at;
-    const subscriptionMode=!weighted?'legacy':active?'manual':system.eligible.some(a=>system.weights.get(a.id)===null)?'fallback':'auto';
-    const subEligible=subscriptionMode==='legacy'||subscriptionMode==='manual'?subscriptions.filter(available):system.eligible;
-    const desired=a=>['legacy','fallback'].includes(subscriptionMode)?1:subscriptionMode==='manual'?configured.weights[a.id]||0:system.weights.get(a.id)||0;
-    const sum=subEligible.reduce((n,a)=>n+desired(a),0),apis=accounts.filter(a=>isApi(a)&&available(a)&&!a.route_block&&a.api_weight>0),apiShare=apis.reduce((n,a)=>n+a.api_weight,0);
-    const weights=new Map(accounts.map(a=>[a.id,apis.includes(a)?a.api_weight:subEligible.includes(a)&&sum>0?Math.max(0,100-apiShare)*desired(a)/sum:0]));
-    const eligible=[...subEligible,...apis],total=eligible.reduce((n,a)=>n+weights.get(a.id),0);
-    if(total>0)for(const a of eligible)weights.set(a.id,weights.get(a.id)/total*100);
-    const mode=apis.length?'api_mixed':subscriptionMode;
-    return {mode,subscriptionMode,reason:system.reason,eligible,weights,system,configuration:{...configured,...(!active?{mode:'auto',expires:null}:{})},accounts:accounts.map(a=>({id:a.id,automatic:isApi(a)?null:system.weights.get(a.id),effective:isApi(a)?weights.get(a.id):['legacy','fallback'].includes(mode)?null:weights.get(a.id),configured:isApi(a)?a.api_weight:active?configured.weights[a.id]??0:null,manualApi:isApi(a)}))};
+    return routingDistribution(accounts,{at,weighted,system:weighted?syncWeights(subscriptions,at):automaticWeights(subscriptions,at),configured:manual()});
   }
-  function allocation(state){
-    const pool=state.eligible;
-    if(['legacy','fallback'].includes(state.mode))return {selected:[...pool].sort((a,b)=>a.last_used-b.last_used||a.id.localeCompare(b.id))[0]};
-    const signature=JSON.stringify([state.mode,state.mode==='manual'?state.configuration.version:0,pool.map(a=>a.id).sort()]),previous=readSetting('routing_schedule',{});
-    const credits=Object.fromEntries(pool.map(a=>[a.id,previous.signature===signature?previous.credits?.[a.id]||0:0]));
-    const mean=Object.values(credits).reduce((n,v)=>n+v,0)/pool.length;
-    for(const a of pool)credits[a.id]=credits[a.id]-mean+state.weights.get(a.id)/100;
-    const candidates=pool.filter(a=>state.weights.get(a.id)>0).sort((a,b)=>credits[b.id]-credits[a.id]||a.id.localeCompare(b.id));
-    const selected=candidates[0];
-    if(selected)credits[selected.id]-=1;
-    return {selected,schedule:{signature,credits}};
-  }
+  const allocation=state=>routingAllocation(state,['legacy','fallback'].includes(state.mode)?{}:readSetting('routing_schedule',{}));
   function selectAccount({protocol='responses'}={}){
     const state=distribution(protocol==='responses'?undefined:store.all("SELECT * FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND removed_at IS NULL"));
     if(!state.eligible.length)throw new AppError(503,'所有账号均不可用，请等待额度恢复或重新登录','no_account');

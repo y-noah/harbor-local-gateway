@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "handoffKind": "pending-final",
+  "bundleDirectory": "/var/lib/harbor-incoming/final",
+  "workDirectory": "/var/lib/harbor-receive",
+  "recoveryDirectory": "/var/lib/harbor-r",
+  "keyFile": "/var/lib/harbor-r/archive.key",
+  "keyVersion": "REPLACE_WITH_APPROVED_SOURCE_KEY_VERSION",
+  "sourceMachine": "REPLACE_WITH_APPROVED_SOURCE_MACHINE_IDENTITY_SHA256",
+  "expectedCluster": "REPLACE_WITH_APPROVED_SYSTEM_IDENTIFIER",
+  "handoffDigest": {
+    "sha256": "REPLACE_WITH_APPROVED_HANDOFF_SHA256",
+    "bytes": 0
+  },
+  "maxBundleBytes": 4398046511104,
+  "maxFiles": 300000,
+  "restoreUid": 999,
+  "restoreGid": 999,
+  "pgBinDirectory": "/usr/lib/postgresql/18/bin",
+  "processTimeoutMs": 7200000
+}
