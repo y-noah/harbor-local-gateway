@@ -4,20 +4,20 @@ import {resolve,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {endianness} from 'node:os';
 import {loadPeriodicApplicationKey,taskPeriodicApplicationKey} from './postgres-periodic-application-key.mjs';
-import {PostgresStore} from './postgres-store.mjs';
 import {backupInventory} from './postgres-backup-inventory.mjs';
+import {backupObservationStore,assertBackupObservationOperation} from './postgres-backup-observation.mjs';
 import {canonical,artifactKey,readManifest,transferError} from './migration-artifacts.mjs';
 const contexts=new WeakMap(),digest=value=>createHash('sha256').update(canonical(value)).digest('hex'),fail=code=>{throw transferError(code);};
 export function postgresBackupContext(value){const record=contexts.get(value);if(!record)fail('backup_context_required');return record;}
 function freeze(value){if(value&&typeof value==='object'&&!Buffer.isBuffer(value)){for(const child of Object.values(value))freeze(child);Object.freeze(value);}return value;}
 function publish(record){for(const name of ['scope','profile','configurationDigest','adminOptions','expected','artifactDirectory','archiveDirectory','key','keyVersion','archiveProfileDigest','restoreDirectory','restoreUid','restoreGid','archiveKeyFile','applicationKey','applicationKeyVersion','applicationKeyDigest','applicationEncryption','pendingBinding','pendingBindingDigest','receiverBinding','periodicReceiverBinding','resumeBinding','resumeOperatorContext'])if(Object.hasOwn(record,name))Object.defineProperty(record,name,{value:freeze(record[name]),enumerable:true,writable:false,configurable:false});record.busy=false;record.pending=null;record.cancellation=null;record.applicationPlan=null;record.periodicApplicationPending=null;record.periodicApplicationCancellation=null;record.periodicBasePreparationPending=null;record.periodicBasePreparationCancellation=null;Object.seal(record);const value=Object.freeze({scope:record.scope});contexts.set(value,record);return value;}
-async function observeBackupCluster(options){
- const store=new PostgresStore({...options,poolSize:1});try{
+async function observeBackupCluster(options,operation){
+ const observed=await backupObservationStore(options,operation),{store}=observed;try{
   if((await store.all("SELECT spcname FROM pg_tablespace WHERE spcname NOT IN ('pg_default','pg_global')")).length)fail('backup_external_tablespaces_unsupported');
   const control=await store.get("SELECT system_identifier::text system_id,extract(epoch from pg_postmaster_start_time())::text postmaster_start,current_setting('server_version_num')::integer version,current_setting('data_directory') data_directory,pg_size_bytes(current_setting('wal_segment_size'))::text segment_bytes FROM pg_control_system()"),checkpoint=await store.get('SELECT timeline_id::integer timeline FROM pg_control_checkpoint()');
   if(control.version<180000||control.version>=190000)fail('backup_postgres_version');
   return {...control,...checkpoint,...await backupInventory(store)};
- }finally{await store.close();}
+ }catch(error){observed.check();throw error;}finally{await observed.close();}
 }
 export async function verifyBackupCluster(context){
  const record=postgresBackupContext(context);if(record.receiverBinding)fail('backup_receiver_readonly');if(record.resumeBinding)fail('backup_resume_readonly');await verifyPostgresBackupPendingBinding(context);const actual=await observeBackupCluster(record.adminOptions);
@@ -58,14 +58,15 @@ export async function loadPostgresBackupArchiveProfile(path='/etc/harbor-storage
  const file=await open(config.keyFile,constants.O_RDONLY|constants.O_NOFOLLOW);let key;try{const info=await file.stat();if(!info.isFile()||info.uid!==config.uid||(info.mode&0o777)!==0o600||info.size!==32)fail('backup_archive_key_not_private');key=artifactKey(await file.readFile());}finally{await file.close();}
  return {configuration:config,configurationDigest:digest(config),key};
 }
-export async function createPostgresBackupContext(path='/etc/harbor-storage-backup.json'){
- return createInstalledPostgresBackupContext(path);
+export async function createPostgresBackupContext(path='/etc/harbor-storage-backup.json',operation){
+ return createInstalledPostgresBackupContext(path,undefined,operation);
 }
 export async function createResumingPostgresBackupContext({context,resumeBinding,signal}={},path='/etc/harbor-storage-backup.json'){
  if(!resumeBinding)fail('backup_resume_binding_required');signal?.throwIfAborted();return createInstalledPostgresBackupContext(path,{context,resumeBinding,signal});
 }
-async function createInstalledPostgresBackupContext(path,resume){
+async function createInstalledPostgresBackupContext(path,resume,operation){
  if(process.platform!=='linux'||process.getuid()!==0||path!=='/etc/harbor-storage-backup.json')fail('backup_root_profile_required');
+ assertBackupObservationOperation(operation);
  const profile=await protectedJson(path);inventory(profile);if(profile.version!==1||Object.keys(profile).some(key=>!['version','dedicatedCluster','expectedCluster','databases','roles','memberships','artifactDirectory','pgBinDirectory','libraryDirectory','archiveProfile','processTimeoutMs','maxBackupBytes','maxWalSegments','checkpointMode','maxRateKb','restoreDirectory','applicationEncryption'].includes(key)))fail('backup_profile_invalid');
  if(!Number.isSafeInteger(profile.processTimeoutMs)||profile.processTimeoutMs<1000||profile.processTimeoutMs>86400000||!Number.isSafeInteger(profile.maxBackupBytes)||profile.maxBackupBytes<1||!Number.isSafeInteger(profile.maxWalSegments)||profile.maxWalSegments<1||profile.maxWalSegments>1048576||!['fast','spread'].includes(profile.checkpointMode)||typeof profile.pgBinDirectory!=='string'||resolve(profile.pgBinDirectory)!==profile.pgBinDirectory)fail('backup_profile_invalid');
  if(profile.maxRateKb!==undefined&&(!Number.isSafeInteger(profile.maxRateKb)||profile.maxRateKb<32||profile.maxRateKb>1048576))fail('backup_profile_invalid');
@@ -73,7 +74,7 @@ async function createInstalledPostgresBackupContext(path,resume){
  const secret=await open('/etc/harbor-storage-operator.env',constants.O_RDONLY|constants.O_NOFOLLOW);let connectionString;try{const info=await secret.stat();if(!info.isFile()||info.uid!==0||(info.mode&0o777)!==0o600||info.size>16384)fail('backup_admin_connection_not_private');const match=/^HARBOR_STORAGE_OPERATOR_ADMIN_DATABASE_URL=(postgres(?:ql)?:\/\/[^\r\n]+)\n?$/.exec(await secret.readFile('utf8'));if(!match)fail('backup_admin_connection_required');connectionString=match[1];}finally{await secret.close();}
  const address=new URL(connectionString);if(address.searchParams.get('sslmode')!=='verify-full'||!address.searchParams.get('sslrootcert'))fail('backup_verified_database_tls_required');
  const {applicationEncryption:configuredApplicationEncryption,...databaseProfile}=profile;
- const archive=await loadPostgresBackupArchiveProfile();let retained=false,application;try{application=await loadPeriodicApplicationKey(configuredApplicationEncryption,archive.key);const actual=await observeBackupCluster({connectionString});
+ const archive=await loadPostgresBackupArchiveProfile();let retained=false,application;try{application=await loadPeriodicApplicationKey(configuredApplicationEncryption,archive.key);const actual=await observeBackupCluster({connectionString},operation);
  if(profile.expectedCluster!==actual.system_id||archive.configuration.expectedCluster!==actual.system_id||archive.configuration.pgDataDirectory!==actual.data_directory||!resume&&(canonical(profile.databases)!==canonical(actual.databases)||canonical(profile.roles)!==canonical(actual.roles)||canonical(profile.memberships)!==canonical(actual.memberships)))fail('backup_cluster_scope_mismatch');
  const expected=resume?{...actual,databases:profile.databases,roles:profile.roles,memberships:profile.memberships}:actual;
  if(resume){const {inspectStorageOperatorResumeBinding}=await import('./storage-operator-resume-binding.mjs');await inspectStorageOperatorResumeBinding(resume.resumeBinding,{context:resume.context,actual,baselineExpected:expected,baselineConfigurationDigest:digest(databaseProfile),signal:resume.signal});}
@@ -82,7 +83,7 @@ async function createInstalledPostgresBackupContext(path,resume){
  if(profile.libraryDirectory!==undefined&&(typeof profile.libraryDirectory!=='string'||resolve(profile.libraryDirectory)!==profile.libraryDirectory))fail('backup_toolchain_not_trusted');
  for(const directory of [profile.pgBinDirectory,...(profile.libraryDirectory?[profile.libraryDirectory]:[])])for(let parent=directory;;parent=resolve(parent,'..')){const info=await lstat(parent);if(!info.isDirectory()||info.isSymbolicLink()||info.uid!==0||(info.mode&0o022)!==0)fail('backup_toolchain_not_trusted');if(parent==='/')break;}
  for(const name of ['pg_basebackup','pg_verifybackup','pg_waldump','pg_controldata']){const file=await lstat(join(profile.pgBinDirectory,name));if(!file.isFile()||file.isSymbolicLink()||file.uid!==0||(file.mode&0o022)!==0)fail('backup_toolchain_not_trusted');}
- resume?.signal?.throwIfAborted();const context=publish({scope:'existing-cluster',profile,configurationDigest:digest(databaseProfile),...application,adminOptions:{connectionString},expected,artifactDirectory,archiveDirectory:archive.configuration.archiveDirectory,key:archive.key,keyVersion:archive.configuration.keyVersion,archiveProfileDigest:archive.configurationDigest,restoreDirectory,restoreUid:restoreOwner.uid,restoreGid:restoreOwner.gid,archiveKeyFile:archive.configuration.keyFile,...(resume?{resumeBinding:resume.resumeBinding,resumeOperatorContext:resume.context}:{}),closed:false});retained=true;return context;
+ resume?.signal?.throwIfAborted();assertBackupObservationOperation(operation);const context=publish({scope:'existing-cluster',profile,configurationDigest:digest(databaseProfile),...application,adminOptions:{connectionString},expected,artifactDirectory,archiveDirectory:archive.configuration.archiveDirectory,key:archive.key,keyVersion:archive.configuration.keyVersion,archiveProfileDigest:archive.configurationDigest,restoreDirectory,restoreUid:restoreOwner.uid,restoreGid:restoreOwner.gid,archiveKeyFile:archive.configuration.keyFile,...(resume?{resumeBinding:resume.resumeBinding,resumeOperatorContext:resume.context}:{}),closed:false});retained=true;return context;
  }finally{if(!retained){archive.key.fill(0);application?.applicationKey?.fill(0);}}
 }
 export async function createTaskPostgresBackupContext({laboratory,directory,archiveKey,applicationKey,applicationKeyVersion='task-application-v1',binDirectory,libraryDirectory,maxBackupBytes=1073741824,maxWalSegments=1024,maxRateKb}={}){

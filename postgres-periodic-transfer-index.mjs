@@ -24,13 +24,18 @@ function sourceCredentials(options){
  if(options.connection){const {user,password,database}=options.connection;if(![user,password,database].every(value=>typeof value==='string'&&value))fail('backup_handoff_credentials_required');return {user,password,database};}
  const address=new URL(options.connectionString);return {user:decodeURIComponent(address.username),password:decodeURIComponent(address.password),database:decodeURIComponent(address.pathname.slice(1))};
 }
+function* catalogPages(entries){
+ let chunk=[],bytes=0,ordinal=0;
+ for(const row of entries){const entry={path:row.path,digest:row.digest},size=Buffer.byteLength(JSON.stringify(entry));if(bytes+size>524288&&chunk.length){yield {name:'handoff-catalog-'+ordinal+'.enc',value:{version:1,ordinal,entries:chunk}};ordinal++;chunk=[];bytes=0;}chunk.push(entry);bytes+=size;}
+ if(chunk.length)yield {name:'handoff-catalog-'+ordinal+'.enc',value:{version:1,ordinal,entries:chunk}};
+}
 // The on-disk output is the existing typed handoff manifest/catalog protocol.
 // Payload bytes stay in the original immutable files: no full-base copy or
 // source hardlink is made. Only the live source proof can authorize an index.
 export async function createPeriodicTransferIndex(context,proof,pointId,{directory,signal}={}){
  const record=postgresBackupContext(context),source=postgresBackupRestoreSource(proof);if(source.context!==context||record.closed||record.pendingBinding||record.resumeBinding||record.receiverBinding||record.applicationPlan)fail('periodic_transfer_source_required');
  if(typeof directory!=='string'||resolve(directory)!==directory||directory===record.artifactDirectory||directory.startsWith(record.artifactDirectory+'/')||directory===record.archiveDirectory||directory.startsWith(record.archiveDirectory+'/'))fail('periodic_transfer_index_directory');
- await privateDirectory(directory);if(await realpath(directory)!==directory)fail('periodic_transfer_index_directory');const existingNames=await readdir(directory),resuming=existingNames.length>0;if(resuming&&!existingNames.includes('handoff.enc'))fail('periodic_transfer_index_incomplete');
+ await privateDirectory(directory);if(await realpath(directory)!==directory)fail('periodic_transfer_index_directory');const existingNames=await readdir(directory),resuming=existingNames.includes('handoff.enc');if(!resuming&&existingNames.some(name=>!/^handoff-catalog-(?:0|[1-9]\d*)\.enc$/.test(name)))fail('periodic_transfer_index_incomplete');
  const archiveKey=Buffer.from(record.key),applicationKey=Buffer.from(periodicApplicationKey(record));
  const lifetime={context,active:false};let completed;try{completed=await withPostgresBackupOperation(record,async()=>{
   await revalidatePeriodicSourceBase(proof,{signal});const backup=await authenticatePeriodicApplicationBackup(context,proof,pointId,{signal}),closed=periodicApplicationBackupSource(backup),point=postgresBackupRecoveryPointSource(closed.point),capture=periodicApplicationCaptureSource(closed.capture),base=join(record.artifactDirectory,proof.backupId),prefix='backup/'+proof.backupId+'/',entries=[],seen=new Set();
@@ -55,8 +60,13 @@ export async function createPeriodicTransferIndex(context,proof,pointId,{directo
    const allowed=new Set(['handoff.enc',...parts.map(row=>row.name)]);if(existingNames.length!==allowed.size||existingNames.some(name=>!allowed.has(name)))fail('periodic_transfer_index_conflict');
    let offset=0;for(const [ordinal,part] of parts.entries()){if(part.name!=='handoff-catalog-'+ordinal+'.enc'||!periodicCipherDigest(part.digest)||!same(await digestFile(join(directory,part.name),{signal}),part.digest))fail('periodic_transfer_index_conflict');const page=await readManifest(join(directory,part.name),applicationKey,{signal});if(page.version!==1||page.ordinal!==ordinal||!Array.isArray(page.entries)||page.entries.length!==part.count||!page.entries.length||!same(page.entries,entries.slice(offset,offset+part.count).map(({path,digest})=>({path,digest}))))fail('periodic_transfer_index_conflict');offset+=part.count;}if(offset!==entries.length)fail('periodic_transfer_index_conflict');manifest=prior;
   }else{
-   const parts=[];let chunk=[],bytes=0;const flush=async()=>{if(!chunk.length)return;const name='handoff-catalog-'+parts.length+'.enc';await writeManifest(join(directory,name),{version:1,ordinal:parts.length,entries:chunk},applicationKey);parts.push({name,count:chunk.length,digest:await digestFile(join(directory,name),{signal})});chunk=[];bytes=0;};
-   for(const row of entries){const entry={path:row.path,digest:row.digest},size=Buffer.byteLength(JSON.stringify(entry));if(bytes+size>524288)await flush();chunk.push(entry);bytes+=size;}await flush();manifest={...claims,parts,created:Date.now()};
+   // A cancelled first preparation may have published catalog pages without
+   // its final handoff. Reuse only authenticated pages matching this live
+   // source exactly; validate all survivors before writing anything new.
+   const pending=new Set(existingNames),reused=new Map();
+   for(const {name,value} of catalogPages(entries)){if(!pending.has(name))continue;const path=join(directory,name);await periodicCipherIdentity(path);if(!same(await readManifest(path,applicationKey,{signal}),value))fail('periodic_transfer_index_conflict');reused.set(name,await digestFile(path,{signal}));pending.delete(name);}
+   if(pending.size)fail('periodic_transfer_index_conflict');
+   const parts=[];for(const {name,value} of catalogPages(entries)){signal?.throwIfAborted();if(!reused.has(name))await writeManifest(join(directory,name),value,applicationKey);const digest=await digestFile(join(directory,name),{signal});if(reused.has(name)&&!same(digest,reused.get(name)))fail('periodic_transfer_index_changed');parts.push({name,count:value.entries.length,digest});}manifest={...claims,parts,created:Date.now()};
   }
   await revalidatePeriodicSourceBase(proof,{signal});if(!same(await digestFile(join(point.directory,'backup-complete.enc'),{signal}),closed.manifestDigest))fail('periodic_transfer_source_changed');signal?.throwIfAborted();if(record.closed)fail('backup_context_closed');if(!resuming)await writeManifest(join(directory,'handoff.enc'),manifest,applicationKey);
   const handoffDigest=await digestFile(join(directory,'handoff.enc'),{signal});if(!same(manifest,await readManifest(join(directory,'handoff.enc'),applicationKey,{signal})))fail('periodic_transfer_index_changed');

@@ -17,20 +17,24 @@ async function controlBytes(directory,name,digest,signal){
 
 // Only the current live source capability selects immutable files. The peer
 // can request a known digest and its missing suffix, never a filesystem path.
-export async function servePeriodicSshSource(index,wire){
+export async function servePeriodicSshSource(index,wire,{finish}={}){
+ if(finish!==undefined&&typeof finish!=='function')fail('configuration_invalid');
  const signal=connection(wire);return usePeriodicTransferIndex(index,async source=>{
+  let complete=false;
+  try{
   await wire.writeJson({kind:'periodic-start',version:1,handoffDigest:source.handoffDigest});
   for(const part of [{name:'handoff.enc',digest:source.handoffDigest},...source.manifest.parts]){await wire.writeJson({kind:'control',name:part.name,digest:part.digest});await wire.writeBytes(await controlBytes(source.directory,part.name,part.digest,signal));}
   const entries=new Map(source.entries.map(entry=>[entry.digest.sha256,entry])),sent=new Set();
   for(;;){
    const request=await wire.readJson();
-   if(request.kind==='complete'){record(request,'complete',['backupId','pointId']);if(request.backupId!==index.backupId||request.pointId!==index.pointId)fail('completion_binding');return {backupId:index.backupId,pointId:index.pointId,transportComplete:true,restoreVerified:false,offhostVerified:false,deploymentAllowed:false};}
+   if(request.kind==='complete'){record(request,'complete',['backupId','pointId']);if(request.backupId!==index.backupId||request.pointId!==index.pointId)fail('completion_binding');complete=true;return {backupId:index.backupId,pointId:index.pointId,transportComplete:true,restoreVerified:false,offhostVerified:false,deploymentAllowed:false};}
    record(request,'suffix',['digest','offset']);if(!periodicCipherDigest(request.digest)||!Number.isSafeInteger(request.offset)||request.offset<0||request.offset>=request.digest.bytes)fail('range_invalid');const entry=entries.get(request.digest.sha256);if(!entry||!same(entry.digest,request.digest)||sent.has(request.digest.sha256))fail('range_invalid');sent.add(request.digest.sha256);
    const input=await openPeriodicTransferSource(entry,{signal});try{
     await wire.writeJson({kind:'suffix',digest:entry.digest,offset:request.offset});const buffer=Buffer.alloc(Math.min(1048576,periodicSshWireLimits.dataBytes));
     for(let at=request.offset;at<entry.digest.bytes;){assertPeriodicTransferIndexActive(index,{signal});const bytes=Math.min(buffer.length,entry.digest.bytes-at),result=await input.read(buffer,0,bytes,at);if(result.bytesRead!==bytes)fail('source_changed');assertPeriodicTransferIndexActive(index,{signal});await wire.writeBytes(buffer.subarray(0,bytes));at+=bytes;}
    }finally{await input.close();}
   }
+  }finally{await finish?.({complete});}
  },{signal});
 }
 

@@ -76,7 +76,15 @@ HARBOR_TEST_PG_BIN_DIR=/private/tools/postgresql/18/bin node --test tests/postgr
 
 ### 应用周期点、全备维护与真实恢复分离
 
-源端 SSH 策略模块 `postgres-periodic-ssh-policy.mjs` 只读取 root／0600 的固定 `/etc/harbor-storage-periodic-ssh.json`，缺失或 `enabled:false` 时关闭，模板见 `periodic-ssh.example.json`。它核对 root 私钥（0600）、不可被组／其他用户改写的主机公钥文件、root／0700 索引目录及受保护祖先；启用时这些材料须预先准备，模块不会创建密钥、安装授权或发起连接。`host/port/user`、`identityFile/knownHostsFile/indexDirectory` 和两项超时由管理员配置；身份与主机公钥文件使用无空白、无 SSH token／环境变量展开的绝对字面路径。参数固定 `/usr/bin/ssh`、非交互身份认证、严格主机公钥核对、禁用代理／转发及远端命令 `harbor-periodic-receive`，不使用默认身份或修改主机公钥文件。策略每次调用读取；关闭阻止后续任务，已开始任务沿原预算收尾。此模块仅提供配置和参数，不代表固定收发 CLI、定时任务或真实异机已经完成。
+源端 SSH 策略模块 `postgres-periodic-ssh-policy.mjs` 只读取 root／0600 的固定 `/etc/harbor-storage-periodic-ssh.json`，缺失或 `enabled:false` 时关闭，模板见 `periodic-ssh.example.json`。它核对 root 私钥（0600）、不可被组／其他用户改写的主机公钥文件、root／0700 索引目录及受保护祖先；启用时这些材料须预先准备，模块不会创建密钥、安装授权或发起连接。`host/port/user`、`identityFile/knownHostsFile/indexDirectory` 和两项超时由管理员配置；身份与主机公钥文件使用无空白、无 SSH token／环境变量展开的绝对字面路径。参数固定 `/usr/bin/ssh`、非交互身份认证、严格主机公钥核对、禁用代理／转发及远端命令 `harbor-periodic-receive`，不使用默认身份或修改主机公钥文件。策略每次调用读取；关闭阻止后续任务，已开始任务沿原预算收尾。该模块提供配置和参数；实际发送由独立固定 CLI 办理，配置启用本身不证明传输或异机恢复成功。
+
+固定 CLI 为 `node storage-periodic-transfer.mjs send|receive`，只读固定配置，不接收任意配置路径。`send` 认证已有 `latestBackup` 周期点并生成轻量传输索引，在 SSH 子进程真实关闭后才释放传输租约。索引续跑允许在 `handoff.enc` 尚未发布时，复用完整写入、AEAD 认证且内容与预期 catalog 匹配的页；未知文件、损坏认证或不匹配内容保全并拒绝，不承诺任意 SIGKILL 遗留的半写文件都能自动清理。`receive` 只接收并认证密文传输，不执行数据库／应用恢复，也不签发恢复或异机验证证明。
+
+自动发送模板为 `periodic-ssh.service.example` 和 `periodic-ssh.timer.example`，分别对应管理员安装后的 `harbor-postgres-periodic-ssh.service` 和同名 `.timer`。它们默认不安装、不加载、不启用，也不修改 SSH policy；policy 缺失或 `enabled:false` 时，CLI 返回关闭状态。`install-tools.py` 的实际安装根为 `/opt/harbor-storage-tools`：Node 位于 `node/bin/node`，应用位于 `app/`，模板只调用 `/opt/harbor-storage-tools/node/bin/node /opt/harbor-storage-tools/app/storage-periodic-transfer.mjs send`。安装前须核对已批准的工具树实际包含此 CLI 及其依赖、固定配置与资源预算；仓库中存在源码不等于当前服务器已经安装。接收端须另行准备既有固定 `receive` CLI、policy 和 SSH 授权，本模板不安装接收入口或密钥。
+
+producer `schedule`、maintainer `maintain-base` 与 sender `send` 使用独立进程：发送仅选择已有最新认证应用周期点，不生产恢复点、不制作全备，也不执行恢复。timer 设为开机1分钟后检查，并在前一次服务退出后通过 `OnUnitInactiveSec=1min` 再次检查，不并发启动同一服务；开机时刻已过时启用 timer，首次检查可立即触发。这只是发送检查频率，不修改原备份间隔或承诺1分钟 RPO。传输还受固定 SSH policy 的 `timeoutMs`／`connectTimeoutSeconds` 和 CLI 的取消、租约与子进程结算约束。
+
+停用时先停止并禁用 `harbor-postgres-periodic-ssh.timer`，再将固定 SSH policy 的 `enabled` 设为 `false`，阻止后续发送；若需取消已经开始的任务，再停止对应 `.service` 并等待收尾。只修改 policy 不会撤销已开始任务，它仍沿启动时读取的预算完成或取消。模板与全备维护一样不另设启动／停止强杀期限：`KillMode=mixed` 将 SIGTERM 交给主 CLI，CLI 负责取消本次 SSH、等待真实进程关闭并释放租约；`SendSIGKILL=no` 阻止服务管理器另行强杀。异常挂起时保留状态和材料并排查，不能把发出停止命令或超时当作清理成功。停用不停止 producer／maintainer，不删除已有索引、密文、恢复收据或源备份。模板仅提供可审阅的调度接线，未在真实服务器启用；`transportComplete` 仅表示传输完成，不等于接收端实际恢复、异机身份验证、RPO／RTO 或部署放行证明。
 
 独立全备维护模板为 `maintain-base.service.example` 和 `maintain-base.timer.example`，管理员核实际工具路径、资源预算及固定配置后，分别安装为 `harbor-postgres-maintain-base.service` 和同名 `.timer`。计时器每分钟检查一次，实际是否全备仍由 `fullIntervalMs`、源数据库代次和现有认证状态判断；同一服务执行中不会被计时器并行启动。它与 `schedule` 独立，不能同时启用旧的每日 `backup.timer` 来代替应用维护。模板不自动安装或启用；关闭时先停止计时器，再停止服务并等待取消收尾，保留已有密文与状态。首次备份尚未成功前，轻点仍报告未就绪，不承诺恢复能力。维护的启动及停止不另设强杀期限，沿固定备份配置和子进程取消机制收尾；异常挂起需管理员排查，不能强杀后把未确认清理当作成功。
 

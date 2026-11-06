@@ -1,0 +1,11 @@
+[Unit]
+Description=Harbor periodic application backup SSH transfer checks
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+Unit=harbor-postgres-periodic-ssh.service
+
+[Install]
+WantedBy=timers.target
+# 前一次发送退出后再等待1分钟；不并发启动同一服务，也不规定备份或恢复点间隔。

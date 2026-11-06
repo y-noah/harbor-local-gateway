@@ -1,0 +1,18 @@
+[Unit]
+Description=Harbor periodic application backup SSH transfer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/opt/harbor-storage-tools/node/bin/node /opt/harbor-storage-tools/app/storage-periodic-transfer.mjs send
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity
+KillSignal=SIGTERM
+KillMode=mixed
+SendSIGKILL=no
+# 只向主CLI发送SIGTERM；由CLI按固定策略预算取消SSH并等待真实子进程关闭及租约释放。
+# 不安装或启用本模板；不串联schedule或maintain-base，不把传输成功当作恢复证明。
