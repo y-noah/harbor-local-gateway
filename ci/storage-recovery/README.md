@@ -74,6 +74,86 @@ HARBOR_TEST_PG_BIN_DIR=/private/tools/postgresql/18/bin node --test tests/postgr
 
 外置应用材料、独立密钥加密包、接收包或恢复批准无法从当前备份目录完整发现，仍必须列入 `pinnedBackupIds`；工具不扫描任意路径或读取其他密钥。旧手工基线不会被协调器主动接管。该入口仅完成数据库周期，不采集新的应用材料、不重放模型、不删除备份或WAL，始终返回 `applicationMaterialsVerified/restoreVerified/offhostVerified/deploymentAllowed=false` 和 `retentionApplied=false`。应用材料一致快照、引用核验后的保留清理及实际RPO／RTO仍须单独闭环，不能用定时配置值当作恢复承诺。回滚时停止本协调服务并关闭配置，可继续使用原手工CLI；不要删除认证状态来强行重置失败。
 
+### 应用周期点、全备维护与真实恢复分离
+
+应用周期默认关闭，仅 root 固定的 `/etc/harbor-storage-application.json` 显式启用后接入原 `schedule`。配置版本1，完整字段为 `enabled`、数据库 `name/oid`、`data/runtime/secrets` 三个材料根（可另设库中路径前缀 `databasePrefix`）、原 HTTP/设备 TLS origin、材料字节及文件数预算；配置不由 HTTP 调用方提交。捕获包含原加密 Key、上游密文对应密钥、正文密钥、账号目录及设备 CA/TLS/report 材料，仍需按实际部署配置完整根目录；配置启用本身不证明备份或恢复完成。
+
+应用材料与控制清单使用独立 root-only 32字节密钥，PG 持有的 WAL key 不能解密。固定 `/etc/harbor-storage-backup.json` 可选增加以下 `applicationEncryption` 段；不配置时 DB-only 备份与保留照常可用，应用入口拒绝。`keyDigest` 为 `SHA256("harbor-periodic-application-key-v1\0" 的UTF-8字节 + 原32字节密钥)`；key文件及祖先须root控制，文件0600、单链接，不能位于任何被捕获的材料根内，也不能与WAL key内容相同。只将该可选段从原数据库配置摘要中分离，原DB字段仍完整校验；每个应用能力、清单、报告与交付独立绑定应用密钥版本及摘要，不为配置应用key强制重做大base。历史verify读取该固定备份配置，应用生产开关关闭或策略文件缺失不影响其密钥入口。
+
+```json
+"applicationEncryption": {
+  "version": 1,
+  "keyFile": "/var/lib/harbor-backup/application.key",
+  "keyVersion": "REPLACE_WITH_APPROVED_APPLICATION_KEY_VERSION",
+  "keyDigest": "REPLACE_WITH_DOMAIN_SEPARATED_KEY_DIGEST"
+}
+```
+
+应用 capture/files、cycle/state、backup-complete、sealed restore/final 及 typed handoff/catalog 均为独立应用密钥保护的 v3 控制闭包；DB base、独立 point/checkpoint、普通DB恢复报告与WAL继续原归档协议。controller在关闭、取消与失败清理后清零所持两把key，应用备份key不交给PG或降权后的验证进程，不收入交付包。
+
+启用应用时三个入口分开运行：`schedule` 按原恢复点间隔（默认5分钟）捕获材料、等待实际后续 WAL 闭包并复核源文件，发布独立不可变的 `backup-complete.enc`；它复用已认证的共享 base，不执行每点整库恢复。`maintain-base` 按原全备间隔（默认24小时）独立制作、完整认证新 base，长步骤不持活动状态控制锁；旧 active 可由另一个 context 持续产点，新 base 完整后才短锁切换。首次没有可用 active 时 schedule 明确输出 `bootstrap_not_ready`，须先成功运行维护入口。两者应使用独立进程和受控资源，不能把维护命令串入5分钟循环；模板不自动安装或启用这些任务。
+
+`schedule` 配置可显式设置 `reuseAuthenticatedBase:true`，默认 `false`，且仅应用周期已启用、独立应用密钥已配置的源端可用。启用后维护只准备 pending 候选；完整 SHA/AEAD 认证结束、明文副本清理和检查点完成后，以 root-only 应用密钥发布源端收据。收据绑定机器、Node/执行代码、数据库及密钥配置、真实原始 verifiedAt，以及完整 immutable 文件集合的 dev/ino/uid/mode/nlink/size/mtime/ctime 和小控制摘要。producer 以小控制及全文件身份核验后短锁采用候选，不在日切或冷启动的产点主链路重读大 base。收据缺失或变化时另用独立 context 后台完整认证，旧可信 active 继续产点；active 的真实文件身份变化后立即停止使用旧 proof，未有可信替代时明确 not-ready，不伪报备份完成。关闭开关保留收据与旧备份并恢复原完整验证行为；普通 verify/restore/receiver 始终完整 SHA 与 AEAD，不使用该源端收据，收据也不进入交付包。源 postmaster 代次变化仍强制新 base，该重建空窗仍必须纳入实际 RPO，不能以收据复用绕过。
+
+`node storage-backup.mjs verify-point <base UUID> <point UUID>` 独立选择已完成点，实际执行 PITR、原员工 Key/上游密文、四类正文密文、设备材料以及独立 Gateway/Worker/publisher 验证。它从已认证的归档策略和材料读取，不依赖当前源材料路径或应用生产开关；固定备份集群配置及工具信任仍需有效。只在真实执行与完整清理成功后封存 `application-restore.enc` 和 v3 `application-final.enc`。点的 `backupComplete:true/restoreVerified:false` 与实际验证状态严格分开；新点不能冒充已经恢复，也不授予 OCI、异机、正式容量或部署激活资格。
+
+应用 v3 顶层状态分别记录 `latestBackup`、`lastVerified`、`pending`、`pendingVerification`；producer 与 verifier 只在短锁内推进各自字段，保留并发产生的新点及最后真实验证点。取消保留已认证的恢复材料与待续状态；未知半成品不猜删。旧的未发布共享密钥应用周期 v1/v2 保全并明确拒绝，不自动迁移、重加密或回退尝试 WAL key。回退先关闭新调度，保留 v3 密文、状态及独立应用密钥，旧清理器对未知格式须拒绝。原数据库-only及 operator pending-final 的格式和严格行为不改变。
+
+周期 checkpoint 对同一 context 已完整验证的 WAL 保存有限内存缓存，命中仍复核密文及 metadata 的实际文件身份与认证小清单，并保留原 `verifiedAt`，不伪刷新完整认证时间。新段、身份变化、源 postmaster 代次变化或显式 scrub 重新完整验证；context 重启后缓存为空，必须重新认证。周期入口与手工 checkpoint 均要求实际 postmaster 代次与 base 一致；源重启后，即使同 timeline、当前五项恢复参数与 base 相同，也必须先维护新 base，不能用当前值推断跨重启 WAL 的历史参数高水位。同代仍核对五项恢复参数不超过 base 封存值，点内代次变化同样拒绝。已有认证旧点及材料保留，仍可按其原目标恢复，不因停止给旧 base 产新点而删除。正式规模吞吐与冷启动耗时仍需真实容量测量，不能用小库运行时间替代。
+
+`node storage-backup.mjs periodic-handoff <base UUID> <point UUID>` 手工生成明确 `periodic-application` 类型的离源包，保存在选定点的 `handoff` 私有目录。包只含共享 base、所选点自己的 checkpoint/WAL 闭包及其应用捕获，不带其他点、operator pending-final、原 `application-final` 或激活证明；归档密钥与独立应用密钥仍须在接收端分别配置。完整包可认证续用，未知或不完整的既有目录保全并拒绝，不借用当前 base 的最新 checkpoint 覆盖所选历史点。
+
+接收端须在原固定 root receiver profile 中显式填写 `handoffKind:"periodic-application"` 并核实包摘要、真实源机器身份、集群、密钥版本、独立工具与恢复预算，缺省仍为原 pending-final；新类型还须在固定receiver profile配置独立 `applicationEncryption`，版本／摘要与源一致，本机keyFile可不同，不能先用未认证包决定密钥或授权。新类型可通过 `storage-receiver.mjs restore` 从包和独立配置的两把密钥实际恢复所选点及原应用材料，无需原数据库、WAL 或源目录。该路径使用接收端 root 控制的已安装源码和 Node、降权后的 Gateway/Worker/publisher；不接受 candidateRuntime，也不能借用旧 pending-final／OCI／激活权限。`restore-and-attest-periodic` 使用接收端既有固定root签名key产生独立目的域的周期恢复签名，绑定选定point、包／checkpoint／backup-complete摘要、应用策略及应用key版本／摘要、真实runtime与恢复结果；签前重核已完成实际恢复的私有receipt与当前闭包。原 attest、pending-final／OCI／activation消费者对新目的明确拒绝，普通签名验证不授予部署权限；严格offhost验证还要求真实不同机器上的root接收与完整恢复；同机任务或 mount namespace 不算异机证明。保留器对完整 typed 包认证并纳入所选 base 整组闭包，控制清单变化令旧清理计划失效。
+
+### 源端周期恢复证明复核
+
+`node storage-backup.mjs verify-periodic-receiver <base UUID> <point UUID>` 只复核周期异机应用恢复，不启停数据库或服务。固定 root/0600 的 `/etc/harbor-storage-periodic-receiver.json` 缺失或 `enabled:false` 时不连接数据库、不读应用密钥、不新增记录；默认模板为 `periodic-receiver.example.json`。启用配置须明确批准真实接收机及独立核实的已安装源码／Node摘要和恢复UID，不能从收到的未验签payload选信任值：
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "receiverMachine": "REPLACE_WITH_APPROVED_RECEIVER_MACHINE_SHA256",
+  "receiverRuntime": {
+    "sourceDigest": "REPLACE_WITH_APPROVED_RECEIVER_SOURCE_SHA256",
+    "nodeDigest": "REPLACE_WITH_APPROVED_RECEIVER_NODE_SHA256",
+    "restoreUid": 65534
+  }
+}
+```
+
+公钥只读既有固定 `/etc/harbor-storage-receiver.pub`（root/0600、单链接），输入只读所选点目录的 `receiver-attestation.json`（root/0600、最多64KiB），不接受调用方路径、Key或机器声明。入口从真实私有backup-complete/point能力和认证handoff重建expected，绑定原数据库与应用密钥版本、策略、所选point及包／checkpoint／complete摘要，再验证独立周期签名、批准runtime和真正不同机器上的root恢复。验前、写前、返回前重核信任、输入和控制闭包；DTO复制、跨context、取消、关闭、配置变化或内容损坏均不发活资格。
+
+成功只在所选点发布独立应用key保护的 `periodic-receiver.enc`，作用域为周期异机应用恢复；`checkpointAt` 固定指向原点，`acceptedAt` 只是源端接收时间，重入不刷新，也不改写现有四个周期状态指针。记录绑定已签恢复结果和接收机／runtime，不授予OCI候选或部署激活资格。task单独品牌入口仅产生 `periodic-receiver-diagnostic.enc`，即使签名格式有效，材料、offhost和部署资格仍为false；同机或namespace不得冒充异机。关闭配置会停止新增并撤销旧活资格，历史密文保留。保留器认证这些记录与输入摘要；尚未消费的输入、未知或损坏控制先保全拒清理。
+
+此入口不自动跨机传输包或签名，不做增量运输，也不直接恢复激活8092。真正异机正向、自动交付／增量复用和完整恢复发布仍需分别完成；旧pending-final／OCI／activation消费者继续拒绝新目的，不能以周期签名替代原目标库角色、候选和设备证明。
+
+### 独立的备份保留入口
+
+保留不随 `schedule` 自动启用。`storage-backup.mjs` 的 `retention-prepare`、`retention-plan` 和 `retention-apply <计划UUID>` 只读取固定 root/0600 `/etc/harbor-storage-retention.json`；缺少配置或 `enabled:false` 时不连接数据库、不新增计划、不清理文件。模板为 `retention.example.json`：启用前必须自行填写正整数 `keepDatabaseCount`、`keepApplicationCount` 和 `minAgeMs`，没有默认保留天数。`pinnedBackupIds` 与 `operatorStateFiles` 也须显式给出；后者只列使用同一备份密钥、仍有外部引用的既有 `operator.enc`，不接收 HTTP 配置或任意命令行路径。
+
+数据库、WAL 与原 operator 协议继续使用原归档密钥；新周期应用 v3 的控制清单和材料只用固定备份 profile 的独立 `applicationEncryption` 密钥及其版本／摘要认证。该密钥须由 root 独占持有，与 PG 归档密钥不同；存在应用材料却未配置对应应用密钥时拒绝清理，不回退尝试归档密钥。没有应用材料的 DB-only 保留不要求新增应用密钥。
+
+先将 host 备份工具及 PG archiver 使用的工具安装为同一受控版本，并排空旧备份／恢复命令，再运行 `retention-prepare`。 新版常驻数据库 `schedule` 使用 artifact 下固定 `.schedule-coordination` 私有目录及独立生命周期锁登记；加密记录及其文件名绑定宿主 `boot_id`、PID／进程启动 tick，记录另绑定 UID、命令行摘要、代码版本、系统与配置及归档／材料作用域。仅当前进程和登记全部匹配时可通过旧进程排空检查，空闲轮询不持归档 SH，活动操作继续由实际 SH 与周期引用保护。旧未登记入口不豁免；崩溃的历史登记保全，不能认领为新进程，正常停止只移除自身未变化的记录。它只准备加密的协调意图，不改 `archive_command`、重启数据库或删除任何备份。 只有成功归档实际 24 位 WAL 段才更新协调回执；history 与 `.backup` 正常归档，保留原有效段回执。归档目录中的 `.backup-coordination.lock` 为 PG UID/0600，root 与 PG 使用同一文件 inode；锁持有期间复核目录和文件的 dev/ino、属主、模式及单链接。固定 `/usr/bin/flock` 对继承 FD 加锁，父 FD 保持锁，进程退出自动释放，不依赖容器不可见的 `/run` 或仅同 netns 有效的抽象 socket。
+
+未准备协调时，新版 `archive-wal` 保留原归档行为，不因缺锁文件而突然停归档；原 host 备份／恢复入口则可持共享锁。准备后，必须等待新版 archiver 在同一真实锁下完成一段实际 WAL 归档并发布认证回执，才能预览或执行清理。回执绑定协调 nonce、工具闭包摘要、锁身份、实际命令摘要及 postmaster 代次；旧版 archiver 忽略新文件时不会获得该回执。源重启、命令或工具变化后必须重新准备并取得新回执。尚有旧受管工具进程或未清理的恢复目录时拒绝清理，不假设旧进程已经配合。发布回执不等于允许停止或改写服务。
+
+数据库全备、checkpoint、应用捕获／绑定、PITR、handoff 和周期状态写入共享归档文件锁；清理提交使用排他锁，并保留每个备份已有的 checkpoint／绑定互斥。共享锁允许 checkpoint 等待 WAL 时 archiver 继续工作。冲突直接返回 busy，不延长原操作期限。大文件认证使用共享访问；排他区间只重新核对小引用和已见证身份、将确定候选移交到 quarantine，不在该区间解密整个备份。
+
+`retention-plan` 对当前 artifact 根及原有 `pending-<runUUID>` 子组逐组认证数据库文件、WAL 清单和配套应用材料，生成加密分页计划，不修改原备份。分别保留最新数据库组、最新应用备份完成组及最小期限内的组；应用组按组内最新认证点的 checkpoint 时间排序，最小期限从 base 创建与最新 `backup-complete.completedAt` 的较新时间计算。周期 v3 的 `backup-complete.enc` 只表示应用材料与后续 checkpoint 已完整绑定，不表示实际恢复通过；最后真实 `restore-verified` 点所在组另行强制保护，新产生但尚未演练的点不能挤掉它。删除单位始终是整个 base 组，组内所有 point、capture 与 WAL 闭包一并保护，不单独剪除仍在保留组中的点。
+
+数据库周期 active/pending、应用周期 v3 的 latestBackup/lastVerified/pending/pendingVerification 四引用、pins 和已登记的外部 operator 引用均受保护。已认证但未闭合的应用 reservation 保留整组；只有明确 failed 且其残留字节全部可认证的闭合失败才不永久 pin。完整点与顶层 latestBackup/lastVerified 的 point ID、checkpoint 和完成／验证时间逐项匹配，不接受指向缺失或未验证点的状态。包内原有 `application.enc`、`operator-final.enc` 和 handoff 摘要仍是组内引用，符合保留条件的旧应用组可整组清理；仅数据库 `restore.enc` 不被误认为永久外部 pin。外置独立密钥包仍由操作者显式 pin 对应数据库备份，工具不导出或尝试其他密钥。未知格式、损坏认证、未知子文件或无法界定的引用继续拒绝清理；旧应用周期 v1/v2 的顶层状态或材料不当作 v3 协议读取，保全并拒绝清理，不自动迁移。精确认证的空 staging/points 目录也必须有明确允许项。
+
+共享锁下完整认证应用点、捕获文件集、独立恢复证据和每个点自己的 WAL catalog；排他移交前只重读 cycles、capture/files、point/checkpoint、backup-complete、application-final、application-restore 与普通 restore 的小控制引用及其名称集合，不在排他区间重读 GiB 材料。控制引用变化令计划过时；checkpoint/files manifest 绑定 catalog 及材料摘要，实际字节仍需先通过共享锁下的全认证。journal 重入使用同一 v3 认证与双闭包，仍只处理原计划删除集合。
+
+WAL 依据所有保留恢复点的连续区间、保留 base 之后的已归档连续尾部及认证 timeline/history 保护，不使用 mtime 或字符串排序判断过期。缺段、未知 timeline、替换或错配的密文／metadata 对均拒绝清理；history 和备份历史文件保守保留。计划中的配置、引用、源代次和候选身份在执行前重新验证，计划过时不会自动扩大删除集合。
+
+规划先同步 `.retention` 与计划目录的父链，并发布加密 `plan-preparation.enc`，之后才分配归档 quarantine、同步父目录、记录 inode 和发布最终计划。计划发布前中断时，下一次 `retention-plan` 在每计划独占锁下续发布原准备记录；只有认证 reservation 指定的私有空分配目录可在尚无 inode 见证时完成绑定，非空、异主或已见证身份变化均拒绝，不删除未知内容。最终计划仍须在 apply 时重新认证，不因恢复发布而获得执行资格。协调回执引用的 WAL 也属于保留闭包；共享锁下完整认证回执及其 WAL/history，并见证认证前后一致的文件身份，共享锁内再核目录配对及见证前后的目录时戳，EX 提交时只复核小回执与原 FD/路径身份、目录时戳，回执或目录变化则拒绝并重新认证；孤立密文或 metadata 均按不完整归档对拒绝。
+
+`retention-apply` 先持久化认证 prepared journal，先同步数据库 quarantine 的父目录，再按计划将完整备份组及无需 WAL 对原子移入其所在文件系统的私有 quarantine，按顺序同步父目录；全部移交后才重新认证并逐文件删除。每次 unlink 前落盘意图，进度使用有界游标。unlink 已不存在时也先同步其父目录再推进；深到浅删除目录时，以计划内已见证且仍存在的最近祖先补同步，最终归档 quarantine 已移除的重入仍同步归档父目录后才完成。每次未完成 journal 重入先在 SH 下重新认证当前保留组和必需 WAL/history 闭包；只按本 journal 的精确移交位置、已提交删除游标及 unlink 意图容许原候选的缺失，不扩大清理集合。中断重入只处理原计划已见证的源／quarantine 身份，不接管同名新文件。计划执行未结束时拒绝创建另一个清理计划，避免遗漏已移交组的 WAL 引用。恢复进行中、源代次或引用变化、身份不明时保留现状并报错，不自动删除未知目录。完成回执仍为 `applicationMaterialsVerified/restoreVerified/offhostVerified/deploymentAllowed=false`；真实恢复和发布资格沿原入口单独核验。
+
+配置关闭只禁止后续清理，不删除协调意图、锁、计划或 journal，也不撤销已完成的文件删除。需要回退工具版本时先关闭清理并核清所有在途操作；未结束的 journal 应由原受控版本认证续行，不能删状态或直接 `rm -rf` 绕过失败。所有计划／执行均有实际磁盘读取成本，启用前单独核存储余量、I/O 影响和原服务占用，不把保留数量当作容量或 RPO/RTO 承诺。
+
 ## 认证包与无源接收端恢复
 
 最终 pending 备份默认不制作传输副本。调用 `createStorageOperatorBackup()` 时显式开启 `prepareReceiverBundle: true`，才会在同一受控写锁回调内，于本次备份的 `handoff/` 子目录生成认证包。必须先完成真实本机 PITR；包只包含当前备份实际引用的数据库、应用文件、检查点清单、WAL 及所需 timeline history 密文，不复制整个持续增长的归档目录。分页清单逐文件绑定长度与摘要；`handoff.enc` 另绑定源机器身份摘要、system_identifier、密钥版本、原 pending 绑定、恢复凭据与最终材料摘要。恢复凭据只在该加密文件内，不含源连接地址；归档密钥须在接收端独立配置，不能随包明文传输。开启后会额外占用密文包空间，应为传输副本、WAL 与实际恢复预留空间。

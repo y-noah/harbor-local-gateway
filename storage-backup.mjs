@@ -1,26 +1,52 @@
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {lstat,chown} from 'node:fs/promises';
-import {createPostgresBackupContext,closePostgresBackupContext,loadPostgresBackupArchiveProfile,loadPostgresBackupScheduleProfile,verifyBackupCluster,postgresBackupContext} from './postgres-backup-context.mjs';
+import {createPostgresBackupContext,closePostgresBackupContext,loadPostgresBackupArchiveProfile,loadPostgresBackupScheduleProfile,loadPostgresBackupRetentionProfile,verifyBackupCluster,postgresBackupContext} from './postgres-backup-context.mjs';
 import {createPostgresBaseBackup,verifyPostgresBackup,checkpointPostgresBackup,inspectPostgresBackup} from './postgres-backup.mjs';
 import {restorePostgresBackup,inspectPostgresBackupRestore} from './postgres-backup-restore.mjs';
 import {preparePostgresBaselineHandoff} from './postgres-backup-handoff.mjs';
 import {archiveWal,readWalManifest} from './postgres-recovery.mjs';
 import {writeManifest,readManifest,canonical,transferError} from './migration-artifacts.mjs';
 import {join} from 'node:path';
+import {loadPeriodicApplicationPolicy} from './postgres-periodic-application-policy.mjs';
 const fail=code=>{throw transferError(code);};
 export async function storageBackupCommand(args,{signal,onScheduleCycle}={}){
- if(!Array.isArray(args)||!['check','prepare-archive','backup','verify','checkpoint','restore','baseline-handoff','archive-wal','schedule'].includes(args[0]))fail('backup_command_invalid');
+ if(!Array.isArray(args)||!['check','prepare-archive','backup','verify','checkpoint','restore','baseline-handoff','archive-wal','schedule','maintain-base','verify-point','periodic-handoff','verify-periodic-receiver','retention-prepare','retention-plan','retention-apply'].includes(args[0]))fail('backup_command_invalid');
  if(args[0]==='archive-wal'){
   if(args.length!==2||!/^(?:[0-9A-F]{24}|[0-9A-F]{8}\.history|[0-9A-F]{24}\.[0-9A-F]{8}\.backup)$/.test(args[1]))fail('backup_wal_name_invalid');
   const archive=await loadPostgresBackupArchiveProfile();try{if(process.getuid()!==archive.configuration.uid)fail('backup_archive_owner_required');const cluster=await readManifest(join(archive.configuration.archiveDirectory,'cluster.enc'),archive.key);if(cluster.scope!=='existing-cluster'||cluster.systemIdentifier!==archive.configuration.expectedCluster||cluster.primaryData!==archive.configuration.pgDataDirectory||cluster.archiveProfileDigest!==archive.configurationDigest||cluster.keyVersion!==archive.configuration.keyVersion)fail('backup_archive_binding');await archiveWal({source:join(cluster.primaryData,'pg_wal',args[1]),name:args[1],directory:archive.configuration.archiveDirectory,key:archive.key});return {state:'wal_archived'};}finally{archive.key.fill(0);}
  }
- if(args.length!==(['verify','checkpoint','restore','baseline-handoff'].includes(args[0])?2:1))fail('backup_arguments_invalid');
+ if(args.length!==(['verify-point','periodic-handoff','verify-periodic-receiver'].includes(args[0])?3:['verify','checkpoint','restore','baseline-handoff','retention-apply'].includes(args[0])?2:1))fail('backup_arguments_invalid');
+ if(args[0]==='retention-apply'&&!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(args[1]))fail('backup_arguments_invalid');
  if(args[0]==='baseline-handoff'&&!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(args[1]))fail('backup_arguments_invalid');
+ if(args[0]==='maintain-base'){
+  const configuration=await loadPostgresBackupScheduleProfile(),applicationConfiguration=await loadPeriodicApplicationPolicy(),{maintainPostgresBackupBase}=await import('./postgres-backup-schedule.mjs');
+  if(!configuration.enabled||!applicationConfiguration.enabled)return {state:'base_maintenance_disabled',deploymentAllowed:false};
+  const context=await createPostgresBackupContext();try{return await maintainPostgresBackupBase(context,configuration,{signal,applicationConfiguration});}finally{await closePostgresBackupContext(context);}
+ }
+ if(args[0]==='verify-periodic-receiver'){
+  if(!args.slice(1).every(value=>/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value)))fail('backup_arguments_invalid');
+  const verifier=await import('./postgres-periodic-receiver-verification.mjs'),policy=await verifier.loadPeriodicReceiverVerificationPolicy();if(!policy.enabled)return {state:'periodic_receiver_verification_disabled',deploymentAllowed:false};
+  const context=await createPostgresBackupContext();try{const proof=await verifyPostgresBackup(context,args[1],{signal}),qualified=await verifier.verifyPeriodicReceiverAttestation(context,proof,args[2],{signal});return qualified.state?qualified:await verifier.inspectPeriodicReceiverVerification(qualified,{signal});}finally{await closePostgresBackupContext(context);}
+ }
+ if(args[0]==='periodic-handoff'){
+  if(!args.slice(1).every(value=>/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value)))fail('backup_arguments_invalid');
+  const {preparePeriodicApplicationHandoff}=await import('./postgres-periodic-application-backup.mjs'),context=await createPostgresBackupContext();
+  try{const proof=await verifyPostgresBackup(context,args[1],{signal});return await preparePeriodicApplicationHandoff(context,proof,args[2],{signal});}finally{await closePostgresBackupContext(context);}
+ }
+ if(args[0]==='verify-point'){
+  if(!args.slice(1).every(value=>/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value)))fail('backup_arguments_invalid');
+  const {verifyPeriodicApplicationBackup}=await import('./postgres-periodic-application-backup.mjs'),context=await createPostgresBackupContext();
+  try{const proof=await verifyPostgresBackup(context,args[1],{signal});return await verifyPeriodicApplicationBackup(context,proof,args[2],{signal});}finally{await closePostgresBackupContext(context);}
+ }
  if(args[0]==='schedule'){
   const configuration=await loadPostgresBackupScheduleProfile(),{watchPostgresBackupSchedule}=await import('./postgres-backup-schedule.mjs');
   if(!configuration.enabled)return watchPostgresBackupSchedule(null,configuration,{signal});
-  const context=await createPostgresBackupContext();try{return await watchPostgresBackupSchedule(context,configuration,{signal,...(onScheduleCycle?{onCycle:onScheduleCycle}:{})});}finally{await closePostgresBackupContext(context);}
+  const applicationConfiguration=await loadPeriodicApplicationPolicy(),context=await createPostgresBackupContext();try{return await watchPostgresBackupSchedule(context,configuration,{signal,applicationConfiguration,...(onScheduleCycle?{onCycle:onScheduleCycle}:{})});}finally{await closePostgresBackupContext(context);}
+ }
+ if(args[0].startsWith('retention-')){
+  const policy=await loadPostgresBackupRetentionProfile(),retention=await import('./postgres-backup-retention.mjs');if(!policy.enabled)return {state:'retention_disabled',retentionApplied:false,applicationMaterialsVerified:false,restoreVerified:false,offhostVerified:false,deploymentAllowed:false};
+  const context=await createPostgresBackupContext();try{if(args[0]==='retention-prepare')return await retention.preparePostgresBackupRetention(context,policy,{signal});if(args[0]==='retention-plan')return await retention.createPostgresBackupRetentionPlan(context,policy,{signal});return await retention.applyPostgresBackupRetention(context,policy,args[1],{signal});}finally{await closePostgresBackupContext(context);}
  }
  const context=await createPostgresBackupContext();try{
   if(args[0]==='check'){await verifyBackupCluster(context);return {state:'cluster_scope_verified',scope:'existing-cluster',deploymentAllowed:false};}

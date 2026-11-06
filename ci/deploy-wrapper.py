@@ -20,6 +20,7 @@ import urllib.error
 CONFIG='/etc/harbor-gateway-deploy.json'
 NAME='harbor-local-gateway'
 STACK='/opt/product-development/harbor-local-gateway'
+STATIC_HELPER='/usr/local/lib/harbor/static-release.py'
 
 def validate(payload,config):
     if not isinstance(payload,dict) or set(payload)!={'action','image'} or payload['action']!='deploy':
@@ -28,6 +29,17 @@ def validate(payload,config):
     if not isinstance(image,str) or not re.fullmatch(re.escape(config['image_prefix'])+r':[0-9a-f]{40}',image):
         raise ValueError('Only an immutable image from this service is allowed')
     return image
+
+def deployment_policy(config,action):
+    # Existing 8092 must remain available: no root flag can re-enable the old stop-first path.
+    port=config.get('port')
+    if type(port)!=int or not 1<=port<=65535:raise ValueError('Invalid root deployment port')
+    policy=config.get('availability_policy','preserve-current' if port==8092 else 'legacy-replace')
+    if policy not in ('preserve-current','legacy-replace'):raise ValueError('Invalid root availability policy')
+    if port==8092 and policy!='preserve-current':raise ValueError('Port 8092 requires preserve-current policy')
+    if action not in ('deploy','deploy-static'):raise ValueError('Unknown deployment action')
+    if action=='deploy' and policy=='preserve-current':raise ValueError('Stop-first deployment is prohibited; only approved static release is available')
+    return policy
 
 def run(*args,check=True,timeout=None):
     return subprocess.run(args,check=check,capture_output=True,text=True,timeout=timeout)
@@ -140,6 +152,7 @@ def activation(action,image):
     return value
 
 def deploy(image,config,archive=None):
+    deployment_policy(config,'deploy')
     engine=config.get('storage_engine','sqlite')
     if engine not in ('sqlite','postgres'):raise ValueError('Invalid storage engine')
     if engine=='postgres':
@@ -152,6 +165,8 @@ def deploy(image,config,archive=None):
     if contract is not None and (not isinstance(contract,str) or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}',contract)):
         raise ValueError('Invalid required data contract')
     current=inspect(NAME)
+    if current and any(binding.get('HostPort')=='8092' for values in (current.get('HostConfig',{}).get('PortBindings') or {}).values() for binding in (values or [])):
+        raise ValueError('An existing 8092 generation cannot use stop-first deployment')
     if current and current['Config'].get('Labels',{}).get('com.aistrong.project')!=NAME:
         raise ValueError('Existing container is not owned by this service')
     if inspect(NAME+'-previous'):
@@ -219,6 +234,20 @@ def main():
     info=Path(CONFIG).lstat()
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o600:raise ValueError('Deployment configuration must be root-owned 0600')
     config=json.loads(Path(CONFIG).read_text())
+    if not isinstance(payload,dict):raise ValueError('Only a deployment request is allowed')
+    deployment_policy(config,payload.get('action'))
+    if isinstance(payload,dict) and payload.get('action')=='deploy-static':
+        # The helper and approval are independently installed by root. CI cannot select a path or command.
+        helper=Path(STATIC_HELPER)
+        for target in [*reversed(helper.parents),helper]:
+            info=target.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('Static helper is not root controlled')
+        with open('/run/harbor-gateway-deploy.lock','w') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            spec=importlib.util.spec_from_file_location('harbor_static_release',helper)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            module.deploy(payload,sys.stdin.buffer,{**globals(),'static_port':config['port']})
+        return
     image=validate(payload,config)
     with open('/run/harbor-gateway-deploy.lock','w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

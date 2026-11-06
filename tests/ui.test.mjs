@@ -54,8 +54,8 @@ test('paged employee search clears selections and all-filter selection cannot ap
 test('paged member detail late credentials cannot replace another dialog',async()=>{
   let release;const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response({member:memberPage().rows[0],rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}}));}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot())+';tab="members";');const pending=page.click('member-detail','member-one');await new Promise(setImmediate);await page.click('close');page.run('modal("another dialog")');release();await pending;assert.equal(page.node('#modal-content').innerHTML,'another dialog');
 });
-test('paged mode reads compact state and loads key usage separately without relying on state credentials',async()=>{
-  const paths=[],state={...pagedSnapshot(),accounts:[],daily:[],requests:[],busy:0,queue:0,totals:{requests:0,success:0}};const page=await ui(path=>{paths.push(path);return response(path.startsWith('/api/admin/state')?state:{rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}});});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview";');assert.equal(await page.run('refresh()'),true);assert.ok(paths.includes('/api/admin/state?people=none'));assert.ok(paths.some(path=>path.startsWith('/api/admin/keys?')));assert.deepEqual(page.run('state.keys'),[]);
+test('总览只读紧凑状态，进入使用数据后才分页读取Key用量',async()=>{
+  const paths=[],state={...pagedSnapshot(),accounts:[],daily:[],requests:[],busy:0,queue:0,totals:{requests:0,success:0}};const page=await ui(path=>{paths.push(path);return response(path.startsWith('/api/admin/state')?state:{rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}});});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview";');assert.equal(await page.run('refresh()'),true);assert.ok(paths.includes('/api/admin/state?people=none'));assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));assert.deepEqual(page.run('state.keys'),[]);page.run('setTab("usage")');await new Promise(setImmediate);assert.ok(paths.some(path=>path.startsWith('/api/admin/keys?')));assert.equal(page.run('tab'),'requests');
 });
 
 const deferredKeyUsage=name=>({id:'synthetic-key-'+name,member_id:'member-'+name,member_name:name,member_enabled:1,prefix:'hg_test_'+name,enabled:1,expires:null,credentials_deferred:true});
@@ -241,7 +241,7 @@ test('logout clears history cache and a pending history page cannot restore priv
  const pending=page.run('tab="history";loadHistory()');await page.node('#logout').onclick();release();await pending;
  assert.equal(page.run('historyData'),null);assert.equal(page.node('#content').innerHTML,'');assert.equal(page.run('recordView'),'usage');
 });
-test('系统操作历史独立导航，离开页面使迟到历史失效且不归入使用记录',async()=>{
+test('系统操作历史归入系统管理，离开页面使迟到历史失效且不归入使用数据',async()=>{
  let release;const paths=[],page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({accounts:[],rows:[],pagination:{page:1,total:0,totalPages:1}})));});
  page.run('admin=true;state='+JSON.stringify({...snapshot(),keys:[]})+';tab="history";');
  const pending=page.run('loadHistory()');assert.equal(page.run('historyLoading'),true);assert.match(page.node('#content').innerHTML,/系统操作历史/);assert.match(page.node('#content').innerHTML,/aria-busy="true"/);assert.ok(!page.run('recordTabs()').includes('data-id="history"'));
@@ -450,9 +450,10 @@ test('temporary weight editor uses server version and offers explicit automatic 
  await page.click('routing-auto');const saved=calls.find(([p])=>p==='/api/admin/balancing/weights');assert.deepEqual(JSON.parse(saved[1].body),{mode:'auto',expected_version:7});
 });
 
-test('recent usage renders both windows and exposes accessible estimate help',async()=>{
+test('参考消耗明细只在使用数据展示两个窗口，总览仅保留汇总',async()=>{
  const page=await ui(()=>response(snapshot()));
  page.run(`admin=true;state={...${JSON.stringify(snapshot())},keys:[{id:'key',member_id:'member',prefix:'hg_fixture',standard:{total:2,unmetered:12,unpriced:1},standard_12h:{total:0.3,unmetered:0,unpriced:0},enabled:1}],members:[{id:'member',name:'Fixture',enabled:1}],sessions:[]};tab='overview';render();`);
+ assert.doesNotMatch(page.node('#content').innerHTML,/近12小时参考消耗（USD）|hg_fixture|最近用量/);page.run("tab='requests';recordView='usage';render();");
  assert.match(page.node('#content').innerHTML,/最近用量/);assert.match(page.node('#content').innerHTML,/aria-label="最近用量说明"/);
  assert.match(page.node('#content').innerHTML,/近12小时参考消耗（USD）/);assert.match(page.node('#content').innerHTML,/0\.30/);assert.doesNotMatch(page.node('#content').innerHTML,/近7天未计量请求/);
  await page.click('usage-help');assert.match(page.node('#modal-content').innerHTML,/缺计量/);assert.match(page.node('#modal-content').innerHTML,/不是实际扣款或订阅扣额/);
@@ -518,8 +519,38 @@ test('request list combines filters with complete totals and discards stale or l
 });
 test('combined connection view preserves drafts and prevents employee access to admin instructions',async()=>{
  const page=await ui(()=>response({ok:true}));page.run('admin=true;state='+JSON.stringify({...snapshot(),endpoint:'http://localhost/v1'})+";tab='playground';draft='待发送';render();");
- assert.match(page.node('#content').innerHTML,/接入与测试/);await page.click('connection-view','guide');assert.match(page.node('#content').innerHTML,/Codex Windows/);assert.equal(page.run('draft'),'待发送');await page.click('connection-view','test');assert.match(page.node('#content').innerHTML,/待发送/);
+ assert.match(page.node('#content').innerHTML,/<h1>系统管理<\/h1>/);await page.click('connection-view','guide');assert.match(page.node('#content').innerHTML,/Codex Windows/);assert.equal(page.run('draft'),'待发送');await page.click('connection-view','test');assert.match(page.node('#content').innerHTML,/待发送/);
  page.run('sending=true');await page.click('connection-view','guide');assert.equal(page.run('connectionView'),'test');page.run('sending=false;admin=false');await page.click('connection-view','guide');assert.equal(page.run('connectionView'),'test');assert.ok(!page.node('#content').innerHTML.includes('data-action="backup"'));
+});
+test('侧栏按使用数据与系统管理归类，保留内部页面的真实刷新范围',async()=>{
+ const html=readFileSync(new URL('../public/index.html',import.meta.url),'utf8'),navigation=html.match(/<nav>([\s\S]*?)<\/nav>/)[1];
+ assert.match(navigation,/data-tab="usage"[^>]*>[\s\S]*?使用数据/);assert.match(navigation,/data-tab="system"[^>]*>[\s\S]*?系统管理/);
+ assert.doesNotMatch(navigation,/data-tab="(?:sessions|requests|history|playground)"/);
+ const page=await ui(()=>response({...snapshot(),sessions:[]}));page.run('admin=true;state='+JSON.stringify({...snapshot(),sessions:[]})+';tab="overview";setTab("system")');
+ assert.equal(page.run('tab'),'playground');assert.equal(page.run('navigationTab()'),'system');assert.equal(page.run('automaticRefreshScope()'),'');
+ page.run('setTab("usage")');assert.equal(page.run('tab'),'requests');assert.equal(page.run('navigationTab()'),'usage');
+ await page.click('record-view','sessions');assert.equal(page.run('tab'),'sessions');assert.equal(page.run('automaticRefreshScope()'),'state:sessions');page.run('setTab("usage")');assert.equal(page.run('tab'),'sessions');
+});
+test('系统管理组内切换保留请求草稿，迟到历史不覆盖接入页，发送中不清理当前页面',async()=>{
+ let release;const page=await ui(path=>path.startsWith('/api/admin/history?')?new Promise(resolve=>release=()=>resolve(response({rows:[],accounts:[],pagination:{page:1,total:0,totalPages:1}}))):response({}));
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),endpoint:'http://localhost/v1'})+';tab="playground";draft="保留草稿";testKey="hg_synthetic_preview";chatSession="synthetic-session";render();');
+ await page.click('connection-view','history');assert.equal(page.run('tab'),'history');assert.equal(page.run('historyLoading'),true);assert.equal(page.run('navigationTab()'),'system');
+ await page.click('connection-view','guide');release();await new Promise(setImmediate);
+ assert.equal(page.run('tab'),'playground');assert.equal(page.run('connectionView'),'guide');assert.equal(page.run('historyData'),null);assert.equal(page.run('draft'),'保留草稿');assert.equal(page.run('chatSession'),'synthetic-session');assert.equal(page.run('testKey'),'hg_synthetic_preview');
+ assert.match(page.node('#content').innerHTML,/Codex Windows/);await page.click('connection-view','test');assert.match(page.node('#content').innerHTML,/保留草稿/);
+ page.run('modal("保留弹窗");sending=true;historyController=new AbortController();setTab("usage")');assert.equal(page.run('tab'),'playground');assert.equal(page.node('#modal').open,true);assert.equal(page.run('historyController.signal.aborted'),false);
+ await page.click('connection-view','history');assert.equal(page.run('tab'),'playground');
+});
+test('使用数据组内切换会话与正文不默认读取正文，迟到请求不能覆盖会话列表',async()=>{
+ let release;const paths=[],state={...snapshot(),sessions:[],capabilities:{recordingHistory:true}},page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({rows:[],models:[],members:[],pagination:{page:1,total:0,totalPages:1}})));});
+ page.run('admin=true;state='+JSON.stringify(state)+';tab="sessions";render();');await page.click('record-view','recordings');assert.equal(page.run('tab'),'requests');assert.equal(page.run('recordView'),'recordings');assert.deepEqual(paths,[]);
+ const pending=page.click('record-view','requests');await new Promise(setImmediate);assert.equal(paths.length,1);assert.ok(paths[0].startsWith('/api/admin/requests?'));
+ await page.click('record-view','sessions');release();await pending;assert.equal(page.run('tab'),'sessions');assert.equal(page.run('requestsData'),null);assert.match(page.node('#content').innerHTML,/近7天活动会话/);assert.ok(!paths.some(path=>path.includes('/recordings/')));
+});
+test('离开使用数据后迟到Key用量不进入总览，总览也不会主动读Key明细',async()=>{
+ let release;const paths=[],page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({rows:[deferredKeyUsage('late')],pagination:{page:1,total:1,totalPages:1}})));});
+ page.run('admin=true;state='+JSON.stringify({...pagedSnapshot(),sessions:[]})+';tab="requests";recordView="usage";keyUsageScope="requests:";');const pending=page.run('loadKeyUsage()');page.run('setTab("overview")');release();await pending;
+ assert.equal(page.run('keyUsageData'),null);assert.doesNotMatch(page.node('#content').innerHTML,/hg_test_late|key-usage-results|近12小时参考消耗/);assert.equal(await page.run('loadKeyUsage()'),false);assert.equal(paths.length,1);
 });
 test('account disable asks for confirmation then shows full migration result',async()=>{
  const calls=[];const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?{...snapshot(),accounts:[{id:'a',name:'A',kind:'codex',enabled:0}]}:{ok:true,moved:8,resetTextSessions:2});});
@@ -791,7 +822,7 @@ test('类型分组下钻使用服务器完整requestFilters并重置分页快照
  const paths=[];const page=await ui(path=>{paths.push(path);return response({rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1},summary:{requests:0,success:0,standard:{},average_ms:0},models:[],members:[],byModel:[],byMember:[]});});const data=typeStatisticsFixture();data.rows[0].requestFilters={...data.rows[0].requestFilters,model_missing:true};page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="requests";recordView="types";typeStatisticsData='+JSON.stringify(data)+';requestsPageSnapshot="old";requestsCursors=new Map([[1,"old-cursor"]]);');await page.click('type-statistics-drill','0');const url=new URL(paths[0],'http://localhost');assert.equal(url.searchParams.get('type'),'usage-a');assert.equal(url.searchParams.get('outcome'),'failed');assert.equal(url.searchParams.get('from'),'1000');assert.equal(url.searchParams.get('to'),'2000');assert.equal(url.searchParams.get('model_missing'),'true');assert.equal(url.searchParams.has('snapshot'),false);assert.equal(url.searchParams.has('cursor'),false);assert.equal(url.searchParams.has('status'),false);assert.equal(page.run('recordView'),'requests');assert.match(page.node('#content').innerHTML,/清除固定筛选/);
 });
 test('总览选择类型后不再把全公司用量和日图展示为筛选结果，健康人数明确全公司',async()=>{
- const page=await ui(()=>response(typeStatisticsFixture()));page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="overview";overviewType="usage-a";typeStatisticsData='+JSON.stringify(typeStatisticsFixture())+';render();');const html=page.node('#content').innerHTML;assert.match(html,/可用账号（全公司）/);assert.match(html,/员工（全公司）/);assert.match(html,/筛选范围参考消耗/);assert.ok(!html.includes('最近 7 天用量'));assert.ok(!html.includes('近12小时参考消耗'));
+ const page=await ui(()=>response(typeStatisticsFixture()));page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="overview";overviewType="usage-a";typeStatisticsData='+JSON.stringify(typeStatisticsFixture())+';render();');const html=page.node('#content').innerHTML;assert.match(html,/可用账号（全公司）/);assert.match(html,/员工（全公司）/);assert.match(html,/筛选范围参考消耗/);assert.doesNotMatch(html,/<table|data-action="type-statistics-drill"|data-action="type-statistics-page"/);assert.ok(!html.includes('最近 7 天用量'));assert.ok(!html.includes('近12小时参考消耗'));
 });
 test('总览与使用类型页的业务结果筛选独立保存，互不改变统计范围',async()=>{
  const paths=[];const page=await ui(path=>{paths.push(path);return response(typeStatisticsFixture());});page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="requests";recordView="types";typeStatisticsFilters.status="failed";');await page.run('loadTypeStatistics()');page.run('tab="overview";overviewType="usage-a";');await page.run('loadTypeStatistics()');assert.equal(new URL(paths[0],'http://localhost').searchParams.get('status'),'failed');assert.equal(new URL(paths[1],'http://localhost').searchParams.has('status'),false);assert.equal(page.run('typeStatisticsFilters.status'),'failed');
@@ -954,8 +985,8 @@ test('会话翻页读取中离开并返回会释放遮罩，旧响应不覆盖�
  let release;const page=await ui(()=>new Promise(resolve=>release=()=>resolve(response({...snapshot(),sessions:[],busy:9}))));page.run('admin=true;state='+JSON.stringify({...snapshot(),sessions:[]})+';tab="sessions";sessionsLoading=true;sessionsPage=2;render();');const pending=page.run('refresh()');page.run('setTab("accounts");setTab("sessions")');assert.equal(page.run('sessionsLoading'),false);assert.equal(page.run('pageRefreshing()'),false);assert.equal(page.run('sessionsPage'),1);release();await pending;assert.equal(page.run('state.busy'),0);assert.equal(page.run('sessionsLoading'),false);
  const next=page.run('refresh()');assert.equal(page.run('pageRefreshing()'),true);release();await next;assert.equal(page.run('state.busy'),9);assert.equal(page.run('pageRefreshing()'),false);
 });
-test('分页总览自动刷新Key用量不启用前景遮罩，手动读取仍反馈',async()=>{
- let release;const value=pagedSnapshot(),result={rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}};const page=await ui(path=>path.startsWith('/api/admin/keys?')?new Promise(resolve=>release=()=>resolve(response(result))):response(value));page.run('admin=true;state='+JSON.stringify(value)+';tab="overview";keyUsageScope="overview:";render();');const pending=page.run('automaticRefresh()');await new Promise(setImmediate);assert.equal(page.run('keyUsageLoading'),false);assert.equal(page.run('pageRefreshing()'),false);assert.ok(!page.node('#content').innerHTML.includes('aria-busy="true"'));release();await pending;
+test('使用数据Key后台读取不启用前景遮罩，手动读取仍反馈',async()=>{
+ let release;const value=pagedSnapshot(),result={rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}};const page=await ui(path=>path.startsWith('/api/admin/keys?')?new Promise(resolve=>release=()=>resolve(response(result))):response(value));page.run('admin=true;state='+JSON.stringify(value)+';tab="requests";recordView="usage";keyUsageScope="requests:";render();');const pending=page.run('loadKeyUsage(true)');await new Promise(setImmediate);assert.equal(page.run('keyUsageLoading'),false);assert.equal(page.run('pageRefreshing()'),false);assert.ok(!page.node('#content').innerHTML.includes('aria-busy="true"'));release();await pending;
  const manual=page.run('loadKeyUsage()');assert.equal(page.run('keyUsageLoading'),true);release();await manual;assert.equal(page.run('keyUsageLoading'),false);
 });
 

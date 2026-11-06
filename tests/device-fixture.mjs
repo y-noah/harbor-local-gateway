@@ -19,7 +19,7 @@ const integration={skip:!socket&&!url?'需隔离PostgreSQL，设备集成测试�
 function databaseOptions(name){if(url){const value=new URL(url);if(name)value.pathname='/'+name;return {connectionString:value.toString(),allowPlaintextLocalNetwork:true};}return {connection:{host:socket,port:Number(process.env.HARBOR_TEST_PG_PORT||55461),user:process.env.HARBOR_TEST_PG_USER||'harbor_ci',database:name||'postgres'}};}
 async function certificateFixture(root){
   const ca=join(root,'ca.pem'),caKey=join(root,'ca-key.pem'),serverKey=join(root,'server-key.pem'),serverCsr=join(root,'server.csr'),serverCert=join(root,'server.pem'),extensions=join(root,'server.cnf');
-  await run('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',caKey,'-out',ca,'-subj','/CN=Harbor Synthetic Device CA','-days','2'],{maxBuffer:32768});await chmod(caKey,0o600);
+  await run('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',caKey,'-out',ca,'-subj','/CN=Harbor Synthetic Device CA','-days','2','-addext','basicConstraints=critical,CA:TRUE'],{maxBuffer:32768});await chmod(caKey,0o600);
   await run('openssl',['req','-newkey','rsa:2048','-nodes','-keyout',serverKey,'-out',serverCsr,'-subj','/CN=localhost'],{maxBuffer:32768});await writeFile(extensions,'subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\n');
   await run('openssl',['x509','-req','-in',serverCsr,'-CA',ca,'-CAkey',caKey,'-set_serial','1','-days','1','-extfile',extensions,'-out',serverCert],{maxBuffer:32768});
   return {ca:await readFile(ca),key:await readFile(serverKey),cert:await readFile(serverCert),issuer:createDeviceCertificateAuthority({certificateFile:ca,keyFile:caKey,days:1})};

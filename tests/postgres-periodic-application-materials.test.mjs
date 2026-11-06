@@ -1,0 +1,49 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {randomBytes,randomUUID} from 'node:crypto';
+import {mkdir,writeFile,readFile,readdir} from 'node:fs/promises';
+import {join} from 'node:path';
+import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
+import {PostgresStore} from '../postgres-store.mjs';
+import {createTaskPostgresBackupContext,closePostgresBackupContext,postgresBackupContext} from '../postgres-backup-context.mjs';
+import {createPostgresBaseBackup,checkpointPostgresBackup} from '../postgres-backup.mjs';
+import {capturePostgresBackupRecoveryPoint,postgresBackupRecoveryPointSource} from '../postgres-backup-recovery-point.mjs';
+import {capturePeriodicApplicationMaterials,verifyPeriodicApplicationCapture,periodicApplicationCaptureSource} from '../postgres-periodic-application-materials.mjs';
+
+test('disabled application capture does not inspect a database and copied descriptions grant no capability',async()=>{
+  assert.equal((await capturePeriodicApplicationMaterials(null,null,{version:1,enabled:false})).state,'periodic_application_disabled');
+  assert.throws(()=>periodicApplicationCaptureSource({scope:'harbor-periodic-application-capture-v3',captureId:randomUUID()}),{code:'periodic_application_capture_required'});
+});
+
+const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB;
+test('private PG pre-checkpoint capture authenticates material coverage, rejects source changes and stays distinct from restore approval',{skip:!binDirectory?'需自有PG18工具；不连接共享数据库':false,timeout:180000},async t=>{
+  const key=randomBytes(32),applicationKey=randomBytes(32),lab=await createPrivatePostgres({binDirectory,libraryDirectory,recovery:{backupKey:key}}),store=new PostgresStore({connection:lab.connection});let context;
+  t.after(async()=>{try{if(context)await closePostgresBackupContext(context);}finally{try{await store.close();}finally{await lab.close();key.fill(0);applicationKey.fill(0);}}});
+  await store.migrate();await store.initializePricing();const database=await store.get('SELECT current_database() name,(SELECT oid::text FROM pg_database WHERE datname=current_database()) oid');
+  context=await createTaskPostgresBackupContext({laboratory:lab,directory:join(lab.directory,'material-backups'),archiveKey:key,applicationKey,binDirectory,libraryDirectory});
+  const proof=await createPostgresBaseBackup(context),materialRoots=[];
+  for(const id of ['data','runtime','secrets']){const directory=join(lab.directory,'material-'+id);await mkdir(directory,{mode:0o700});materialRoots.push({id,directory});}
+  const data=materialRoots[0].directory,runtime=materialRoots[1].directory,secrets=materialRoots[2].directory;
+  await writeFile(join(data,'settings.json'),JSON.stringify({synthetic:true}),{mode:0o600});await writeFile(join(data,'key-encryption.key'),randomBytes(32),{mode:0o600});await writeFile(join(data,'recording-encryption.key'),randomBytes(32),{mode:0o600});await writeFile(join(runtime,'auth.json'),'AAAA',{mode:0o600});await writeFile(join(secrets,'postgres-report.key'),randomBytes(32),{mode:0o600});
+  const policy={version:1,enabled:true,database,materialRoots,publicOrigin:'http://127.0.0.1:18881',deviceOrigin:'https://127.0.0.1:18882',maxBytes:4096,maxFiles:20};
+  const capture=await capturePeriodicApplicationMaterials(context,proof,policy),source=periodicApplicationCaptureSource(capture,{context,proof}),original=await readFile(join(source.directory,'capture.enc'));
+  assert.equal(source.applicationMaterialsVerified,false);assert.equal(source.deploymentAllowed,false);assert.equal(source.manifest.files.files,5);
+  assert.equal((await verifyPeriodicApplicationCapture(context,proof,policy,capture.captureId)).captureId,capture.captureId);
+  await checkpointPostgresBackup(proof);
+  const point=await capturePostgresBackupRecoveryPoint(context,proof,{pointId:capture.captureId,applicationCapture:capture});
+  assert.equal(postgresBackupRecoveryPointSource(point).manifest.applicationCapture.captureId,capture.captureId);
+  assert.equal((await capturePostgresBackupRecoveryPoint(context,proof,{pointId:capture.captureId,applicationCapture:capture})).pointId,point.pointId);
+  await assert.rejects(capturePostgresBackupRecoveryPoint(context,proof,{applicationCapture:capture}),{code:'backup_recovery_point_application_capture'});
+  await assert.rejects(capturePostgresBackupRecoveryPoint(context,proof,{pointId:capture.captureId,applicationCapture:{...capture}}),{code:'periodic_application_capture_required'});
+  await assert.rejects(verifyPeriodicApplicationCapture(context,proof,{...policy,database:{name:database.name,oid:'1'}},capture.captureId),{code:'periodic_application_database_binding'});
+  await assert.rejects(capturePeriodicApplicationMaterials(context,proof,{...policy,materialRoots:materialRoots.map(row=>row.id==='runtime'?{...row,directory:postgresBackupContext(context).artifactDirectory}:row)}),{code:'periodic_application_source_overlap'});
+  await writeFile(join(runtime,'auth.json'),'BBBB',{mode:0o600});
+  await assert.rejects(verifyPeriodicApplicationCapture(context,proof,policy,capture.captureId),{code:'transfer_files_changed'});
+  assert.deepEqual(await readFile(join(source.directory,'capture.enc')),original);
+  await writeFile(join(runtime,'auth.json'),'AAAA',{mode:0o600});
+  const id=randomUUID(),running=capturePeriodicApplicationMaterials(context,proof,policy,{captureId:id}),record=postgresBackupContext(context);
+  assert.equal(record.busy,true);const rejection=assert.rejects(running,{name:'AbortError'});
+  await closePostgresBackupContext(context);await rejection;
+  assert.equal(record.busy,false);assert.equal(record.pending,null);assert.ok(record.key.every(byte=>byte===0));assert.ok(record.applicationKey.every(byte=>byte===0));
+  assert.equal((await readdir(join(source.directory,'..'))).includes(id),false);assert.deepEqual(await readFile(join(source.directory,'capture.enc')),original);
+});

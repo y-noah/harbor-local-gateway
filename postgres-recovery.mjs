@@ -6,7 +6,8 @@ import {endianness} from 'node:os';
 import {join,resolve,basename,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {PostgresStore} from './postgres-store.mjs';
-import {artifactKey,privateDirectory,regularFile,digestFile,sealFile,openFile,writeManifest,readManifest,captureFileSet,restoreFileSet,transferError,digestOpenedFile,syncDirectory} from './migration-artifacts.mjs';
+import {withBackupArchiveLock,readBackupCoordinationIntent,backupCoordinationCodeDigest,backupCoordinationFiles,backupCoordinationProtocol} from './postgres-backup-lock.mjs';
+import {artifactKey,privateDirectory,regularFile,digestFile,sealFile,openFile,writeManifest,readManifest,captureFileSet,restoreFileSet,transferError,digestOpenedFile,syncDirectory,canonical} from './migration-artifacts.mjs';
 
 const physicalProofs=new WeakMap();
 const walName=name=>typeof name==='string'&&/^(?:[0-9A-F]{24}|[0-9A-F]{8}\.history|[0-9A-F]{24}\.[0-9A-F]{8}\.backup)$/.test(name);
@@ -43,13 +44,28 @@ export async function inspectArchivedWal({name,directory,key,ownerUid=process.ge
  if(!walName(name))throw transferError('recovery_wal_name_invalid');const meta=await readWalManifest(join(directory,name+'.meta.enc'),key,{ownerUid}),cluster=await readWalManifest(join(directory,'cluster.enc'),key,{ownerUid});if(![1,2].includes(meta.version)||meta.systemIdentifier!==cluster.systemIdentifier||JSON.stringify(await digestFile(join(directory,name+'.enc')))!==JSON.stringify(meta.encrypted)||requireBoundName&&meta.version!==2||meta.version===2&&meta.identity?.name!==name)throw transferError('recovery_wal_conflict');
  const path=join(directory,name+'.enc'),info=await regularFile(path),file=await open(path,'r'),header=Buffer.alloc(20),tag=Buffer.alloc(16);try{await file.read(header,0,20,0);await file.read(tag,0,16,info.size-16);}finally{await file.close();}if(!header.subarray(0,8).equals(Buffer.from('HBRART01')))throw transferError('transfer_artifact_invalid');const decipher=createDecipheriv('aes-256-gcm',key,header.subarray(8));decipher.setAAD(header.subarray(0,8));decipher.setAuthTag(tag);const digest=createHash('sha256');let prefix=Buffer.alloc(0),bytes=0;const prefixLimit=name.endsWith('.history')?1048576:40,consume=chunk=>{if(prefix.length<prefixLimit)prefix=Buffer.concat([prefix,chunk.subarray(0,prefixLimit-prefix.length)]);digest.update(chunk);bytes+=chunk.length;};try{if(info.size<37)throw Error();for await(const encrypted of createReadStream(path,{start:20,end:info.size-17}))consume(decipher.update(encrypted));consume(decipher.final());}catch{throw transferError('transfer_artifact_authentication_failed');}const content={sha256:digest.digest('hex'),bytes},identity=await completeWalIdentity(segmentIdentity(name,prefix,bytes,cluster.systemIdentifier),async historyName=>{const value=await inspectArchivedWal({name:historyName,directory,key,ownerUid,requireBoundName});if(value.content.bytes>1048576||value.historyBytes?.length!==value.content.bytes)throw transferError('recovery_wal_history_invalid');return {bytes:value.historyBytes,content:value.content};});if(JSON.stringify(content)!==JSON.stringify(meta.content)||meta.version===2&&JSON.stringify(identity)!==JSON.stringify(meta.identity))throw transferError('recovery_wal_conflict');const result={...meta,identity};if(name.endsWith('.history'))Object.defineProperty(result,'historyBytes',{value:prefix});return result;
 }
-export async function archiveWal({source,name,directory,key,afterPublish}={}){
+export async function archiveWal(options={}){
+ const {directory,key}=options,intent=await readBackupCoordinationIntent({directory,key});
+ // Existing archive commands keep working until an administrator explicitly
+ // prepares coordination. Retention refuses to run without a real new receipt.
+ if(!intent)return archiveWalInner(options);
+ return withBackupArchiveLock({directory},async lease=>{
+  const current=await readBackupCoordinationIntent({directory,key});if(canonical(current)!==canonical(intent))throw transferError('backup_coordination_intent_changed');
+  await archiveWalInner(options);await lease.assertPath();
+  if(/^[0-9A-F]{24}$/.test(options.name)&&intent.codeDigest===await backupCoordinationCodeDigest())await writeManifest(join(directory,backupCoordinationFiles.receipt),{version:1,protocol:backupCoordinationProtocol,nonce:intent.nonce,systemId:intent.systemId,postmasterStart:intent.postmasterStart,commandDigest:intent.commandDigest,codeDigest:intent.codeDigest,lockIdentity:lease.identity,walName:options.name,created:Date.now()},key,{replace:true});
+ });
+}
+async function archiveWalInner({source,name,directory,key,afterPublish}={}){
  await privateDirectory(directory);artifactKey(key);if(!walName(name)||basename(source)!==name)throw transferError('recovery_wal_name_invalid');const cluster=await readManifest(join(directory,'cluster.enc'),key),actual=await realpath(source);if(!actual.startsWith(resolve(cluster.primaryData)+'/pg_wal/'))throw transferError('recovery_wal_source_invalid');const expected=await digestFile(actual),identity=await plainWalIdentity(actual,name,cluster.systemIdentifier),encrypted=join(directory,name+'.enc'),meta=join(directory,name+'.meta.enc');let replace=false;
  try{const prior=await inspectArchivedWal({name,directory,key});if(JSON.stringify(prior.content)!==JSON.stringify(expected))throw transferError('recovery_wal_conflict');if(prior.version===2)return;replace=true;}catch(error){if(error.code!=='ENOENT'){const value=await lstat(meta);if(value.size!==0||!value.isFile()||value.isSymbolicLink())throw error;replace=true;}}
  try{await regularFile(encrypted);}catch(error){if(error.code!=='ENOENT')throw error;const temporary=join(directory,'.wal-'+randomBytes(12).toString('hex'));try{await sealFile(actual,temporary,key,{maxBytes:expected.bytes});try{await link(temporary,encrypted);await syncDirectory(directory);}catch(error){if(error.code!=='EEXIST')throw error;}}finally{await rm(temporary,{force:true});}}
  if(JSON.stringify(await digestOpenedFile(encrypted,key))!==JSON.stringify(expected))throw transferError('recovery_wal_conflict');await afterPublish?.();await writeManifest(meta,{version:2,systemIdentifier:cluster.systemIdentifier,identity,content:expected,encrypted:await digestFile(encrypted)},key,{replace});await inspectArchivedWal({name,directory,key,requireBoundName:true});
 }
-export async function restoreWal({name,destination,directory,targetData,key}={}){
+export async function restoreWal(options={}){
+ const {directory,key}=options;if(!await readBackupCoordinationIntent({directory,key}))return restoreWalInner(options);
+ return withBackupArchiveLock({directory},()=>restoreWalInner(options));
+}
+async function restoreWalInner({name,destination,directory,targetData,key}={}){
  await privateDirectory(directory);artifactKey(key);if(!walName(name))throw transferError('recovery_wal_name_invalid');const target=await realpath(targetData),output=resolve(destination);if(dirname(output)!==join(target,'pg_wal'))throw transferError('recovery_wal_destination_invalid');const meta=await inspectArchivedWal({name,directory,key});const temporary=join(dirname(output),'.restore-'+randomBytes(8).toString('hex'));try{await openFile(join(directory,name+'.enc'),temporary,key);if(JSON.stringify(await digestFile(temporary))!==JSON.stringify(meta.content))throw transferError('recovery_wal_conflict');await plainWalIdentity(temporary,name,meta.systemIdentifier,async name_=>{const history=await inspectArchivedWal({name:name_,directory,key});return {bytes:history.historyBytes,content:history.content};});await rename(temporary,output);}finally{await rm(temporary,{force:true});}
 }
 export function validateRehearsalServerSettings(settings){

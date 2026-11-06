@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "enabled": false,
+  "keepDatabaseCount": null,
+  "keepApplicationCount": null,
+  "minAgeMs": null,
+  "pinnedBackupIds": [],
+  "operatorStateFiles": []
+}

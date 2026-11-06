@@ -4,5 +4,6 @@
   "fullIntervalMs": 86400000,
   "checkpointIntervalMs": 300000,
   "pollIntervalMs": 60000,
-  "pinnedBackupIds": []
+  "pinnedBackupIds": [],
+  "reuseAuthenticatedBase": false
 }

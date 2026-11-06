@@ -1,3 +1,4 @@
+import {withPostgresBackupOperation} from './postgres-backup-lock.mjs';
 import {mkdir,readFile,rm} from 'node:fs/promises';
 import {constants,createReadStream,createWriteStream} from 'node:fs';
 import {pipeline} from 'node:stream/promises';
@@ -21,7 +22,8 @@ function planFor(context){const record=postgresBackupContext(context),plan=plans
 function sameDigest(a,b){return canonical(a)===canonical(b);}
 async function privateKey(path){const info=await regularFile(path);if((info.mode&0o077)!==0||info.size!==32)fail('storage_operator_application_key_invalid');return readFile(path);}
 async function copyCipher(source,destination,{signal}={}){await regularFile(source);const output=createWriteStream(destination,{flags:'wx',mode:0o600});let owned=false;output.once('open',()=>{owned=true;});try{await pipeline(createReadStream(source,{flags:constants.O_RDONLY|constants.O_NOFOLLOW}),output,{signal});}catch(error){if(owned)await rm(destination,{force:true});throw error;}}
-export async function captureStorageOperatorBackupApplication({context,proof,operatorContext,backupKey,signal,verifyRestoredRuntime=false,restoredRuntimeTlsHost,restoredRuntimeCandidate}={}){
+export async function captureStorageOperatorBackupApplication(options={}){return withPostgresBackupOperation(postgresBackupContext(options.context),()=>captureApplicationInner(options),{signal:options.signal});}
+async function captureApplicationInner({context,proof,operatorContext,backupKey,signal,verifyRestoredRuntime=false,restoredRuntimeTlsHost,restoredRuntimeCandidate}={}){
  if(typeof verifyRestoredRuntime!=='boolean')fail('storage_operator_runtime_flag_invalid');const record=postgresBackupContext(context),source=postgresBackupRestoreSource(proof),trusted=storageOperatorContext(operatorContext),binding=await verifyPostgresBackupPendingBinding(context);artifactKey(backupKey);
  if(!binding||source.context!==context||trusted.configurationDigest!==binding.configurationDigest||!timingSafeEqual(backupKey,record.key)||binding.backupKeyVersion!==record.keyVersion||record.applicationPlan)fail('storage_operator_application_binding_mismatch');
  const candidateRuntime=restoredRuntimeCandidate===undefined?null:inspectTaskRestoredCandidate(restoredRuntimeCandidate);if(candidateRuntime&&!verifyRestoredRuntime)fail('storage_operator_runtime_flag_invalid');if(verifyRestoredRuntime&&record.scope!=='task-owned')fail('storage_operator_runtime_task_scope_required');const roots=binding.materialRoots;if(!roots.length||roots.some(root=>root.id===auditId)||!roots.some(root=>root.id==='data'))fail('storage_operator_application_roots_invalid');

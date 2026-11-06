@@ -7,11 +7,11 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {PostgresStore} from '../postgres-store.mjs';
 import {createPrivatePostgres,startOwnedCapacityChild} from '../tools/capacity/owned-runtime.mjs';
 import {createTaskPostgresBackupContext,closePostgresBackupContext,postgresBackupContext} from '../postgres-backup-context.mjs';
-import {verifyPostgresBackup,checkpointPostgresBackup,withPostgresBackupCheckpointLock} from '../postgres-backup.mjs';
+import {verifyPostgresBackup,checkpointPostgresBackup,checkpointPeriodicPostgresBackup,withPostgresBackupCheckpointLock} from '../postgres-backup.mjs';
 import {restorePostgresBackup,inspectPostgresBackupRestore} from '../postgres-backup-restore.mjs';
 import {readManifest,writeManifest,digestFile} from '../migration-artifacts.mjs';
 import {acquireInstance} from '../instance.mjs';
-import {postgresBackupSchedulePolicy,runPostgresBackupScheduleCycle,watchPostgresBackupSchedule} from '../postgres-backup-schedule.mjs';
+import {postgresBackupSchedulePolicy,runPostgresBackupScheduleCycle,watchPostgresBackupSchedule,maintainPostgresBackupBase} from '../postgres-backup-schedule.mjs';
 
 const policy={version:1,enabled:true,fullIntervalMs:10000,checkpointIntervalMs:1000,pollIntervalMs:1000};
 test('periodic backup policy is opt-in, bounded and cannot reinterpret unknown options',async()=>{
@@ -23,11 +23,11 @@ test('periodic backup policy is opt-in, bounded and cannot reinterpret unknown o
 
 const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB;
 const real={skip:!binDirectory?'需要本任务独占PG18工具，不连接共享数据库':false,timeout:180000};
-async function fixture(t){
-  const key=randomBytes(32),lab=await createPrivatePostgres({binDirectory,libraryDirectory,recovery:{backupKey:key}}),store=new PostgresStore({connection:lab.connection});let context;
-  t.after(async()=>{try{if(context)await closePostgresBackupContext(context);}finally{try{await store.close();}finally{await lab.close();key.fill(0);}}});
+async function fixture(t,{application=false}={}){
+  const key=randomBytes(32),applicationKey=application?randomBytes(32):null,lab=await createPrivatePostgres({binDirectory,libraryDirectory,recovery:{backupKey:key}}),store=new PostgresStore({connection:lab.connection});let context;
+  t.after(async()=>{try{if(context)await closePostgresBackupContext(context);}finally{try{await store.close();}finally{await lab.close();key.fill(0);applicationKey?.fill(0);}}});
   await store.migrate();await store.initializePricing();const directory=join(lab.directory,'periodic-backups');
-  context=await createTaskPostgresBackupContext({laboratory:lab,directory,archiveKey:key,binDirectory,libraryDirectory});
+  context=await createTaskPostgresBackupContext({laboratory:lab,directory,archiveKey:key,binDirectory,libraryDirectory,...(applicationKey?{applicationKey,applicationKeyVersion:'task-application-v3'}:{})});
   return {key,lab,store,context,directory,stateFile:join(directory,'periodic-state.enc')};
 }
 test('periodic real base/WAL cycle resumes, pins immutable baselines and restores a genuine checkpoint',real,async t=>{
@@ -100,4 +100,32 @@ test('a real postmaster generation change creates a new base without modifying t
   try{const until=Date.now()+10000;let ready=false;while(Date.now()<until){assert.equal(child.exitCode,null);try{ready=(await probe.get('SELECT 1 n')).n===1;if(ready)break;}catch{}await delay(10);}assert.equal(ready,true);}
   finally{await probe.close();}
   const second=await runPostgresBackupScheduleCycle(f.context,policy);assert.notEqual(second.backupId,first.backupId);assert.equal(second.state,'base_and_checkpoint_created');assert.deepEqual(await readFile(join(f.directory,first.backupId,'checkpoint.enc')),old);
+});
+
+
+test('application producer rejects an incompatible old base after parameter restart and maintenance rotates before interval for genuine source-free recovery',real,async t=>{
+  const {capturePeriodicApplicationBackup}=await import('../postgres-periodic-application-backup.mjs'),{verifyPostgresBackupRecoveryPoint}=await import('../postgres-backup-recovery-point.mjs'),f=await fixture(t,{application:true}),record=postgresBackupContext(f.context),materialRoots=[];
+  for(const id of ['data','runtime','secrets']){const directory=join(f.lab.directory,'parameter-material-'+id);await mkdir(directory,{mode:0o700});await writeFile(join(directory,'synthetic.txt'),'owned parameter-restart material',{mode:0o600});materialRoots.push({id,directory});}
+  const database=await f.store.get('SELECT current_database() name,(SELECT oid::text FROM pg_database WHERE datname=current_database()) oid'),applicationConfiguration={version:1,enabled:true,database,materialRoots,publicOrigin:'http://localhost:18094',deviceOrigin:'https://localhost:18095',maxBytes:4096,maxFiles:20},configuration={version:1,enabled:true,fullIntervalMs:86400000,checkpointIntervalMs:300000,pollIntervalMs:1000,pinnedBackupIds:[]},options={applicationConfiguration};
+  const initial=await maintainPostgresBackupBase(f.context,configuration,options);assert.equal(initial.state,'base_maintenance_completed');const first=await runPostgresBackupScheduleCycle(f.context,configuration,options);assert.equal(first.application.backupComplete,true,first.application.failureCode);
+  assert.equal((await maintainPostgresBackupBase(f.context,configuration,options)).state,'base_maintenance_not_due');
+  const oldProof=await verifyPostgresBackup(f.context,initial.backupId),oldMetadata=await readManifest(join(f.directory,initial.backupId,'backup.enc'),f.key),oldCheckpoint=await readFile(join(f.directory,initial.backupId,'checkpoint.enc')),increased=oldMetadata.recoverySettings.max_connections+1;
+  let child=f.lab.process,previousGeneration=record.expected.postmaster_start;
+  const restart=async connections=>{
+    await f.lab.runtime.stop(child);child=startOwnedCapacityChild(f.lab.runtime,join(binDirectory,'postgres'),['-D',f.lab.dataDirectory,'-c','max_connections='+connections],{role:'database',env:{LD_LIBRARY_PATH:libraryDirectory??''}});const probe=new PostgresStore({connection:{...f.lab.connection,host:f.lab.socketDirectory,port:f.lab.databasePort}});
+    try{const deadline=Date.now()+15000;let ready=false;while(Date.now()<deadline){assert.equal(child.exitCode,null);try{const observed=await probe.get("SELECT current_setting('max_connections')::integer connections,extract(epoch FROM pg_postmaster_start_time())::text started,(SELECT timeline_id::integer FROM pg_control_checkpoint()) timeline");ready=observed.connections===connections&&observed.started!==previousGeneration&&observed.timeline===oldMetadata.timeline;if(ready){previousGeneration=observed.started;break;}}catch{}await delay(10);}assert.equal(ready,true,'owned source restarts with the requested real parameter on the same timeline');}finally{await probe.close();}
+  };
+  await restart(increased);
+  await assert.rejects(checkpointPostgresBackup(oldProof),{code:'backup_source_restarted'});await assert.rejects(checkpointPeriodicPostgresBackup(oldProof),{code:'backup_source_restarted'});
+  const blocked=await runPostgresBackupScheduleCycle(f.context,configuration,options);assert.equal(blocked.state,'base_maintenance_required');assert.equal(blocked.reason,'source_generation_changed');
+  const direct=await capturePeriodicApplicationBackup(f.context,oldProof,applicationConfiguration);assert.equal(direct.backupComplete,false);assert.equal(direct.failureCode,'backup_source_restarted');assert.deepEqual(await readFile(join(f.directory,initial.backupId,'checkpoint.enc')),oldCheckpoint);
+  await restart(oldMetadata.recoverySettings.max_connections);
+  await assert.rejects(checkpointPostgresBackup(oldProof),{code:'backup_source_restarted'});await assert.rejects(checkpointPeriodicPostgresBackup(oldProof),{code:'backup_source_restarted'});
+  const lowered=await runPostgresBackupScheduleCycle(f.context,configuration,options);assert.equal(lowered.state,'base_maintenance_required');assert.equal(lowered.reason,'source_generation_changed','returning to the old values cannot prove the WAL high-water mark');
+  const rejected=await capturePeriodicApplicationBackup(f.context,oldProof,applicationConfiguration);assert.equal(rejected.backupComplete,false);assert.equal(rejected.failureCode,'backup_source_restarted');assert.deepEqual(await readFile(join(f.directory,initial.backupId,'checkpoint.enc')),oldCheckpoint);
+  const oldPoint=await verifyPostgresBackupRecoveryPoint(f.context,oldProof,first.application.pointId),oldRestored=inspectPostgresBackupRestore(await restorePostgresBackup(oldProof,{recoveryPoint:oldPoint}));assert.equal(oldRestored.restoreVerified,true);assert.equal(oldRestored.recoverySettings.max_connections,oldMetadata.recoverySettings.max_connections,'an already authenticated point before both restarts remains restorable');
+  const replacement=await maintainPostgresBackupBase(f.context,configuration,options);assert.equal(replacement.state,'base_maintenance_completed');assert.notEqual(replacement.backupId,initial.backupId,'a different source generation rotates before the daily interval even after parameters return');
+  const current=await runPostgresBackupScheduleCycle(f.context,configuration,options);assert.equal(current.application.backupComplete,true,current.application.failureCode);assert.equal(current.backupId,replacement.backupId);const metadata=await readManifest(join(f.directory,replacement.backupId,'backup.enc'),f.key);assert.equal(metadata.recoverySettings.max_connections,oldMetadata.recoverySettings.max_connections);
+  const proof=await verifyPostgresBackup(f.context,replacement.backupId),point=await verifyPostgresBackupRecoveryPoint(f.context,proof,current.application.pointId);await f.lab.runtime.stop(child);
+  const restored=inspectPostgresBackupRestore(await restorePostgresBackup(proof,{recoveryPoint:point}));assert.equal(restored.restoreVerified,true);assert.equal(restored.recoverySettings.max_connections,oldMetadata.recoverySettings.max_connections);assert.equal(restored.recoveryPointId,current.application.pointId);assert.deepEqual(await readFile(join(f.directory,initial.backupId,'checkpoint.enc')),oldCheckpoint);
 });
