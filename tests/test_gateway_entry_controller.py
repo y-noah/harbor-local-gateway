@@ -1,6 +1,8 @@
 import importlib.util
 import copy
 import unittest
+import stat
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +29,15 @@ class EntryBoundaryTests(unittest.TestCase):
    self.assertEqual(state['phase'],'withdrawing');self.assertEqual(enabled,[])
    result=controller.run_action(config,'withdraw')
    self.assertEqual(result['phase'],'withdrawn');self.assertTrue(result['existingNatAndTcRetained']);self.assertEqual(state['phase'],'withdrawn')
+
+ def test_status_only_waits_for_fixed_typed_unavailable_reply(self):
+  image='registry.example/harbor:'+'a'*40
+  results=[(75,'{"code":"entry_status_unavailable"}','active_database_not_ready'),(75,'{"code":"entry_status_denied"}','active_database_status_denied'),(1,'{"code":"entry_status_denied"}','active_database_status_denied')]
+  for status,diagnostic,expected in results:
+   result=SimpleNamespace(returncode=status,stdout='',stderr=diagnostic)
+   with self.subTest(status=status,diagnostic=diagnostic),patch.object(controller,'trusted_parents'),patch.object(Path,'lstat',return_value=SimpleNamespace(st_mode=stat.S_IFREG|0o644,st_uid=0)),patch.object(controller.subprocess,'run',return_value=result) as invoked:
+    with self.assertRaisesRegex(RuntimeError,expected):controller.read_active_authorization(image)
+    args,kwargs=invoked.call_args;self.assertEqual(args[0],['/opt/harbor-storage-tools/node/bin/node','/usr/local/lib/harbor/gateway-entry-activation-status.mjs']);self.assertEqual(set(kwargs['env']),{'PATH','LANG'});self.assertEqual(__import__('json').loads(kwargs['input']),{'image':image})
 
  def test_public_ipv4_can_never_be_remapped_by_legacy_proxy_policy(self):
   config={'version':1,'socketPath':'/run/harbor-entry/legacy.sock','sourceAddress':'10.62.0.2','sourcePort':8092,'maxConnections':1,'maxHeaderBytes':4096,'headerTimeoutMs':1000,'connectTimeoutMs':1000,'legacyEffectivePeers':[{'clientNetwork':'203.0.113.0/24','peerAddress':'10.62.0.1','witnessSha256':'a'*64}]}

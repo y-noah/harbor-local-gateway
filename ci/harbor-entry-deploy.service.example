@@ -1,0 +1,22 @@
+[Unit]
+Requires=harbor-entry-runtime.service
+After=harbor-entry-runtime.service
+Description=Harbor 固定部署探针 cgroup 锚点
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -B -c 'import signal; signal.pause()'
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+UMask=0077
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

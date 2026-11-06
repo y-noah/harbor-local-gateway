@@ -1,5 +1,9 @@
 import copy
 import importlib.util
+import json
+import os
+import fcntl
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -63,5 +67,90 @@ class RecoveryBoundaryTests(unittest.TestCase):
    with self.subTest(field=field),self.assertRaises(RuntimeError):recovery.validate_proof(Boundary,changed,{'source':source},row)
   proof['sourceFence']['sourceStartedAt']='another-generation'
   with self.assertRaises(RuntimeError):recovery.validate_proof(Boundary,proof,{'source':source},row)
+
+
+class RunningSourceRecoveryTests(unittest.TestCase):
+ def fixture(self,root):
+  class Boundary:
+   require=staticmethod(controller.require)
+   fingerprint=staticmethod(controller.fingerprint)
+   validate=staticmethod(lambda config:config)
+  c=Boundary();c.ACTIVE=root/'active';c.WRITER_AUTHORIZED=root/'writer';c.PROFILE=root/'controller.json';c.STATE=root/'state.json';c.config={'source':{'containerId':'a'*64,'imageId':'sha256:'+'b'*64,'pid':123,'startTicks':'456','startedAt':'original','address':'172.18.0.2'}};c.row={'Id':'a'*64,'Image':'sha256:'+'b'*64,'State':{'Running':True,'Pid':123,'StartedAt':'original','Dead':False,'OOMKilled':False,'Error':''},'HostConfig':{'RestartPolicy':{'Name':'no','MaximumRetryCount':0}},'Mounts':[{'Source':'original','Destination':'/app/data'}]};c.entry={'slot':'legacy','phase':'holding','inflight':2};c.calls=[]
+  c.private_json=lambda path:json.loads(Path(path).read_text())
+  def save(path,value):Path(path).write_text(json.dumps(value))
+  c.save_json=save;c.save_state=lambda value:save(c.STATE,value);save(c.PROFILE,c.config);save(c.STATE,{'phase':'holding','configDigest':c.fingerprint(c.config),'sourceRestartPolicy':{'Name':'unless-stopped','MaximumRetryCount':0}})
+  def source(config):
+   c.require(c.row['Id']==config['source']['containerId'] and c.row['Image']==config['source']['imageId'] and c.row['State']['Pid']==config['source']['pid'] and c.row['State']['StartedAt']==config['source']['startedAt'],'source_generation_changed');return copy.deepcopy(c.row)
+  c.verify_source=source;c.verify_environment=lambda config:c.calls.append('verify-network');c.verify_resources=lambda state,config:c.calls.append('verify-rules');c.entry_state=lambda:copy.deepcopy(c.entry)
+  def execute(args):
+   c.calls.append(args);c.require(args[:2]==['/usr/bin/docker','update'],'unexpected_command');c.row['HostConfig']['RestartPolicy']={'Name':'unless-stopped','MaximumRetryCount':0};return ''
+  c.execute=execute
+  def action(config,action):
+   c.calls.append(action);state=c.private_json(c.STATE)
+   if action=='withdraw':state['phase']='withdrawn';c.entry['phase']='active'
+   elif action=='arm':state['phase']='routed'
+   else:raise RuntimeError('unexpected_action')
+   c.save_state(state)
+  c.run_action=action;return c
+ def test_running_original_restores_entry_policy_and_retires_run_without_node(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);c=self.fixture(root);operator=root/'operator.json';operator.write_text(json.dumps({'runDirectory':str(root/'run')}));journal=root/'recovery.json'
+   with patch.object(recovery,'verify_original_source_health'),patch.object(recovery,'OPERATOR_PROFILE',operator),patch.object(recovery,'JOURNAL',journal),patch.object(recovery,'no_candidates'):
+    result=recovery.recover_running_source(c,c.config,c.private_json(c.STATE))
+   self.assertTrue(result['freshRunRequired']);self.assertFalse(result['sourceRestarted']);self.assertFalse(operator.exists());self.assertEqual(c.entry['phase'],'active');self.assertEqual(c.private_json(c.STATE)['phase'],'routed');self.assertTrue(c.private_json(c.STATE)['recoveryComplete']);self.assertEqual([x for x in c.calls if x in ['withdraw','arm']],['withdraw','arm']);self.assertEqual(c.row['HostConfig']['RestartPolicy']['Name'],'unless-stopped')
+ def test_hold_interrupted_before_state_save_can_restore_original(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);c=self.fixture(root);state=c.private_json(c.STATE);state['phase']='routed';c.save_state(state);operator=root/'operator.json';operator.write_text(json.dumps({'runDirectory':str(root/'run')}))
+   with patch.object(recovery,'verify_original_source_health'),patch.object(recovery,'OPERATOR_PROFILE',operator),patch.object(recovery,'JOURNAL',root/'recovery.json'),patch.object(recovery,'no_candidates'):
+    result=recovery.recover_running_source(c,c.config,c.private_json(c.STATE))
+   self.assertTrue(result['freshRunRequired']);self.assertEqual(c.entry['phase'],'active')
+ def test_writer_marker_refuses_running_branch(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);c=self.fixture(root);c.WRITER_AUTHORIZED.touch()
+   with patch.object(recovery,'verify_original_source_health'),patch.object(recovery,'no_candidates'),self.assertRaises(RuntimeError):recovery.recover_running_source(c,c.config,c.private_json(c.STATE))
+   self.assertEqual(c.calls,[])
+ def test_changed_original_generation_refused_before_any_mutation(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);c=self.fixture(root);c.row['State']['Pid']=124
+   with patch.object(recovery,'verify_original_source_health'),patch.object(recovery,'no_candidates'),self.assertRaises(RuntimeError):recovery.recover_running_source(c,c.config,c.private_json(c.STATE))
+   self.assertEqual(c.calls,[])
+ def test_candidate_entry_cannot_be_resumed_as_original(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);c=self.fixture(root);c.entry['slot']='candidate'
+   with patch.object(recovery,'verify_original_source_health'),patch.object(recovery,'no_candidates'),self.assertRaises(RuntimeError):recovery.recover_running_source(c,c.config,c.private_json(c.STATE))
+   self.assertNotIn('withdraw',c.calls)
+ def test_retry_after_profile_retirement_finishes_same_original(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);c=self.fixture(root);operator=root/'operator.json';operator.write_text(json.dumps({'runDirectory':str(root/'run')}));journal=root/'recovery.json';original_action=c.run_action
+   def interrupted(config,action):
+    if action=='arm':raise RuntimeError('simulated_disconnect')
+    return original_action(config,action)
+   with patch.object(recovery,'verify_original_source_health'),patch.object(recovery,'OPERATOR_PROFILE',operator),patch.object(recovery,'JOURNAL',journal),patch.object(recovery,'no_candidates'):
+    c.run_action=interrupted
+    with self.assertRaises(RuntimeError):recovery.recover_running_source(c,c.config,c.private_json(c.STATE))
+    self.assertFalse(operator.exists());self.assertEqual(c.private_json(c.STATE)['phase'],'withdrawn');c.run_action=original_action;result=recovery.recover_running_source(c,c.config,c.private_json(c.STATE));self.assertTrue(result['freshRunRequired']);self.assertEqual(c.private_json(c.STATE)['phase'],'routed')
+
+class SupervisedRecoveryLockTests(unittest.TestCase):
+ def test_inherited_open_file_descriptions_leave_supervisor_locks_held(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);paths=[root/'deploy.lock',root/'controller-state.lock'];original=[];inherited=[]
+   class Boundary:
+    STATE=root/'controller-state.json'
+    require=staticmethod(controller.require)
+    trusted_parents=staticmethod(lambda path:None)
+   real_fstat=os.fstat
+   def root_metadata(fd):
+    s=real_fstat(fd);return os.stat_result((s.st_mode,s.st_ino,s.st_dev,s.st_nlink,0,s.st_gid,s.st_size,s.st_atime,s.st_mtime,s.st_ctime))
+   for path in paths:
+    fd=os.open(path,os.O_CREAT|os.O_RDWR,0o600);fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);original.append(fd);inherited.append(os.dup(fd))
+   try:
+    with patch.object(recovery,'DEPLOY_LOCK',paths[0]),patch.object(recovery,'load_controller',return_value=Boundary()),patch.object(recovery.os,'geteuid',return_value=0),patch.object(recovery.os,'fstat',side_effect=root_metadata),patch.object(recovery,'recover',return_value={'phase':'recovery-complete','freshRunRequired':True}),patch('sys.stdout',new_callable=io.StringIO):recovery.main(supervised_locks=tuple(inherited))
+    for path in paths:
+     probe=os.open(path,os.O_RDWR)
+     try:
+      with self.assertRaises(BlockingIOError):fcntl.flock(probe,fcntl.LOCK_EX|fcntl.LOCK_NB)
+     finally:os.close(probe)
+   finally:
+    for fd in original:os.close(fd)
 
 if __name__=='__main__':unittest.main()

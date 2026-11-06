@@ -1,0 +1,15 @@
+[Unit]
+Description=Harbor 运行目录及入口启动保护
+Requires=docker.service
+After=docker.service network.target
+Before=harbor-entry-deploy.service harbor-entry-legacy.service harbor-entry-candidate.service harbor-gateway-entry.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/harbor/entry-runtime.py boot-guard
+RemainAfterExit=yes
+UMask=0077
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

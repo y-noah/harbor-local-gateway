@@ -661,10 +661,17 @@ def active_record():
 
 
 def read_active_authorization(image):
- node=Path('/opt/harbor-storage-tools/node/bin/node');helper=Path('/opt/harbor-storage-tools/app/storage-activation-deploy.mjs')
- for path in [node,helper]:
+ node=Path('/opt/harbor-storage-tools/node/bin/node');helper=Path('/usr/local/lib/harbor/gateway-entry-activation-status.mjs');business=Path('/opt/harbor-storage-tools/app/storage-activation-deploy.mjs')
+ for path in [node,helper,business]:
   trusted_parents(path);info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'activation_helper_untrusted')
- return json.loads(execute([str(node),str(helper)],json.dumps({'action':'status','image':image}),timeout=150))
+ try:result=subprocess.run([str(node),str(helper)],input=json.dumps({'image':image}),capture_output=True,text=True,timeout=150,env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C'})
+ except subprocess.TimeoutExpired:raise RuntimeError('entry_controller_active_database_not_ready') from None
+ require(len(result.stdout)<65536 and len(result.stderr)<65536,'activation_output_budget')
+ if result.returncode==75:
+  try:unavailable=json.loads(result.stderr)=={'code':'entry_status_unavailable'}
+  except (ValueError,TypeError):unavailable=False
+  if unavailable:raise RuntimeError('entry_controller_active_database_not_ready')
+ require(result.returncode==0,'active_database_status_denied');return json.loads(result.stdout)
 
 
 def socket_owner(path):
@@ -687,7 +694,10 @@ def refreshed_bypass(config,slot='candidate'):
 
 def install_owned_network(runtime,previous):
  tables=json.loads(execute(['/usr/sbin/nft','--json','list','tables']));exists=any(v.get('table',{}).get('name')==TABLE for v in tables.get('nftables',[]))
- if exists:
+ boot_guard=exists and previous and previous.get('phase')=='boot-guarded'
+ if boot_guard:
+  approved=validate(private_json(PROFILE));require(previous.get('configDigest')==fingerprint(approved) and previous.get('guardFingerprint')==guard_fingerprint(approved) and previous.get('rulesDigest')==state_rules_digest(),'boot_guard_unowned')
+ if exists and not boot_guard:
   require(previous and previous.get('rulesDigest')==state_rules_digest() and previous.get('mangleDigest')==mangle_digest(),'active_resources_unowned')
   live={v['ifname'] for v in json.loads(execute(['/usr/sbin/ip','-j','link','show']))}
   for dev,digest in previous.get('tcDigests',{}).items():

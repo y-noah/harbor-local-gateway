@@ -1,0 +1,34 @@
+[Unit]
+Requires=harbor-entry-runtime.service
+After=harbor-entry-runtime.service
+Description=Harbor 固定候选透明桥
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+RootDirectory=/var/lib/harbor-entry/jails/candidate
+RootDirectoryStartOnly=yes
+ExecStartPre=+/usr/bin/python3 -I -B /usr/local/lib/harbor/entry-runtime.py candidate-pre
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/harbor/gateway-legacy-transparent.py
+ExecStartPost=+/bin/sh -ec 'i=0; while [ ! -S /run/harbor-entry/candidate.sock ]; do i=$((i+1)); test "$i" -lt 100; sleep 0.05; done; exec /usr/bin/python3 -I -B /usr/local/lib/harbor/entry-runtime.py candidate-post'
+BindReadOnlyPaths=/usr /lib /lib64
+BindReadOnlyPaths=/etc/harbor-entry/candidate:/etc
+BindPaths=/run/harbor-entry:/run/harbor-entry
+ProtectSystem=strict
+ReadWritePaths=/run/harbor-entry
+ProtectHome=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_INET
+UMask=0077
+Restart=on-failure
+RestartSec=1
+TimeoutStartSec=420
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

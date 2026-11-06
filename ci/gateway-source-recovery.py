@@ -1,8 +1,9 @@
 #!/usr/bin/python3
-"""Fixed-root, pre-writer recovery of the exact fenced Harbor source.
+"""Fixed-root, pre-writer recovery of the exact original Harbor source.
 
-No caller-supplied proof, source, command, or container is accepted. The formal
-verifier releases its SQLite lease before Docker starts. A write-ahead journal
+No caller-supplied proof, source, command, or container is accepted. A source
+that never stopped requires its original live generation and network. For a
+fenced source the formal verifier releases its SQLite lease before Docker starts. A write-ahead journal
 then permits only this same CID to complete network admission after interruption.
 """
 import copy
@@ -85,11 +86,62 @@ def validate_proof(c,proof,config,row):
  c.require(len(mounts)==1 and mounts[0].get('Type')=='bind' and mounts[0].get('RW') is True and mounts[0].get('Source')==proof.get('sourceDataDir') and str(Path(proof['sourceDataDir']).resolve())==proof['sourceDataDir'],'recovery_source_mount')
 
 
+def verify_original_source_health(c):
+ connection=http.client.HTTPConnection('localhost',timeout=3);connection.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);connection.sock.settimeout(3);connection.sock.connect('/run/harbor-entry/legacy.sock')
+ try:
+  connection.request('GET','/health',headers={'Host':'127.0.0.1:8092','x-harbor-entry-client-address':'127.0.0.1','Connection':'close'});reply=connection.getresponse();c.require(reply.status==200 and len(reply.read(65537))<=65536,'recovery_running_source_health')
+ finally:connection.close()
+
+
+def recover_running_source(c,config,state):
+ """Undo only an entry hold around the exact source that was never stopped."""
+ no_writer(c,state);no_candidates(c,config['source'])
+ c.require(state.get('configDigest')==c.fingerprint(config) and state.get('phase') in ['holding','withdrawing','withdrawn','routed'],'recovery_running_configuration')
+ row=c.verify_source(config);c.require(not any(row['State'].get(key) for key in ['Dead','OOMKilled','Error']),'recovery_running_source_error')
+ c.verify_environment(config);c.verify_resources(state,config);verify_original_source_health(c)
+ entry=c.entry_state();c.require(entry.get('slot')=='legacy' and entry.get('phase') in ['holding','drained','active'],'recovery_running_entry')
+ if JOURNAL.exists():
+  journal=c.private_json(JOURNAL);c.require(journal.get('mode')=='original-running' and journal.get('originalConfig')==config and journal.get('sourceMounts')==row.get('Mounts',[]) and journal.get('phase') in ['running-authorized','running-withdrawn'],'recovery_running_journal')
+ else:
+  c.require(state.get('phase') in ['holding','routed'] and entry['phase'] in ['holding','drained'],'recovery_running_initial_phase')
+  operator=c.private_json(OPERATOR_PROFILE);digest=c.fingerprint(operator)
+  journal={'version':1,'mode':'original-running','phase':'running-authorized','originalConfig':config,'sourceMounts':row.get('Mounts',[]),'sourceRestartPolicy':state.get('sourceRestartPolicy'),'operatorProfileDigest':digest,'retiredProfile':str(OPERATOR_PROFILE.with_name('harbor-storage-operator.retired-running-'+digest+'.json'))}
+  c.save_json(JOURNAL,journal)
+ # No new snapshot or fenced Node proof is needed: CID, image, PID/start ticks,
+ # StartedAt, network and mounts prove this is the still-running original.
+ # Retire the fixed run before resuming traffic so no stale driver can fence it.
+ retired=Path(journal['retiredProfile'])
+ if OPERATOR_PROFILE.exists():
+  operator=c.private_json(OPERATOR_PROFILE);c.require(c.fingerprint(operator)==journal['operatorProfileDigest'],'recovery_running_operator_changed')
+  if retired.exists():c.require(c.private_json(retired)==operator,'recovery_running_retired_changed')
+  else:c.save_json(retired,operator)
+  OPERATOR_PROFILE.unlink();directory=os.open(OPERATOR_PROFILE.parent,os.O_RDONLY|os.O_DIRECTORY)
+  try:os.fsync(directory)
+  finally:os.close(directory)
+ else:c.require(retired.exists() and c.fingerprint(c.private_json(retired))==journal['operatorProfileDigest'],'recovery_running_retired_missing')
+ policy=journal.get('sourceRestartPolicy');c.require(isinstance(policy,dict) and policy.get('Name') in ['no','always','unless-stopped','on-failure'] and type(policy.get('MaximumRetryCount')) is int and policy['MaximumRetryCount']>=0,'recovery_restart_policy')
+ current=row.get('HostConfig',{}).get('RestartPolicy');c.require(current in [policy,{'Name':'no','MaximumRetryCount':0}],'recovery_running_restart_changed')
+ value=policy['Name']+(':'+str(policy['MaximumRetryCount']) if policy['Name']=='on-failure' and policy['MaximumRetryCount'] else '')
+ c.execute(['/usr/bin/docker','update','--restart='+value,config['source']['containerId']])
+ updated=c.verify_source(config);verify_original_source_health(c);c.require(updated.get('Mounts',[])==journal['sourceMounts'] and updated.get('HostConfig',{}).get('RestartPolicy')==policy,'recovery_running_source_changed')
+ no_writer(c,c.private_json(c.STATE));no_candidates(c,config['source'])
+ if c.private_json(c.STATE)['phase'] in ['holding','withdrawing','routed']:c.run_action(config,'withdraw')
+ journal['phase']='running-withdrawn';c.save_json(JOURNAL,journal)
+ c.require(c.private_json(c.STATE)['phase']=='withdrawn','recovery_running_withdraw')
+ c.run_action(config,'arm');final=c.private_json(c.STATE);c.require(final['phase']=='routed' and c.entry_state().get('slot')=='legacy' and c.entry_state().get('phase')=='active','recovery_running_resume')
+ c.verify_source(config);c.verify_environment(config);c.verify_resources(final,config)
+ final['recoveryComplete']=True;c.save_state(final);journal['phase']='complete';journal['runtimeConfigDigest']=c.fingerprint(config);c.save_json(JOURNAL,journal)
+ return {'phase':'recovery-complete','sourceRunning':True,'sourceRestarted':False,'freshRunRequired':True,'pgDataPreserved':True}
+
+
 def recover(c):
  config=c.validate(c.private_json(c.PROFILE));state=c.private_json(c.STATE);no_writer(c,state)
  if state.get('phase')=='routed' and state.get('recoveryComplete') is True:
   journal=c.private_json(JOURNAL);c.require(journal.get('phase')=='complete' and journal.get('runtimeConfigDigest')==c.fingerprint(config),'recovery_completed_changed');c.verify_source(config)
   return {'phase':'recovery-complete','sourceRunning':True,'freshRunRequired':True}
+ row=c.inspect_container(config['source']['containerId'])
+ if row.get('State',{}).get('Running') is True and (state.get('phase') in ['holding','withdrawing','withdrawn','routed'] or JOURNAL.exists() and c.private_json(JOURNAL).get('mode')=='original-running'):
+  return recover_running_source(c,config,state)
  c.require(state.get('phase') in ['holding','recovery-starting'],'recovery_phase');entry=c.entry_state()
  c.require(entry.get('slot')=='legacy' and entry.get('phase') in ['drained','active'] and entry.get('inflight')==0,'recovery_entry_changed')
  if entry['phase']=='active':c.require(state['phase']=='recovery-starting' and c.private_json(JOURNAL).get('phase')=='network-ready','recovery_premature_resume')
@@ -196,12 +248,18 @@ def recover(c):
  return {'phase':'recovery-complete','sourceRunning':True,'freshRunRequired':True,'pgDataPreserved':True}
 
 
-def main():
- if os.geteuid()!=0 or len(sys.argv)!=1:raise RuntimeError('source_recovery_fixed_root_only')
+def main(supervised_locks=None):
+ if os.geteuid()!=0 or supervised_locks is None and len(sys.argv)!=1:raise RuntimeError('source_recovery_fixed_root_only')
  c=load_controller();descriptors=[]
  try:
-  for path in [DEPLOY_LOCK,c.STATE.with_suffix('.lock')]:
-   c.trusted_parents(path);fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600);descriptors.append(fd);info=os.fstat(fd)
+  paths=[DEPLOY_LOCK,c.STATE.with_suffix('.lock')]
+  if supervised_locks is not None:c.require(isinstance(supervised_locks,tuple) and len(supervised_locks)==len(paths) and all(type(fd) is int and fd>=3 for fd in supervised_locks),'recovery_supervised_descriptors')
+  for index,path in enumerate(paths):
+   c.trusted_parents(path)
+   if supervised_locks is None:fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+   else:
+    fd=supervised_locks[index];expected=path.lstat();actual=os.fstat(fd);c.require((actual.st_dev,actual.st_ino)==(expected.st_dev,expected.st_ino),'recovery_supervised_lock_changed')
+   descriptors.append(fd);info=os.fstat(fd)
    c.require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'recovery_lock_untrusted');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
   c._recovery_controller_fd=descriptors[-1]
   print(json.dumps(recover(c),separators=(',',':')))

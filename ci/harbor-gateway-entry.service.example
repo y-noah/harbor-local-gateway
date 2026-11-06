@@ -1,0 +1,18 @@
+[Unit]
+Description=Harbor 固定公网入口
+Requires=docker.service harbor-entry-runtime.service harbor-entry-deploy.service harbor-entry-candidate.service
+Wants=harbor-entry-legacy.service harbor-entry-candidate.service
+After=docker.service harbor-entry-runtime.service harbor-entry-deploy.service harbor-entry-legacy.service harbor-entry-candidate.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/python3 -I -B /usr/local/lib/harbor/entry-runtime.py entry-pre
+ExecStart=/usr/bin/docker start --attach harbor-gateway-entry
+ExecStartPost=/bin/sh -c 'if [ -f /var/lib/harbor-entry/active.json ]; then exec /usr/bin/python3 -I -B /usr/local/lib/harbor/gateway-entry-controller.py restore-active; fi'
+ExecStop=/usr/bin/docker stop --time 10 harbor-gateway-entry
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
