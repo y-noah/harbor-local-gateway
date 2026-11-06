@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "enabled": false,
+  "host": "backup.example.invalid",
+  "port": 22,
+  "user": "harbor_backup",
+  "identityFile": "/etc/harbor-backup/ssh.key",
+  "knownHostsFile": "/etc/harbor-backup/known_hosts",
+  "indexDirectory": "/var/lib/harbor-backup/transfer-indexes",
+  "timeoutMs": 3600000,
+  "connectTimeoutSeconds": 10
+}
