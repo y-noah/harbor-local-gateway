@@ -21,9 +21,10 @@ CONFIG='/etc/harbor-gateway-deploy.json'
 NAME='harbor-local-gateway'
 STACK='/opt/product-development/harbor-local-gateway'
 STATIC_HELPER='/usr/local/lib/harbor/static-release.py'
+ENTRY_HELPER='/usr/local/lib/harbor/gateway-entry-controller.py'
 
 def validate(payload,config):
-    if not isinstance(payload,dict) or set(payload)!={'action','image'} or payload['action']!='deploy':
+    if not isinstance(payload,dict) or set(payload)!={'action','image'} or payload['action'] not in ('deploy','deploy-entry-postgres'):
         raise ValueError('Only a deployment request is allowed')
     image=payload['image']
     if not isinstance(image,str) or not re.fullmatch(re.escape(config['image_prefix'])+r':[0-9a-f]{40}',image):
@@ -37,9 +38,19 @@ def deployment_policy(config,action):
     policy=config.get('availability_policy','preserve-current' if port==8092 else 'legacy-replace')
     if policy not in ('preserve-current','legacy-replace'):raise ValueError('Invalid root availability policy')
     if port==8092 and policy!='preserve-current':raise ValueError('Port 8092 requires preserve-current policy')
-    if action not in ('deploy','deploy-static'):raise ValueError('Unknown deployment action')
+    if action not in ('deploy','deploy-static','deploy-entry-postgres'):raise ValueError('Unknown deployment action')
+    if action=='deploy-entry-postgres' and (port!=8092 or policy!='preserve-current' or config.get('storage_engine')!='postgres'):raise ValueError('Entry deployment requires the preserved 8092 PostgreSQL composition')
     if action=='deploy' and policy=='preserve-current':raise ValueError('Stop-first deployment is prohibited; only approved static release is available')
     return policy
+
+def deployment_action(payload,config):
+    enabled=config.get('entry_deployment_enabled',False)
+    if type(enabled)!=bool:raise ValueError('Root entry deployment flag must be boolean')
+    action=payload.get('action')
+    if action=='deploy' and enabled:action='deploy-entry-postgres'
+    deployment_policy(config,action)
+    return action
+
 
 def run(*args,check=True,timeout=None):
     return subprocess.run(args,check=check,capture_output=True,text=True,timeout=timeout)
@@ -151,6 +162,34 @@ def activation(action,image):
     if not isinstance(value,dict) or value.get('contract')!='harbor-storage-activation-deploy-v1':raise ValueError('Activation helper response is invalid')
     return value
 
+def deploy_entry_postgres(image,config,archive=None):
+    deployment_policy(config,'deploy-entry-postgres')
+    helper=Path(ENTRY_HELPER)
+    for target in [*reversed(helper.parents),helper]:
+        info=target.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('Entry controller is not root controlled')
+    if not stat.S_ISREG(helper.lstat().st_mode):raise ValueError('Entry controller must be a regular file')
+    spec=importlib.util.spec_from_file_location('harbor_entry_controller',helper)
+    controller=importlib.util.module_from_spec(spec);spec.loader.exec_module(controller)
+    approval=activation('check',image)
+    context=controller.authorize_deployment(image=image,approval=approval)
+    def guarded_activation(action,requested_image):
+        if requested_image!=image:raise ValueError('Entry activation image changed')
+        if action in ('check','preflight','consume','status'):context.check()
+        value=activation(action,requested_image)
+        if action in ('check','preflight','consume','status'):context.check(value)
+        return value
+    spec=importlib.util.spec_from_file_location('harbor_postgres_deploy',Path(__file__).with_name('postgres-deploy.py'))
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    api={**globals(),'activation':guarded_activation,'http_code':lambda port,path,headers=None:context.probe(port,path,headers),'entry_deployment':context}
+    result=module.deploy(image,config,archive,api)
+    # Failed final CAS leaves PostgreSQL and the held entry intact for explicit
+    # recovery. It must never trigger an automatic SQLite restart.
+    latest=guarded_activation('status',image)
+    entry=context.activate(latest)
+    return {**result,'entry':entry}
+
+
 def deploy(image,config,archive=None):
     deployment_policy(config,'deploy')
     engine=config.get('storage_engine','sqlite')
@@ -226,6 +265,20 @@ def deploy(image,config,archive=None):
     if previous:
         docker('rm',NAME+'-previous')
 
+def receive_deployment_image(stream,payload,config,action):
+    transport=config.get('image_transport','registry')
+    if transport not in ('registry','ssh_archive'):raise ValueError('Invalid image transport')
+    installed=config.get('entry_installed_release',False)
+    if type(installed) is not bool:raise ValueError('Installed entry release must be a root boolean')
+    if installed and payload.get('action')=='deploy-entry-postgres':
+        deployment_policy(config,action)
+        if action!='deploy-entry-postgres':raise ValueError('Installed entry release requires the explicit entry action')
+        if stream.read(1):raise ValueError('Installed entry release does not accept image bytes')
+        # The entry consumer still verifies the approved OCI identity and runs
+        # the ordinary activation/preflight checks against the installed image.
+        return None,'installed'
+    return (receive_archive(stream,STACK+'/import') if transport=='ssh_archive' else None),transport
+
 def main():
     os.umask(0o077)
     request=sys.stdin.buffer.readline(4097)
@@ -235,8 +288,8 @@ def main():
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o600:raise ValueError('Deployment configuration must be root-owned 0600')
     config=json.loads(Path(CONFIG).read_text())
     if not isinstance(payload,dict):raise ValueError('Only a deployment request is allowed')
-    deployment_policy(config,payload.get('action'))
-    if isinstance(payload,dict) and payload.get('action')=='deploy-static':
+    action=deployment_action(payload,config)
+    if action=='deploy-static':
         # The helper and approval are independently installed by root. CI cannot select a path or command.
         helper=Path(STATIC_HELPER)
         for target in [*reversed(helper.parents),helper]:
@@ -251,12 +304,11 @@ def main():
     image=validate(payload,config)
     with open('/run/harbor-gateway-deploy.lock','w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        transport=config.get('image_transport','registry')
-        if transport not in ('registry','ssh_archive'):raise ValueError('Invalid image transport')
         archive=None
         try:
-            if transport=='ssh_archive':archive=receive_archive(sys.stdin.buffer,STACK+'/import')
-            result=deploy(image,config,archive)
+            archive,transport=receive_deployment_image(sys.stdin.buffer,payload,config,action)
+            result=(deploy_entry_postgres if action=='deploy-entry-postgres' else deploy)(image,config,archive)
+            if action=='deploy-entry-postgres':result={**result,'wireAction':payload['action'],'effectiveAction':action,'imageTransport':transport}
             if config.get('storage_engine')=='postgres':print(json.dumps({'postgres_deployment':result},sort_keys=True))
         finally:
             if archive:Path(archive).unlink(missing_ok=True)

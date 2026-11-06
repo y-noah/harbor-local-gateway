@@ -822,7 +822,7 @@ test('类型分组下钻使用服务器完整requestFilters并重置分页快照
  const paths=[];const page=await ui(path=>{paths.push(path);return response({rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1},summary:{requests:0,success:0,standard:{},average_ms:0},models:[],members:[],byModel:[],byMember:[]});});const data=typeStatisticsFixture();data.rows[0].requestFilters={...data.rows[0].requestFilters,model_missing:true};page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="requests";recordView="types";typeStatisticsData='+JSON.stringify(data)+';requestsPageSnapshot="old";requestsCursors=new Map([[1,"old-cursor"]]);');await page.click('type-statistics-drill','0');const url=new URL(paths[0],'http://localhost');assert.equal(url.searchParams.get('type'),'usage-a');assert.equal(url.searchParams.get('outcome'),'failed');assert.equal(url.searchParams.get('from'),'1000');assert.equal(url.searchParams.get('to'),'2000');assert.equal(url.searchParams.get('model_missing'),'true');assert.equal(url.searchParams.has('snapshot'),false);assert.equal(url.searchParams.has('cursor'),false);assert.equal(url.searchParams.has('status'),false);assert.equal(page.run('recordView'),'requests');assert.match(page.node('#content').innerHTML,/清除固定筛选/);
 });
 test('总览选择类型后不再把全公司用量和日图展示为筛选结果，健康人数明确全公司',async()=>{
- const page=await ui(()=>response(typeStatisticsFixture()));page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="overview";overviewType="usage-a";typeStatisticsData='+JSON.stringify(typeStatisticsFixture())+';render();');const html=page.node('#content').innerHTML;assert.match(html,/可用账号（全公司）/);assert.match(html,/员工（全公司）/);assert.match(html,/筛选范围参考消耗/);assert.doesNotMatch(html,/<table|data-action="type-statistics-drill"|data-action="type-statistics-page"/);assert.ok(!html.includes('最近 7 天用量'));assert.ok(!html.includes('近12小时参考消耗'));
+ const page=await ui(()=>response(typeStatisticsFixture()));page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="overview";overviewType="usage-a";typeStatisticsData='+JSON.stringify(typeStatisticsFixture())+';render();');const html=page.node('#content').innerHTML;assert.match(html,/可用账号（全公司）/);assert.match(html,/员工（全公司）/);assert.match(html,/类型请求概览/);assert.match(html,/请求／成功／失败/);assert.doesNotMatch(html,/参考消耗|USD|\$6\.15|<table|data-action="type-statistics-drill"|data-action="type-statistics-page"/);assert.ok(!html.includes('最近 7 天请求'));assert.ok(!html.includes('近12小时参考消耗'));
 });
 test('总览与使用类型页的业务结果筛选独立保存，互不改变统计范围',async()=>{
  const paths=[];const page=await ui(path=>{paths.push(path);return response(typeStatisticsFixture());});page.run('admin=true;state='+JSON.stringify(typeSnapshot())+';tab="requests";recordView="types";typeStatisticsFilters.status="failed";');await page.run('loadTypeStatistics()');page.run('tab="overview";overviewType="usage-a";');await page.run('loadTypeStatistics()');assert.equal(new URL(paths[0],'http://localhost').searchParams.get('status'),'failed');assert.equal(new URL(paths[1],'http://localhost').searchParams.has('status'),false);assert.equal(page.run('typeStatisticsFilters.status'),'failed');
@@ -995,4 +995,18 @@ test('正文类型筛选按需加载目录，同一在途去重并原位更新�
 });
 test('概览已在途类型目录进入正文后只更新筛选，不自动读取正文或覆盖草稿',async()=>{
  let release;const paths=[],page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({types:[{id:'type-a',code:'A',name:'研发'}]})));});prepareRecordingAdmin(page);page.run('tab="overview"');const pending=page.run('loadTypeCatalog()');page.run('tab="requests";recordView="recordings";recordingAdminFilters.q="保留草稿";');const select={value:'type-a',innerHTML:''};page.node('#recording-query-form').querySelector=()=>select;page.run('bindRecordingAdmin()');select.onfocus({target:{name:'type',tagName:'SELECT'}});assert.equal(paths.length,1);release();await pending;assert.match(select.innerHTML,/A · 研发/);assert.equal(page.run('recordingAdminFilters.q'),'保留草稿');assert.deepEqual(paths,['/api/admin/member-types']);
+});
+
+test('运行总览只显示请求趋势和运行状态，金额只在使用数据展示',async()=>{
+ const data={...snapshot(),usageWindow:{start:Date.UTC(2026,10,1)},daily:[{day:'2026-11-01',requests:7,standard:{total:123.45}}]};
+ const page=await ui(()=>response(data));page.run('admin=true;state='+JSON.stringify(data)+';tab="overview";render();');
+ const html=page.node('#content').innerHTML;assert.match(html,/最近 7 天请求/);assert.match(html,/处理中 \/ 排队/);assert.match(html,/<span class="chart-label">7<\/span>/);assert.doesNotMatch(html,/参考消耗|Standard|USD|\$123\.45/);
+});
+
+
+test('总览宽屏布局仅作用于管理员总览，切页与员工入口恢复默认宽度',async()=>{
+ const page=await ui(()=>response(snapshot())),classes=new Map();page.node('.page').classList.toggle=(name,value)=>classes.set(name,value);page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="overview";render()');assert.equal(classes.get('overview-page'),true);page.run('tab="accounts";render()');assert.equal(classes.get('overview-page'),false);page.run('admin=false;tab="playground";render()');assert.equal(classes.get('overview-page'),false);
+});
+test('页头省去空说明与英文眉题，接入测试保留能力限制',async()=>{
+ const page=await ui(()=>response(snapshot()));const title=page.run('heading("INTERNAL LABEL","标题","")');assert.equal(title,'<div class="page-heading"><div><h1>标题</h1></div></div>');page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="playground";render()');const html=page.node('#content').innerHTML;assert.doesNotMatch(html,/用员工 Key 验证鉴权、订阅调用与额度统计|使用员工 Key 从 Windows、WSL 或其他机器连接网关/);assert.match(html,/不执行代码或访问工作文件/);
 });

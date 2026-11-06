@@ -106,3 +106,5 @@
 @media(max-width:760px){.brand{padding-bottom:18px}.aside-bottom{display:block;padding:10px 0 0;margin-top:12px}.sidebar-status{flex-direction:column;gap:3px;padding-left:0;margin-bottom:6px}.sidebar-connection{font-size:0;min-height:12px;justify-content:center;gap:0;overflow:visible}.sidebar-connection::before{width:6px;height:6px}.sidebar-actions{flex-direction:column;gap:2px;padding:3px}.sidebar-tools{width:100%}.management-settings summary{justify-content:center;padding:7px 0}.sidebar-tool-label,.sidebar-chevron{display:none}.management-menu{left:calc(100% + 12px);bottom:0;width:204px}.sidebar-action{width:32px;height:32px}.page{padding-top:24px}.loading-mask{font-size:12px}.page-refresh-note{font-size:11px}}
 
 .action-loading::after{content:'';display:inline-block;width:12px;height:12px;margin-left:7px;vertical-align:middle;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:loading-spin .8s linear infinite}.connection-error{background:#fbece7;color:#ae5949}@media(prefers-reduced-motion:reduce){.action-loading::after{animation:none}}
+
+.page.overview-page{max-width:none}.overview-page .two-col{align-items:start}

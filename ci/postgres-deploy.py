@@ -297,9 +297,10 @@ def verify_started_composition(api,image,config,started,approval):
     if api['http_code'](port,'/api/admin/state')!=401 or api['http_code'](port,'/health',{'Host':'untrusted.invalid'})!=403 or device_http_code(stack,config,'/api/admin/state')!=401 or device_http_code(stack,config,'/health',{'Host':'untrusted.invalid'})!=403:raise RuntimeError('PostgreSQL authentication checks failed')
 
 def deploy(image,config,archive,api):
-    stack=api['STACK'];name=api['NAME'];worker=name+'-worker';port=config['port'];docker=api['docker'];shutdown_rows=[];inspect=lambda target:container_inspection(api,target,shutdown_rows)
+    stack=api['STACK'];name=api['NAME'];worker=name+'-worker';port=config['port'];docker=api['docker'];entry_deployment=api.get('entry_deployment');shutdown_rows=[];inspect=lambda target:container_inspection(api,target,shutdown_rows)
     if not callable(api.get('activation')):raise ValueError('PostgreSQL activation consumer is required')
     approval=api['activation']('check',image)
+    if entry_deployment is not None:entry_deployment.check(approval)
     if approval.get('contract')!='harbor-storage-activation-deploy-v1' or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',approval.get('deploymentId','')) or not re.fullmatch(r'[a-f0-9]{64}',approval.get('receiptDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('configDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('manifestDigest','')) or approval.get('revision')!=image.rsplit(':',1)[-1]:raise ValueError('Activation approval is invalid')
     def activate(action):
         value=api['activation'](action,image)
@@ -323,6 +324,14 @@ def deploy(image,config,archive,api):
             if not owned(row) or row['Id']!=identity or row.get('State',{}).get('Running') is not False:
                 shutdown_rows.append({'container':target,'outcome':'unknown','reason':'candidate_changed_after_stop'});record_shutdown_diagnostic(stack,shutdown_rows);raise ShutdownUnconfirmed('Candidate changed after stop; composition retained')
         for identity in identities.values():docker('rm',identity)
+        for target in identities:
+            if inspect(target) is not None:raise ShutdownUnconfirmed('Candidate removal is not confirmed; entry remains held')
+        return identities
+    def revoke_reclaimed(identities):
+        value=activate('revoke')
+        if entry_deployment is not None and identities:
+            entry_deployment.unbind_candidate(activation=value,removed_container_ids=list(identities.values()))
+        return value
     common,budgets=configuration(config,stack)
     current,old_worker=inspect(name),inspect(worker)
     for instance in [current,old_worker]:
@@ -345,11 +354,13 @@ def deploy(image,config,archive,api):
         source=approval.get('sourceFence') or {}
         if previous and (previous.get('Id')!=source.get('sourceContainerId') or previous.get('Image')!=source.get('sourceImageId') or not legacy_sqlite_source(api,previous,'gateway',config)):raise ShutdownUnconfirmed('Previous source generation is not approved')
         if current and not owned(current) or old_worker and not owned(old_worker):raise ShutdownUnconfirmed('Mixed deployment generations require inspection')
-        if owned(current) and owned(old_worker) and all(row.get('State',{}).get('Running') and row['State'].get('Health',{}).get('Status')=='healthy' for row in (current,old_worker)) and api['http_code'](port,'/ready')==200 and device_http_code(stack,config,'/ready')==200:
+        pair_healthy=owned(current) and owned(old_worker) and all(row.get('State',{}).get('Running') and row['State'].get('Health',{}).get('Status')=='healthy' for row in (current,old_worker))
+        if entry_deployment is not None and pair_healthy:entry_deployment.bind_candidate(current)
+        if pair_healthy and api['http_code'](port,'/ready')==200 and device_http_code(stack,config,'/ready')==200:
             if activate('status').get('state')!='active':raise ShutdownUnconfirmed('Healthy containers lack active authorization')
             try:verify_started_composition(api,image,config,int(time.time()*1000),approval)
             except Exception:
-                try:reclaim_candidates([name,worker]);activate('revoke')
+                try:revoke_reclaimed(reclaim_candidates([name,worker]))
                 except Exception as cleanup_error:raise ShutdownUnconfirmed('Resumed candidate revocation unconfirmed; retain migration material') from cleanup_error
                 raise
             return {'shutdown_contract':SHUTDOWN_CONTRACT,'shutdown':[],'activation':{'state':'active','resumed':True}}
@@ -377,7 +388,7 @@ def deploy(image,config,archive,api):
             except ShutdownContractUnsupported as error:
                 if instance.get('State',{}).get('Running'):raise ShutdownUnconfirmed('Running legacy shutdown contract requires controlled maintenance') from error
         old_proofs.append(previous)
-    rollback=bool(all(rollback_environment_matches(instance,stack) for instance in [current,old_worker]) and all(value is not None for value in old_shutdown) and current and old_worker and current.get('Config',{}).get('Image')==old_worker.get('Config',{}).get('Image') and all(value is not None and all(value[key]==proof[key] for key in ['contract','schema_digest','database_digest','device_ca_digest']) for value in old_proofs))
+    rollback=entry_deployment is None and bool(all(rollback_environment_matches(instance,stack) for instance in [current,old_worker]) and all(value is not None for value in old_shutdown) and current and old_worker and current.get('Config',{}).get('Image')==old_worker.get('Config',{}).get('Image') and all(value is not None and all(value[key]==proof[key] for key in ['contract','schema_digest','database_digest','device_ca_digest']) for value in old_proofs))
     marker(stack,proof)
     stopped=[];created=[]
     originals={target:existing['Config']['Image'] for target,existing in [(name,current),(worker,old_worker)] if existing}
@@ -392,12 +403,13 @@ def deploy(image,config,archive,api):
             if kind=='gateway':args+=['--env','HARBOR_LISTEN_HOST=0.0.0.0','--env','HARBOR_PORT='+str(port),'--publish',str(port)+':'+str(port),'--publish',str(config['device_tls_port'])+':'+str(config['device_tls_port'])]
             else:args+=['--health-cmd','node /app/ci/postgres-preflight.mjs --worker-health','--health-interval','15s','--health-timeout','5s','--health-start-period','30s']
             created.append(target);docker(*args,image,'node','/app/'+entry)
+        if entry_deployment is not None:entry_deployment.bind_candidate(inspect(name))
         verify_started_composition(api,image,config,started,approval)
     except Exception as error:
         if isinstance(error,ShutdownUnconfirmed):raise
         # Finish candidate intake and durable cleanup before removing either member.
         # Unknown cleanup retains the whole composition and blocks automatic rollback.
-        reclaim_candidates(created)
+        reclaimed=reclaim_candidates(created)
         for target,previous_image in originals.items():
             previous=inspect(target+'-previous');restored=inspect(target)
             if previous and previous.get('Config',{}).get('Image')==previous_image and previous.get('Config',{}).get('Labels',{}).get('com.aistrong.project')==name and not restored:
@@ -405,10 +417,11 @@ def deploy(image,config,archive,api):
             if rollback and restored and restored.get('Config',{}).get('Image')==previous_image and restored.get('Config',{}).get('Labels',{}).get('com.aistrong.project')==name and not restored.get('State',{}).get('Running'):
                 docker('start',target)
         if not rollback:
-            try:activate('revoke')
+            try:revoke_reclaimed(reclaimed)
             except Exception as cleanup_error:raise ShutdownUnconfirmed('Activation revocation unconfirmed; retain PG data and migration material') from cleanup_error
         raise
-    for target in stopped:docker('rm',target+'-previous')
+    if entry_deployment is None:
+        for target in stopped:docker('rm',target+'-previous')
     return {'shutdown_contract':SHUTDOWN_CONTRACT,'shutdown':shutdown_rows,'activation':{'state':'active','resumed':False}}
 
 

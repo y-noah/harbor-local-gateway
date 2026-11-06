@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Explicit infrastructure preparation; never migrates, fences or activates Harbor."""
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -20,6 +21,11 @@ ARCHIVE_PROFILE = Path('/etc/harbor-storage-archive.json')
 ARCHIVE_BACKUP_KEY = Path('/etc/harbor-storage-backup.key')
 ARCHIVE_COMMAND = '/usr/local/bin/node /opt/harbor-storage-report/storage-backup.mjs archive-wal %f'
 DIGEST = re.compile(r'^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$')
+
+# Shared fixed-local inventory performs complete real per-CID inspections.
+inventory_spec = importlib.util.spec_from_file_location('harbor_bootstrap_container_inventory', Path(__file__).with_name('rotate-tools.py'))
+inventory = importlib.util.module_from_spec(inventory_spec)
+inventory_spec.loader.exec_module(inventory)
 
 def require(condition, code):
     if not condition: raise ValueError(code)
@@ -56,7 +62,12 @@ def docker(*args): return execute(['/usr/bin/docker',*args])
 def inspect(kind,name):
     # A failed inspect never means absence. Inventory must positively show it.
     if kind=='container':
-        ids=docker('container','ls','--all','--filter','name=^/'+name+'$','--format','{{.ID}}').split()
+        rows=inventory.local_containers()
+        require(isinstance(rows,list) and all(isinstance(row,dict) and isinstance(row.get('Name'),str) and re.fullmatch(r'/[a-zA-Z0-9][a-zA-Z0-9_.-]*',row['Name']) for row in rows),'bootstrap_container_inventory')
+        require(len({row['Name'] for row in rows})==len(rows),'bootstrap_resource_collision')
+        matches=[row for row in rows if row['Name']=='/'+name]
+        require(len(matches)<=1,'bootstrap_resource_collision')
+        return matches[0] if matches else None
     else:
         ids=docker('network','ls','--filter','name=^'+name+'$','--format','{{.ID}}').split()
     if not ids:return None

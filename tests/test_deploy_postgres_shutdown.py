@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch,Mock
 import test_deploy_postgres as base
 pg=base.pg
 
@@ -288,3 +288,58 @@ class PostgreSQLShutdownTests(unittest.TestCase):
   from unittest.mock import Mock
   for response in [Mock(returncode=1,stdout=''),Mock(returncode=0,stdout='[{}]')]:
    with patch.object(base.wrapper,'docker',return_value=response),self.assertRaises(RuntimeError):base.wrapper.inspect_image(base.OLD)
+
+ def test_entry_pg_binds_before_private_probe_preserves_stopped_sqlite_and_never_uses_old_http(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state,config=self.sqlite_source_fixture(directory);bound=[]
+   context=Mock();context.bind_candidate.side_effect=lambda row:bound.append(row['Id'])
+   def probe(port,path,headers=None):
+    self.assertTrue(bound,'candidate identity must be bound before readiness/auth probe')
+    return 403 if headers else 401 if path=='/api/admin/state' else 200
+   context.probe.side_effect=probe;api['entry_deployment']=context;api['http_code']=context.probe
+   result=pg.deploy(base.IMAGE,config,None,api)
+   self.assertEqual(result['activation']['state'],'active');context.check.assert_called_once();self.assertEqual(bound,[state[base.NAME]['Id']]);self.assertIn(base.NAME+'-previous',state);self.assertFalse(state[base.NAME+'-previous']['State']['Running']);self.assertFalse(any(call[0]=='start' for call in calls));self.assertNotIn(('rm',base.NAME+'-previous'),calls)
+ def test_entry_failure_preserves_held_admission_without_automatic_previous_pg_restart(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory,fail=True);context=Mock();api['entry_deployment']=context
+   with self.assertRaises(subprocess.CalledProcessError):pg.deploy(base.IMAGE,base.CONFIG,None,api)
+   self.assertFalse(any(call[0]=='start' for call in calls));self.assertFalse(context.activate.called)
+
+ def test_entry_cleanup_does_not_revoke_or_unbind_when_docker_rm_did_not_remove_candidate(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory,fail=True);context=Mock();api['entry_deployment']=context;original=api['docker']
+   def docker(*args,**kwargs):
+    if args[0]=='rm':return Mock(returncode=0,stdout='')
+    return original(*args,**kwargs)
+   api['docker']=docker
+   with self.assertRaisesRegex(pg.ShutdownUnconfirmed,'removal is not confirmed'):pg.deploy(base.IMAGE,base.CONFIG,None,api)
+   self.assertNotIn('revoke',api['activation_calls']);self.assertFalse(any(call[0]=='start' for call in calls))
+
+ def test_bound_entry_candidate_is_unbound_only_after_absence_and_failed_activation_receipt(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state,config=self.sqlite_source_fixture(directory);context=Mock();api['entry_deployment']=context;api['http_code']=lambda port,path,headers=None:200
+   def unbind(*,activation,removed_container_ids):
+    self.assertEqual(activation['state'],'failed');self.assertNotIn(base.NAME+'-worker',state);self.assertTrue(all(row.get('Id') not in removed_container_ids for row in state.values()));self.assertEqual(len(removed_container_ids),2)
+   context.unbind_candidate.side_effect=unbind
+   with self.assertRaisesRegex(RuntimeError,'authentication'):pg.deploy(base.IMAGE,config,None,api)
+   context.bind_candidate.assert_called_once();context.unbind_candidate.assert_called_once();self.assertFalse(any(call[0]=='start' for call in calls));self.assertFalse(context.activate.called)
+ def test_failed_activation_revoke_never_unbinds_entry_candidate(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory,fail=True);context=Mock();api['entry_deployment']=context;original=api['activation']
+   def activation(action,image):
+    if action=='revoke':raise RuntimeError('revocation not confirmed')
+    return original(action,image)
+   api['activation']=activation
+   with self.assertRaisesRegex(pg.ShutdownUnconfirmed,'revocation unconfirmed'):pg.deploy(base.IMAGE,base.CONFIG,None,api)
+   context.unbind_candidate.assert_not_called();self.assertFalse(any(call[0]=='start' for call in calls))
+ def test_failed_controller_unbind_remains_blocked_without_legacy_restart(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory,fail=True);context=Mock();context.unbind_candidate.side_effect=RuntimeError('controller guard changed');api['entry_deployment']=context
+   with self.assertRaisesRegex(pg.ShutdownUnconfirmed,'revocation unconfirmed'):pg.deploy(base.IMAGE,base.CONFIG,None,api)
+   context.unbind_candidate.assert_called_once();self.assertFalse(any(call[0]=='start' for call in calls))
+ def test_resumed_bound_candidate_failure_uses_the_same_confirmed_cleanup_callback(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state,config=self.sqlite_source_fixture(directory);api['entry_deployment']=Mock();pg.deploy(base.IMAGE,config,None,api)
+   expected={state[base.NAME]['Id'],state[base.NAME+'-worker']['Id']};context=Mock();api['entry_deployment']=context;api['http_code']=lambda port,path,headers=None:200
+   with self.assertRaisesRegex(RuntimeError,'authentication'):pg.deploy(base.IMAGE,config,None,api)
+   context.unbind_candidate.assert_called_once();kwargs=context.unbind_candidate.call_args.kwargs;self.assertEqual(set(kwargs['removed_container_ids']),expected);self.assertEqual(kwargs['activation']['state'],'failed');self.assertFalse(any(call[0]=='start' for call in calls));self.assertFalse(state[base.NAME+'-previous']['State']['Running'])

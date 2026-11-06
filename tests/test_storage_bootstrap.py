@@ -26,8 +26,26 @@ class BootstrapTests(unittest.TestCase):
   actual=source();actual['Mounts'][0]['Source']=str(b.ROOT)
   with self.assertRaisesRegex(ValueError,'source_overlap'):b.source_observation(configuration(),actual)
  def test_failed_inventory_is_not_absence(self):
-  with patch.object(b,'docker',side_effect=ValueError('unavailable')):
+  with patch.object(b.inventory,'local_containers',side_effect=ValueError('unavailable')),patch.object(b,'docker') as docker:
    with self.assertRaises(ValueError):b.inspect('container',b.PROJECT)
+   docker.assert_not_called()
+ def test_container_inventory_exact_name_returns_real_inspect_row_and_positive_absence(self):
+  row={**source(),'Id':'a'*64,'Name':'/'+b.PROJECT};similar={**source(),'Id':'b'*64,'Name':'/'+b.PROJECT+'-postgres-infra-extra'}
+  with patch.object(b.inventory,'local_containers',return_value=[row,similar]) as inventory,patch.object(b,'docker') as docker:
+   self.assertIs(b.inspect('container',b.PROJECT),row);self.assertIsNone(b.inspect('container',b.PROJECT+'-postgres-infra'));docker.assert_not_called();self.assertEqual(inventory.call_count,2)
+  with patch.object(b.inventory,'local_containers',return_value=[]):self.assertIsNone(b.inspect('container',b.PROJECT))
+ def test_unknown_or_duplicate_inventory_names_are_never_absence(self):
+  for rows in [None,[{}],[{'Name':None}],[{'Name':'missing-slash'}],[{'Name':'/valid'},{'Name':'/valid'}]]:
+   with self.subTest(rows=rows),patch.object(b.inventory,'local_containers',return_value=rows),self.assertRaises(ValueError):b.inspect('container',b.PROJECT)
+ def test_network_inventory_keeps_the_existing_positive_query_and_inspection(self):
+  row={'Id':'network-synthetic','Name':'network-synthetic'}
+  with patch.object(b.inventory,'local_containers') as inventory,patch.object(b,'docker',side_effect=['network-id',json.dumps([row])]) as docker:
+   self.assertEqual(b.inspect('network','network-synthetic'),row);inventory.assert_not_called();self.assertEqual(docker.call_args_list[0].args,('network','ls','--filter','name=^network-synthetic$','--format','{{.ID}}'));self.assertEqual(docker.call_args_list[1].args,('network','inspect','network-synthetic'))
+ def test_shared_inventory_dependency_chain_has_no_bootstrap_import_or_runtime_action(self):
+  self.assertEqual(Path(b.inventory.__file__).name,'rotate-tools.py');self.assertEqual(Path(b.inventory.b.__file__).name,'install-tools.py')
+  with patch.object(subprocess,'run',side_effect=AssertionError('import must not execute Docker or host commands')):
+   spec=importlib.util.spec_from_file_location('bootstrap_import_probe',ROOT/'ci/storage-recovery/bootstrap.py');loaded=importlib.util.module_from_spec(spec);spec.loader.exec_module(loaded)
+   self.assertEqual(Path(loaded.inventory.b.__file__).name,'install-tools.py')
  def test_container_plan_preserves_old_ports_and_data(self):
   plan=b.container_arguments(configuration(),{'owner':'a'*32});text=' '.join(plan)
   self.assertIn('127.0.0.1:55432:5432',plan);self.assertNotIn('8092:',text);self.assertNotIn('8093:',text)

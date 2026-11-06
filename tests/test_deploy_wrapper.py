@@ -5,6 +5,7 @@ import io
 import json
 import gzip
 import tarfile
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch,Mock
@@ -16,6 +17,26 @@ CONFIG={'image_prefix':'registry.test/gateway/harbor-local-gateway','port':43127
 IMAGE=CONFIG['image_prefix']+':'+'a'*40
 
 class DeploymentGuardTests(unittest.TestCase):
+    def test_installed_entry_release_is_explicit_root_only_and_rejects_image_bytes(self):
+        config={**CONFIG,'port':8092,'storage_engine':'postgres','availability_policy':'preserve-current','image_transport':'ssh_archive','entry_installed_release':True}
+        payload={'action':'deploy-entry-postgres','image':IMAGE}
+        with patch.object(guard,'receive_archive') as receive:
+            self.assertEqual(guard.receive_deployment_image(io.BytesIO(),payload,config,'deploy-entry-postgres'),(None,'installed'))
+            receive.assert_not_called()
+            with self.assertRaises(ValueError):guard.receive_deployment_image(io.BytesIO(b'x'),payload,config,'deploy-entry-postgres')
+            for change in [{'storage_engine':'sqlite'},{'port':43127},{'availability_policy':'legacy-replace'},{'entry_installed_release':1},{'entry_installed_release':'true'},{'entry_installed_release':None}]:
+                with self.subTest(change=change),self.assertRaises(ValueError):guard.receive_deployment_image(io.BytesIO(),payload,{**config,**change},'deploy-entry-postgres')
+            with self.assertRaises(ValueError):guard.validate({**payload,'entry_installed_release':True},config)
+
+    def test_installed_entry_release_default_and_old_wire_keep_the_original_transport(self):
+        config={**CONFIG,'port':8092,'storage_engine':'postgres','availability_policy':'preserve-current','image_transport':'ssh_archive'}
+        payload={'action':'deploy-entry-postgres','image':IMAGE}
+        for change,wire in [({},payload),({'entry_installed_release':False},payload),({'entry_installed_release':True},{'action':'deploy','image':IMAGE})]:
+            with self.subTest(change=change,wire=wire),patch.object(guard,'receive_archive',return_value='approved-archive') as receive:
+                stream=io.BytesIO(b'archive')
+                self.assertEqual(guard.receive_deployment_image(stream,wire,{**config,**change},'deploy-entry-postgres'),('approved-archive','ssh_archive'))
+                receive.assert_called_once_with(stream,guard.STACK+'/import')
+
     def archive(self,directory,image=IMAGE,extra=None):
         path=Path(directory)/'image.tar'
         content={'manifest.json':json.dumps([{'RepoTags':[image],'Config':'config.json','Layers':['layer.tar']}]).encode(),
@@ -115,5 +136,79 @@ class DeploymentGuardTests(unittest.TestCase):
             with patch.object(guard,'inspect',side_effect=[current,None]),patch.object(guard,'docker') as docker,patch.object(guard,'run',return_value=Mock(stdout=ports)):
                 with self.assertRaises(ValueError):guard.deploy(IMAGE,CONFIG)
                 docker.assert_not_called()
+
+    def test_entry_action_is_explicit_pg_only_and_never_weakens_legacy_policy(self):
+        config={**CONFIG,'port':8092,'storage_engine':'postgres'}
+        self.assertEqual(guard.validate({'action':'deploy-entry-postgres','image':IMAGE},config),IMAGE)
+        self.assertEqual(guard.deployment_policy(config,'deploy-entry-postgres'),'preserve-current')
+        for invalid in [{**config,'storage_engine':'sqlite'},{**config,'port':8082},{**config,'availability_policy':'legacy-replace'}]:
+            with self.assertRaises(ValueError):guard.deployment_policy(invalid,'deploy-entry-postgres')
+        with self.assertRaises(ValueError):guard.deployment_policy(config,'deploy')
+
+    def test_entry_wrapper_injects_only_controller_probe_and_activates_after_pg_success(self):
+        config={**CONFIG,'port':8092,'storage_engine':'postgres'}
+        context=Mock(activated=True);controller=Mock();controller.authorize_deployment.return_value=context
+        postgres=Mock();postgres.deploy.return_value={'activation':{'state':'active'}}
+        approval={'state':'active','sourceFence':{'synthetic':'full'}}
+        loader=Mock();spec=Mock(loader=loader)
+        with patch.object(guard.Path,'lstat',return_value=Mock(st_mode=stat.S_IFREG|0o600,st_uid=0)),patch.object(guard.importlib.util,'spec_from_file_location',return_value=spec),patch.object(guard.importlib.util,'module_from_spec',side_effect=[controller,postgres]),patch.object(guard,'activation',return_value=approval),patch.object(guard,'docker') as docker:
+            result=guard.deploy_entry_postgres(IMAGE,config)
+            controller.authorize_deployment.assert_called_once_with(image=IMAGE,approval=approval)
+            api=postgres.deploy.call_args.args[3];api['http_code'](8092,'/ready');context.probe.assert_called_once_with(8092,'/ready',None);self.assertIs(api['entry_deployment'],context)
+            self.assertEqual(context.check.call_count,2);context.check.assert_called_with(approval);context.activate.assert_called_once_with(approval);self.assertIn('entry',result);docker.assert_not_called()
+
+    def test_entry_controller_rejection_or_final_cas_failure_does_not_call_legacy_deploy(self):
+        config={**CONFIG,'port':8092,'storage_engine':'postgres'}
+        for phase in ['authorize','activate']:
+            with self.subTest(phase=phase):
+                context=Mock(activated=False);controller=Mock();controller.authorize_deployment.return_value=context;postgres=Mock();postgres.deploy.return_value={}
+                if phase=='authorize':controller.authorize_deployment.side_effect=RuntimeError('source fence refused')
+                else:context.activate.side_effect=RuntimeError('CAS refused')
+                with patch.object(guard.Path,'lstat',return_value=Mock(st_mode=stat.S_IFREG|0o600,st_uid=0)),patch.object(guard.importlib.util,'spec_from_file_location',return_value=Mock(loader=Mock())),patch.object(guard.importlib.util,'module_from_spec',side_effect=[controller,postgres]),patch.object(guard,'activation',return_value={}),patch.object(guard,'deploy') as legacy,patch.object(guard,'docker') as docker:
+                    with self.assertRaises(RuntimeError):guard.deploy_entry_postgres(IMAGE,config)
+                    legacy.assert_not_called();docker.assert_not_called()
+                    if phase=='authorize':postgres.deploy.assert_not_called()
+
+    def test_root_only_wire_mapping_is_disabled_by_default_and_rejects_invalid_flags(self):
+        payload={'action':'deploy','image':IMAGE};config={**CONFIG,'port':8092,'storage_engine':'postgres'}
+        missing=object()
+        for flag in [missing,None,False,'true',1,{},[]]:
+            changed=dict(config)
+            if flag is not missing:changed['entry_deployment_enabled']=flag
+            with self.subTest(flag=flag),self.assertRaises(ValueError):guard.deployment_action(payload,changed)
+        enabled={**config,'entry_deployment_enabled':True};self.assertEqual(guard.deployment_action(payload,enabled),'deploy-entry-postgres')
+        for changed in [{**enabled,'port':8082},{**enabled,'storage_engine':'sqlite'},{**enabled,'availability_policy':'legacy-replace'}]:
+            with self.assertRaises(ValueError):guard.deployment_action(payload,changed)
+        with self.assertRaises(ValueError):guard.validate({**payload,'entry_deployment_enabled':True},enabled)
+        with self.assertRaises(ValueError):guard.deployment_policy(enabled,'deploy')
+        with patch.object(guard,'docker') as docker,self.assertRaises(ValueError):guard.deploy(IMAGE,enabled)
+        docker.assert_not_called()
+
+    def test_strict_controller_four_methods_need_no_activated_attribute_and_probe_adapter_supplies_headers(self):
+        class Context:
+            __slots__=('events',)
+            def __init__(self):self.events=[]
+            def check(self,approval=None):self.events.append(('check',approval))
+            def probe(self,port,path,headers):self.events.append(('probe',port,path,headers));return 200
+            def bind_candidate(self,row):self.events.append(('bind',row))
+            def activate(self,approval):self.events.append(('activate',approval));return {'phase':'active','slot':'candidate'}
+        context=Context();controller=Mock();controller.authorize_deployment.return_value=context
+        def deploy(image,config,archive,api):
+            self.assertEqual(api['http_code'](8092,'/ready'),200);api['http_code'](8092,'/health',{'Host':'untrusted.invalid'});return {'activation':{'state':'active'}}
+        postgres=Mock();postgres.deploy.side_effect=deploy
+        with patch.object(guard.Path,'lstat',return_value=Mock(st_mode=stat.S_IFREG|0o600,st_uid=0)),patch.object(guard.importlib.util,'spec_from_file_location',return_value=Mock(loader=Mock())),patch.object(guard.importlib.util,'module_from_spec',side_effect=[controller,postgres]),patch.object(guard,'activation',return_value={'state':'active'}):
+            result=guard.deploy_entry_postgres(IMAGE,{**CONFIG,'port':8092,'storage_engine':'postgres'})
+            self.assertEqual(result['entry']['slot'],'candidate');self.assertIn(('probe',8092,'/ready',None),context.events)
+
+    def test_main_root_wire_mapping_still_calls_full_entry_gate_and_cannot_fall_back(self):
+        from unittest.mock import mock_open
+        cases=[('deploy',{'entry_deployment_enabled':True}),('deploy-entry-postgres',{'entry_installed_release':True,'image_transport':'ssh_archive'})]
+        for wire,extra in cases:
+            config={**CONFIG,'port':8092,'storage_engine':'postgres',**extra}
+            with self.subTest(wire=wire),tempfile.TemporaryDirectory() as directory:
+                target=Path(directory)/'config';target.write_text(json.dumps(config));stdin=Mock(buffer=io.BytesIO((json.dumps({'action':wire,'image':IMAGE})+'\n').encode()))
+                with patch.object(guard,'CONFIG',str(target)),patch.object(guard.sys,'stdin',stdin),patch.object(guard.Path,'lstat',return_value=Mock(st_mode=stat.S_IFREG|0o600,st_uid=0)),patch.object(guard,'open',mock_open(),create=True),patch.object(guard.fcntl,'flock'),patch.object(guard,'receive_archive') as receive,patch.object(guard,'deploy_entry_postgres',side_effect=RuntimeError('controller gate refused')) as entry,patch.object(guard,'deploy') as legacy:
+                    with self.assertRaisesRegex(RuntimeError,'controller gate refused'):guard.main()
+                    entry.assert_called_once_with(IMAGE,config,None);legacy.assert_not_called();receive.assert_not_called()
 
 if __name__=='__main__':unittest.main()

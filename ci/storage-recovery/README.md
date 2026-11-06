@@ -222,6 +222,18 @@ publisher 使用独立 `harbor-receiver-publisher-source-v1` 清单，覆盖控�
 
 `sourceMaterialPreparations`另外只读检查原`data/recording-encryption.key`的存在、普通文件类型、UID1000／0600与32字节长度；元数据通过不代表内容已验。旧SQLite可能没有该材料，须在正式迁移前由明确授权的材料准备步骤为缺失项生成新的独立正文主密钥并安装到源data，不能复用`key-encryption.key`或数据库报告key；已存在的材料绝不覆盖或自动重生成，异常须核查。bootstrap只报告该待办，不生成或安装此正文密钥，不写原data。原Key主密钥及账号登录材料保持，最终恢复应用与存储预检仍须实际核验正文材料。
 
+### 保留冷集群的显式版本换绑
+
+换绑的写挂载检查复用下述 `rotate-tools.py` 的完整本机库存及持资源状态判定，覆盖暂停、重启、移除中和 dead 状态；只读挂载及已确认无资源的停止实例保留原行为，任何未知库存或状态均拒绝，不依赖仅 running 的列表查询。
+
+已存在的 PGDATA、归档密钥和旧迁移 pending 不使用 `prepare` 重建。独立入口 `python3 ci/storage-recovery/rebind-bootstrap.py check|apply|rollback` 仅消费固定 root/0600、单链接的 `/etc/harbor-postgres-rebind.json`。批准版本1包含随机 UUID `id`、`expected`（`bootstrapSha256/stateSha256/publisherSha256/owner/cluster`）、`source`（`containerId/startedAt/dataSource/runtimeSource`）和完整 `nextBootstrap`。SHA 均取原文件字节；下一配置只能改变业务 B、与其绑定的基础设施 I、真实来源镜像 ID，并将 `publisherDatabase` 清为 null，端口与两个 origin 保持。旧 operator 已绑定的 publisher 允许与 bootstrap 的空值不同，但其完整旧字节也必须明确批准。
+
+仅在原 infra 正向确认缺失或已停止、owner/旧指纹/精确来源代次与目录均匹配、无运行容器可写挂载受保护材料、冷 PG18 的真实 system_identifier 与原归档配置一致时允许修改。入口持原三个控制文件 inode 锁，在 `postgres-infra/rebind/<UUID>/journal.json` 保存原字节和新字节，先持久化写意图，再原 inode 写入并 fsync；重复 `apply` 续跑，`rollback` 同样支持中断续跑并恢复原字节。原 key/TLS/PG 控制材料身份与摘要发生变化、未知 inode、已完成文件被外部修改或批准文件变化时均保全拒绝。日志与快照只留 root 私有目录，不输出密钥；回滚后同一批准不能再次 apply，应另签新批准。操作期间不可并发启动 infra、重启来源或修改控制文件。
+
+该入口不启动/删除容器，不改 PGDATA、TLS、归档、旧 pending，也不迁移或签发激活。先准备真实 CI 的 B/I 与受信 host helper；Node/app 安装不依赖 bootstrap，可先完成，原 `install-tools.py` 对非空工具树仍拒绝覆盖，升级前应排空引用原路径的任务并原样保留旧工具树。宿主 PG 工具仍需单独安装。完成换绑后按原入口启动同一集群，实际重做本代 baseline、异机恢复和新的独立迁移 run；旧 baseline/target 不能代替最新业务捕获，原 SQLite 锁及 activation 门禁保持。
+
+`ci/verify-source-recovery.mjs` 是独立 host 源码入口，安装到 `/usr/local/lib/harbor/verify-source-recovery.mjs` 后只由受控恢复器在持部署和 controller 锁时调用。它从固定 root operator 配置和已安装 B 模块读取实际状态，不接收“可恢复”参数；复用正式 resume inventory、签名 registry、精确角色 OID、SQLite lease 与源文件验证。未分配/未创建 runtime、部分导入及 promotion 已提交但尚未 consume 均须逐项正向证明；目标文件缺失本身不构成许可。完整旧捕获存在时匹配原数据/材料，否则在新私有目录调用原 capture 校验当前被隔离的权威源，输出明确的验证模式，不伪称历史快照匹配。仅撤销本次已认证角色/私有 lease，外来会话保留并拒绝恢复；任何实际 activation/deployment 消费拒绝。返回前释放源和 DB lease，恢复器继续持互斥锁；结果不是持久 capability，也不恢复网络/启动源或删除 PG。task-owned 真 PG 组件测试只输出 diagnostic 合同，不能作为 formal 恢复凭据。host 脚本须按独立批准 commit/SHA 交付，不为此重建固定业务镜像。
+
 ### 可选 CI 基础设施镜像验证
 
 默认流水线不运行基础设施验证，也不把它加入原业务镜像或部署门禁。创建流水线时显式设置 `HARBOR_POSTGRES_INFRA_SMOKE=1`，待同流水线 B 构建完成后，手动运行 `image_postgres_infrastructure`；后续准备和child smoke自动消费这两份同project/pipeline/commit/producer的严格digest收据，不回退tag或旧流水线镜像。可选作业失败不自动部署，也不改变现有候选验证与发布依赖。
@@ -243,6 +255,10 @@ PG首次初始化即显式`wal_level=replica`、`archive_mode=on`，避免以后
 官方initdb的固定初始化SQL仅作用于本工具新建的专用空集群，撤销全部初始数据库（含postgres/template1）的PUBLIC CONNECT/TEMP及当前库public schema默认CREATE；不在已有PGDATA或共享集群执行。Unix peer只匹配postgres管理／报告角色，其余local和hostssl路径用SCRAM，明文拒绝；后续runtime仍由正式迁移创建并核验自身目标库权限、无其他库CONNECT／无成员关系，不能借管理员URL绕过issuer。CI smoke另核实际数据库ACL已撤销PUBLIC通路。物理复制不匹配HBA的数据库`all`，bootstrap默认不开放physical replication。首次physical backup前，管理员须从实际root管理TLS连接读取`inet_client_addr()`，与本项目owned Docker bridge的gateway交叉核实后，仅为该单一来源批准IPv4 `/32`或IPv6 `/128`的`hostssl replication postgres` SCRAM规则，并显式拒绝非TLS复制；不得自动开放`0.0.0.0/0`或`::/0`复制准入，其他角色没有复制HBA许可，runtime也不得取得REPLICATION属性。核对原HBA字节、专用集群与归属后，仅替换已批准的固定HBA并调用`pg_reload_conf()`，再核`pg_hba_file_rules`及实际备份结果；普通数据库规则、监听和宿主回环发布端口不变，不重启PG，bootstrap的`check`不会自动改已有HBA。
 
 宿主Node+业务源码安装入口为`install-tools.py`，仅读固定`/etc/harbor-storage-tools.json`(root0600)，明确批准业务B digest、infra digest、revision及Node24.21.0；它只消费已有本地镜像，不启动临时容器，核真实Node／imageManifest后原子发布`/opt/harbor-storage-tools/{node/bin/node,app}`，已有非空目录拒绝覆盖。输出及installation.json保持`postgresHostToolsInstalled:false`，不能据Node+app安装成功认定宿主PG备份工具链或其他迁移前置已齐全；该工具组件验证不代表已在服务器安装。
+
+`rotate-tools.py prepare|accept|rollback` 提供既有非空工具树的独立可逆轮换，不改原安装算法。只消费固定 root/0600 `/etc/harbor-storage-tools-rotation.json`：版本1、UUID `id`、`expected.profileSha256/receiptSha256/treeIdentity`（原目录 dev/ino）和原工具配置格式的 `nextTools`。先停止定时调用并核实无旧 host 任务；工具再核真实进程 exe/cwd/maps/fd、Node/Python 的独立脚本入口，以及运行容器的工具树挂载，不对 `python -c` 源码文本或搜索词做子串判定。Docker 库存固定连接本机 root 控制的 `/run/docker.sock`，由真实 `docker info` 取得可信 data-root；磁盘仅提供 root 所有的 hex ID 目录集合，再逐 ID 调用真实 inspect 取状态及挂载，目录集合/inode、父目录及 socket 前后须一致，不读取磁盘 State 代替 API，也不以失败/超时当不存在。paused/restarting/removing/dead 保守检查工具挂载，完整停止且无资源者不扩大阻断。共享原 Node 安装锁，并持旧/新树原 PG 安装锁；观察不完整或存在使用者均拒绝，不停止进程。
+
+`prepare` 将原树原子 no-replace 移至 `/opt/harbor-storage-tools-history/<UUID>/previous`，在私有 journal 保存原 profile 字节并同 inode 写新 profile；原 installer 随后仍只向缺失 canonical 安装，PG 工具继续单独安装。`accept` 实际核新 receipt、源码 manifest 和 Node，再登记新树身份。`rollback` 保留新版整树为同目录 `replaced`，恢复原 profile 字节及原树 inode；每次移名和配置写入先存意图、同步目录/文件，重复原命令可续跑。未知目录、外来 canonical、原 profile 被替换或修改、批准变化均保全拒绝；不删除任何版本，不要求重新下载新镜像才能回退，也不改原服务和 activation。轮换 helper 必须从工具树之外的受信 host artifact 执行，不能以本机测试冒充服务器已完成轮换。
 
 新空集群的固定initdb参数为`--auth-local=peer --auth-host=scram-sha-256 --no-locale --encoding=UTF8`，与现有恢复／容量私有PG入口一致；CI smoke实际核`server_encoding=UTF8`及`datcollate/datctype=C`。不依赖官方镜像LANG或宿主glibc语言排序版本，也不会给已有库修改collation。
 
