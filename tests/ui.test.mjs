@@ -63,7 +63,7 @@ test('R45 changing a paged usage filter immediately removes the previous range w
   let release;const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response({rows:[deferredKeyUsage('Bob')],pagination:{page:1,pageSize:25,total:1,totalPages:1}}));}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot())+';tab="requests";recordView="usage";keyUsageScope="requests:";keyUsageData='+JSON.stringify({rows:[deferredKeyUsage('Alice')],pagination:{page:1,pageSize:25,total:1,totalPages:1}})+';render();');assert.match(page.node('#content').innerHTML,/Alice/);page.node('#request-filter').onchange({target:{value:'bob'}});await new Promise(setImmediate);assert.doesNotMatch(page.node('#content').innerHTML,/Alice/);assert.match(page.node('#content').innerHTML,/正在读取/);release();await new Promise(setImmediate);assert.match(page.node('#content').innerHTML,/Bob/);
 });
 test('R46 paged key usage displays the server page for case-insensitive and trimmed searches',async()=>{
-  const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot())+';tab="requests";recordView="usage";requestFilter=" alice ";keyUsageScope="requests: alice ";keyUsageData='+JSON.stringify({rows:[deferredKeyUsage('Alice')],pagination:{page:1,pageSize:25,total:1,totalPages:1}})+';render();');assert.match(page.node('#content').innerHTML,/Alice/);assert.match(page.node('#content').innerHTML,/共 1 把Key/);
+  const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot())+';tab="requests";recordView="usage";requestFilter=" alice ";keyUsageScope="requests: alice ";keyUsageData='+JSON.stringify({rows:[deferredKeyUsage('Alice')],pagination:{page:1,pageSize:25,total:1,totalPages:1}})+';render();');assert.match(page.node('#content').innerHTML,/Alice/);assert.match(page.node('#content').innerHTML,/共 1 个 Key/);
 });
 
 const typeHistory=()=>({type:{id:'usage-a',code:'A',name:'复杂研发',version:2,default_version:2},items:[{version:1,created:1,defaults:{allowed_models:['gpt-6.1-sol'],usage_limits:{enabled:false,rules:[]}}}],after:1,has_more:false});
@@ -238,8 +238,30 @@ test('nightly history names skipped account groups and preserves heavy-session e
 test('logout clears history cache and a pending history page cannot restore private data',async()=>{
  let release;const page=await ui(path=>path.startsWith('/api/admin/history')?new Promise(r=>release=()=>r(response({accounts:[],rows:[{id:'private-history'}],pagination:{page:1,pageSize:25,total:1,totalPages:1}}))):response({ok:true}));
  page.run('admin=true;state='+JSON.stringify({...snapshot(),keys:[]})+";tab='requests';");
- const pending=page.click('record-view','history');await page.node('#logout').onclick();release();await pending;
+ const pending=page.run('tab="history";loadHistory()');await page.node('#logout').onclick();release();await pending;
  assert.equal(page.run('historyData'),null);assert.equal(page.node('#content').innerHTML,'');assert.equal(page.run('recordView'),'usage');
+});
+test('系统操作历史独立导航，离开页面使迟到历史失效且不归入使用记录',async()=>{
+ let release;const paths=[],page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({accounts:[],rows:[],pagination:{page:1,total:0,totalPages:1}})));});
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),keys:[]})+';tab="history";');
+ const pending=page.run('loadHistory()');assert.equal(page.run('historyLoading'),true);assert.match(page.node('#content').innerHTML,/系统操作历史/);assert.match(page.node('#content').innerHTML,/aria-busy="true"/);assert.ok(!page.run('recordTabs()').includes('data-id="history"'));
+ page.run('setTab("accounts")');release();await pending;
+ assert.equal(page.run('historyData'),null);assert.equal(page.run('historyLoading'),false);assert.equal(paths.length,1);assert.ok(paths[0].startsWith('/api/admin/history?'));
+});
+test('侧栏管理设置集中入口并按实际环境提供备份，员工不见管理操作',async()=>{
+ const paths=[],page=await ui(path=>{paths.push(path);return response({});});
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),mode:'PostgreSQL · 开发验证',capabilities:{recordingHistory:true}}));
+ const pg=page.run('managementSettings()');assert.match(pg,/统计口径/);assert.match(pg,/模型费率/);assert.match(pg,/正文保留期/);assert.match(pg,/备份由运维命令管理/);assert.ok(!pg.includes('data-action="backup"'));
+ await page.click('backup');assert.deepEqual(paths,[]);
+ page.run('state.mode="本机 · 订阅测试"');assert.match(page.run('managementSettings()'),/data-action="backup"/);
+ page.run('admin=false');assert.equal(page.run('managementSettings()'),'');
+});
+test('手动刷新显示当前区域反馈，切页和失败会解除，后台刷新不罩页面',async()=>{
+ let release;const page=await ui(()=>new Promise(resolve=>release=()=>resolve(response({...snapshot(),busy:9}))));page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";render();');
+ const pending=page.run('refresh()');assert.equal(page.run('pageRefreshing()'),true);assert.equal(page.node('#refresh').disabled,true);assert.equal(page.node('#page-refresh-note').hidden,false);
+ page.run('setTab("members")');assert.equal(page.run('pageRefreshing()'),false);assert.equal(page.node('#refresh').disabled,false);release();await pending;assert.equal(page.run('state.busy'),0);assert.equal(page.run('foregroundRefreshVersion'),0);
+ const failed=await ui(()=>response({error:{message:'合成刷新失败'}},503));failed.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";render();');await failed.run('refresh()');assert.equal(failed.run('pageRefreshing()'),false);assert.equal(failed.node('#refresh').disabled,false);assert.match(failed.node('#toast').textContent,/合成刷新失败/);
+ let finish;const background=await ui(()=>new Promise(resolve=>finish=()=>resolve(response(snapshot()))));background.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";render();');const updating=background.run('automaticRefresh()');assert.equal(background.run('pageRefreshing()'),false);assert.equal(background.node('#refresh').disabled,false);finish();await updating;
 });
 
 test('expired admin session closes modal and allows password entry',async()=>{
@@ -513,7 +535,7 @@ test('a fixed API session created after its dialog closes cannot replace a newer
 test('automatic refresh is limited to live views and the unfiltered first request page',async()=>{
  const calls=[];const page=await ui(path=>{calls.push(path);return response(snapshot());});page.run('admin=true;state='+JSON.stringify(snapshot())+';');
  for(const tab of ['members','playground']){page.run('tab='+JSON.stringify(tab));await page.run('automaticRefresh()');}
- for(const record of ['usage','history']){page.run("tab='requests';recordView="+JSON.stringify(record));await page.run('automaticRefresh()');}
+ page.run("tab='history'");await page.run('automaticRefresh()');page.run("tab='requests';recordView='usage'");await page.run('automaticRefresh()');
  page.run("tab='requests';recordView='requests';requestsFilters.page=2;");await page.run('automaticRefresh()');page.run("requestsFilters.page=1;requestsFilters.model='gpt-fixture'");await page.run('automaticRefresh()');assert.deepEqual(calls,[]);
  for(const tab of ['overview','accounts','sessions']){page.run('tab='+JSON.stringify(tab));await page.run('automaticRefresh()');}assert.equal(calls.length,3);assert.ok(calls.every(x=>x==='/api/admin/state'));
  page.run("tab='overview';document.hidden=true");await page.run('automaticRefresh()');page.run("document.hidden=false;document.activeElement.tagName='TEXTAREA'");await page.run('automaticRefresh()');page.run("document.activeElement.tagName='BODY'");page.node('#modal').open=true;await page.run('automaticRefresh()');assert.equal(calls.length,3);
@@ -524,7 +546,7 @@ test('a late automatic response cannot refresh a static page reached after the r
 test('automatic latest-request refresh does not flash loading or replace unchanged rows; manual refresh remains available',async()=>{
  let release;const result={observedAt:1,summary:{requests:1,success:1,input:1,output:1,cached:0,unmetered:0,active:0,average_ms:1000},pagination:{page:1,pageSize:25,total:1,totalPages:1},rows:[],models:[],members:[],byModel:[],byMember:[]};
  const calls=[];const page=await ui(path=>{calls.push(path);return new Promise(r=>release=()=>r(response({...result,observedAt:2})));});page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(result)+";render();");const before=page.node('#content').innerHTML,pending=page.run('automaticRefresh()');assert.equal(page.node('#content').innerHTML,before);assert.ok(!page.node('#content').innerHTML.includes('正在读取'));release();await pending;assert.equal(page.node('#content').innerHTML,before);assert.ok(calls[0].startsWith('/api/admin/requests?'));assert.ok(!calls.includes('/api/admin/state'));
- page.run("recordView='history';historyData=null;render()");assert.equal(page.run('automaticRefreshScope()'),'');
+ page.run("tab='history';historyData=null;render()");assert.equal(page.run('automaticRefreshScope()'),'');
 });
 
 test('request refresh restores online status after an outage without accepting late responses',async()=>{
@@ -557,7 +579,7 @@ test('account entry separates subscription and Key types and preserves independe
 const pricingState=()=>({seedCaptured:'2026-10-29',settings:{enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[]},state:{active:'a'.repeat(64)},unpricedModels:[{model:'new-model',requests:2}],rates:[{model:'gpt-6.1-sol',input:'2',cached:'0.1',output:'10',manual:false}]});
 test('late fee settings cannot replace a newer dialog and the settings view identifies missing prices without raw usage',async()=>{
  let release;const page=await ui(()=>new Promise(r=>release=()=>r(response(pricingState()))));page.run('admin=true;');const pending=page.click('pricing-settings');await page.click('close');page.run("modal('<h2>other</h2>')");release();await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>other</h2>');
- const html=page.run('pricingOverview('+JSON.stringify(pricingState())+')');assert.match(html,/new-model：2条/);assert.match(html,/缺价不按0/);assert.match(html,/Standard参考消耗USD/);assert.doesNotMatch(html,/亿 Token/);assert.match(html,/\$2\.00/);assert.match(html,/\$0\.10/);
+ const html=page.run('pricingOverview('+JSON.stringify(pricingState())+')');assert.match(html,/new-model：2条/);assert.match(html,/缺价不按0/);assert.match(html,/USD \/ 100万Token/);assert.doesNotMatch(html,/亿 Token/);assert.match(html,/\$2\.00/);assert.match(html,/\$0\.10/);
 });
 test('fee alias removal identifies the exact mapping even after the server has reordered the list',async()=>{
  const a={name:'alias-a',target:'gpt-6.1-sol',from:1,to:null,source:'fixture A'},b={name:'alias-b',target:'gpt-6.1-sol',from:1,to:null,source:'fixture B'},calls=[];
@@ -783,6 +805,23 @@ const recordingSearchPage=(patch={})=>({items:[{id:'recording-one',started:Date.
 const recordingDocumentPage=(patch={})=>({state:'complete',turn_state:'known',source_sequence:2,indexed_at:100,index_pending:false,expires_at:Date.now()+3600000,items:[{ordinal:1,kind:'user',text:'<script>不得执行()</script>',metadata:{},continuation:false}],next:1,has_more:false,...patch});
 const exportTask=(patch={})=>({id:'recording.export:11111111-1111-1111-1111-111111111111',status:'queued',job_status:'queued',rows:0,bytes:0,chunks:0,created:Date.now(),expires:Date.now()+3600000,include_body:false,format:'csv',limits:{rows:1000,bytes:1048576},download_ready:false,...patch});
 const prepareRecordingAdmin=page=>page.run('admin=true;state='+JSON.stringify(recordingAdminSnapshot())+';tab="requests";recordView="recordings";');
+test('正文管理默认只显示条件，进入和返回不读取正文状态目录或旧导出任务',async()=>{
+ const calls=[],page=await ui(path=>{calls.push(path);return response(path.includes('/status')?{index_pending:0,index_failed:0,storage:{status:'healthy'}}:path.includes('/exports')?{items:[],next_cursor:null}:recordingSearchPage());});
+ prepareRecordingAdmin(page);page.run('recordView="usage";recordingAdminFilters.q="保留查询草稿";recordingAdminTab="exports";recordingAdminData='+JSON.stringify(recordingSearchPage())+';recordingAdminStatus={index_pending:7};recordingExportList={items:[],next_cursor:null};');
+ await page.click('record-view','recordings');await new Promise(setImmediate);
+ assert.deepEqual(calls,[]);assert.equal(page.run('recordingAdminData'),null);assert.equal(page.run('recordingAdminStatus'),null);assert.equal(page.run('recordingAdminQuery'),null);assert.equal(page.run('recordingExportList'),null);assert.equal(page.run('recordingAdminTab'),'query');assert.equal(page.run('recordingAdminFilters.q'),'保留查询草稿');
+ assert.ok(!page.node('#content').innerHTML.includes('合成中文问题'));assert.ok(!page.node('#content').innerHTML.includes('后台状态待读取'));
+ for(const timer of page.intervals)timer.fn();await new Promise(setImmediate);assert.deepEqual(calls,[]);
+ await page.click('recording-admin-status');assert.deepEqual(calls,['/api/admin/recordings/status']);
+ await page.run('loadRecordingAdminQuery(true)');assert.ok(calls[1].startsWith('/api/admin/recordings/search?'));
+ await page.click('recording-admin-tab','exports');assert.ok(calls[2].startsWith('/api/admin/recordings/exports?'));
+ page.run('setTab("accounts");setTab("requests")');await new Promise(setImmediate);assert.equal(calls.length,3);assert.equal(page.run('recordingAdminData'),null);assert.equal(page.run('recordingAdminStatus'),null);assert.equal(page.run('recordingExportList'),null);assert.equal(page.run('recordingAdminTab'),'query');
+});
+test('会话正文入口只带入条件，查询仍由管理员主动发起',async()=>{
+ const paths=[],page=await ui(path=>{paths.push(path);return response(recordingSearchPage());});prepareRecordingAdmin(page);
+ await page.run('openRecordingSession("session-explicit")');assert.deepEqual(paths,[]);assert.equal(page.run('recordingAdminFilters.session'),'session-explicit');assert.equal(page.run('recordingAdminData'),null);
+ await page.run('loadRecordingAdminQuery(true)');assert.equal(paths.length,1);assert.ok(paths[0].startsWith('/api/admin/recordings/session?'));assert.equal(new URL(paths[0],'http://localhost').searchParams.get('session'),'session-explicit');
+});
 test('正文查询固定时间和游标，字面中文代码正确编码且片段始终转义',async()=>{
  const paths=[];const page=await ui(path=>{paths.push(path);return response(recordingSearchPage({has_more:paths.length===1,next:paths.length===1?'opaque-next':null}));});prepareRecordingAdmin(page);page.run('recordingAdminFilters.q="中文 createInvoice()";');await page.run('loadRecordingAdminQuery(true)');assert.match(page.node('#content').innerHTML,/&lt;img src=x onerror=alert\(1\)&gt;/);assert.ok(!page.node('#content').innerHTML.includes('<img src=x'));await page.click('recording-query-page','next');const first=new URL(paths[0],'http://localhost'),next=new URL(paths[1],'http://localhost');assert.equal(first.searchParams.get('q'),'中文 createInvoice()');assert.equal(first.searchParams.get('from'),next.searchParams.get('from'));assert.equal(next.searchParams.get('cursor'),'opaque-next');
 });
@@ -908,4 +947,21 @@ test('账号管理复用原停用与移除确认，不因打开管理而写入',
 });
 test('检查Key后只更新仍在查看的账号管理，迟到检查不覆盖其他弹窗',async()=>{
  let release;const data={...snapshot(),accounts:managedAccounts()},page=await ui((path,options)=>path.endsWith('/check')?new Promise(resolve=>{release=()=>resolve(response({ready:true}));}):response(data));page.run('admin=true;state='+JSON.stringify(data)+';');await page.click('manage-account','api-one');const checking=page.click('check-account','api-one');await new Promise(setImmediate);await page.click('manage-account','api-two');release();await checking;assert.match(page.node('#modal-content').innerHTML,/合成API Key二/);assert.equal(page.run('accountManagementId'),'api-two');
+});
+
+// Foreground cancellation and automatic paged reads exercise separate lifecycles.
+test('会话翻页读取中离开并返回会释放遮罩，旧响应不覆盖新查询',async()=>{
+ let release;const page=await ui(()=>new Promise(resolve=>release=()=>resolve(response({...snapshot(),sessions:[],busy:9}))));page.run('admin=true;state='+JSON.stringify({...snapshot(),sessions:[]})+';tab="sessions";sessionsLoading=true;sessionsPage=2;render();');const pending=page.run('refresh()');page.run('setTab("accounts");setTab("sessions")');assert.equal(page.run('sessionsLoading'),false);assert.equal(page.run('pageRefreshing()'),false);assert.equal(page.run('sessionsPage'),1);release();await pending;assert.equal(page.run('state.busy'),0);assert.equal(page.run('sessionsLoading'),false);
+ const next=page.run('refresh()');assert.equal(page.run('pageRefreshing()'),true);release();await next;assert.equal(page.run('state.busy'),9);assert.equal(page.run('pageRefreshing()'),false);
+});
+test('分页总览自动刷新Key用量不启用前景遮罩，手动读取仍反馈',async()=>{
+ let release;const value=pagedSnapshot(),result={rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}};const page=await ui(path=>path.startsWith('/api/admin/keys?')?new Promise(resolve=>release=()=>resolve(response(result))):response(value));page.run('admin=true;state='+JSON.stringify(value)+';tab="overview";keyUsageScope="overview:";render();');const pending=page.run('automaticRefresh()');await new Promise(setImmediate);assert.equal(page.run('keyUsageLoading'),false);assert.equal(page.run('pageRefreshing()'),false);assert.ok(!page.node('#content').innerHTML.includes('aria-busy="true"'));release();await pending;
+ const manual=page.run('loadKeyUsage()');assert.equal(page.run('keyUsageLoading'),true);release();await manual;assert.equal(page.run('keyUsageLoading'),false);
+});
+
+test('正文类型筛选按需加载目录，同一在途去重并原位更新且失败可重试',async()=>{
+ const paths=[];let release,fail=true;const page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(fail?response({error:{message:'目录暂时失败'}},503):response({types:[{id:'type-a',code:'A',name:'研发'}]})));});prepareRecordingAdmin(page);const select={value:'historical_unknown',innerHTML:''};page.node('#recording-query-form').querySelector=()=>select;page.run('bindRecordingAdmin()');const form=page.node('#recording-query-form'),event={target:{name:'type',tagName:'SELECT'}};assert.deepEqual(paths,[]);select.onfocus(event);form.onpointerdown(event);assert.deepEqual(paths,['/api/admin/member-types']);release();await new Promise(setImmediate);assert.equal(page.run('typeCatalogController'),null);fail=false;form.onpointerdown(event);select.onfocus(event);assert.equal(paths.length,2);release();await new Promise(setImmediate);assert.match(select.innerHTML,/A · 研发/);assert.match(select.innerHTML,/value="historical_unknown" selected/);assert.equal(select.value,'historical_unknown');assert.equal(page.run('recordingAdminData'),null);assert.equal(page.run('recordingAdminStatus'),null);assert.ok(paths.every(path=>path==='/api/admin/member-types'));
+});
+test('概览已在途类型目录进入正文后只更新筛选，不自动读取正文或覆盖草稿',async()=>{
+ let release;const paths=[],page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({types:[{id:'type-a',code:'A',name:'研发'}]})));});prepareRecordingAdmin(page);page.run('tab="overview"');const pending=page.run('loadTypeCatalog()');page.run('tab="requests";recordView="recordings";recordingAdminFilters.q="保留草稿";');const select={value:'type-a',innerHTML:''};page.node('#recording-query-form').querySelector=()=>select;page.run('bindRecordingAdmin()');select.onfocus({target:{name:'type',tagName:'SELECT'}});assert.equal(paths.length,1);release();await pending;assert.match(select.innerHTML,/A · 研发/);assert.equal(page.run('recordingAdminFilters.q'),'保留草稿');assert.deepEqual(paths,['/api/admin/member-types']);
 });
