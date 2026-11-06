@@ -8,18 +8,19 @@ import {capacityRunLifetime,capacityRunBudget} from './certificate-lifetime.mjs'
 import {uiAcceptancePlan} from './ui-acceptance.mjs';
 import {verifyDataset} from './dataset.mjs';
 import {normalizeCapacityResourceLimits} from './resources.mjs';
+import {normalizeCapacityDiskBudget} from './storage-budget.mjs';
 
 const invalid=()=>{throw Error('capacity_factory_owner_configuration');};
 const safeKeys=(value,allowed)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(key=>allowed.includes(key));
 export function validateCapacityFactoryJob(job){
- if(!safeKeys(job,['target','execution'])||!safeKeys(job.target,['profile','purpose','binDirectory','libraryDirectory','storageRoot','runLifetimeMs','windowsHelper','employeeCount','resourceDelegatedRoot','diskBudget','resourceLimits'])||!safeKeys(job.execution??{},['executeLong','browserLauncher','uiMaxDurationMs','apiMaxDurationMs']))invalid();
+ if(!safeKeys(job,['target','execution'])||!safeKeys(job.target,['profile','purpose','binDirectory','libraryDirectory','storageRoot','runLifetimeMs','windowsHelper','employeeCount','resourceDelegatedRoot','diskBudget','resourceLimits','recovery'])||!safeKeys(job.execution??{},['executeLong','browserLauncher','uiMaxDurationMs','apiMaxDurationMs']))invalid();
  const {target,execution={}}=job;if(target.resourceLimits!==undefined){normalizeCapacityResourceLimits(target.resourceLimits);if(target.resourceDelegatedRoot===undefined)throw Error('capacity_resource_delegation_required');}capacityPlan(target.profile??'selfcheck');if(!['run','seed','verify'].includes(target.purpose??'run'))invalid();
  for(const key of ['binDirectory','libraryDirectory','storageRoot','resourceDelegatedRoot'])if(target[key]!==undefined&&(typeof target[key]!=='string'||!isAbsolute(target[key])))invalid();
  if(execution.browserLauncher!==undefined&&(typeof execution.browserLauncher!=='string'||!isAbsolute(execution.browserLauncher)))invalid();
  if(execution.executeLong!==undefined&&typeof execution.executeLong!=='boolean')invalid();
- const formal=target.profile==='formal',run=(target.purpose??'run')==='run';if(formal&&run&&execution.executeLong!==true)throw Error('capacity_formal_execution_not_authorized');
+ const formal=target.profile==='formal',run=(target.purpose??'run')==='run';if(target.recovery!==undefined&&(typeof target.recovery!=='boolean'||target.recovery&&!run))invalid();if(formal&&run&&target.recovery===false)throw Error('capacity_formal_recovery_required');if(target.diskBudget!==undefined)normalizeCapacityDiskBudget(target.diskBudget);if(formal&&run&&execution.executeLong!==true)throw Error('capacity_formal_execution_not_authorized');
  capacityRunLifetime(target.runLifetimeMs,{required:formal&&run});if(run){if(formal&&!execution.browserLauncher)throw Error('capacity_browser_launcher_required');apiCoverageDuration(execution.apiMaxDurationMs,{required:formal});if(execution.browserLauncher)uiAcceptancePlan({profile:target.profile??'selfcheck',maxDurationMs:execution.uiMaxDurationMs});capacityRunBudget({plan:capacityPlan(target.profile??'selfcheck'),runLifetimeMs:target.runLifetimeMs,apiMaxDurationMs:execution.apiMaxDurationMs,uiMaxDurationMs:execution.browserLauncher?execution.uiMaxDurationMs:undefined});}
- const validated=structuredClone(job);if(target.resourceLimits!==undefined)validated.target.resourceLimits=normalizeCapacityResourceLimits(validated.target.resourceLimits);return validated;
+ const validated=structuredClone(job);if(target.resourceLimits!==undefined)validated.target.resourceLimits=normalizeCapacityResourceLimits(validated.target.resourceLimits);if(target.diskBudget!==undefined)validated.target.diskBudget=normalizeCapacityDiskBudget(validated.target.diskBudget);if(formal&&run)validated.target.recovery=true;return validated;
 }
 async function processIdentity(pid){const raw=await readFile('/proc/'+pid+'/stat','utf8'),fields=raw.slice(raw.lastIndexOf(')')+2).split(' ');return {parent:Number(fields[1]),state:fields[0],started:fields[19]};}
 

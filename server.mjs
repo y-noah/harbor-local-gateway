@@ -2,7 +2,7 @@ import http from 'node:http';
 import {integer,name,expiry,bool,apiKeyValue,apiWeightValue} from './admin-input.mjs';
 import {homedir} from 'node:os';
 import {acquireInstance} from './instance.mjs';
-import {passwordHash,createAdminAuth} from './auth.mjs';
+import {passwordHash,createAdminAuth,adminCookieName} from './auth.mjs';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -50,6 +50,7 @@ export function createGateway(options={}) {
     if(existsSync(configPath))config=JSON.parse(readFileSync(configPath,'utf8'));
     else {config={port:43127,adminToken:randomBytes(32).toString('base64url'),codexBinary:discoverCodex(),reserveTokens:32000};writeFileSync(configPath,JSON.stringify(config,null,2));}
   }
+  adminCookieName(config);
   if(!options.config){
     const binary=recoverCodexBinary(config.codexBinary);
     if(binary!==config.codexBinary){config.codexBinary=binary;writeFileSync(configPath,JSON.stringify(config,null,2));}

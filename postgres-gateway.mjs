@@ -14,7 +14,7 @@ import {fileURLToPath} from 'node:url';
 import {monitorEventLoopDelay} from 'node:perf_hooks';
 import {PostgresStore} from './postgres-store.mjs';
 import {AppError,revealStoredKey} from './store.mjs';
-import {createAdminAuth,passwordHash} from './auth.mjs';
+import {createAdminAuth,passwordHash,adminCookieName} from './auth.mjs';
 import {networkConfig,acceptsRequest} from './network.mjs';
 import {acquireInstance} from './instance.mjs';
 import {createRequestBodyBudget} from './request-body-budget.mjs';
@@ -74,7 +74,7 @@ async function initialConfig(data,configPath){
   }
   let config;
   if(!await missing(pending)){
-    config=JSON.parse((await privateFile(pending)).toString('utf8'));
+    config=JSON.parse((await privateFile(pending)).toString('utf8'));adminCookieName(config);
     if(!validConfig(config)||passwordHash(password,config.adminPasswordHash.salt).digest!==config.adminPasswordHash.digest)throw new AppError(503,'待完成启动配置与密码副本不一致','gateway_configuration');
   }else{
     config={port:43127,codexBinary:'codex',adminPasswordHash:passwordHash(password)};
@@ -139,6 +139,7 @@ export async function createPostgresGateway(options={}){
       if(!await missing(configPath))config=JSON.parse((await privateFile(configPath)).toString('utf8'));
       else config=await initialConfig(data,configPath);
     }
+    adminCookieName(config);
     if(!validConfig(config))throw new AppError(503,'服务启动配置无效','gateway_configuration');
     deviceSettings=options.devices??await deviceConfiguration(env);if(options.devices===undefined)ownedDeviceIssuer=deviceSettings?.issuer;
     const encrypted=(await store.get("SELECT EXISTS(SELECT 1 FROM harbor.keys WHERE secret_cipher IS NOT NULL) OR EXISTS(SELECT 1 FROM harbor.accounts WHERE api_secret_cipher IS NOT NULL) required")).required;

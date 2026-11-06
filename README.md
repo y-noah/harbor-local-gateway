@@ -20,9 +20,17 @@ CLI在数据库所有权丢失后停止接纳、完成必要持久化并退出�
 
 正文采集记录客户端实际上传的本轮内容及工具交互，不把整段历史重复记为本轮，也不声称记录客户端未上传的操作。部署者应按实际需求配置采集、访问控制和保留周期。
 
+## 管理登录配置
+
+同一主机并行运行多个实例时，可在各自 `data/settings.json` 显式设置不同的 `adminCookieName`（例如 `harbor_session_preview`），避免浏览器在不同端口覆盖管理登录。名称须为1–64位ASCII字符、字母开头，仅含字母、数字、下划线或连字符；空值、非法类型及其他字符均拒绝启动，PG预检也校验。未设置时沿用 `harbor_session`；名称在启动时固定，不从请求Host或转发头派生。变更后重启并重新登录；只读取和注销当前名称，不回退读取或清除其他名称的Cookie。删除此字段或设回 `harbor_session` 即恢复默认，但同主机不同端口再次共用该名称。配置不修改管理密码、员工Key或Cookie原有属性，也不提供端口间安全隔离；各实例分别维护自己的配置。
+
 ## 容量实验资源
 
 容量运行可显式提供 `--resource-limits-file <JSON文件>`，通过现有 `--owner-entry` 和 `--delegated-cgroup` 路径交给 native owner；声明资源但未提供委派时拒绝，不把声明当实测。省略配置仍为网关／Worker共享4 vCPU／8 GiB、数据库独立4 vCPU／8 GiB。配置只包含 `gatewayWorker`、`database` 两角色的 `cpuQuota` 与 `memoryLimitBytes`，可附完整 `processLimits.gateway/worker` 及可选 `processLimits.database`；未附时叶子继承所属角色上限，并继续受共享组约束。CPU须能按100000微秒周期精确表示且不低于内核1000微秒最小quota，内存为正安全整数字节。非法值、缺字段、未知字段及超过角色的叶子限额在创建资源前拒绝。
+
+`run/seed/verify` 的 `--disk-budget-file <JSON文件>` 沿相同执行链传入显式磁盘计划，固定包含 `dataBytes`、`metadataBytes`、`indexBytes`、`walBytes`、`backupBytes`、`temporaryBytes`、`growthBytes` 七项正安全整数字节；未知字段、缺项、零值或非法类型在导入适配器／分配资源前拒绝。实际formal执行仍按 `--storage-root` 核选定目录的真实可用空间、完整正文源大小及各项合计，不把计划当作全量实测。WSL等稀疏虚拟磁盘还须核实际宿主卷空间，不能只根据虚拟文件系统的逻辑余量开始全量造数。省略该参数不生成虚构预算，formal仍因缺证拒绝；既有selfcheck默认不变。
+
+formal `run` 通过CLI和native owner时自动接通原有物理恢复阶段，不能显式关闭；`seed/verify` 及selfcheck默认不启用恢复。它让同factory的原Key、TLS、正文与设备恢复评估可达，不会自动安装runtime trust、批准拓扑或把其他运行的恢复收据当成本轮资格。正式数据量和性能门槛保持不变，其他前置缺失仍在造数前拒绝。
 
 例如，采用不同进程限额复现实验，可使用以下声明（文件由执行者明确选择，不来自客户端请求）：
 

@@ -4,10 +4,16 @@ import {AppError,hash} from './store.mjs';
 export function passwordHash(password,salt=randomBytes(16).toString('hex')){
   return {salt,digest:scryptSync(password,salt,32).toString('hex')};
 }
+export function adminCookieName(config){
+  const name=config.adminCookieName;if(name===undefined)return 'harbor_session';
+  if(typeof name!=='string'||name.length<1||name.length>64||!/^[A-Za-z]/.test(name)||/[^A-Za-z0-9_-]/.test(name))throw new AppError(503,'管理Cookie名称配置无效','admin_cookie_configuration');
+  return name;
+}
 export function createAdminAuth(config,{clock=Date.now}={}){
+  const cookieName=adminCookieName(config);
   const maxSessions=100,sessions=new Map();let failures=0,blockedUntil=0,pendingLogins=0,loginTail=Promise.resolve();
-  const cookie=(token,seconds)=>`harbor_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${seconds}`;
-  function token(req){return String(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('harbor_session='))?.slice(15)||'';}
+  const cookie=(token,seconds)=>`${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${seconds}`;
+  function token(req){return String(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='))?.slice(cookieName.length+1)||'';}
   function authenticated(req){
     const key=token(req),expires=sessions.get(key);if(!expires)return false;
     if(expires<=clock()){sessions.delete(key);return false;}return true;
