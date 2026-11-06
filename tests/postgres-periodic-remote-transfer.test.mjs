@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {randomBytes,createHash} from 'node:crypto';
 import fs from 'node:fs';
 import {syncBuiltinESMExports} from 'node:module';
-import {execFile} from 'node:child_process';
+import {execFile,spawn} from 'node:child_process';
+import {once,getEventListeners} from 'node:events';
 import {promisify} from 'node:util';
 import {mkdir,readFile,readdir,writeFile,rm,lstat} from 'node:fs/promises';
 import {join} from 'node:path';
@@ -13,9 +14,12 @@ import {createTaskPostgresBackupContext,closePostgresBackupContext,postgresBacku
 import {createPeriodicSourceBase,loadAuthenticatedPeriodicBase} from '../postgres-backup.mjs';
 import {publishPeriodicBaseVerification} from '../postgres-periodic-base-verification.mjs';
 import {capturePeriodicApplicationBackup} from '../postgres-periodic-application-backup.mjs';
-import {createPeriodicTransferIndex,usePeriodicTransferIndex,openPeriodicTransferSource,releasePeriodicTransferIndex} from '../postgres-periodic-transfer-index.mjs';
-import {createTaskPeriodicObjectStore,closePeriodicObjectStore,createPeriodicTransferInbox,writePeriodicTransferControl,describePeriodicRemoteHandoff,receiveRemotePeriodicIndex,releasePeriodicTransferInbox,periodicObjectStoreSettings,materializePeriodicStoredBundle} from '../postgres-periodic-object-store.mjs';
+import {createPeriodicTransferIndex,usePeriodicTransferIndex,openPeriodicTransferSource,releasePeriodicTransferIndex,inspectPeriodicTransferIndex} from '../postgres-periodic-transfer-index.mjs';
+import {acquireInstance} from '../instance.mjs';
+import {createTaskPeriodicObjectStore,closePeriodicObjectStore,createPeriodicTransferInbox,writePeriodicTransferControl,describePeriodicRemoteHandoff,receiveRemotePeriodicIndex,releasePeriodicTransferInbox,periodicObjectStoreSettings,materializePeriodicStoredBundle,periodicObjectStoreLifetime} from '../postgres-periodic-object-store.mjs';
 import {digestFile} from '../migration-artifacts.mjs';
+import {PeriodicSshWire} from '../postgres-periodic-ssh-wire.mjs';
+import {servePeriodicSshSource,receivePeriodicSshTransfer} from '../postgres-periodic-ssh-transfer.mjs';
 
 const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB;
 async function boundedGate(promise,label){let timer;try{return await Promise.race([promise,new Promise((resolve,reject)=>{timer=setTimeout(()=>reject(Error('synthetic_gate_deadline_'+label)),5000);})]);}finally{clearTimeout(timer);}}
@@ -47,6 +51,37 @@ test('authenticated remote ranges resume real encrypted objects, enforce inbox q
  const resumed=await deliver(first.index,target.store);assert.equal(resumed.transportComplete,true);for(const field of ['restoreVerified','offhostVerified','deploymentAllowed'])assert.equal(resumed[field],false);const before=calls,repeated=await deliver(first.index,target.store);assert.equal(repeated.bytesSent,0);assert.equal(calls,before,'received object identities avoid all source ranges');
  const next=await indexAt('index-two'),delivered=await deliver(next.index,target.store);assert.equal(delivered.baseBytesSent,0,'new point reuses the same authenticated encrypted base');assert.ok(delivered.bytesSent>0);
  await releasePeriodicTransferInbox(target.store,stopped.inbox);
+ function pipePeers(){const forward=spawn('/bin/cat',[],{stdio:['pipe','pipe','ignore']}),reverse=spawn('/bin/cat',[],{stdio:['pipe','pipe','ignore']}),exited=[once(forward,'exit'),once(reverse,'exit')],source=new PeriodicSshWire(reverse.stdout,forward.stdin,{timeoutMs:3600000}),receiver=new PeriodicSshWire(forward.stdout,reverse.stdin,{timeoutMs:3600000});return {source,receiver,async close(){source.close();receiver.close();forward.kill('SIGKILL');reverse.kill('SIGKILL');await Promise.all(exited);}};}
+ // The owner lifetime spans the whole receiver, including before start and
+ // while a control frame has not yet reached any object-store operation.
+ for(const stage of ['before-start','control-header','control-cipher']){
+  const ending=await storeAt('owner-close-'+stage),lifetime=periodicObjectStoreLifetime(ending.store),listeners=getEventListeners(lifetime,'abort').length,pipes=pipePeers();let waitingCipher=false;const readBytes=pipes.receiver.readBytes.bind(pipes.receiver);pipes.receiver.readBytes=async bytes=>{waitingCipher=true;return readBytes(bytes);};
+  const receiving=receivePeriodicSshTransfer(ending.store,pipes.receiver),rejected=assert.rejects(receiving,{name:'AbortError'});assert.equal(getEventListeners(lifetime,'abort').length,listeners+1);
+  try{
+   if(stage!=='before-start'){const handoffDigest=inspectPeriodicTransferIndex(first.index).handoffDigest;await pipes.source.writeJson({kind:'periodic-start',version:1,handoffDigest});if(stage==='control-cipher'){await pipes.source.writeJson({kind:'control',name:'handoff.enc',digest:handoffDigest});await pipes.source.writeBytes(Buffer.alloc(1));}
+    const deadline=Date.now()+5000;for(;;){if((await readdir(join(ending.directory,'incoming'))).length===1&&pipes.receiver.reading&&(stage!=='control-cipher'||waitingCipher&&pipes.receiver.input.readableLength===0))break;if(Date.now()>=deadline)throw Error('synthetic_owner_close_stage_deadline');await new Promise(resolve=>setImmediate(resolve));}
+   }
+   await boundedGate(closePeriodicObjectStore(ending.store),'owner-'+stage);await boundedGate(rejected,'receiver-'+stage);assert.deepEqual(await readdir(join(ending.directory,'incoming')),[]);assert.equal(getEventListeners(lifetime,'abort').length,listeners);
+  }finally{await pipes.close();}
+ }
+ // More failures than maxPoints must not strand private control inboxes. A
+ // subsequent normal protocol transfer below uses this exact same store.
+ for(let attempt=0;attempt<=limits.maxPoints;attempt++){
+  const pipes=pipePeers(),receiving=receivePeriodicSshTransfer(target.store,pipes.receiver),rejected=assert.rejects(receiving,{code:'periodic_ssh_control_invalid'}),handoffDigest=inspectPeriodicTransferIndex(first.index).handoffDigest;
+  try{await pipes.source.writeJson({kind:'periodic-start',version:1,handoffDigest});await pipes.source.writeJson({kind:'control',name:'foreign.enc',digest:handoffDigest});await rejected;assert.deepEqual(await readdir(join(target.directory,'incoming')),[]);}finally{await pipes.close();}
+ }
+ // Keep the peer connected but withhold the requested suffix. Store close
+ // must cancel that real pipe read, release its lease and clean only controls.
+ const blocked=await storeAt('blocked-wire');await usePeriodicTransferIndex(first.index,async source=>{
+  const pipes=pipePeers(),receiving=receivePeriodicSshTransfer(blocked.store,pipes.receiver),rejected=assert.rejects(receiving,{name:'AbortError'});
+  try{await pipes.source.writeJson({kind:'periodic-start',version:1,handoffDigest:source.handoffDigest});for(const part of [{name:'handoff.enc',digest:source.handoffDigest},...source.manifest.parts]){await pipes.source.writeJson({kind:'control',name:part.name,digest:part.digest});await pipes.source.writeBytes(await readFile(join(source.directory,part.name)));}assert.equal((await pipes.source.readJson()).kind,'suffix');await boundedGate(closePeriodicObjectStore(blocked.store),'closed-store-network-read');await boundedGate(rejected,'closed-store-receiver-cleanup');assert.deepEqual(await readdir(join(blocked.directory,'incoming')),[]);assert.ok((await readdir(join(blocked.directory,'partial'))).some(name=>name.endsWith('.cursor.enc')),'partial remains resumable');const lease=await acquireInstance(join(blocked.directory,'.periodic-object-store'));await lease.release();}
+  finally{await pipes.close();}
+ });
+ // Standard subprocess pipes carry the fixed protocol. Both peers still use
+ // genuine in-process index/store capabilities; no capability is serialized.
+ const wirePoint=await indexAt('index-wire'),forward=spawn('/bin/cat',[],{stdio:['pipe','pipe','ignore']}),reverse=spawn('/bin/cat',[],{stdio:['pipe','pipe','ignore']}),forwardExit=once(forward,'exit'),reverseExit=once(reverse,'exit'),sourceWire=new PeriodicSshWire(reverse.stdout,forward.stdin,{timeoutMs:30000}),receiverWire=new PeriodicSshWire(forward.stdout,reverse.stdin,{timeoutMs:30000});
+ try{const [sent,received]=await Promise.all([servePeriodicSshSource(wirePoint.index,sourceWire),receivePeriodicSshTransfer(target.store,receiverWire)]);assert.equal(sent.transportComplete,true);assert.equal(received.transportComplete,true);assert.equal(received.baseBytesSent,0);assert.ok(received.bytesSent>0);for(const field of ['restoreVerified','offhostVerified','deploymentAllowed']){assert.equal(sent[field],false);assert.equal(received[field],false);}}
+ finally{sourceWire.close();receiverWire.close();forward.kill('SIGKILL');reverse.kill('SIGKILL');await Promise.all([forwardExit,reverseExit]);}
  // A correct-length but corrupt stream leaves a durable reset intention. A
  // retry must re-read the object, including a crash after truncation but before
  // the cursor can record the new empty-file identity.
@@ -95,7 +130,7 @@ test('authenticated remote ranges resume real encrypted objects, enforce inbox q
   fs.promises.mkdir=async(path,...args)=>{const result=await originalMkdir(path,...args);if(boundary==='inbox-create'&&String(path).startsWith(join(ending.directory,'incoming','i-'))){reached();await boundedGate(gate,'release');}return result;};
   fs.promises.open=async(path,...args)=>{const handle=await originalOpen(path,...args);if(boundary==='control-write'&&String(path)===join(created,'handoff.enc')){const close=handle.close.bind(handle);handle.close=async()=>{handleClosed=true;return close();};reached();await boundedGate(gate,'release');}return handle;};syncBuiltinESMExports();
   let writing,closing;
-  try{writing=boundary==='inbox-create'?createPeriodicTransferInbox(ending.store):writePeriodicTransferControl(ending.store,created,'handoff.enc',content,digest);await boundedGate(entered,'enter');closing=closePeriodicObjectStore(ending.store).then(()=>{closed=true;});await Promise.resolve();assert.equal(closed,false,'close waits for the actual pending operation and lease cleanup');continueWork();await assert.rejects(boundedGate(writing,'write-settle'),{name:'AbortError'});await boundedGate(closing,'close-settle');assert.equal(closed,true);if(boundary==='control-write')assert.equal(handleClosed,true);}
+  try{writing=boundary==='inbox-create'?createPeriodicTransferInbox(ending.store):writePeriodicTransferControl(ending.store,created,'handoff.enc',content,digest);await boundedGate(entered,'enter');closing=closePeriodicObjectStore(ending.store).then(()=>{closed=true;});await Promise.resolve();assert.equal(closed,false,'close waits for the actual pending operation and lease cleanup');continueWork();await assert.rejects(boundedGate(writing,'write-settle'),{name:'AbortError'});await boundedGate(closing,'close-settle');assert.equal(closed,true);if(boundary==='control-write')assert.equal(handleClosed,true);else assert.deepEqual(await readdir(join(ending.directory,'incoming')),[],'an inbox created but not delivered is rolled back after close');}
   finally{continueWork();fs.promises.open=originalOpen;fs.promises.mkdir=originalMkdir;syncBuiltinESMExports();await boundedGate(Promise.allSettled([writing,closing]),'cleanup');}
  }
  assert.equal((await db.get('SELECT COUNT(*)::text n FROM harbor.accounts')).n,'0');
