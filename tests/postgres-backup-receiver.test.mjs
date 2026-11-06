@@ -4,9 +4,9 @@ import {mkdtemp,mkdir,writeFile,rm,stat,readFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomBytes,randomUUID} from 'node:crypto';
-import {createPostgresBackupReceiver,createTaskPostgresBackupReceiver,inspectPostgresBackupReceiver,copyReceiverWalArchive} from '../postgres-backup-receiver.mjs';
+import {createPostgresBackupReceiver,createPeriodicPostgresBackupReceiver,createTaskPostgresBackupReceiver,inspectPostgresBackupReceiver,copyReceiverWalArchive} from '../postgres-backup-receiver.mjs';
 import {createReceivedPostgresBackupContext} from '../postgres-backup-context.mjs';
-import {storageReceiverCommand,inspectPostgresReceiverRestore} from '../storage-receiver.mjs';
+import {storageReceiverCommand,storagePeriodicReceiverCommand,inspectPostgresReceiverRestore} from '../storage-receiver.mjs';
 import {handoffFiles,preparePostgresBackupHandoff,preparePostgresBaselineHandoff,validHandoffPath,copyBackupCipher,digestBackupCipher} from '../postgres-backup-handoff.mjs';
 import {writeManifest,digestFile} from '../migration-artifacts.mjs';
 test('receiver rejects copied capabilities, arbitrary profiles, commands and unowned task paths before creating resources',async()=>{
@@ -26,4 +26,12 @@ test('baseline paths cannot carry final application claims and its public entry 
 });
 test('the actual WAL archive transfer crosses filesystem devices, verifies ciphertext and preserves input after cancellation',{skip:process.platform!=='linux'},async t=>{
  const directory=await mkdtemp(join(tmpdir(),'harbor-wal-crossfs-'));let second;try{try{second=await mkdtemp('/dev/shm/harbor-wal-crossfs-');}catch(error){if(['ENOENT','EACCES','EPERM','EROFS'].includes(error.code)){t.skip('缺少可写的独立tmpfs挂载');return;}throw error;}assert.notEqual((await stat(directory)).dev,(await stat(second)).dev,'must exercise distinct actual filesystem devices');await mkdir(join(directory,'wal'),{mode:0o700});const key=randomBytes(32),source=join(directory,'wal','cluster.enc');try{await writeManifest(source,{version:1,systemIdentifier:'123'},key);}finally{key.fill(0);}const entry={path:'wal/cluster.enc',digest:await digestFile(source)},destination=join(second,'copied');await copyReceiverWalArchive({directory,destination,entries:[entry]});assert.deepEqual(await readFile(join(destination,'cluster.enc')),await readFile(source));assert.deepEqual(await digestFile(source),entry.digest);const aborted=join(second,'cancelled');await assert.rejects(copyReceiverWalArchive({directory,destination:aborted,entries:[entry],signal:AbortSignal.abort()}),{name:'AbortError'});await assert.rejects(stat(aborted),{code:'ENOENT'});assert.deepEqual(await digestFile(source),entry.digest);}finally{await rm(directory,{recursive:true,force:true});if(second)await rm(second,{recursive:true,force:true});}
+});
+
+// The independent periodic fixed profile cannot select the migration profile
+// or request pending-final/candidate capabilities.
+test('periodic fixed receiver rejects caller profiles and nonperiodic signing commands',async()=>{
+ for(const options of [{path:'/tmp/override'},{profile:{handoffKind:'periodic-application'}},{candidateRuntime:{}}])await assert.rejects(createPeriodicPostgresBackupReceiver(options),{code:'backup_receiver_root_profile_required'});
+ for(const command of ['restore-and-attest','restore-and-attest-application','shell'])await assert.rejects(storagePeriodicReceiverCommand([command]),{code:'backup_receiver_command_invalid'});
+ if(process.getuid()!==0)await assert.rejects(createPeriodicPostgresBackupReceiver(),{code:'backup_receiver_root_profile_required'});
 });
