@@ -1,0 +1,11 @@
+[Unit]
+Description=Harbor periodic application backup base maintenance checks
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+Unit=harbor-postgres-maintain-base.service
+
+[Install]
+WantedBy=timers.target
+# 此处仅为到期检查频率；实际全备间隔由固定schedule配置的fullIntervalMs决定。
