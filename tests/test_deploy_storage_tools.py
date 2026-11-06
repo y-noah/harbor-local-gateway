@@ -208,7 +208,7 @@ class StorageToolsTests(unittest.TestCase):
     def synthetic_app(self):
         app = self.path / 'source-app'
         app.mkdir()
-        names = ['storage-operator-context.mjs', 'storage-activation-issuer.mjs', 'storage-operator-backup.mjs', 'storage-operator.mjs', 'storage-backup.mjs', 'storage-maintenance.mjs', 'ci/storage-operator-tools/owned-runtime.mjs', 'package.json', 'package-lock.json', 'public/index.html', 'public/app.js', 'public/style.css', 'clients/image-mcp.mjs', 'clients/harbor.example.toml', 'ci/postgres-deploy.py', 'ci/deploy-wrapper.py', 'migrations/001-synthetic.sql']
+        names = ['storage-receiver-candidate-signal.py', 'storage-operator-context.mjs', 'storage-activation-issuer.mjs', 'storage-operator-backup.mjs', 'storage-operator.mjs', 'storage-backup.mjs', 'storage-maintenance.mjs', 'ci/storage-operator-tools/owned-runtime.mjs', 'package.json', 'package-lock.json', 'public/index.html', 'public/app.js', 'public/style.css', 'clients/image-mcp.mjs', 'clients/harbor.example.toml', 'ci/postgres-deploy.py', 'ci/deploy-wrapper.py', 'migrations/001-synthetic.sql']
         for name in names:
             target = app / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -269,7 +269,7 @@ class StorageToolsTests(unittest.TestCase):
             shutil.copytree(ROOT / name, app / name, symlinks=False)
         for path in ROOT.glob('*.mjs'):
             shutil.copyfile(path, app / path.name)
-        for name in ['package.json', 'package-lock.json']:
+        for name in ['package.json', 'package-lock.json', 'storage-receiver-candidate-signal.py']:
             shutil.copyfile(ROOT / name, app / name)
         (app / 'ci').mkdir()
         for pattern in ['postgres-*.mjs', 'postgres-deploy.py', 'deploy-wrapper.py']:

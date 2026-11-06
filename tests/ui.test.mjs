@@ -555,8 +555,8 @@ test('request refresh restores online status after an outage without accepting l
  const page=await ui(()=>release===null?new Promise(r=>release=()=>r(response(data))):failing?response({error:{message:'synthetic outage'}},502):response(data));
  page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(data));
  await page.run('automaticRefresh()');assert.equal(page.node('#connection').textContent,'连接异常');
- failing=false;await page.run('automaticRefresh()');assert.equal(page.node('#connection').textContent,'● 服务在线');
- failing=true;await page.run('automaticRefresh()');failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'● 服务在线');
+ failing=false;await page.run('automaticRefresh()');assert.equal(page.node('#connection').textContent,'服务在线');
+ failing=true;await page.run('automaticRefresh()');failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'服务在线');
  release=null;const pending=page.run('automaticRefresh()');page.run("tab='members';render()");page.node('#connection').textContent='new-page-status';release();await pending;
  assert.equal(page.node('#connection').textContent,'new-page-status');
 });
