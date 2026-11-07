@@ -425,7 +425,7 @@ class EntryDeployment:
   else:require(entry.get('slot')=='candidate' and entry.get('phase')=='active' and entry.get('epoch')==self.state.get('activatedEpoch'),'entry_activation_changed')
   if self.candidate is not None:
    row=inspect_container(self.candidate['containerId']);self.verify_candidate_row(row);require(self.endpoint(row)==self.candidate['address'],'candidate_address_changed')
-  if approval is not None and approval.get('state')=='active':
+  if approval is not None and approval.get('state')=='active' and self.approval.get('contract')!='harbor-local-assurance-deploy-v1':
    authorized={'version':1,'image':self.image,'approval':approval_binding(self.approval),'configDigest':self.state['configDigest']}
    if WRITER_AUTHORIZED.exists():require(private_json(WRITER_AUTHORIZED)==authorized,'writer_authorization_changed')
    else:save_json(WRITER_AUTHORIZED,authorized)
@@ -600,7 +600,8 @@ class EntryDeployment:
   # response fails. No cleanup/revocation/SQLite fallback is allowed afterward.
   marker=private_json(STORAGE_MARKER);require(marker.get('contract')=='postgres-conversation-v2' and re.fullmatch('[a-f0-9]{64}',marker.get('database_digest','')),'storage_marker')
   row=inspect_container(self.candidate['containerId']);self.verify_candidate_row(row)
-  active={'version':1,'image':self.image,'approval':approval_binding(self.approval),'candidate':self.candidate,'candidateProfileDigest':self.state['candidateBridgeProfileDigest'],'storageMarkerDigest':fingerprint(marker),'mounts':candidate_mounts(row),'configDigest':self.state['configDigest']}
+  active={'version':1,'image':self.image,'approval':approval_binding(self.approval),'candidate':self.candidate,'candidateProfileDigest':self.state['candidateBridgeProfileDigest'],'storageMarkerDigest':fingerprint(marker),'mounts':candidate_mounts(row,self.approval),'configDigest':self.state['configDigest']}
+  if self.approval.get('contract')=='harbor-local-assurance-deploy-v1':active['storageMarkerPath']=str(STORAGE_MARKER)
   if ACTIVE.exists():require({k:v for k,v in private_json(ACTIVE).items() if k!='networkSnapshot'}==active,'active_binding_collision')
   else:active['networkSnapshot']=network_snapshot(self.state);save_json(ACTIVE,active)
   entry_config=private_json(ENTRY_CONFIG);require(entry_config.get('slots',{}).get('candidate')=='/run/harbor-entry/candidate.sock','entry_candidate_slot');entry_config['initialSlot']='candidate';save_json(ENTRY_CONFIG,entry_config)
@@ -611,9 +612,13 @@ class EntryDeployment:
   durable=private_json(ACTIVE);durable['networkSnapshot']=network_snapshot(self.state);save_json(ACTIVE,durable);return entry
 
 
-def authorize_deployment(*,image,approval):
+def authorize_deployment(*,image,approval,local_assurance=False):
  require(os.geteuid()==0 and isinstance(image,str) and re.fullmatch('[a-zA-Z0-9_.:/-]+:[a-f0-9]{40}',image),'deployment_image')
- require(isinstance(approval,dict) and approval.get('contract')=='harbor-storage-activation-deploy-v1' and approval.get('revision')==image.rsplit(':',1)[1],'deployment_approval')
+ require(type(local_assurance) is bool,'local_assurance_mode')
+ if local_assurance:
+  require(local_assurance_module().validate_authorization(image,approval),'local_assurance_approval')
+ else:
+  require(isinstance(approval,dict) and approval.get('contract')=='harbor-storage-activation-deploy-v1' and approval.get('revision')==image.rsplit(':',1)[1],'deployment_approval')
  config=validate(private_json(PROFILE));state=private_json(STATE);require(state.get('configDigest')==fingerprint(config) and state.get('phase') in ['holding','candidate-binding','candidate-bound','activating','activated'],'deployment_state')
  binding={'image':image,'approval':approval_binding(approval)}
  require(state.get('deploymentBinding') in [None,binding],'deployment_binding_changed')
@@ -637,19 +642,23 @@ def deployment_inventory(approval):
 def network_snapshot(state):return {key:copy.deepcopy(state.get(key)) for key in ['rulesDigest','mangleDigest','tcDigests','sourceBridgePort','configDigest']}
 
 
-def candidate_mounts(row):
+def candidate_mounts(row,approval=None):
+ root='/opt/product-development/harbor-local-gateway'
+ if (approval or {}).get('contract')=='harbor-local-assurance-deploy-v1':root=str(local_assurance_module().RUN)
  mounts=[{'source':v.get('Source'),'destination':v.get('Destination'),'readWrite':v.get('RW')} for v in row.get('Mounts',[]) if v.get('Destination') in ['/app/data','/app/runtime']]
- require({v['destination']:v['source'] for v in mounts}=={'/app/data':'/opt/product-development/harbor-local-gateway/pg-data','/app/runtime':'/opt/product-development/harbor-local-gateway/runtime'},'candidate_material_mounts')
+ require({v['destination']:v['source'] for v in mounts}=={'/app/data':root+'/pg-data','/app/runtime':root+'/runtime'},'candidate_material_mounts')
  return sorted(mounts,key=lambda v:v['destination'])
 
 
 def active_record():
  active=private_json(ACTIVE);config=validate(private_json(PROFILE))
  require(active.get('version')==1 and active.get('configDigest')==fingerprint(config),'active_configuration_changed')
- require(active.get('storageMarkerDigest')==fingerprint(private_json(STORAGE_MARKER)),'active_material_marker_changed')
+ marker=STORAGE_MARKER
+ if active.get('approval',{}).get('contract')=='harbor-local-assurance-deploy-v1':marker=local_assurance_module().verified_marker_path(active['image'],active)
+ require(active.get('storageMarkerDigest')==fingerprint(private_json(marker)),'active_material_marker_changed')
  temporary=object.__new__(EntryDeployment);temporary.image=active['image'];temporary.approval=active['approval']
  row=inspect_container(active['candidate']['containerId']);temporary.verify_candidate_row(row)
- require(row['Image']==active['candidate']['imageId'] and candidate_mounts(row)==active['mounts'],'active_candidate_materials_changed')
+ require(row['Image']==active['candidate']['imageId'] and candidate_mounts(row,active['approval'])==active['mounts'],'active_candidate_materials_changed')
  # StartedAt/PID/IP are runtime facts, not the permanent release identity.
  address=temporary.endpoint(row);profile=private_json(CANDIDATE_PROFILE)
  require(profile.get('socketPath')=='/run/harbor-entry/candidate.sock','active_slot_changed')
@@ -660,7 +669,14 @@ def active_record():
  save_json(ACTIVE,active);return active,config,row
 
 
+def local_assurance_module():
+ path=Path('/usr/local/lib/harbor/local-assurance-deploy.py')
+ trusted_parents(path);info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'local_assurance_helper_untrusted')
+ spec=importlib.util.spec_from_file_location('harbor_local_assurance',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+
 def read_active_authorization(image):
+ if ACTIVE.exists() and private_json(ACTIVE).get('approval',{}).get('contract')=='harbor-local-assurance-deploy-v1':return local_assurance_module().active_authorization(image)
  node=Path('/opt/harbor-storage-tools/node/bin/node');helper=Path('/usr/local/lib/harbor/gateway-entry-activation-status.mjs');business=Path('/opt/harbor-storage-tools/app/storage-activation-deploy.mjs')
  for path in [node,helper,business]:
   trusted_parents(path);info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'activation_helper_untrusted')

@@ -91,3 +91,13 @@ class EntryBoundaryTests(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,'source_fence_changed'):deployment.check()
 
 if __name__=='__main__':unittest.main()
+
+class LocalMaterialBindingTests(unittest.TestCase):
+ def test_local_materials_require_fixed_release_root_and_strict_default_unchanged(self):
+  root=Path('/opt/product-development/harbor-local-gateway/local-assurance/fixed-release')
+  row={'Mounts':[{'Source':str(root/'pg-data'),'Destination':'/app/data','RW':True},{'Source':str(root/'runtime'),'Destination':'/app/runtime','RW':True}]}
+  with patch.object(controller,'local_assurance_module',return_value=SimpleNamespace(RUN=root)):
+   self.assertEqual(len(controller.candidate_mounts(row,{'contract':'harbor-local-assurance-deploy-v1'})),2)
+   with self.assertRaisesRegex(RuntimeError,'candidate_material_mounts'):controller.candidate_mounts(row)
+   row['Mounts'][0]['Source']='/tmp/other'
+   with self.assertRaisesRegex(RuntimeError,'candidate_material_mounts'):controller.candidate_mounts(row,{'contract':'harbor-local-assurance-deploy-v1'})

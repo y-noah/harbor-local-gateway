@@ -225,3 +225,25 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
    with patch.object(pg.os,'fsync',side_effect=fsync),self.assertRaises(OSError):pg.deploy(IMAGE,CONFIG,None,api)
    self.assertTrue((Path(directory)/'postgres-storage.json').exists());self.assertFalse(any(args[0]=='stop' for args in calls));self.assertFalse(any(args[0]=='run' and '-d' in args for args in calls))
 if __name__=='__main__':unittest.main()
+
+class LocalMigrationMaterialHandoffTests(unittest.TestCase):
+ def test_secrets_parent_must_remain_root_private_while_app_children_use_runtime_uid(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory)
+   for relative in ['secrets/device','pg-data/recording-spool','runtime']:(root/relative).mkdir(parents=True,mode=0o700)
+   for p in root.rglob('*'):
+    if p.is_dir():p.chmod(0o700)
+   for relative in ['secrets/postgres.env','secrets/postgres-report.key','secrets/postgres-ca.crt','secrets/device/server.key','secrets/device/ca.key','secrets/device/server.pem','secrets/device/ca.pem','pg-data/key-encryption.key','pg-data/recording-encryption.key','pg-data/settings.json']:
+    p=root/relative;p.write_text('synthetic');p.chmod(0o644 if p.suffix in ['.crt','.pem'] else 0o600)
+   (root/'secrets/postgres.env').write_text('HARBOR_DATABASE_URL=postgresql://synthetic:synthetic@database.test/harbor?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.crt\nHARBOR_RECORDING_STORAGE_MODE=report\n')
+   original=Path.lstat;secrets_uid=0
+   def metadata(path,*args,**kw):
+    result=original(path,*args,**kw);uid=0
+    if path==root/'secrets':uid=secrets_uid
+    elif path==root/'runtime' or path==root/'pg-data' or root/'pg-data' in path.parents or path==root/'secrets/device' or root/'secrets/device' in path.parents or path==root/'secrets/postgres-report.key':uid=1000
+    mode=result.st_mode & ~0o022 if path in root.parents else result.st_mode
+    return os.stat_result((mode,result.st_ino,result.st_dev,result.st_nlink,uid,result.st_gid,result.st_size,result.st_atime,result.st_mtime,result.st_ctime))
+   with patch.object(Path,'lstat',metadata):
+    common,_=pg.configuration(CONFIG,directory);self.assertIn('--env-file',common)
+    secrets_uid=1000
+    with self.assertRaisesRegex(ValueError,'ownership'):pg.configuration(CONFIG,directory)

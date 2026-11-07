@@ -37,6 +37,29 @@ class DeploymentGuardTests(unittest.TestCase):
                 self.assertEqual(guard.receive_deployment_image(stream,wire,{**config,**change},'deploy-entry-postgres'),('approved-archive','ssh_archive'))
                 receive.assert_called_once_with(stream,guard.STACK+'/import')
 
+    def test_local_assurance_dispatch_is_root_only_installed_and_does_not_invoke_strict_activation(self):
+        config={**CONFIG,'port':8092,'storage_engine':'postgres','local_assurance_release':True,'entry_installed_release':True}
+        module=Mock();module.deploy.return_value={'mode':'local-assurance'}
+        with patch.object(guard.Path,'lstat',return_value=Mock(st_mode=stat.S_IFREG|0o600,st_uid=0)),patch.object(guard.importlib.util,'spec_from_file_location',return_value=Mock(loader=Mock())) as load,patch.object(guard.importlib.util,'module_from_spec',return_value=module),patch.object(guard,'activation') as activation:
+            self.assertEqual(guard.deploy_entry_postgres(IMAGE,config),{'mode':'local-assurance'})
+            load.assert_called_once_with('harbor_local_assurance_deploy',Path(guard.LOCAL_ASSURANCE_HELPER))
+            self.assertEqual(module.deploy.call_args.args[:3],(IMAGE,config,None));self.assertIs(module.deploy.call_args.args[3],guard.__dict__);activation.assert_not_called()
+        for change,archive in [({'local_assurance_release':1},None),({'local_assurance_release':'true'},None),({'local_assurance_release':None},None),({'entry_installed_release':False},None),({},'archive'),({'port':8094},None),({'storage_engine':'sqlite'},None),({'availability_policy':'legacy-replace'},None)]:
+            with self.subTest(change=change,archive=archive),patch.object(guard.importlib.util,'spec_from_file_location') as load,self.assertRaises(ValueError):
+                guard.deploy_entry_postgres(IMAGE,{**config,**change},archive)
+            load.assert_not_called()
+        with self.assertRaises(ValueError):guard.validate({'action':'deploy-entry-postgres','image':IMAGE,'local_assurance_release':True},config)
+
+    def test_local_assurance_refuses_untrusted_helper_and_explicit_false_keeps_strict_gate(self):
+        config={**CONFIG,'port':8092,'storage_engine':'postgres','local_assurance_release':True,'entry_installed_release':True}
+        for info in [Mock(st_mode=stat.S_IFLNK|0o777,st_uid=0),Mock(st_mode=stat.S_IFREG|0o600,st_uid=1000),Mock(st_mode=stat.S_IFREG|0o622,st_uid=0)]:
+            with self.subTest(mode=info.st_mode),patch.object(guard.Path,'lstat',return_value=info),patch.object(guard.importlib.util,'spec_from_file_location') as load,self.assertRaises(ValueError):guard.deploy_entry_postgres(IMAGE,config)
+            load.assert_not_called()
+        with patch.object(guard.Path,'lstat',return_value=Mock(st_mode=stat.S_IFREG|0o600,st_uid=0)),patch.object(guard.importlib.util,'spec_from_file_location',return_value=Mock(loader=Mock())) as load,patch.object(guard.importlib.util,'module_from_spec',return_value=Mock()),patch.object(guard,'activation',side_effect=RuntimeError('strict gate retained')) as activation:
+            with self.assertRaisesRegex(RuntimeError,'strict gate retained'):guard.deploy_entry_postgres(IMAGE,{**config,'local_assurance_release':False})
+            activation.assert_called_once_with('check',IMAGE)
+            self.assertEqual(load.call_args.args[0],'harbor_entry_controller')
+
     def archive(self,directory,image=IMAGE,extra=None):
         path=Path(directory)/'image.tar'
         content={'manifest.json':json.dumps([{'RepoTags':[image],'Config':'config.json','Layers':['layer.tar']}]).encode(),

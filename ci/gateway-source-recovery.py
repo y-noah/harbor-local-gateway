@@ -93,7 +93,7 @@ def verify_original_source_health(c):
  finally:connection.close()
 
 
-def recover_running_source(c,config,state):
+def recover_running_source(c,config,state,*,retire_operator=True):
  """Undo only an entry hold around the exact source that was never stopped."""
  no_writer(c,state);no_candidates(c,config['source'])
  c.require(state.get('configDigest')==c.fingerprint(config) and state.get('phase') in ['holding','withdrawing','withdrawn','routed'],'recovery_running_configuration')
@@ -110,15 +110,16 @@ def recover_running_source(c,config,state):
  # No new snapshot or fenced Node proof is needed: CID, image, PID/start ticks,
  # StartedAt, network and mounts prove this is the still-running original.
  # Retire the fixed run before resuming traffic so no stale driver can fence it.
- retired=Path(journal['retiredProfile'])
- if OPERATOR_PROFILE.exists():
-  operator=c.private_json(OPERATOR_PROFILE);c.require(c.fingerprint(operator)==journal['operatorProfileDigest'],'recovery_running_operator_changed')
-  if retired.exists():c.require(c.private_json(retired)==operator,'recovery_running_retired_changed')
-  else:c.save_json(retired,operator)
-  OPERATOR_PROFILE.unlink();directory=os.open(OPERATOR_PROFILE.parent,os.O_RDONLY|os.O_DIRECTORY)
-  try:os.fsync(directory)
-  finally:os.close(directory)
- else:c.require(retired.exists() and c.fingerprint(c.private_json(retired))==journal['operatorProfileDigest'],'recovery_running_retired_missing')
+ if retire_operator:
+  retired=Path(journal['retiredProfile'])
+  if OPERATOR_PROFILE.exists():
+   operator=c.private_json(OPERATOR_PROFILE);c.require(c.fingerprint(operator)==journal['operatorProfileDigest'],'recovery_running_operator_changed')
+   if retired.exists():c.require(c.private_json(retired)==operator,'recovery_running_retired_changed')
+   else:c.save_json(retired,operator)
+   OPERATOR_PROFILE.unlink();directory=os.open(OPERATOR_PROFILE.parent,os.O_RDONLY|os.O_DIRECTORY)
+   try:os.fsync(directory)
+   finally:os.close(directory)
+  else:c.require(retired.exists() and c.fingerprint(c.private_json(retired))==journal['operatorProfileDigest'],'recovery_running_retired_missing')
  policy=journal.get('sourceRestartPolicy');c.require(isinstance(policy,dict) and policy.get('Name') in ['no','always','unless-stopped','on-failure'] and type(policy.get('MaximumRetryCount')) is int and policy['MaximumRetryCount']>=0,'recovery_restart_policy')
  current=row.get('HostConfig',{}).get('RestartPolicy');c.require(current in [policy,{'Name':'no','MaximumRetryCount':0}],'recovery_running_restart_changed')
  value=policy['Name']+(':'+str(policy['MaximumRetryCount']) if policy['Name']=='on-failure' and policy['MaximumRetryCount'] else '')
@@ -168,29 +169,35 @@ def recover(c):
   # Missing proof after a verifier failure stays closed; never infer safe from absence.
   journal=c.private_json(JOURNAL);c.require(journal.get('version')==1 and journal.get('phase') in ['authorized','source-started','network-ready'],'recovery_journal')
   config=journal['originalConfig'];c.validate(config);c.require(state.get('configDigest')==c.fingerprint(config),'recovery_journal_configuration')
+ return finish_recovery(c,config,state,journal)
+
+
+def finish_recovery(c,config,state,journal,*,local_assurance=False):
+ """Complete verified source restart/network admission; caller owns authorization."""
  source=config['source'];no_candidates(c,source);no_writer(c,state)
  if journal['phase']=='network-ready':verify_network_snapshot(c,journal.get('networkSnapshot'),journal.get('runtimeConfig',{}))
- # Disable the fixed old-run entry before restarting SQLite. The run remains
- # archived for diagnosis; a later migration must explicitly provision a new run.
- retired=OPERATOR_PROFILE.with_name('harbor-storage-operator.retired-'+journal['proof']['runId']+'.json')
- if OPERATOR_PROFILE.exists():
-  operator=c.private_json(OPERATOR_PROFILE);c.require(c.fingerprint(operator)==journal['operatorProfileDigest'],'recovery_operator_profile_changed')
-  if retired.exists():c.require(c.private_json(retired)==operator,'recovery_retired_profile_changed')
-  else:c.save_json(retired,operator)
-  OPERATOR_PROFILE.unlink();directory=os.open(OPERATOR_PROFILE.parent,os.O_RDONLY|os.O_DIRECTORY)
-  try:os.fsync(directory)
-  finally:os.close(directory)
- else:c.require(c.fingerprint(c.private_json(retired))==journal['operatorProfileDigest'],'recovery_retired_profile_missing')
- marker=c.STORAGE_MARKER
- if marker.exists():
-  expected=journal['proof'].get('storageMarker');c.require(expected is not None and c.private_json(marker)==expected,'recovery_storage_marker_unknown')
-  archived=marker.with_name('postgres-storage.retired-'+journal['proof']['runId']+'.json')
-  if archived.exists():c.require(c.private_json(archived)==expected,'recovery_storage_archive_changed')
-  else:c.save_json(archived,expected)
-  marker.unlink()
-  directory=os.open(marker.parent,os.O_RDONLY|os.O_DIRECTORY)
-  try:os.fsync(directory)
-  finally:os.close(directory)
+ if not local_assurance:
+  # Disable the fixed old-run entry before restarting SQLite. The run remains
+  # archived for diagnosis; a later migration must explicitly provision a new run.
+  retired=OPERATOR_PROFILE.with_name('harbor-storage-operator.retired-'+journal['proof']['runId']+'.json')
+  if OPERATOR_PROFILE.exists():
+   operator=c.private_json(OPERATOR_PROFILE);c.require(c.fingerprint(operator)==journal['operatorProfileDigest'],'recovery_operator_profile_changed')
+   if retired.exists():c.require(c.private_json(retired)==operator,'recovery_retired_profile_changed')
+   else:c.save_json(retired,operator)
+   OPERATOR_PROFILE.unlink();directory=os.open(OPERATOR_PROFILE.parent,os.O_RDONLY|os.O_DIRECTORY)
+   try:os.fsync(directory)
+   finally:os.close(directory)
+  else:c.require(c.fingerprint(c.private_json(retired))==journal['operatorProfileDigest'],'recovery_retired_profile_missing')
+  marker=c.STORAGE_MARKER
+  if marker.exists():
+   expected=journal['proof'].get('storageMarker');c.require(expected is not None and c.private_json(marker)==expected,'recovery_storage_marker_unknown')
+   archived=marker.with_name('postgres-storage.retired-'+journal['proof']['runId']+'.json')
+   if archived.exists():c.require(c.private_json(archived)==expected,'recovery_storage_archive_changed')
+   else:c.save_json(archived,expected)
+   marker.unlink()
+   directory=os.open(marker.parent,os.O_RDONLY|os.O_DIRECTORY)
+   try:os.fsync(directory)
+   finally:os.close(directory)
  row=c.inspect_container(source['containerId']);c.require(row['Image']==source['imageId'] and row.get('Mounts',[])==journal['sourceMounts'],'recovery_source_materials_changed')
  if not row['State']['Running']:
   c.verify_source(config,running=False);c.execute(['/usr/bin/docker','start',source['containerId']],timeout=60)

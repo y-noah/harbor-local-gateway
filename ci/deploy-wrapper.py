@@ -22,6 +22,7 @@ NAME='harbor-local-gateway'
 STACK='/opt/product-development/harbor-local-gateway'
 STATIC_HELPER='/usr/local/lib/harbor/static-release.py'
 ENTRY_HELPER='/usr/local/lib/harbor/gateway-entry-controller.py'
+LOCAL_ASSURANCE_HELPER='/usr/local/lib/harbor/local-assurance-deploy.py'
 
 def validate(payload,config):
     if not isinstance(payload,dict) or set(payload)!={'action','image'} or payload['action'] not in ('deploy','deploy-entry-postgres'):
@@ -164,6 +165,18 @@ def activation(action,image):
 
 def deploy_entry_postgres(image,config,archive=None):
     deployment_policy(config,'deploy-entry-postgres')
+    local_assurance=config.get('local_assurance_release',False)
+    if type(local_assurance) is not bool:raise ValueError('Local assurance flag must be a root boolean')
+    if local_assurance:
+        if config.get('entry_installed_release') is not True or archive is not None:raise ValueError('Local assurance requires the installed entry image')
+        helper=Path(LOCAL_ASSURANCE_HELPER)
+        for target in [*reversed(helper.parents),helper]:
+            info=target.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('Local assurance helper is not root controlled')
+        if not stat.S_ISREG(helper.lstat().st_mode):raise ValueError('Local assurance helper must be a regular file')
+        spec=importlib.util.spec_from_file_location('harbor_local_assurance_deploy',helper)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module.deploy(image,config,archive,globals())
     helper=Path(ENTRY_HELPER)
     for target in [*reversed(helper.parents),helper]:
         info=target.lstat()

@@ -301,7 +301,8 @@ def deploy(image,config,archive,api):
     if not callable(api.get('activation')):raise ValueError('PostgreSQL activation consumer is required')
     approval=api['activation']('check',image)
     if entry_deployment is not None:entry_deployment.check(approval)
-    if approval.get('contract')!='harbor-storage-activation-deploy-v1' or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',approval.get('deploymentId','')) or not re.fullmatch(r'[a-f0-9]{64}',approval.get('receiptDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('configDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('manifestDigest','')) or approval.get('revision')!=image.rsplit(':',1)[-1]:raise ValueError('Activation approval is invalid')
+    expected_contract='harbor-local-assurance-deploy-v1' if api.get('local_assurance') is True and config.get('local_assurance_release') is True else 'harbor-storage-activation-deploy-v1'
+    if approval.get('contract')!=expected_contract or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',approval.get('deploymentId','')) or not re.fullmatch(r'[a-f0-9]{64}',approval.get('receiptDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('configDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('manifestDigest','')) or approval.get('revision')!=image.rsplit(':',1)[-1]:raise ValueError('Activation approval is invalid')
     def activate(action):
         value=api['activation'](action,image)
         if any(value.get(key)!=approval.get(key) for key in ('contract','deploymentId','receiptDigest','configDigest','manifestDigest','revision')):raise ShutdownUnconfirmed('Activation identity changed; composition retained')
