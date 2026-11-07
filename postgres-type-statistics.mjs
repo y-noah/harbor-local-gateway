@@ -56,16 +56,23 @@ export function createPostgresTypeStatistics(store,{clock=Date.now,queryQueue,pa
     return store.transaction(async()=>{
       const visibility=(await store.get('SELECT pg_current_snapshot()::text visibility')).visibility;
       const versions=await store.all(`SELECT DISTINCT p.revision FROM harbor.requests r${joins} WHERE ${scope.where} AND ${validPrice} AND p.total_atoms IS NOT NULL ORDER BY p.revision LIMIT $${args.length+1}`,...args,maxVersions+1);if(versions.length>maxVersions)capacity();
-      const data=`WITH data AS MATERIALIZED (SELECT ${typeKey} type_key,r.usage_type_id type_id,r.usage_type_code snapshot_code,r.usage_type_name snapshot_name,r.member_id,COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model,r.business_status status,r.started,r.ended,
+      const data=`WITH data AS (SELECT ${typeKey} type_key,r.usage_type_id type_id,r.usage_type_code snapshot_code,r.usage_type_name snapshot_name,r.member_id,COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model,r.business_status status,r.started,r.ended,
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,CASE WHEN ${validPrice} THEN p.revision END revision,
         ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
         FROM harbor.requests r${joins} WHERE ${scope.where})`;
-      const total=await store.get(`${data} SELECT ${aggregateSql},${counters},(SELECT COUNT(*) FROM (SELECT ${key} group_key FROM data GROUP BY ${key}) groups) group_count FROM data`,...args);
-      const totalPages=Math.max(1,Math.ceil(total.group_count/query.pageSize)),page=Math.min(query.page,totalPages);
-      const rows=await store.all(`${data},grouped AS(SELECT ${key} group_key,MIN(type_id) type_id,MIN(snapshot_code) snapshot_code,MIN(snapshot_name) snapshot_name,MIN(chosen_model) model,MIN(member_id) member_id,${aggregateSql},${counters} FROM data GROUP BY ${key})
-        SELECT g.*,t.code current_code,t.name current_name,m.name member_name FROM grouped g
-        LEFT JOIN harbor.member_types t ON t.id=g.type_id LEFT JOIN harbor.members m ON m.id=g.member_id
-        ORDER BY g.group_key COLLATE "C" LIMIT $${args.length+1} OFFSET $${args.length+2}`,...args,query.pageSize,(page-1)*query.pageSize);
+      // Aggregate the complete filtered window and its groups together. Only the
+      // small grouped relation is materialized/reused for counting and paging.
+      const resultRows=await store.all(`${data},keyed AS(SELECT data.*,${key} group_key FROM data),
+        grouped AS MATERIALIZED(SELECT GROUPING(group_key) is_total,group_key,MIN(type_id) type_id,MIN(snapshot_code) snapshot_code,MIN(snapshot_name) snapshot_name,MIN(chosen_model) model,MIN(member_id) member_id,${aggregateSql},${counters}
+          FROM keyed GROUP BY GROUPING SETS((),(group_key))),
+        counts AS(SELECT COUNT(*) FILTER(WHERE is_total=0) group_count FROM grouped),
+        paged AS(SELECT * FROM grouped WHERE is_total=0 ORDER BY group_key COLLATE "C" LIMIT $${args.length+1}
+          OFFSET (SELECT (LEAST($${args.length+2}::bigint,GREATEST(1,CEIL(group_count::numeric/$${args.length+1})))::bigint-1)*$${args.length+1} FROM counts))
+        SELECT g.*,c.group_count,t.code current_code,t.name current_name,m.name member_name
+          FROM (SELECT * FROM grouped WHERE is_total=1 UNION ALL SELECT * FROM paged) g CROSS JOIN counts c
+          LEFT JOIN harbor.member_types t ON t.id=g.type_id LEFT JOIN harbor.members m ON m.id=g.member_id
+          ORDER BY g.is_total DESC,g.group_key COLLATE "C"`,...args,query.pageSize,query.page);
+      const [total,...rows]=resultRows,totalPages=Math.max(1,Math.ceil(total.group_count/query.pageSize)),page=Math.min(query.page,totalPages);
       const filters={...scope.filters,page:1},items=rows.map(row=>{
         let identity,drilldown;
         if(query.groupBy==='type'){const special=row.group_key==='unclassified'?'未分类':row.group_key==='historical_unknown'?'历史类型未知':null;identity={typeId:row.type_id,type:row.type_id??row.group_key,code:row.current_code??row.snapshot_code??null,name:special??row.current_name??row.snapshot_name??'类型名称未记录',classificationSource:'request_snapshot',labelSource:special?'system':row.current_name!==null?'current_type_catalog':'request_snapshot'};drilldown={...filters,type:identity.type};}

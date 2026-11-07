@@ -1012,3 +1012,23 @@ test('总览宽屏布局仅作用于管理员总览，切页与员工入口恢�
 test('页头省去空说明与英文眉题，接入测试保留能力限制',async()=>{
  const page=await ui(()=>response(snapshot()));const title=page.run('heading("INTERNAL LABEL","标题","")');assert.equal(title,'<div class="page-heading"><div><h1>标题</h1></div></div>');page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="playground";render()');const html=page.node('#content').innerHTML;assert.doesNotMatch(html,/用员工 Key 验证鉴权、订阅调用与额度统计|使用员工 Key 从 Windows、WSL 或其他机器连接网关/);assert.match(html,/不执行代码或访问工作文件/);
 });
+
+test('员工独立读取不等待全局状态，已完成列表不被全局刷新遮罩锁住',async()=>{
+ const paths=[];let release;const base=pagedSnapshot();
+ const page=await ui(path=>{paths.push(path);if(path.startsWith('/api/admin/state'))return new Promise(resolve=>{release=()=>resolve(response(base));});return response(memberPage());});
+ page.run('admin=true;state='+JSON.stringify(base)+';tab="members";');
+ const pending=page.run('refresh()');await new Promise(setImmediate);
+ assert.ok(paths.some(path=>path.startsWith('/api/admin/members?')));assert.ok(release);
+ assert.equal(page.run('membersData.rows.length'),1);assert.equal(page.run('membersLoading'),false);assert.equal(page.run('pageRefreshing()'),true);
+ assert.doesNotMatch(page.node('#content').innerHTML, /id="members-results" class="loading-region" aria-busy="true"/);
+ release();assert.equal(await pending,true);assert.equal(paths.filter(path=>path.startsWith('/api/admin/members?')).length,1);
+});
+
+test('请求明细与汇总先于慢全局状态完成且不重复读取',async()=>{
+ const paths=[];let release;const base={...pagedSnapshot(),capabilities:{pagedMembers:true}};
+ const page=await ui(path=>{paths.push(path);if(path.startsWith('/api/admin/state'))return new Promise(resolve=>{release=()=>resolve(response(base));});if(path.includes('view=summary'))return response({summary:{requests:0,success:0,active:0,average_ms:0,standard:{}},byModel:[],byMember:[],models:[],members:[]});return response({rows:[],snapshot:'synthetic',pagination:{page:1,pageSize:25,total:0,totalPages:1}});});
+ page.run('admin=true;state='+JSON.stringify(base)+';tab="requests";recordView="requests";');
+ const pending=page.run('refresh()');await new Promise(setImmediate);
+ assert.equal(page.run('requestsLoading'),false);assert.equal(page.run('requestsData.summary.requests'),0);assert.ok(release);
+ release();assert.equal(await pending,true);assert.equal(paths.filter(path=>path.includes('view=list')).length,1);assert.equal(paths.filter(path=>path.includes('view=summary')).length,1);
+});

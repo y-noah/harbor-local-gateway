@@ -11,11 +11,11 @@ import {createGatewayEntryProcess,validateGatewayEntryProcessConfig} from '../ga
 const limits={maxInflightRequests:2,maxQueuedRequests:3,maxQueuedBytes:32768,maxRequestBytes:4096,maxWaitMs:1000};
 const listen=(server,options)=>new Promise((resolve,reject)=>{server.once('error',reject);server.listen(options,()=>resolve(server.address()));});
 async function call(options,body){return new Promise((resolve,reject)=>{const req=http.request({...options,agent:false},res=>{let text='';res.on('data',chunk=>text+=chunk);res.once('end',()=>resolve({status:res.statusCode,text,value:()=>JSON.parse(text)}));res.on('error',reject);});req.on('error',reject);req.end(body);});}
-async function fixture(t,{timeout=80}={}){
+async function fixture(t,{timeout=80,handler}={}){
  const dir=await mkdtemp(join(tmpdir(),'entry-process-')),servers=[],runtime=[];t.after(async()=>{await Promise.all(runtime.map(item=>item.shutdown()));for(const server of servers){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}await rm(dir,{recursive:true,force:true});});
  const probe=http.createServer(),address=await listen(probe,{host:'::',port:0});await new Promise(resolve=>probe.close(resolve));
  const config={listenPort:address.port,slots:{legacy:join(dir,'old.sock'),candidate:join(dir,'new.sock')},initialSlot:'legacy',limits,shutdownTimeoutMs:timeout},controlPath=join(dir,'control.sock');
- for(const [slot,path] of Object.entries(config.slots)){const server=http.createServer((req,res)=>{req.resume();if(req.url==='/hang'){res.write('stream');return;}res.end(slot);});servers.push(server);await listen(server,path);}
+ for(const [slot,path] of Object.entries(config.slots)){const server=http.createServer((req,res)=>{if(handler)return handler(req,res,slot);req.resume();if(req.url==='/hang'){res.write('stream');return;}res.end(slot);});servers.push(server);await listen(server,path);}
  return {config,controlPath,async start(){const item=await createGatewayEntryProcess({config,controlPath});runtime.push(item);return item;},command(command,expectedEpoch,slot){const body=JSON.stringify({command,expectedEpoch,...(slot?{slot}:{})});return call({socketPath:controlPath,path:'/control',method:'POST',headers:{'Content-Type':'application/json'}},body);},state:()=>call({socketPath:controlPath,path:'/state',method:'GET'}),data:()=>call({host:'127.0.0.1',port:config.listenPort,path:'/',method:'GET'})};
 }
 test('real private control CAS and held queue activate only preconfigured slots',{timeout:5000},async t=>{
@@ -52,4 +52,43 @@ test('dual-stack peer normalization only unwraps actual IPv4-mapped IPv6',()=>{
 
 test('shutdown deadline includes a TCP client with incomplete HTTP headers',{timeout:5000},async t=>{
  const f=await fixture(t,{timeout:40}),runtime=await f.start(),client=net.connect({host:'127.0.0.1',port:f.config.listenPort});client.on('error',()=>{});t.after(()=>client.destroy());await once(client,'connect');client.write('GET / HTTP/1.1\r\nHost: incomplete');await new Promise(resolve=>setImmediate(resolve));assert.equal(runtime.state().inflight,0);const started=performance.now();await runtime.shutdown();assert.ok(performance.now()-started<1000,'partial headers must not wait for the Node default parser timeout');assert.equal(runtime.state().phase,'closed');await assert.rejects(access(f.controlPath));
+});
+
+for(const [event,request,status] of [
+ ['connect','CONNECT example.test:443 HTTP/1.1\r\nHost: example.test\r\n\r\n',405],
+ ['upgrade','GET / HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',426]
+])test(`rejected ${event} survives a peer reset during the response`,{timeout:5000},async t=>{
+ const f=await fixture(t);const runtime=await f.start();
+ // Reset the real accepted TCP socket during rejection, exercising its error
+ // lifecycle deterministically instead of depending on packet scheduling.
+ runtime.server.prependOnceListener(event,(_req,socket)=>{
+  const end=socket.end;socket.end=function(...args){
+   const result=end.apply(this,args);
+   this.destroy(Object.assign(new Error('peer reset'),{code:'ECONNRESET'}));
+   return result;
+  };
+ });
+ const client=net.connect({host:'127.0.0.1',port:f.config.listenPort});client.on('error',()=>{});
+ await once(client,'connect');client.resume();client.end(request);
+ await new Promise(resolve=>client.once('close',resolve));
+ assert.equal((await f.data()).text,'legacy');assert.equal((await f.state()).value().phase,'active');
+ const normal=net.connect({host:'127.0.0.1',port:f.config.listenPort});let response='';normal.on('data',chunk=>response+=chunk);normal.end(request);
+ await once(normal,'close');assert.match(response,new RegExp(`^HTTP/1.1 ${status} `));
+});
+
+async function untilState(check){const deadline=Date.now()+2000;while(!check()){assert.ok(Date.now()<deadline,'connection lifecycle reaches its terminal state');await new Promise(resolve=>setTimeout(resolve,5));}}
+
+test('upstream SSE reset closes only its response, releases admission and never replays',{timeout:5000},async t=>{
+ let calls=0,upstream,upstreamClosed=false;const prefix='data: synthetic partial\n\n';
+ const f=await fixture(t,{handler(req,res,slot){req.resume();if(req.url!=='/reset-stream'){res.end(slot);return;}calls++;upstream=res;res.on('close',()=>{upstreamClosed=true;});res.writeHead(200,{'Content-Type':'text/event-stream'});res.write(prefix);}}),runtime=await f.start();
+ let text='',aborted=false,completed=false,responses=0;
+ await new Promise((resolve,reject)=>{const request=http.get({host:'127.0.0.1',port:f.config.listenPort,path:'/reset-stream',agent:false},response=>{responses++;response.on('data',chunk=>{text+=chunk;if(text.length>=prefix.length){assert.equal(text,prefix);upstream.destroy();}});response.once('aborted',()=>{aborted=true;resolve();});response.once('end',()=>{completed=true;reject(Error('truncated SSE must not look complete'));});response.on('error',()=>{});});request.on('error',reject);});
+ await untilState(()=>runtime.state().inflight===0&&upstreamClosed);assert.equal(aborted,true);assert.equal(completed,false);assert.equal(text,prefix);assert.equal(calls,1);assert.equal(responses,1);assert.equal((await f.data()).text,'legacy');assert.equal((await f.state()).value().phase,'active');
+});
+
+test('TCP reset during an unfinished upload cancels the single upstream and keeps entry healthy',{timeout:5000},async t=>{
+ let calls=0,body='',upstreamClosed=false,received;const started=new Promise(resolve=>received=resolve);
+ const f=await fixture(t,{handler(req,res,slot){if(req.url!=='/upload-reset'){req.resume();res.end(slot);return;}calls++;req.on('data',chunk=>{body+=chunk;received();});req.on('error',()=>{});res.on('close',()=>{upstreamClosed=true;});}}),runtime=await f.start();
+ const request=http.request({host:'127.0.0.1',port:f.config.listenPort,path:'/upload-reset',method:'POST',headers:{'Transfer-Encoding':'chunked'},agent:false});request.on('error',()=>{});request.write('synthetic upload prefix');await started;request.socket.resetAndDestroy();
+ await untilState(()=>runtime.state().inflight===0&&upstreamClosed);assert.equal(body,'synthetic upload prefix');assert.equal(calls,1);assert.equal((await f.data()).text,'legacy');assert.equal((await f.state()).value().phase,'active');
 });

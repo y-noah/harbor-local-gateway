@@ -1,5 +1,5 @@
 import {AppError,usageWindow,storedModelAllowlist,revealStoredKey} from './store.mjs';
-import {fields,validPrice,joins,aggregate,aggregateSql} from './postgres-reference-query.mjs';
+import {fields,validPrice,joins,aggregate,aggregateSql,referenceAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresMemberLimits,postgresMemberLimitConfiguration} from './postgres-member-limits.mjs';
 
 const fail=(status,message,code='member_query_invalid')=>{throw new AppError(status,message,code);};
@@ -25,14 +25,17 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
   const empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(field=>[field,'0']))}).standard;
   async function usage(scope,ids,at){
     if(!ids.length)return new Map();const window=usageWindow(at);
-    const rows=await store.all(`WITH source AS MATERIALIZED (
-      SELECT r.${scope}_id owner_id,r.ip,r.device_id,r.device_auth_state,r.started,r.ended,r.status,r.usage_at,
+    const rows=await store.all(`WITH data AS (
+      SELECT r.${scope}_id owner_id,r.ip,r.device_id,r.device_auth_state,r.started,r.ended,r.status,(r.usage_at>=$4 AND r.usage_at<$5) recent,
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,CASE WHEN ${validPrice} THEN p.revision END revision,
         ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
       FROM harbor.requests r${joins} WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3
-    ),data AS(SELECT source.*,recent FROM source CROSS JOIN (VALUES(false),(true)) period(recent) WHERE NOT recent OR (usage_at>=$4 AND usage_at<$5))
-    SELECT owner_id,recent,COUNT(DISTINCT ip) ips,COUNT(DISTINCT device_id) used_devices,COUNT(*) FILTER(WHERE device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(started) last_seen,${aggregateSql} FROM data GROUP BY owner_id,recent`,ids,window.start,window.end,at-12*3600000,at);
-    return new Map(rows.map(row=>[row.owner_id+':'+row.recent,{standard:aggregate(row).standard,ips:row.ips,used_devices:row.used_devices,unverified_requests:row.unverified_requests,last_seen:row.last_seen}]));
+    )
+    SELECT owner_id,COUNT(DISTINCT ip) ips,COUNT(DISTINCT device_id) used_devices,COUNT(*) FILTER(WHERE device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(started) last_seen,${aggregateSql},${referenceAggregateSql({condition:'recent',prefix:'recent_'})} FROM data GROUP BY owner_id`,ids,window.start,window.end,at-12*3600000,at);
+    return new Map(rows.flatMap(row=>[
+      [row.owner_id+':false',{standard:aggregate(row).standard,ips:row.ips,used_devices:row.used_devices,unverified_requests:row.unverified_requests,last_seen:row.last_seen}],
+      [row.owner_id+':true',{standard:aggregate(Object.fromEntries(Object.entries(row).filter(([key])=>key.startsWith('recent_')).map(([key,value])=>[key.slice(7),value]))).standard}]
+    ]));
   }
   const used=(data,id)=>({standard:data.get(id+':false')?.standard??empty,standard_12h:data.get(id+':true')?.standard??empty,ips:data.get(id+':false')?.ips??0,used_devices:data.get(id+':false')?.used_devices??0,unverified_requests:data.get(id+':false')?.unverified_requests??0,last_seen:data.get(id+':false')?.last_seen??null});
   async function registered(scope,ids){

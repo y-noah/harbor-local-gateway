@@ -37,7 +37,15 @@ export function createGatewayEntry({route,limits}={}){
   const item={req,res,bytes,cancel:()=>remove(item)};item.timer=setTimeout(()=>{if(remove(item))unavailable(res);},config.maxWaitMs);item.timer.unref();
   queue.push(item);queuedBytes+=bytes;req.once('aborted',item.cancel);res.once('close',item.cancel);
  }
- const server=http.createServer(handle);server.on('checkContinue',handle);server.on('connect',(_req,socket)=>socket.end('HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n'));server.on('upgrade',(_req,socket)=>socket.end('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n'));
+ // CONNECT and Upgrade detach sockets from Node's ordinary HTTP lifecycle.
+ // A peer reset while writing the rejection must only close that connection.
+ function rejectProtocol(socket,status){
+  socket.on('error',()=>socket.destroy());
+  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+ }
+ const server=http.createServer(handle);server.on('checkContinue',handle);
+ server.on('connect',(_req,socket)=>rejectProtocol(socket,'405 Method Not Allowed'));
+ server.on('upgrade',(_req,socket)=>rejectProtocol(socket,'426 Upgrade Required'));
  function hold(){if(state==='closed')throw fail('gateway_entry_closed');state='holding';return status();}
  function activate(route){if(state!=='holding'||inflight!==0)throw fail('gateway_entry_not_drained');active=gatewayEntryRoute(route);state='active';release();return status();}
  function resume(){if(state!=='holding')throw fail('gateway_entry_not_holding');state='active';release();return status();}

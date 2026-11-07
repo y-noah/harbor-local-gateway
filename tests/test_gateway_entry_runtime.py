@@ -49,6 +49,45 @@ class EntryRuntimeTests(unittest.TestCase):
   state['phase']='prepared';state['configDigest']=controller.fingerprint(config)
   with patch.object(Boundary,'verify_resources',side_effect=RuntimeError('rules absent'),create=True),self.assertRaisesRegex(RuntimeError,'rules absent'):runtime.entry_pre(Boundary)
 
+ def test_first_committed_restart_uses_active_pg_identity_without_retired_source(self):
+  config={'source':{'containerId':'old'}};candidate={'containerId':'new'}
+  state={'phase':'activated','configDigest':controller.fingerprint(config),'candidate':candidate}
+  class Boundary:
+   PROFILE=Path('/fixed/profile');STATE=Path('/fixed/state')
+   validate=staticmethod(lambda value:value)
+   fingerprint=staticmethod(controller.fingerprint)
+   @staticmethod
+   def private_json(path):return config if path==Boundary.PROFILE else state
+  with patch.object(Boundary,'active_record',return_value=({'candidate':candidate},config,{}),create=True) as active,patch.object(Boundary,'verify_source',create=True) as fence,patch.object(Boundary,'verify_resources',create=True) as resources:
+   runtime.verify_start_guard(Boundary)
+   active.assert_called_once();fence.assert_not_called();resources.assert_called_once_with(state,config,fenced=True)
+   resources.reset_mock();fence.side_effect=AssertionError('retired source must not be queried')
+   runtime.verify_start_guard(Boundary);resources.assert_called_once_with(state,config,fenced=True);resources.reset_mock()
+   active.return_value=({'candidate':{'containerId':'foreign'}},config,{})
+   with self.assertRaisesRegex(RuntimeError,'active_guard_binding'):runtime.verify_start_guard(Boundary)
+   resources.assert_not_called()
+   active.side_effect=RuntimeError('active_database_authorization_changed')
+   with self.assertRaisesRegex(RuntimeError,'active_database_authorization_changed'):runtime.verify_start_guard(Boundary)
+   resources.assert_not_called()
+
+ def test_repeated_committed_start_checks_runtime_candidate_and_auth_each_time(self):
+  config={'source':{'containerId':'old'}};candidate={'containerId':'new','imageId':'pg-image','address':'10.0.0.2'};view={'source':dict(candidate)}
+  state={'phase':'active-prepared','configDigest':controller.fingerprint(config),'candidate':candidate,'activeRuntimeConfig':view}
+  class Boundary:
+   PROFILE=Path('/fixed/profile');STATE=Path('/fixed/state')
+   validate=staticmethod(lambda value:value);fingerprint=staticmethod(controller.fingerprint)
+   private_json=staticmethod(lambda path:config if path==Boundary.PROFILE else state)
+  with patch.object(Boundary,'active_record',return_value=({'candidate':candidate},config,{}),create=True) as active,patch.object(Boundary,'verify_resources',create=True) as resources:
+   for phase in ['active-prepared','activated']:
+    state['phase']=phase;runtime.verify_start_guard(Boundary)
+   self.assertEqual(active.call_count,2);self.assertEqual(resources.call_count,2)
+   view['source']['containerId']='old';resources.reset_mock()
+   with self.assertRaisesRegex(RuntimeError,'active_runtime_candidate_binding'):runtime.verify_start_guard(Boundary)
+   resources.assert_not_called();view['source']=dict(candidate)
+   active.side_effect=RuntimeError('active_database_authorization_changed')
+   with self.assertRaisesRegex(RuntimeError,'active_database_authorization_changed'):runtime.verify_start_guard(Boundary)
+   resources.assert_not_called()
+
  def test_candidate_waits_inside_one_start_job_for_observed_readiness(self):
   class Boundary:
    calls=[]

@@ -19,11 +19,16 @@ export function aggregate(row){
   return {requests:row.requests,success:row.success,active:row.active,average_ms:Number(row.average_ms||0),unmetered:row.unmetered,unpriced:row.unpriced,standard};
 }
 
-export const aggregateSql=`      COUNT(*) requests,COUNT(*) FILTER(WHERE status='ok') success,COUNT(*) FILTER(WHERE status IN ('queued','running')) active,
-      AVG(ended-started) FILTER(WHERE ended>=started) average_ms,COUNT(*) FILTER(WHERE total IS NOT NULL) known,
-      COUNT(*) FILTER(WHERE total IS NULL AND price_state='pending') pending,
-      COUNT(*) FILTER(WHERE total IS NULL AND (price_state='unpriced' OR price_state IS NULL)) unpriced,
-      COUNT(*) FILTER(WHERE total IS NULL AND price_state='expired') expired,
-      COUNT(*) FILTER(WHERE total IS NULL AND price_state NOT IN ('pending','unpriced','expired')) unmetered,
-      ${fields.map(f=>'COALESCE(SUM('+f+'),0)::text '+f).join(',')},
-      ARRAY_AGG(DISTINCT revision) FILTER(WHERE total IS NOT NULL AND revision IS NOT NULL) revisions`;
+// Fixed SQL callers can aggregate several windows in one scan without duplicating
+// request rows. Every amount remains NUMERIC until its text/BigInt boundary.
+export function referenceAggregateSql({condition='',prefix=''}={}){
+  const filter=predicate=>condition||predicate?` FILTER(WHERE ${[condition,predicate].filter(Boolean).map(value=>'('+value+')').join(' AND ')})`:'',
+    count=(name,predicate)=>`COUNT(*)${filter(predicate)} ${prefix}${name}`;
+  return [count('requests'),count('success',"status='ok'"),count('active',"status IN ('queued','running')"),
+    `AVG(ended-started)${filter('ended>=started')} ${prefix}average_ms`,count('known','total IS NOT NULL'),
+    count('pending',"total IS NULL AND price_state='pending'"),count('unpriced',"total IS NULL AND (price_state='unpriced' OR price_state IS NULL)"),
+    count('expired',"total IS NULL AND price_state='expired'"),count('unmetered',"total IS NULL AND price_state NOT IN ('pending','unpriced','expired')"),
+    ...fields.map(field=>`COALESCE(SUM(${field})${filter()},0)::text ${prefix}${field}`),
+    `ARRAY_AGG(DISTINCT revision)${filter('total IS NOT NULL AND revision IS NOT NULL')} ${prefix}revisions`].join(',');
+}
+export const aggregateSql=referenceAggregateSql();

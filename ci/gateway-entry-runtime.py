@@ -45,7 +45,19 @@ def verify_start_guard(c):
  if state['phase'] in ['guarded','boot-guarded']:
   need(state.get('guardFingerprint')==c.guard_fingerprint(config) and state.get('rulesDigest')==c.state_rules_digest(),'actual_guard_changed')
  else:
-  need(state.get('configDigest')==c.fingerprint(config),'guard_configuration_changed');c.verify_resources(state,state.get('activeRuntimeConfig',config))
+  need(state.get('configDigest')==c.fingerprint(config),'guard_configuration_changed')
+  view=state.get('activeRuntimeConfig',config);fenced=False
+  if state['phase'] in ['activated','active-prepared']:
+   # The durable ACTIVE decision and live PG identity authorize every restart.
+   # The retired SQLite container is never a startup dependency or target.
+   active,approved,_=c.active_record()
+   need(approved==config and active.get('candidate')==state.get('candidate'),'active_guard_binding')
+   if state.get('activeRuntimeConfig'):
+    candidate=active['candidate'];source=view.get('source',{})
+    need(source.get('containerId')==candidate.get('containerId') and source.get('imageId')==candidate.get('imageId') and source.get('address')==candidate.get('address'),'active_runtime_candidate_binding')
+   else:fenced=True
+  if fenced:c.verify_resources(state,config,fenced=True)
+  else:c.verify_resources(state,view)
  return state
 
 def ensure_run(c):

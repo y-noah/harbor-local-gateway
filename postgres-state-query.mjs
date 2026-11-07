@@ -37,11 +37,16 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       const from='FROM harbor.sessions s JOIN harbor.members m ON m.id=s.member_id JOIN harbor.accounts a ON a.id=s.account_id WHERE s.updated>=$1 AND s.updated<$2';
       const total=(await store.get('SELECT COUNT(*) n '+from,window.start,window.end)).n,totalPages=Math.max(1,Math.ceil(total/sessionPageSize)),page=Math.min(sessionPage,totalPages);
       const sessions=await store.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${from} ORDER BY s.updated DESC,s.id DESC LIMIT $3 OFFSET $4`,window.start,window.end,sessionPageSize,(page-1)*sessionPageSize);
-      const rows=await store.all(`WITH source AS MATERIALIZED (
-        SELECT CASE WHEN r.member_id=ANY($5::text[]) THEN r.member_id END member_id,
-          CASE WHEN r.key_id=ANY($6::text[]) THEN r.key_id END key_id,
-          CASE WHEN r.account_id=ANY($7::text[]) THEN r.account_id END account_id,
-          CASE WHEN r.session_id=ANY($8::text[]) THEN r.session_id END session_id,
+      // The paged UI omits people. Its DTO uses only seven-day company,
+      // account, visible-session and day totals; no twelve-hour groups escape.
+      const loadPeople=people==='all',usageArgs=loadPeople?
+        [window.start,window.end,recentUsageWindow.start,at,members.map(r=>r.id),keys.map(r=>r.id),accounts.map(r=>r.id),sessions.map(r=>r.id)]:
+        [window.start,window.end,accounts.map(r=>r.id),sessions.map(r=>r.id)];
+      const rows=await store.all(`WITH source AS ${loadPeople?'MATERIALIZED ':''}(
+        SELECT ${loadPeople?`CASE WHEN r.member_id=ANY($5::text[]) THEN r.member_id END member_id,
+          CASE WHEN r.key_id=ANY($6::text[]) THEN r.key_id END key_id,`:''}
+          CASE WHEN r.account_id=ANY($${loadPeople?7:3}::text[]) THEN r.account_id END account_id,
+          CASE WHEN r.session_id=ANY($${loadPeople?8:4}::text[]) THEN r.session_id END session_id,
           to_char(to_timestamp(r.usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
           r.usage_at,r.ip,r.status,r.started,r.ended,
           CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
@@ -49,12 +54,11 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
           ${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms END ${f}`).join(',')}
         FROM harbor.requests r${joins} WHERE r.usage_at>=$1 AND r.usage_at<$2
       ), data AS (
-        SELECT source.*,period.recent FROM source CROSS JOIN (VALUES(false),(true)) period(recent)
-        WHERE NOT period.recent OR (usage_at>=$3 AND usage_at<$4)
-      ) SELECT recent,GROUPING(member_id) g_member,GROUPING(key_id) g_key,GROUPING(account_id) g_account,GROUPING(session_id) g_session,GROUPING(day) g_day,
-        member_id,key_id,account_id,session_id,day,COUNT(DISTINCT ip) ips,MAX(started) last_seen,${aggregateSql}
-        FROM data GROUP BY GROUPING SETS((recent),(recent,member_id),(recent,key_id),(recent,account_id),(recent,session_id),(recent,day))`,
-        window.start,window.end,recentUsageWindow.start,at,members.map(r=>r.id),keys.map(r=>r.id),accounts.map(r=>r.id),sessions.map(r=>r.id));
+        ${loadPeople?`SELECT source.*,period.recent FROM source CROSS JOIN (VALUES(false),(true)) period(recent)
+        WHERE NOT period.recent OR (usage_at>=$3 AND usage_at<$4)`:'SELECT source.*,false recent FROM source'}
+      ) SELECT recent,${loadPeople?'GROUPING(member_id) g_member,GROUPING(key_id) g_key':'1 g_member,1 g_key'},GROUPING(account_id) g_account,GROUPING(session_id) g_session,GROUPING(day) g_day,
+        ${loadPeople?'member_id,key_id':'NULL::text member_id,NULL::text key_id'},account_id,session_id,day,COUNT(DISTINCT ip) ips,MAX(started) last_seen,${aggregateSql}
+        FROM data GROUP BY GROUPING SETS((recent),${loadPeople?'(recent,member_id),(recent,key_id),':''}(recent,account_id),(recent,session_id),(recent,day))`,...usageArgs);
       const groups=new Map(),daily=[];let totals;
       for(const row of rows){
         const dimension=['member','key','account','session','day'].find(name=>!row['g_'+name]);

@@ -1,9 +1,9 @@
 """8092 本机保障发布；独立合同，不签发或冒充 offhost/严格 activation 证明。"""
 from pathlib import Path
 from types import SimpleNamespace
-import fcntl,hashlib,importlib.util,json,os,re,signal,stat,subprocess,time
+import copy,fcntl,hashlib,importlib.util,json,os,re,signal,stat,subprocess,time,traceback
 PROFILE=Path('/etc/harbor-local-assurance-release.json')
-RELEASE='4ad63d04-7c44-43d8-b747-8a7dab78e1ec'
+RELEASE='bd5f8135-bec1-4747-a27b-dca84a8d5b8b'
 REVISION='26f91a202dcd258b38d4721a4b029822a4f0da92'
 CONTRACT='harbor-local-assurance-deploy-v1'
 RUN=Path('/opt/product-development/harbor-local-gateway/local-assurance')/RELEASE
@@ -25,11 +25,16 @@ def validate_profile(profile,image,config):
  return profile
 
 class LocalOperationUnknown(RuntimeError):pass
+class LocalHelperExited(RuntimeError):
+ def __init__(self,action,returncode):
+  super().__init__('Local assurance helper exited unsuccessfully; material retained');self.action=action;self.returncode=returncode
+
 
 def helper(action,timeout=1200):
  try:result=subprocess.run(['/opt/harbor-storage-tools/node/bin/node','/usr/local/lib/harbor/local-assurance-migrate.mjs',action],capture_output=True,timeout=timeout,env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','HOME':'/root'})
  except subprocess.TimeoutExpired as error:raise LocalOperationUnknown('Helper outcome requires inspection') from error
- if result.returncode!=0:raise RuntimeError('Local assurance migration failed; material retained')
+ if result.returncode<0:raise LocalOperationUnknown('Helper terminated without a confirmed result')
+ if result.returncode!=0:raise LocalHelperExited(action,result.returncode)
  value=json.loads(result.stdout)
  if value.get('contract')!='harbor-local-assurance-migration-v1' or value.get('releaseId')!=RELEASE or value.get('offhostVerified') is not False or value.get('deploymentAllowed') is not False:raise ValueError('Local assurance helper contract changed')
  return value
@@ -150,9 +155,15 @@ def run_release(image,config,archive,api):
  if config.get('local_assurance_release') is not True:raise ValueError('Local assurance root dispatch is disabled')
  entry=load_file(api['ENTRY_HELPER'],'local_entry_controller')
  composition=load_file(Path(__file__).with_name('postgres-deploy.py'),'local_postgres_composition')
- entry_config=entry.validate(entry.private_json(entry.PROFILE));original=entry.verify_source(entry_config)
- initial=entry.private_json(entry.STATE)
- if initial.get('phase') not in ['prepared','withdrawn','routed']:raise ValueError('Entry topology must be prepared before local release')
+ entry_config=entry.validate(entry.private_json(entry.PROFILE));initial=entry.private_json(entry.STATE)
+ resuming=STATE.exists()
+ if resuming:
+  previous=retained_release_context(entry,entry_config,initial);original=entry.verify_source(entry_config,running=False)
+  if initial.get('deploymentBinding'):
+   entry.save_json(RUN/('prewriter-binding-'+str(time.time_ns())+'.json'),initial['deploymentBinding']);initial.pop('deploymentBinding');entry.save_state(initial)
+ else:
+  original=entry.verify_source(entry_config)
+  if initial.get('phase') not in ['prepared','withdrawn','routed']:raise ValueError('Entry topology must be prepared before local release')
  operator=private_json('/etc/harbor-storage-operator.json');candidate_network(verify_live=True)
  if operator['source'].get('supervisorKind')!='docker-restart':raise ValueError('This local release only supports the existing Docker supervisor')
  if original['Id']!=profile['source']['containerId'] or original['Image']!=profile['source']['imageId']:raise ValueError('Original source identity changed')
@@ -162,17 +173,22 @@ def run_release(image,config,archive,api):
  RUN.mkdir(mode=0o700,parents=True,exist_ok=True);(RUN/'backup').mkdir(mode=0o700,exist_ok=True)
  for name,path in [('entry-controller.json',entry.PROFILE),('gateway-deploy.json',Path(api['CONFIG']))]:
   target=RUN/'backup'/name
-  if target.exists():raise RuntimeError('Local release backup already exists; inspect previous attempt')
+  if target.exists():
+   if resuming:continue
+   raise RuntimeError('Local release backup already exists; inspect previous attempt')
   fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
   with os.fdopen(fd,'wb') as file:file.write(Path(path).read_bytes());file.flush();os.fsync(file.fileno())
  saved={'contract':CONTRACT,'releaseId':RELEASE,'image':image,'phase':'prepared','sourceContainerId':original['Id'],'sourceRestartPolicy':original['HostConfig']['RestartPolicy'],'sourceMounts':original.get('Mounts',[]),'profileIdentityDigest':profile_identity(profile),'offhostVerified':False}
- journal(entry,saved);context=None;migration=None;device_gate=None;preflight_attempted=False
+ if resuming:saved={**previous,'phase':'prepared','resumedVerifiedMigration':True}
+ journal(entry,saved);context=None;migration=None;device_gate=None;preflight_attempted=False;migration_attempted=resuming
  try:
   device_gate=device_gate_install(entry,config['device_tls_port'])
   state=entry.private_json(entry.STATE)
   if state['phase'] in ['prepared','withdrawn']:entry.run_action(entry_config,'arm')
-  entry.run_action(entry_config,'hold-drain');saved['phase']='holding';journal(entry,saved)
-  migration=helper('migrate',1200)
+  if not resuming:entry.run_action(entry_config,'hold-drain')
+  saved['phase']='holding';journal(entry,saved)
+  migration_attempted=True
+  migration=helper('resume' if resuming else 'migrate',1200)
   if migration.get('identityAndDataVerified') is not True or migration.get('state') not in ['data-verified','verified']:raise RuntimeError('Local migration is not verified')
   common,_=composition.configuration(config,str(RUN));local_api={**api,'STACK':str(RUN)}
   def proof_docker(*args,**kwargs):
@@ -183,7 +199,7 @@ def run_release(image,config,archive,api):
   fence=private_json(RUN/'source-fence.json');fence=fence.get('sourceFence',fence.get('fence',fence))
   receipt=hashlib.sha256(json.dumps({'migration':migration,'candidate':proof},sort_keys=True).encode()).hexdigest()
   approval={'contract':CONTRACT,'deploymentId':RELEASE,'receiptDigest':receipt,'configDigest':profile['businessConfigDigest'],'manifestDigest':profile['businessImage'].split('@')[1],'revision':REVISION,'sourceFence':fence,'state':'pending','offhostVerified':False}
-  saved.update(phase='verified',approval=approval,migration=migration,candidateProof=proof);journal(entry,saved)
+  saved.pop('errorCategory',None);saved.update(phase='verified',approval=approval,migration=migration,candidateProof=proof);journal(entry,saved)
   context=entry.authorize_deployment(image=image,approval=approval,local_assurance=True)
   activation=LocalActivation(entry,approval,proof)
   local_api.update(local_assurance=True,activation=activation,entry_deployment=context,http_code=lambda port,path,headers=None:context.probe(port,path,headers))
@@ -196,6 +212,13 @@ def run_release(image,config,archive,api):
   if entry.ACTIVE.exists():
    saved.update(phase='commit-unknown-or-active',errorCategory=type(error).__name__,sqliteRollbackForbidden=True);journal(entry,saved);raise
   saved.update(phase='failed-before-public',errorCategory=type(error).__name__);journal(entry,saved)
+  # A drain failure precedes every source/DB mutation. Resume the exact original
+  # before optional cleanup, which may itself time out on a busy Docker daemon.
+  if not migration_attempted or helper_exited_before_migration(error):
+   saved['recovery']=resume_before_migration(entry,entry_config,original)
+   saved['phase']='source-restored';journal(entry,saved)
+   if device_gate is not None:device_gate_remove(entry,device_gate)
+   raise
   # 未确认候选退出时保留现场，不能把未知状态当成已回收。
   if isinstance(error,LocalOperationUnknown):raise
   if isinstance(error,composition.ShutdownUnconfirmed) and context is None:
@@ -222,6 +245,51 @@ def run_release(image,config,archive,api):
   recovery=load_file(Path(api['ENTRY_HELPER']).with_name('gateway-source-recovery.py'),'local_source_recovery')
   saved['recovery']=recover_local_source(entry,recovery,profile,saved,closed);saved['phase']='source-restored';journal(entry,saved)
   raise
+
+
+
+
+def same_mounts(left,right):
+ return sorted(json.dumps(v,sort_keys=True) for v in left)==sorted(json.dumps(v,sort_keys=True) for v in right)
+
+
+def retained_release_context(entry,config,state):
+ previous=private_json(STATE);fence=private_json(RUN/'source-fence.json');actual=fence.get('sourceFence',{})
+ entry.require(previous.get('phase')=='failed-before-public' and previous.get('releaseId')==RELEASE and state.get('phase')=='holding' and not (RUN/'source-recovery.json').exists(),'local_resume_previous')
+ entry.require(not entry.ACTIVE.exists() and not entry.WRITER_AUTHORIZED.exists() and not state.get('writerAuthorized') and not any(state.get(k) for k in ['candidate','candidateIntent','activeRuntimeConfig']),'local_resume_writer')
+ row=entry.verify_source(config,running=False)
+ entry.require(fence.get('state')=='fenced' and actual.get('sourceContainerId')==row['Id']==previous['sourceContainerId'] and actual.get('sourceImageId')==row['Image'] and actual.get('sourceStartedAt')==row['State']['StartedAt'] and actual.get('sourceFinishedAt')==row['State']['FinishedAt'] and all(actual.get(k) is True for k in ['sourceStopped','supervisorFenced','productionVerified']) and same_mounts(row.get('Mounts',[]),previous['sourceMounts']),'local_resume_fence')
+ control=entry.entry_state();entry.require(control.get('slot')=='legacy' and control.get('phase')=='drained' and control.get('inflight')==0,'local_resume_entry')
+ recovery=load_file(Path(entry.__file__).with_name('gateway-source-recovery.py'),'resume_inventory');recovery.no_candidates(entry,config['source'])
+ return previous
+
+
+def migration_intent_absent():
+ return all(not os.path.lexists(RUN/name) for name in ['migration-intent.json','state.enc','source-fence.json'])
+
+def helper_exited_before_migration(error):
+ return isinstance(error,LocalHelperExited) and error.action=='migrate' and error.returncode>0 and migration_intent_absent()
+
+
+def resume_before_migration(entry,config,original):
+ """Resume only the original sole SQLite writer after proven no migration."""
+ state=entry.private_json(entry.STATE)
+ entry.require(not entry.ACTIVE.exists() and not entry.WRITER_AUTHORIZED.exists() and not state.get('writerAuthorized') and not any(state.get(k) for k in ['candidate','candidateIntent','candidateOperations','activeRuntimeConfig']),'local_pre_migration_writer')
+ entry.require(migration_intent_absent(),'local_pre_migration_intent')
+ row=entry.inspect_container(original['Id'])
+ entry.require(row['Id']==original['Id'] and row['Image']==original['Image'] and same_mounts(row.get('Mounts',[]),original.get('Mounts',[])) and row.get('HostConfig',{}).get('RestartPolicy')==original.get('HostConfig',{}).get('RestartPolicy'),'local_pre_migration_source')
+ runtime=copy.deepcopy(config);actual=row['State'];runtime['source'].update(pid=actual['Pid'],startedAt=actual['StartedAt'],startTicks=entry.process_ticks(actual['Pid']))
+ entry.verify_source(runtime)
+ entry.require(not entry.execute(['/usr/bin/docker','container','ls','--all','--no-trunc','--filter','label=com.harbor.activation-deployment-id='+RELEASE,'--format','{{.ID}}']).strip(),'local_pre_migration_candidate')
+ for name in ['harbor-local-gateway-worker','harbor-local-gateway-previous','harbor-local-gateway-postgres-check']:
+  entry.require(not entry.execute(['/usr/bin/docker','container','ls','--all','--filter','name=^/'+name+'$','--format','{{.ID}}']).strip(),'local_pre_migration_candidate')
+ recovery=load_file(Path(entry.__file__).with_name('gateway-source-recovery.py'),'pre_migration_health');recovery.verify_original_source_health(entry)
+ current=entry.entry_state()
+ entry.require(current.get('slot')=='legacy' and current.get('phase') in ['active','holding','drained'],'local_pre_migration_slot')
+ if current['phase'] in ['holding','drained']:current=entry.entry_state('resume',current['epoch'])
+ entry.require(current.get('slot')=='legacy' and current.get('phase')=='active','local_pre_migration_resume')
+ if state.get('phase')=='holding':state['phase']='routed';entry.save_state(state)
+ return {'sourceRunning':True,'sourceRestarted':False,'sourceGenerationChanged':runtime['source']!=config['source'],'generationRebindRequired':runtime['source']!=config['source'],'migrationStarted':False,'entryEpoch':current['epoch']}
 
 
 def verified_marker_path(image,active):
@@ -258,7 +326,7 @@ def recover_local_source(entry,recovery,profile,saved,closed):
   return recovery.recover_running_source(entry,config,state,retire_operator=False)
  fence=private_json(RUN/'source-fence.json')
  actual=fence.get('sourceFence',{})
- entry.require(fence.get('state')=='fenced' and saved['phase']=='failed-before-public' and saved['sourceContainerId']==row['Id']==profile['source']['containerId'] and row['Image']==profile['source']['imageId'] and row.get('Mounts',[])==saved['sourceMounts'],'local_recovery_source_identity')
+ entry.require(fence.get('state')=='fenced' and saved['phase']=='failed-before-public' and saved['sourceContainerId']==row['Id']==profile['source']['containerId'] and row['Image']==profile['source']['imageId'] and same_mounts(row.get('Mounts',[]),saved['sourceMounts']),'local_recovery_source_identity')
  entry.require(actual.get('sourceContainerId')==row['Id'] and actual.get('sourceImageId')==row['Image'] and actual.get('sourceStartedAt')==row['State']['StartedAt'] and actual.get('sourceFinishedAt')==row['State']['FinishedAt'] and all(actual.get(k) is True for k in ['sourceStopped','supervisorFenced','productionVerified']),'local_recovery_fence')
  entry.require(closed.get('state')=='closed' and closed.get('targetSessions')==0 and (closed.get('runtimeLoginRevoked') is True or closed.get('noRuntimeAllocated') is True),'local_recovery_runtime_not_closed')
  entry.verify_source(config,running=False);entry.verify_resources(state,config,fenced=True)
@@ -283,7 +351,22 @@ def deploy(image,config,archive,api):
  validate_profile(private_json(PROFILE),image,config)
  RUN.mkdir(mode=0o700,parents=True,exist_ok=True)
  result_file=RUN/'runner-result.json'
- if result_file.exists():raise RuntimeError('Previous local release requires inspection')
+ if result_file.exists():
+  prior=private_json(result_file)
+  if prior.get('state')!='failed-retained':raise RuntimeError('Previous local release is not resumable')
+  entry=load_file(api['ENTRY_HELPER'],'resume_entry')
+  retained_release_context(entry,entry.validate(entry.private_json(entry.PROFILE)),entry.private_json(entry.STATE))
+  process=private_json(RUN/'runner-process.json')
+  try:
+   current=Path('/proc',str(process['pid']),'stat').read_text().rsplit(')',1)[1].split()[19]
+   if current==process['startTicks']:raise RuntimeError('Previous local runner remains live')
+  except FileNotFoundError:pass
+  attempt=RUN/'attempts'/str(time.time_ns());attempt.mkdir(mode=0o700,parents=True)
+  previous_release=attempt/'release.json';previous_release.write_bytes(STATE.read_bytes());previous_release.chmod(0o600)
+  for name in ['runner-result.json','runner-process.json','runner.log']:
+   source=RUN/name
+   if source.exists():os.rename(source,attempt/name)
+
  pid=os.fork()
  if pid==0:
   os.setsid();signal.signal(signal.SIGHUP,signal.SIG_IGN)
@@ -295,7 +378,8 @@ def deploy(image,config,archive,api):
   os.replace(RUN/'runner-process.pending',RUN/'runner-process.json')
   value={'contract':CONTRACT,'releaseId':RELEASE,'offhostVerified':False};code=1
   try:value['result']=run_release(image,config,archive,api);value['state']='complete';code=0
-  except BaseException as error:value.update(state='failed-retained',errorCategory=type(error).__name__)
+  except BaseException as error:
+   traceback.print_exc();value.update(state='failed-retained',errorCategory=type(error).__name__)
   finally:
    temporary=result_file.with_suffix('.pending');fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
    with os.fdopen(fd,'w') as file:json.dump(value,file);file.write('\n');file.flush();os.fsync(file.fileno())

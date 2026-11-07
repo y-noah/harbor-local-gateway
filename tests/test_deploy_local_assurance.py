@@ -27,7 +27,10 @@ class Tests(unittest.TestCase):
     active.write_text('{}');ctx.activated=True
    ctx.activate=activate
    def save(path,value):saved.clear();saved.update(json.loads(json.dumps(value)))
-   entry=types.SimpleNamespace(EntryDeployment=types.SimpleNamespace(enter_probe_worker=lambda scope:calls.append('scope')),PROFILE=entryprofile,STATE=Path(td)/'entry-state',ACTIVE=active,STORAGE_MARKER=None,validate=lambda x:x,private_json=lambda p:{} if p==entryprofile else {'phase':'prepared'},verify_source=lambda x:source,run_action=lambda c,a:calls.append(a),save_json=save,authorize_deployment=lambda **kw:ctx)
+   def run_action(config,action):
+    calls.append(action)
+    if action=='hold-drain' and failure=='drain-failed':raise RuntimeError('old connections did not drain')
+   entry=types.SimpleNamespace(EntryDeployment=types.SimpleNamespace(enter_probe_worker=lambda scope:calls.append('scope')),PROFILE=entryprofile,STATE=Path(td)/'entry-state',ACTIVE=active,STORAGE_MARKER=None,validate=lambda x:x,private_json=lambda p:{} if p==entryprofile else {'phase':'prepared'},verify_source=lambda x:source,run_action=run_action,save_json=save,authorize_deployment=lambda **kw:ctx)
    class Unknown(RuntimeError):pass
    comp=types.SimpleNamespace(ShutdownUnconfirmed=Unknown,configuration=lambda *a:([],{}),image_proof=lambda *a:(_ for _ in ()).throw(Unknown('capability rejected')) if failure=='preflight-rejected' else {'contract':'postgres-conversation-v2'},container_inspection=lambda *a:None,deploy=lambda *a:calls.append('compose') or {'healthy':True})
    def helper(action,timeout=0):
@@ -51,11 +54,13 @@ class Tests(unittest.TestCase):
    if failure=='preflight-run-unknown':
     def attempted(local_api,*args):local_api['docker']('run','synthetic');raise Unknown('outcome unknown')
     comp.image_proof=attempted
-   with patch.object(m,'RUN',run),patch.object(m,'STATE',run/'release.json'),patch.object(m,'private_json',side_effect=private),patch.object(m,'load_file',side_effect=load),patch.object(m,'helper',side_effect=helper),patch.object(m,'reclaim_before_public',side_effect=lambda *a:calls.append('reclaim')),patch.object(m,'restore_publisher',side_effect=lambda db:calls.append('restore-publisher')),patch.object(m,'recover_local_source',side_effect=lambda *a:calls.append('recover') or {'sourceRunning':True}),patch.object(m,'device_gate_install',return_value={}),patch.object(m,'device_gate_remove'),patch.object(m,'candidate_network',return_value={}):
+   with patch.object(m,'RUN',run),patch.object(m,'STATE',run/'release.json'),patch.object(m,'private_json',side_effect=private),patch.object(m,'load_file',side_effect=load),patch.object(m,'helper',side_effect=helper),patch.object(m,'reclaim_before_public',side_effect=lambda *a:calls.append('reclaim')),patch.object(m,'restore_publisher',side_effect=lambda db:calls.append('restore-publisher')),patch.object(m,'recover_local_source',side_effect=lambda *a:calls.append('recover') or {'sourceRunning':True}),patch.object(m,'resume_before_migration',side_effect=lambda *a:calls.append('resume-before-migration') or {'migrationStarted':False}),patch.object(m,'device_gate_install',return_value={}),patch.object(m,'device_gate_remove'),patch.object(m,'candidate_network',return_value={}):
     if failure is None:m.run_release(image,config,None,api)
     else:
      with self.assertRaises(RuntimeError):m.run_release(image,config,None,api)
    return calls,saved
+ def test_drain_failure_restores_traffic_without_invoking_migration(self):
+  calls,state=self.scenario('drain-failed');self.assertEqual(calls,['scope','prepare','arm','hold-drain','resume-before-migration']);self.assertEqual(state['phase'],'source-restored')
  def test_success_is_verified_then_single_cutover(self):
   calls,state=self.scenario(None);self.assertEqual(calls,['scope','prepare','arm','hold-drain','migrate','compose','activate']);self.assertEqual(state['phase'],'committed');self.assertFalse(state['offhostVerified'])
  def test_prepublic_activation_failure_reclaims_before_recovery(self):
@@ -219,3 +224,76 @@ class DynamicRootPolicyTests(unittest.TestCase):
    with self.assertRaisesRegex(ValueError,'network identity changed'):m.verify_candidate_network({'NetworkSettings':{'Networks':{'bridge':{'NetworkID':'a'*64}}}})
    config.pop('postgres_network')
    with self.assertRaisesRegex(ValueError,'approved isolated'):m.candidate_network()
+
+class PreMigrationDrainFailureTests(unittest.TestCase):
+ def fixture(self,root,restarted=False):
+  state={'phase':'holding'};calls=[];config={'source':{'containerId':'same','imageId':'old','pid':10,'startedAt':'old-start','startTicks':'10','address':'172.18.0.2'}}
+  original={'Id':'same','Image':'old','Mounts':[{'Source':'original-data'}],'HostConfig':{'RestartPolicy':{'Name':'unless-stopped','MaximumRetryCount':0}}}
+  row={**original,'State':{'Running':True,'Pid':11 if restarted else 10,'StartedAt':'new-start' if restarted else 'old-start'}}
+  def require(ok,code):
+   if not ok:raise RuntimeError(code)
+  def verify(view):
+   require(view['source']['containerId']==row['Id'] and view['source']['imageId']==row['Image'] and view['source']['pid']==row['State']['Pid'] and view['source']['startedAt']==row['State']['StartedAt'] and row['State']['Running'],'source_generation');return row
+  def control(command=None,epoch=None):
+   calls.append(command);return {'slot':'legacy','phase':'drained','epoch':7,'queued':3} if command is None else {'slot':'legacy','phase':'active','epoch':8,'queued':0}
+  entry=types.SimpleNamespace(__file__=str(root/'entry.py'),STATE=root/'state',ACTIVE=root/'active',WRITER_AUTHORIZED=root/'writer',private_json=lambda p:state,require=require,inspect_container=Mock(return_value=row),verify_source=Mock(side_effect=verify),process_ticks=lambda pid:str(pid),execute=Mock(return_value=''),entry_state=control,save_state=lambda v:calls.append(v['phase']))
+  health=types.SimpleNamespace(verify_original_source_health=lambda e:calls.append('health'))
+  return entry,health,original,config,row,calls
+ def test_drain_releases_queued_traffic_before_fallible_cleanup(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);entry,health,original,config,row,calls=self.fixture(root)
+   with patch.object(m,'RUN',root),patch.object(m,'load_file',return_value=health):result=m.resume_before_migration(entry,config,original)
+   self.assertEqual(calls,['health',None,'resume','routed']);self.assertFalse(result['migrationStarted']);self.assertFalse(result['sourceRestarted']);self.assertFalse(result['sourceGenerationChanged'])
+ def test_same_container_automatic_restart_uses_observed_generation_and_health(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td);entry,health,original,config,row,calls=self.fixture(root,True)
+   with patch.object(m,'RUN',root),patch.object(m,'load_file',return_value=health):result=m.resume_before_migration(entry,config,original)
+   self.assertTrue(result['sourceGenerationChanged']);self.assertTrue(result['generationRebindRequired']);self.assertEqual(config['source']['pid'],10);self.assertEqual(entry.verify_source.call_args.args[0]['source']['pid'],11);self.assertEqual(calls,['health',None,'resume','routed'])
+ def test_intent_writer_or_active_never_resumes_sqlite(self):
+  for evidence in ['source-fence.json','migration-intent.json','state.enc','writer','active']:
+   with self.subTest(evidence=evidence),tempfile.TemporaryDirectory() as td:
+    root=Path(td);(root/evidence).write_text('{}');entry,health,original,config,row,calls=self.fixture(root)
+    with patch.object(m,'RUN',root),patch.object(m,'load_file',return_value=health),self.assertRaises(RuntimeError):m.resume_before_migration(entry,config,original)
+    self.assertEqual(calls,[])
+ def test_foreign_container_materials_or_candidate_never_resume(self):
+  for change in ['image','mount','candidate','not-running','health']:
+   with self.subTest(change=change),tempfile.TemporaryDirectory() as td:
+    root=Path(td);entry,health,original,config,row,calls=self.fixture(root,True)
+    if change=='image':row['Image']='different'
+    if change=='mount':row['Mounts']=[{'Source':'different'}]
+    if change=='candidate':entry.execute.return_value='candidate-id'
+    if change=='not-running':row['State']['Running']=False
+    if change=='health':health.verify_original_source_health=Mock(side_effect=RuntimeError('unhealthy'))
+    with patch.object(m,'RUN',root),patch.object(m,'load_file',return_value=health),self.assertRaises(RuntimeError):m.resume_before_migration(entry,config,original)
+    self.assertNotIn('resume',calls)
+ def test_only_normal_helper_exit_with_no_intent_can_use_early_resume(self):
+  with tempfile.TemporaryDirectory() as td,patch.object(m,'RUN',Path(td)):
+   self.assertTrue(m.helper_exited_before_migration(m.LocalHelperExited('migrate',1)))
+   for error in [m.LocalOperationUnknown('timeout'),RuntimeError('unknown'),m.LocalHelperExited('resume',1),m.LocalHelperExited('migrate',-9)]:self.assertFalse(m.helper_exited_before_migration(error))
+   for name in ['migration-intent.json','state.enc','source-fence.json']:
+    p=Path(td)/name;p.write_text('{}');self.assertFalse(m.helper_exited_before_migration(m.LocalHelperExited('migrate',1)));p.unlink()
+
+class RetainedMigrationResumeTests(unittest.TestCase):
+ def test_resume_requires_same_stopped_source_without_any_public_writer(self):
+  for change in ['valid','generation','writer','candidate','recovery-started']:
+   with self.subTest(change=change),tempfile.TemporaryDirectory() as td:
+    root=Path(td);source={'containerId':'source'};row={'Id':'source','Image':'image','State':{'StartedAt':'started','FinishedAt':'finished'},'Mounts':[{'Source':'preserved','Destination':'/app/data'},{'Source':'runtime','Destination':'/app/runtime'}]};previous={'phase':'failed-before-public','releaseId':m.RELEASE,'sourceContainerId':'source','sourceMounts':list(reversed(row['Mounts']))};state={'phase':'holding'};fence={'state':'fenced','sourceFence':{'sourceContainerId':'source','sourceImageId':'image','sourceStartedAt':'started','sourceFinishedAt':'finished','sourceStopped':True,'supervisorFenced':True,'productionVerified':True}}
+    if change=='generation':fence['sourceFence']['sourceStartedAt']='another-generation'
+    if change=='candidate':state['candidateIntent']={'id':'unexpected'}
+    if change=='writer':(root/'writer').write_text('{}')
+    if change=='recovery-started':(root/'source-recovery.json').write_text('{}')
+    def require(ok,code):
+     if not ok:raise RuntimeError(code)
+    inventory=Mock();entry=types.SimpleNamespace(__file__=str(root/'entry.py'),ACTIVE=root/'active',WRITER_AUTHORIZED=root/'writer',require=require,verify_source=Mock(return_value=row),entry_state=lambda:{'slot':'legacy','phase':'drained','inflight':0})
+    with patch.object(m,'RUN',root),patch.object(m,'private_json',side_effect=lambda p:previous if p==m.STATE else fence),patch.object(m,'load_file',return_value=types.SimpleNamespace(no_candidates=inventory)):
+     if change=='valid':self.assertEqual(m.retained_release_context(entry,{'source':source},state),previous);inventory.assert_called_once()
+     else:
+      with self.assertRaises(RuntimeError):m.retained_release_context(entry,{'source':source},state)
+      inventory.assert_not_called()
+
+class MountIdentityTests(unittest.TestCase):
+ def test_docker_mount_order_is_irrelevant_but_scope_and_permissions_are_exact(self):
+  a=[{'Source':'data','Destination':'/app/data','RW':True},{'Source':'runtime','Destination':'/app/runtime','RW':True}]
+  self.assertTrue(m.same_mounts(a,list(reversed(a))))
+  self.assertFalse(m.same_mounts(a,[{**a[0],'RW':False},a[1]]))
+  self.assertFalse(m.same_mounts(a,[{**a[0],'Source':'foreign'},a[1]]))

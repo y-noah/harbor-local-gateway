@@ -233,9 +233,16 @@ class PostgreSQLShutdownTests(unittest.TestCase):
   state.pop(base.NAME+'-worker');source=state[base.NAME]
   source['State'].update(Running=False,Status='exited')
   source['Config'].update(Cmd=['node','server.mjs'],WorkingDir='/app',Entrypoint=['docker-entrypoint.sh'],Env=['HARBOR_DATA_DIR=/app/data'],Labels={'com.aistrong.project':base.NAME})
-  state[base.OLD]['Config']['Labels']={'com.harbor.data-contract':'session-metadata-only-v1'}
+  state[base.OLD]['Config']['Labels']={'com.harbor.data-contract':'session-metadata-only-v1','org.opencontainers.image.revision':base.OLD.rsplit(':',1)[-1]}
+  state[source['Image']]=state[base.OLD]
   config={**base.CONFIG,'image_prefix':base.IMAGE.rsplit(':',1)[0],'postgres_legacy_source_engine':'sqlite'}
   return api,calls,state,config
+ def test_sqlite_provenance_uses_exact_container_image_when_tag_was_rebuilt(self):
+  with tempfile.TemporaryDirectory() as directory:
+   self.prepare(directory);api,calls,state,config=self.sqlite_source_fixture(directory);source=state[base.NAME];state[base.OLD]={'Id':'sha256:'+'f'*64,'Config':{'Labels':{}}}
+   self.assertTrue(pg.legacy_sqlite_source(api,source,'gateway',config))
+   state[source['Image']]['Config']['Labels']['org.opencontainers.image.revision']='e'*40
+   with self.assertRaises(pg.ShutdownUnconfirmed):pg.legacy_sqlite_source(api,source,'gateway',config)
  def test_explicit_stopped_main_sqlite_shape_can_first_cutover_without_pg_preflight(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state,config=self.sqlite_source_fixture(directory);original=api['docker']

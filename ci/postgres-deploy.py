@@ -48,8 +48,10 @@ def legacy_sqlite_source(api,instance,role,config):
     no_code_injection(actual)
     image_name=actual.get('Image','');prefix=config.get('image_prefix')
     if not isinstance(prefix,str) or not re.fullmatch(re.escape(prefix)+r':[0-9a-f]{40}',image_name):raise ShutdownUnconfirmed('Legacy SQLite image source is not verified')
-    image=image_inspection(api,image_name,[]);labels=image['Config'].get('Labels',{}) or {}
-    if image['Id']!=instance.get('Image') or labels.get('com.harbor.data-contract')!='session-metadata-only-v1' or labels.get('com.harbor.ci-validation-only')=='true':raise ShutdownUnconfirmed('Legacy SQLite image contract is not verified')
+    image_id=instance.get('Image')
+    if not isinstance(image_id,str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',image_id):raise ShutdownUnconfirmed('Legacy SQLite image identity is invalid')
+    image=image_inspection(api,image_id,[]);labels=image['Config'].get('Labels',{}) or {}
+    if image['Id']!=image_id or labels.get('org.opencontainers.image.revision')!=image_name.rsplit(':',1)[-1] or labels.get('com.harbor.data-contract')!='session-metadata-only-v1' or labels.get('com.harbor.ci-validation-only')=='true':raise ShutdownUnconfirmed('Legacy SQLite image contract is not verified')
     return True
 
 def container_shutdown(api,instance,role):
