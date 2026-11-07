@@ -11,7 +11,7 @@ User=root
 Group=root
 RootDirectory=/var/lib/harbor-entry/jails/legacy
 RootDirectoryStartOnly=yes
-ExecStartPre=+/usr/bin/python3 -I -B /usr/local/lib/harbor/gateway-entry-controller.py slot-start legacy
+ExecStartPre=+/usr/bin/nsenter --mount=/proc/1/ns/mnt --root=/proc/1/root --wd=/ -- /usr/bin/python3 -I -B /usr/local/lib/harbor/gateway-entry-controller.py slot-start legacy
 ExecStart=/usr/bin/python3 -I -B /usr/local/lib/harbor/gateway-legacy-transparent.py
 BindReadOnlyPaths=/usr /lib /lib64
 BindReadOnlyPaths=/etc/harbor-entry/legacy:/etc
