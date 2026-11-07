@@ -279,7 +279,7 @@ def verify_resources(state,config,fenced=False):
   if policy:
    owned=state.get('candidateDeviceIndices',{});critical=dev in owned or dev not in state['dynamicPeerDeviceIndices'] or dev==state.get('sourceBridgePort')
    expected=owned.get(dev,state['dynamicPeerDeviceIndices'].get(dev))
-   if not critical and live.get(dev)!=expected:continue
+   if not critical and (expected is None or live.get(dev)!=expected):continue
    require(expected is not None and live.get(dev)==expected,'tc_device_identity_changed')
   require(tc_digest(dev)==digest,'tc_rules_changed')
  sets=json.loads(execute(['/usr/sbin/nft','--json','list','set','inet',TABLE,'enabled_ports']))

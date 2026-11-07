@@ -148,3 +148,12 @@ class DynamicPeerIdentityTransitionTests(unittest.TestCase):
    controller.verify_resources(policy,{});tc.assert_not_called()
    live[0]['ifindex']=20
    with self.assertRaisesRegex(RuntimeError,'tc_rules_changed'):controller.verify_resources(policy,{})
+
+class DynamicPeerInitialAbsenceTests(unittest.TestCase):
+ def test_peer_already_absent_at_policy_capture_does_not_become_critical(self):
+  policy={'allowDynamicBridgePeers':True,'phase':'prepared','sourceBridgePort':'source','rulesDigest':'r','mangleDigest':'m','tcDigests':{'old-peer':'old'},'dynamicPeerDeviceIndices':{'old-peer':None}}
+  def execute(args):return json.dumps({'nftables':[{'set':{'elem':[]}}]}) if args[0]=='/usr/sbin/nft' else '[]'
+  with patch.object(controller,'dynamic_bridge_policy',return_value=policy),patch.object(controller,'state_rules_digest',return_value='r'),patch.object(controller,'mangle_digest',return_value='m'),patch.object(controller,'execute',side_effect=execute),patch.object(controller,'tc_digest') as tc:
+   controller.verify_resources(policy,{});tc.assert_not_called()
+   policy['candidateDeviceIndices']={'old-peer':None}
+   with self.assertRaisesRegex(RuntimeError,'tc_device_identity_changed'):controller.verify_resources(policy,{})
