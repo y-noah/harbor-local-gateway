@@ -78,7 +78,7 @@ export async function runStorageOperator({context,backupKey,activationKey,baseli
     const verifySource=async()=>{await guard();const observed=await inspectSqliteSourceLease(lease,{directory:config.runDirectory});if(observed.source!==source.sourceDataDir||canonical(observed.content)!==canonical(source.content))fail('storage_operator_source_changed');const files=await readManifest(join(directory,'files.enc'),backupKey);if(canonical(await digestFile(join(directory,'files.enc')))!==canonical(source.files.manifestDigest))fail('storage_operator_file_manifest_changed');await verifyFileSetSources(files,{exclude:config.fileRoots.filter(root=>resolve(root.source)===source.sourceDataDir).flatMap(root=>['gateway.sqlite','gateway.sqlite-wal','gateway.sqlite-shm'].map(relative=>({root:root.id,relative})))});};
     await verifySource();
     if(!['promotion_pending','runtime_verified','pending'].includes(state.phase)){
-      await phase('importing');await transferSqlite({directory,key:backupKey,signal,beforeBatch:guard,afterBatch:async row=>{await guard();await afterBatch?.(row);}});await verifySource();await phase('verified');
+      await phase('importing');await transferSqlite({directory,key:backupKey,batchRows:config.transferBatchRows,signal,beforeBatch:guard,afterBatch:async row=>{await guard();await afterBatch?.(row);}});await verifySource();await phase('verified');
     }
     if(!state.filesRestored){
       if(!await exists(materials)){

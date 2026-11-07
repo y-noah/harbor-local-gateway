@@ -16,6 +16,11 @@ import {storageOperatorSourceSupervisor,fenceStorageOperatorSupervisor,verifySto
 
 const exec=promisify(execFile),contexts=new WeakMap(),hash=value=>createHash('sha256').update(canonical(value)).digest('hex');
 const fail=code=>{throw transferError(code);};
+function transferBatchRowsOption(value){
+  if(!Object.hasOwn(value,'transferBatchRows'))return {};
+  if(!Number.isInteger(value.transferBatchRows)||value.transferBatchRows<1||value.transferBatchRows>500)fail('storage_operator_transfer_batch_rows');
+  return {transferBatchRows:value.transferBatchRows};
+}
 function observeCommand({signal,deadline}){return (binary,args,options={})=>{signal?.throwIfAborted();const remaining=deadline===undefined?Infinity:Math.floor(deadline-performance.now());if(remaining<=0)fail('storage_operator_private_preflight_timeout');return exec(binary,args,{...options,signal,timeout:Math.min(options.timeout??30000,remaining)});};}
 export function storageOperatorContext(context){const value=contexts.get(context);if(!value)fail('storage_operator_context_required');return value;}
 export function storageOperatorCandidateOrigins(candidate){
@@ -34,14 +39,15 @@ function publish(record){freeze(record.configuration);freeze(record.adminOptions
 
 // Only task-owned real processes can enter this test path. This scope can never
 // certify a Docker stop, candidate image, off-host backup or production activation.
-export async function createTaskStorageOperatorContext({laboratory,runtime,sourceChild,sourceDataDir,runDirectory,fileRoots,preflightTimeoutMs=120000}={}){
+export async function createTaskStorageOperatorContext({laboratory,runtime,sourceChild,sourceDataDir,runDirectory,fileRoots,preflightTimeoutMs=120000,transferBatchRows}={}){
   if(!isOwnedLaboratory(laboratory)||!isOwnedRuntime(runtime)||ownedProcessProof(runtime,sourceChild).role!=='gateway')fail('storage_operator_task_ownership');
   if(!Number.isSafeInteger(preflightTimeoutMs)||preflightTimeoutMs<1000||preflightTimeoutMs>120000)fail('storage_operator_preflight_budget');
+  const transfer=transferBatchRowsOption(transferBatchRows===undefined?{}:{transferBatchRows});
   const source=await sourceDirectory(sourceDataDir),identity=await physical(source),pid=sourceChild.pid;let fenced=false;
   if(!source.startsWith(laboratory.directory+'/')||!resolve(runDirectory).startsWith(laboratory.directory+'/')||!Array.isArray(fileRoots)||fileRoots.some(root=>!resolve(root.source).startsWith(laboratory.directory+'/')))fail('storage_operator_task_path_not_owned');
   const observe=async()=>{if(!fenced||sourceChild.pid!==pid||sourceChild.exitCode!==0||sourceChild.signalCode!==null)fail('storage_operator_source_not_fenced');await sourceDirectory(source);if(canonical(await physical(source))!==canonical(identity))fail('storage_operator_source_identity');return {scope:'task-owned',sourceStopped:true,supervisorFenced:true,productionVerified:false};};
   const admin=new PostgresStore({connection:laboratory.connection,allowPlaintextLocalNetwork:true,poolSize:1});let registry;try{const row=await admin.get('SELECT current_database() database,(SELECT oid::text FROM pg_database WHERE datname=current_database()) database_oid');registry={database:row.database,databaseOid:row.database_oid,schema:'harbor_operator_registry',allowMetadataWrites:true};}finally{await admin.close();}
-  const configuration=structuredClone({sourceDataDir:source,runDirectory:resolve(runDirectory),fileRoots,expectedCluster:null,sourceIdentity:identity,registry,backupKeyVersion:'task-owned'});
+  const configuration=structuredClone({sourceDataDir:source,runDirectory:resolve(runDirectory),fileRoots,expectedCluster:null,sourceIdentity:identity,registry,backupKeyVersion:'task-owned',...transfer});
   return publish({scope:'task-owned',preflightTimeoutMs,sourceOwnerUid:process.getuid(),configuration,configurationDigest:hash(configuration),adminOptions:{connection:laboratory.connection,allowPlaintextLocalNetwork:true},
     fence:async()=>{if(!fenced){await runtime.stop(sourceChild);fenced=true;}return observe();},observe,
     runtimePreflight:async({store,materials})=>{await store.verifySchema();await verifyStoredCredentials(store,await readFile(join(materials,'data','key-encryption.key')));return {scope:'task-runtime-core',credentialsVerified:true,schemaVerified:true,candidateVerified:false,missing:['actual_candidate_image_preflight','fresh_storage_report','server_device_tls_preflight']};}
@@ -56,7 +62,8 @@ async function rootFile(path){if(path!=='/etc/harbor-storage-operator.json')fail
 const digest=/^sha256:[a-f0-9]{64}$/;
 export async function createDockerStorageOperatorContext(configFile){
   if(process.platform!=='linux'||process.getuid()!==0)fail('storage_operator_root_required');
-  const config=await rootFile(configFile),allowed=['version','source','runDirectory','fileRoots','expectedCluster','candidate','backupRequired','registry','backupKeyVersion','baselineReceiverMachine','infrastructurePublisher'];
+  const config=await rootFile(configFile),allowed=['version','source','runDirectory','fileRoots','expectedCluster','candidate','backupRequired','registry','backupKeyVersion','baselineReceiverMachine','infrastructurePublisher','transferBatchRows'];
+  const transfer=transferBatchRowsOption(config);
   storageOperatorSourceSupervisor(config.source);
   if(config.baselineReceiverMachine!==undefined&&!/^[a-f0-9]{64}$/.test(config.baselineReceiverMachine))fail('storage_operator_baseline_receiver_required');
   if(typeof config.backupKeyVersion!=='string'||!/^[-a-zA-Z0-9_.]{1,64}$/.test(config.backupKeyVersion))fail('storage_operator_backup_key_version');
@@ -82,7 +89,7 @@ export async function createDockerStorageOperatorContext(configFile){
     const active=(await command('/usr/bin/docker',['ps','--quiet','--filter','label=com.aistrong.project='+config.source.project],{timeout:15000,maxBuffer:16384})).stdout.trim();if(active)fail('storage_operator_other_source_active');
     containerId??=row.Id;return {scope:'docker-systemd',sourceStopped:true,supervisorFenced:true,productionVerified:true,sourceImageId:row.Image,sourceContainerId:row.Id,sourceStartedAt:row.State.StartedAt,sourceFinishedAt:row.State.FinishedAt};
   };
-  const configuration={sourceDataDir:source,runDirectory:resolve(config.runDirectory),fileRoots:config.fileRoots,expectedCluster:config.expectedCluster,candidate:config.candidate,backupRequired:config.backupRequired,sourceIdentity:identity,sourceController:structuredClone(config.source),...(infrastructurePublisher?{infrastructurePublisher}:{}),registry:config.registry,backupKeyVersion:config.backupKeyVersion,...(config.baselineReceiverMachine?{baselineReceiverMachine:config.baselineReceiverMachine}:{})};
+  const configuration={sourceDataDir:source,runDirectory:resolve(config.runDirectory),fileRoots:config.fileRoots,expectedCluster:config.expectedCluster,candidate:config.candidate,backupRequired:config.backupRequired,sourceIdentity:identity,sourceController:structuredClone(config.source),...(infrastructurePublisher?{infrastructurePublisher}:{}),registry:config.registry,backupKeyVersion:config.backupKeyVersion,...transfer,...(config.baselineReceiverMachine?{baselineReceiverMachine:config.baselineReceiverMachine}:{})};
   const context=publish({scope:'docker-systemd',preflightTimeoutMs:120000,sourceOwnerUid:config.source.uid,configuration,configurationDigest:hash(configuration),adminOptions:{connectionString},
     fence:async()=>{const row=await inspect();if(!/^[a-f0-9]{64}$/.test(row.Id??'')||containerId!==undefined&&row.Id!==containerId)fail('storage_operator_source_identity');containerId??=row.Id;await fenceStorageOperatorSupervisor(config.source,exec);await exec('/usr/bin/docker',['update','--restart=no',containerId],{timeout:15000,maxBuffer:16384});if((await inspect()).State.Running)await exec('/usr/bin/docker',['stop','--time','300',containerId],{timeout:330000,maxBuffer:16384});return observe();},observe,
     runtimePreflight:async({connection,materials,target,signal,deadline:callerDeadline})=>{

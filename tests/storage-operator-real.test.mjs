@@ -17,15 +17,15 @@ import {readManifest,writeManifest} from '../migration-artifacts.mjs';
 import {openRehearsalTarget,verifyRehearsalIsolation,destroyRehearsalTarget,transferSqlite,verifyTransferredSqliteSnapshot} from '../sqlite-postgres-transfer.mjs';
 const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB;
 const options={skip:!binDirectory?'requires isolated PG18':false,timeout:180000};
-async function fixture(){
+async function fixture({transferBatchRows,requestCount=3}={}){
   const laboratory=await createPrivatePostgres({binDirectory,libraryDirectory}),runtime=createOwnedRuntime(),source=join(laboratory.directory,'source'),homes=join(laboratory.directory,'source-runtime'),runDirectory=join(laboratory.directory,'operator'),master=randomBytes(32),backupKey=randomBytes(32),activationKey=randomBytes(32);let store,child;
   try{
     for(const directory of [source,homes,runDirectory,join(homes,'synthetic-account')])await mkdir(directory,{mode:0o700});await writeFile(join(source,'key-encryption.key'),master,{mode:0o600});await writeFile(join(source,'settings.json'),JSON.stringify({port:0,codexBinary:process.execPath,adminPasswordHash:{salt:'a'.repeat(32),digest:'b'.repeat(64)}}),{mode:0o600});await writeFile(join(homes,'synthetic-account','auth.json'),'{"synthetic":"offline"}',{mode:0o600});
-    store=new Store(join(source,'gateway.sqlite'),{encryptionKey:master});const member=store.createMember('合成迁移员工',null,null,['gpt-6.1-sol']),actor=store.authenticate(member.secret);store.run("INSERT INTO accounts(id,name,home,state,auth_mode) VALUES('synthetic-api','合成账号',?,'ready','openai_api')",join(homes,'synthetic-account'));store.saveUpstreamKey('synthetic-api','synthetic-upstream-key');for(let index=0;index<3;index++){const id=store.observe(actor,'synthetic-network','synthetic-agent','gpt-6.1-sol');store.finish(id,{input:100+index,output:10,cached:5});if(index===0)store.run('UPDATE requests SET manual_cost_atoms=? WHERE id=?','123456789123456789123',id);}store.close();store=null;
+    store=new Store(join(source,'gateway.sqlite'),{encryptionKey:master});const member=store.createMember('合成迁移员工',null,null,['gpt-6.1-sol']),actor=store.authenticate(member.secret);store.run("INSERT INTO accounts(id,name,home,state,auth_mode) VALUES('synthetic-api','合成账号',?,'ready','openai_api')",join(homes,'synthetic-account'));store.saveUpstreamKey('synthetic-api','synthetic-upstream-key');for(let index=0;index<requestCount;index++){const id=store.observe(actor,'synthetic-network','synthetic-agent','gpt-6.1-sol');store.finish(id,{input:100+index,output:10,cached:5});if(index===0)store.run('UPDATE requests SET manual_cost_atoms=? WHERE id=?','123456789123456789123',id);}store.close();store=null;
     const entry=join(laboratory.directory,'legacy-fixture.mjs'),gateway=new URL('../server.mjs',import.meta.url).href,instance=new URL('../instance.mjs',import.meta.url).href;
     await writeFile(entry,'import {createGateway} from '+JSON.stringify(gateway)+';import {acquireInstance} from '+JSON.stringify(instance)+';const instance=await acquireInstance(process.env.HARBOR_DATA_DIR);const app=createGateway({dataDir:process.env.HARBOR_DATA_DIR,runtimeDir:process.env.HARBOR_RUNTIME_DIR,pricingFetch:async()=>({ok:false,status:503})});app.server.listen(0,"127.0.0.1",()=>process.send({ready:true}));process.on("SIGTERM",()=>app.close().then(()=>instance.release()).then(()=>process.exit(0)));\n');
     child=runtime.start(process.execPath,[entry],{role:'gateway',env:{HARBOR_DATA_DIR:source,HARBOR_RUNTIME_DIR:homes},stdio:['ignore','pipe','pipe','ipc']});await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('source fixture readiness timeout')),15000);child.once('error',reject);child.on('message',message=>{if(message.ready){clearTimeout(timer);resolve();}});child.once('exit',()=>{clearTimeout(timer);reject(Error('source fixture exited'));});});
-    const fileRoots=[{id:'data',source},{id:'runtime',source:homes,destinationPrefix:'/app/runtime'}],context=await createTaskStorageOperatorContext({laboratory,runtime,sourceChild:child,sourceDataDir:source,runDirectory,fileRoots});
+    const fileRoots=[{id:'data',source},{id:'runtime',source:homes,destinationPrefix:'/app/runtime'}],context=await createTaskStorageOperatorContext({laboratory,runtime,sourceChild:child,sourceDataDir:source,runDirectory,fileRoots,transferBatchRows});
     return {laboratory,runtime,source,homes,fileRoots,sourceChild:child,runDirectory,backupKey,activationKey,member,master,legacyEntry:entry,context,close:async()=>{await runtime.close();await laboratory.close();}};
   }catch(error){store?.close();await runtime.close();await laboratory.close();throw error;}
 }
@@ -238,4 +238,28 @@ test('read-only registry inspection never creates or adopts metadata and cannot 
   assert.equal((await admin.get('SELECT COUNT(*) n FROM harbor_operator_registry.runs')).n,0);assert.equal((await admin.get("SELECT COUNT(*) n FROM pg_database WHERE datname LIKE 'harbor_rehearsal_%'")).n,0);assert.equal(f.sourceChild.exitCode,null);await assert.rejects(lstat(join(f.runDirectory,'operator.enc')),{code:'ENOENT'});
   await admin.query('DROP SCHEMA harbor_operator_registry CASCADE');writable=await openStorageOperatorRegistry(f.context,{key:f.backupKey,cluster});assert.notEqual(inspectStorageOperatorRegistry(writable).schemaOid,original.schemaOid);await assert.rejects(readStorageOperatorAllocation(readonly,{runId:'synthetic-unallocated'}),{code:'storage_operator_registry_foreign'});
  }finally{if(readonly)await closeStorageOperatorRegistry(readonly);if(writable)await closeStorageOperatorRegistry(writable);await admin.close();await f.close();}
+});
+
+test('configured 500-row operator batches resume cancellation and retain complete row verification',options,async()=>{
+ const f=await fixture({transferBatchRows:500,requestCount:1201});let target;
+ try{
+  assert.equal(storageOperatorContext(f.context).configuration.transferBatchRows,500);const cancelled=new AbortController(),first=[];
+  await assert.rejects(runStorageOperator({...f,signal:cancelled.signal,afterBatch:row=>{if(row.table==='requests'){first.push(row.rows);cancelled.abort();}}}),{code:'transfer_interrupted'});assert.deepEqual(first,[500]);
+  const resumed=[];const result=await runStorageOperator({...f,afterBatch:row=>{if(row.table==='requests')resumed.push(row.rows);}});assert.equal(result.state,'pending');assert.deepEqual(resumed,[500,201]);
+  target=await adminTarget(f);assert.equal((await target.store.get('SELECT COUNT(*) n FROM harbor.requests')).n,1201);assert.equal((await target.store.get('SELECT COUNT(*) n FROM harbor.request_prices')).n,1201);
+  const verified=await verifyTransferredSqliteSnapshot({directory:join(f.runDirectory,'artifacts'),key:f.backupKey,store:target.store,batchRows:500});assert.ok(verified.rows>=1201);
+  await target.store.run("UPDATE harbor.requests SET model='synthetic-tampered' WHERE id=(SELECT id FROM harbor.requests ORDER BY id DESC LIMIT 1)");await assert.rejects(verifyTransferredSqliteSnapshot({directory:join(f.runDirectory,'artifacts'),key:f.backupKey,store:target.store,batchRows:500}),{code:'transfer_target_conflict'});
+ }finally{await target?.store.close();await f.close();}
+});
+
+test('allocated legacy operator state rejects an explicit batch configuration change and still resumes its original context',options,async()=>{
+ const f=await fixture();
+ try{
+  const trusted=storageOperatorContext(f.context);assert.equal(Object.hasOwn(trusted.configuration,'transferBatchRows'),false);
+  await assert.rejects(runStorageOperator({...f,afterPhase:phase=>{if(phase==='target_manifest_prepared')throw Error('synthetic allocated pause');}}),/synthetic allocated pause/);
+  const original=await readManifest(join(f.runDirectory,'operator.enc'),f.backupKey);assert.ok(original.allocation.databaseOid);
+  const changed=await createTaskStorageOperatorContext({laboratory:f.laboratory,runtime:f.runtime,sourceChild:f.sourceChild,sourceDataDir:f.source,runDirectory:f.runDirectory,fileRoots:f.fileRoots,transferBatchRows:500});assert.notEqual(storageOperatorContext(changed).configurationDigest,trusted.configurationDigest);
+  await assert.rejects(runStorageOperator({...f,context:changed}),{code:'storage_operator_state_mismatch'});assert.equal((await readManifest(join(f.runDirectory,'operator.enc'),f.backupKey)).configurationDigest,original.configurationDigest);assert.equal(f.sourceChild.exitCode,null,'configuration drift must refuse before fencing the owned source');
+  assert.equal((await runStorageOperator(f)).state,'pending');
+ }finally{await f.close();}
 });

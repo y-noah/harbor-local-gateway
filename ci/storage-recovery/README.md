@@ -38,6 +38,8 @@ node storage-maintenance.mjs restore-files --directory /private/rehearsal --dest
 
 演练结束后可用 `destroy-target`（同样的 directory/key-file 与管理员环境变量）删除工具创建的私有数据库/角色。它复核目标归属和访问隔离，遇到其他连接不强制删除；文件清理由调用方在确认资源已退出后办理。
 
+固定 root `/etc/harbor-storage-operator.json` 可选 `transferBatchRows`，仅接受整数 1～500；省略时继续沿用每批100行，且不改变旧配置摘要。每批仍受2MiB、单行1MiB上限约束，事务前后均执行原来源围栏与 SQLite lease 检查；增加行数只减少批次数，不减少每批校验。显式字段纳入可信配置摘要，已有 operator state 不允许中途增加或更改此值（包括显式补写100）；需沿原配置续行，或在原任务安全收尾后另行准备新任务。发布可经实际预算验证后显式配置500，不作为所有环境默认值。
+
 ## PostgreSQL 全量恢复与 PITR
 
 正式可运行恢复主路径为 PostgreSQL 18 的物理 basebackup 加连续 WAL。物理恢复保留集群 system_identifier、事务 ID 及快照语义。应用配置、员工/上游 Key 主密钥、正文密钥、设备 CA/TLS 材料、账号 home 和两个 spool 与数据库共同保全；客户端设备私钥不属于服务器备份。
