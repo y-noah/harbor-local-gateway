@@ -178,39 +178,26 @@ export async function verifyPeriodicApplicationBackup(context,proof,pointId,{sig
 // Manual typed export of one closed point. It contains no current source paths
 // to execute and never claims the source point has been restored or activated.
 export async function preparePeriodicApplicationHandoff(context,proof,pointId,{signal}={}){
-  const {record,source,base}=contextFor(context,proof),{backupMachineIdentity,copyBackupCipher,postgresBackupFileSetPaths,validHandoffPath,handoffFiles}=await import('./postgres-backup-handoff.mjs'),{readWalCheckpointSegments}=await import('./postgres-backup-wal-catalog.mjs'),{inspectArchivedWal}=await import('./postgres-recovery.mjs');
-  return operate(context,proof,'handoff-'+pointId,async signal=>{
-    const backup=await authenticatePeriodicApplicationBackup(context,proof,pointId,{signal}),closed=periodicApplicationBackupSource(backup),point=postgresBackupRecoveryPointSource(closed.point),capture=periodicApplicationCaptureSource(closed.capture),destination=join(point.directory,'handoff');
-    let lease;try{lease=await acquireInstance(destination);}catch(error){if(error.code==='EADDRINUSE')fail('periodic_application_handoff_busy');throw error;}
-    let owned=false,complete=false,identity;
-    const credentials=()=>{if(record.adminOptions.connection){const {user,password,database}=record.adminOptions.connection;if(![user,password,database].every(value=>typeof value==='string'&&value))fail('backup_handoff_credentials_required');return {user,password,database};}const address=new URL(record.adminOptions.connectionString);return {user:decodeURIComponent(address.username),password:decodeURIComponent(address.password),database:decodeURIComponent(address.pathname.slice(1))};};
-    const summary=async manifest=>({version:1,kind:'periodic-application',backupId:proof.backupId,pointId,handoffDigest:await digestFile(join(destination,'handoff.enc'),{signal}),files:manifest.count,bytes:manifest.totalBytes,backupComplete:true,restoreVerified:false,offhostVerified:false,deploymentAllowed:false});
-    try{
-      if(await exists(destination)){
-        await privateDirectory(destination);const manifest=await readManifest(join(destination,'handoff.enc'),periodicApplicationKey(record),{signal});
-        if(manifest.applicationKeyVersion!==record.applicationKeyVersion||manifest.applicationKeyDigest!==record.applicationKeyDigest||manifest.version!==1||manifest.kind!=='periodic-application'||manifest.backupId!==proof.backupId||manifest.pointId!==pointId||manifest.configurationDigest!==record.configurationDigest||manifest.keyVersion!==record.keyVersion||!same(manifest.backupCompleteDigest,closed.manifestDigest)||!same(manifest.checkpointDigest,point.manifest.checkpointDigest)||manifest.sourceMachine!==await backupMachineIdentity())fail('periodic_application_handoff_binding');
-        for await(const unused of handoffFiles({directory:destination,key:periodicApplicationKey(record),manifest,signal,maxFiles:manifest.count,maxBytes:manifest.totalBytes+manifest.parts.reduce((n,row)=>n+row.digest.bytes,1048576)})){}return summary(manifest);
-      }
-      await mkdir(destination,{mode:0o700});owned=true;identity=await lstat(destination);await syncDirectory(point.directory);
-      const seen=new Set(),parts=[];let entries=[],entryBytes=0,count=0,totalBytes=0;
-      const flush=async()=>{if(!entries.length)return;const name='handoff-catalog-'+parts.length+'.enc';await writeManifest(join(destination,name),{version:1,ordinal:parts.length,entries},periodicApplicationKey(record));parts.push({name,count:entries.length,digest:await digestFile(join(destination,name),{signal})});entries=[];entryBytes=0;};
-      const add=async(path,from)=>{
-        signal?.throwIfAborted();if(seen.has(path))return;if(!validHandoffPath(path,proof.backupId,'periodic-application',pointId))fail('backup_handoff_path_invalid');seen.add(path);
-        const digest=await digestFile(from,{signal});await copyBackupCipher(from,join(destination,path),{signal,maxBytes:digest.bytes});if(!same(await digestFile(from,{signal}),digest)||!same(await digestFile(join(destination,path),{signal}),digest))fail('backup_handoff_source_changed');
-        const entry={path,digest},bytes=Buffer.byteLength(JSON.stringify(entry));if(entryBytes+bytes>524288)await flush();entries.push(entry);entryBytes+=bytes;totalBytes+=digest.bytes;count++;if(!Number.isSafeInteger(totalBytes))fail('backup_handoff_capacity');
-      };
-      const prefix='backup/'+proof.backupId+'/';await add(prefix+'backup.enc',join(base,'backup.enc'));
-      for await(const name of postgresBackupFileSetPaths(base,record.key))await add(prefix+name,join(base,name));
-      const pointPrefix=prefix+'points/'+pointId+'/';for(const name of ['point.enc','checkpoint.enc','backup-complete.enc',...point.checkpoint.walCatalog.parts.map(row=>row.name)])await add(pointPrefix+name,join(point.directory,name));
-      const capturePrefix=prefix+'application-staging/'+pointId+'/';await add(capturePrefix+'capture.enc',join(capture.directory,'capture.enc'));for await(const name of postgresBackupFileSetPaths(capture.directory,periodicApplicationKey(record)))await add(capturePrefix+name,join(capture.directory,name));
-      await add('wal/cluster.enc',join(record.archiveDirectory,'cluster.enc'));
-      const addWal=async name=>{if(seen.has('wal/'+name+'.enc'))return;const meta=await inspectArchivedWal({name,directory:record.archiveDirectory,key:record.key,ownerUid:record.restoreUid,requireBoundName:true});await add('wal/'+name+'.enc',join(record.archiveDirectory,name+'.enc'));await add('wal/'+name+'.meta.enc',join(record.archiveDirectory,name+'.meta.enc'));if(meta.identity?.history)await addWal(meta.identity.history.name);};
-      for await(const row of readWalCheckpointSegments({directory:point.directory,key:record.key,checkpoint:point.checkpoint,signal}))await addWal(row.name);await flush();
-      const manifest={version:1,...periodicApplicationKeyBinding(record),kind:'periodic-application',backupId:proof.backupId,pointId,scope:record.scope,sourceMachine:await backupMachineIdentity(),configurationDigest:record.configurationDigest,keyVersion:record.keyVersion,expected:record.expected,credentials:credentials(),backupCompleteDigest:closed.manifestDigest,checkpointDigest:point.manifest.checkpointDigest,captureManifestHash:hash(capture.manifest),pointManifestHash:hash(point.manifest),applicationPolicyDigest:closed.manifest.applicationPolicyDigest,parts,count,totalBytes,created:Date.now()};
-      if(!same(await digestFile(join(point.directory,'backup-complete.enc'),{signal}),closed.manifestDigest)||!same(await digestFile(join(base,'backup.enc'),{signal}),point.manifest.baseManifestDigest))fail('periodic_application_handoff_source_changed');
-      signal?.throwIfAborted();await syncDirectory(join(destination,'backup',proof.backupId));await syncDirectory(join(destination,'backup'));await writeManifest(join(destination,'handoff.enc'),manifest,periodicApplicationKey(record));await syncDirectory(point.directory);complete=true;return summary(manifest);
-    }finally{
-      try{if(owned&&!complete){if(!identity)fail('periodic_application_handoff_cleanup_unknown');const actual=await lstat(destination);if(actual.dev!==identity.dev||actual.ino!==identity.ino||!actual.isDirectory()||actual.isSymbolicLink()||actual.uid!==identity.uid)fail('periodic_application_handoff_cleanup_unknown');await (await import('node:fs/promises')).rm(destination,{recursive:true});await syncDirectory(point.directory);}}finally{await lease.release();}
-    }
-  },{signal});
+ const {record}=contextFor(context,proof),{withCanonicalPeriodicHandoff,inspectCanonicalPeriodicCopies,periodicCipherIdentity}=await import('./postgres-periodic-handoff.mjs'),{copyBackupCipher,handoffFiles,handoffControlEntries,backupMachineIdentity}=await import('./postgres-backup-handoff.mjs');
+ return operate(context,proof,'handoff-'+pointId,async signal=>{
+  const backup=await authenticatePeriodicApplicationBackup(context,proof,pointId,{signal}),closed=periodicApplicationBackupSource(backup),destination=join(closed.directory,'handoff');
+  if(await exists(join(destination,'handoff.enc'))){
+   let lease;try{lease=await acquireInstance(destination);}catch(error){if(error.code==='EADDRINUSE')fail('periodic_application_handoff_busy');throw error;}try{
+   const manifest=await readManifest(join(destination,'handoff.enc'),periodicApplicationKey(record),{signal});
+   if(manifest.applicationKeyVersion!==record.applicationKeyVersion||manifest.applicationKeyDigest!==record.applicationKeyDigest||manifest.version!==1||manifest.kind!=='periodic-application'||manifest.backupId!==proof.backupId||manifest.pointId!==pointId||manifest.configurationDigest!==record.configurationDigest||manifest.keyVersion!==record.keyVersion||!same(manifest.backupCompleteDigest,closed.manifestDigest)||!same(manifest.checkpointDigest,closed.manifest.checkpointDigest)||manifest.sourceMachine!==await backupMachineIdentity())fail('periodic_application_handoff_binding');
+   const entries=[],maxBytes=manifest.totalBytes+manifest.parts.reduce((n,row)=>n+row.digest.bytes,1048576);for await(const entry of handoffControlEntries({directory:destination,key:periodicApplicationKey(record),manifest,signal,maxFiles:manifest.count,maxBytes}))entries.push(entry);
+   const present=await inspectCanonicalPeriodicCopies(destination,manifest,entries,{signal});
+   if(present.size===entries.length)return {version:1,kind:'periodic-application',backupId:proof.backupId,pointId,handoffDigest:await digestFile(join(destination,'handoff.enc'),{signal}),files:manifest.count,bytes:manifest.totalBytes,backupComplete:true,restoreVerified:false,offhostVerified:false,deploymentAllowed:false};
+   }finally{await lease.release();}
+  }
+  return withCanonicalPeriodicHandoff(context,proof,pointId,{signal},async source=>{
+  const present=await inspectCanonicalPeriodicCopies(source.directory,source.manifest,source.entries,{signal});
+  for(const entry of source.entries){signal?.throwIfAborted();if(present.has(entry.path))continue;
+   if(!same(entry.identity,await periodicCipherIdentity(entry.sourcePath,entry.uid)))fail('backup_handoff_source_changed');
+   await copyBackupCipher(entry.sourcePath,join(source.directory,entry.path),{signal,maxBytes:entry.digest.bytes});
+   if(!same(entry.identity,await periodicCipherIdentity(entry.sourcePath,entry.uid))||!same(await digestFile(join(source.directory,entry.path),{signal}),entry.digest))fail('backup_handoff_source_changed');
+  }
+  for await(const unused of handoffFiles({directory:source.directory,key:periodicApplicationKey(record),manifest:source.manifest,signal,maxFiles:source.manifest.count,maxBytes:source.manifest.totalBytes+source.manifest.parts.reduce((n,row)=>n+row.digest.bytes,1048576)})){}
+  return {version:1,kind:'periodic-application',backupId:proof.backupId,pointId,handoffDigest:source.handoffDigest,files:source.manifest.count,bytes:source.manifest.totalBytes,backupComplete:true,restoreVerified:false,offhostVerified:false,deploymentAllowed:false};
+ });},{signal});
 }

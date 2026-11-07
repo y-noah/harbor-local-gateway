@@ -80,6 +80,10 @@ HARBOR_TEST_PG_BIN_DIR=/private/tools/postgresql/18/bin node --test tests/postgr
 
 固定 CLI 为 `node storage-periodic-transfer.mjs send|receive`，只读固定配置，不接收任意配置路径。`send` 认证已有 `latestBackup` 周期点并生成轻量传输索引，在 SSH 子进程真实关闭后才释放传输租约。索引续跑允许在 `handoff.enc` 尚未发布时，复用完整写入、AEAD 认证且内容与预期 catalog 匹配的页；未知文件、损坏认证或不匹配内容保全并拒绝，不承诺任意 SIGKILL 遗留的半写文件都能自动清理。`receive` 只接收并认证密文传输，不执行数据库／应用恢复，也不签发恢复或异机验证证明。
 
+自动传输与手动 `periodic-handoff` 共用所选源点原 `handoff/handoff.enc` 和目录页字节。自动入口先在该固定位置发布canonical控制闭包，再将相同控制字节复制到传输索引目录；base、所选point、应用材料及WAL仍从原不可变密文引用读取，生成索引不预制完整本地包。手动导出沿同一目录页补齐独立完整拷贝，不重加密控制清单，只有完整拷贝验证通过才返回导出结果。完整旧手动包直接复用；源点尚无canonical时，旧索引只有与当前认证源闭包完全匹配才可按原字节采用，两处已有不同控制字节时保全拒绝，不放宽源端恢复证明的包摘要比较。
+
+源点控制闭包与手动补齐共用互斥，生成、拷贝和传输仍在各自既有的archive操作租约内进行。取消保留已经认证的控制页和匹配拷贝，清理本次未完成文件后释放资源；未知或损坏材料不覆盖、不当作成功。保留器认证同一控制闭包及任何已存在的拷贝，对尚未拷贝的条目核对原base／point／应用文件及WAL引用；只有控制页不等同材料缺失，也不允许提前删除其恢复依赖。源端验签继续使用原point路径及严格expected，自动与手动恢复签名不会因重新生成控制密文而形成不同包摘要。
+
 自动发送模板为 `periodic-ssh.service.example` 和 `periodic-ssh.timer.example`，分别对应管理员安装后的 `harbor-postgres-periodic-ssh.service` 和同名 `.timer`。它们默认不安装、不加载、不启用，也不修改 SSH policy；policy 缺失或 `enabled:false` 时，CLI 返回关闭状态。`install-tools.py` 的实际安装根为 `/opt/harbor-storage-tools`：Node 位于 `node/bin/node`，应用位于 `app/`，模板只调用 `/opt/harbor-storage-tools/node/bin/node /opt/harbor-storage-tools/app/storage-periodic-transfer.mjs send`。安装前须核对已批准的工具树实际包含此 CLI 及其依赖、固定配置与资源预算；仓库中存在源码不等于当前服务器已经安装。接收端须另行准备既有固定 `receive` CLI、policy 和 SSH 授权，本模板不安装接收入口或密钥。
 
 producer `schedule`、maintainer `maintain-base` 与 sender `send` 使用独立进程：发送仅选择已有最新认证应用周期点，不生产恢复点、不制作全备，也不执行恢复。timer 设为开机1分钟后检查，并在前一次服务退出后通过 `OnUnitInactiveSec=1min` 再次检查，不并发启动同一服务；开机时刻已过时启用 timer，首次检查可立即触发。这只是发送检查频率，不修改原备份间隔或承诺1分钟 RPO。传输还受固定 SSH policy 的 `timeoutMs`／`connectTimeoutSeconds` 和 CLI 的取消、租约与子进程结算约束。

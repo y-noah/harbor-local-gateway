@@ -91,9 +91,15 @@ export async function authenticatePeriodicApplicationRetentionGroup(record,direc
     if(children.includes('handoff')){
       const bundle=join(path,'handoff'),handoff=await readManifest(join(bundle,'handoff.enc'),periodicApplicationKey(record),{signal});
       if(handoff.applicationKeyVersion!==record.applicationKeyVersion||handoff.applicationKeyDigest!==record.applicationKeyDigest||!backup||handoff.version!==1||handoff.kind!=='periodic-application'||handoff.backupId!==metadata.backupId||handoff.pointId!==id||handoff.scope!==metadata.scope||handoff.configurationDigest!==metadata.configurationDigest||handoff.keyVersion!==metadata.keyVersion||handoff.expected?.system_id!==metadata.systemId||!same(handoff.checkpointDigest,checkpointDigest)||!same(handoff.backupCompleteDigest,await digestFile(join(path,'backup-complete.enc'),{signal}))||handoff.captureManifestHash!==hash(capture)||handoff.pointManifestHash!==hash(point)||handoff.applicationPolicyDigest!==capture.applicationPolicyDigest)fail('periodic_retention_handoff_binding');
-      const {handoffFiles}=await import('./postgres-backup-handoff.mjs'),maxBytes=record.profile.maxBackupBytes*2+record.profile.maxWalSegments*Number(metadata.segmentBytes)*2;
+      const {handoffControlEntries}=await import('./postgres-backup-handoff.mjs'),{inspectCanonicalPeriodicCopies,periodicCipherIdentity}=await import('./postgres-periodic-handoff.mjs'),maxBytes=record.profile.maxBackupBytes*2+record.profile.maxWalSegments*Number(metadata.segmentBytes)*2;
       if(!Number.isSafeInteger(maxBytes))fail('periodic_retention_handoff_capacity');
-      for await(const entry of handoffFiles({directory:bundle,key:periodicApplicationKey(record),manifest:handoff,signal,maxFiles:100000,maxBytes}))allowed.add(relative+'/handoff/'+entry.path);
+      const entries=[];for await(const entry of handoffControlEntries({directory:bundle,key:periodicApplicationKey(record),manifest:handoff,signal,maxFiles:100000,maxBytes}))entries.push(entry);
+      const present=await inspectCanonicalPeriodicCopies(bundle,handoff,entries,{signal});
+      for(const entry of entries){
+       allowed.add(relative+'/handoff/'+entry.path);if(present.has(entry.path))continue;
+       const prefix='backup/'+metadata.backupId+'/',wal=entry.path.startsWith('wal/'),original=wal?join(record.archiveDirectory,entry.path.slice(4)):entry.path.startsWith(prefix)?join(directory,entry.path.slice(prefix.length)):null;
+       if(!original)fail('periodic_retention_handoff_binding');await periodicCipherIdentity(original,wal?record.restoreUid:process.getuid());if(!same(await digestFile(original,{signal}),entry.digest))fail('periodic_retention_handoff_binding');
+      }
       allowed.add(relative+'/handoff/handoff.enc');for(const part of handoff.parts)allowed.add(relative+'/handoff/'+part.name);
     }
     const receiverNames=['periodic-receiver.enc','periodic-receiver-diagnostic.enc'].filter(name=>children.includes(name));
