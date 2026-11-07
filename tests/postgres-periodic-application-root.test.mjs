@@ -89,6 +89,24 @@ test('isolated fixed-root application point restores through real service UID ga
     await writeFile(periodicProfile,JSON.stringify(periodicConfiguration),{mode:0o600});
     const periodicAttestation=await periodicCommand(['restore-and-attest-periodic']),periodicReceived=verifyStorageReceiverPeriodicAttestation(periodicAttestation,publicKey,{expected});
     assert.equal(periodicReceived.kind,'periodic-application');assert.equal(periodicReceived.checks.applicationMaterialsVerified,true);assert.equal(periodicReceived.runtime.crossUidExecutionVerified,true);assert.equal(periodicReceived.sourceMachine,periodicReceived.receiverMachine);assert.equal(periodicReceived.checks.offhostDatabaseVerified,false);assert.throws(()=>verifyOffhostStorageReceiverPeriodicAttestation(periodicAttestation,publicKey,{expected}),{code:'periodic_receiver_attestation_offhost_required'});
+    // The automatic job selects only an authenticated cached point, while
+    // preserving the independent root policy and manual migration profile.
+    const {storagePeriodicRestoreCommand}=await import('../storage-periodic-restore.mjs'),selection=['verify',handoff.backupId,handoff.pointId];
+    await writeFile(periodicProfile,JSON.stringify({version:1,enabled:false}),{mode:0o600});
+    assert.equal((await storagePeriodicRestoreCommand(selection)).state,'periodic_restore_disabled');
+    const {bundleDirectory:unusedBundle,handoffDigest:unusedHandoff,...dynamicProfile}=periodicConfiguration;
+    await writeFile(periodicProfile,JSON.stringify(dynamicProfile),{mode:0o600});
+    const objects=join(fixture.directory,'objects'),indexDirectory=join(fixture.directory,'index');await mkdir(objects,{mode:0o700});await mkdir(indexDirectory,{mode:0o700});
+    await writeFile('/etc/harbor-storage-periodic-transfer.json',JSON.stringify({version:1,enabled:true,directory:objects,sourceMachine:manifest.sourceMachine,expectedCluster:record.expected.system_id,keyVersion:record.keyVersion,archiveKeyFile:record.archiveKeyFile,archiveUid:record.restoreUid,applicationEncryption:record.applicationEncryption}),{flag:'wx',mode:0o600});
+    const {loadAuthenticatedPeriodicBase}=await import('../postgres-backup.mjs'),{createPeriodicTransferIndex,releasePeriodicTransferIndex}=await import('../postgres-periodic-transfer-index.mjs'),objectStore=await import('../postgres-periodic-object-store.mjs');
+    const sourceProof=await loadAuthenticatedPeriodicBase(fixture.context,handoff.backupId),index=await createPeriodicTransferIndex(fixture.context,sourceProof,handoff.pointId,{directory:indexDirectory}),store=await objectStore.loadPeriodicObjectStore();
+    try{await objectStore.transferPeriodicIndex(index,store);const materialized=await objectStore.materializePeriodicStoredBundle(store,handoff.backupId,handoff.pointId);await assert.rejects(objectStore.inspectPeriodicStoredBundle({...materialized}),{code:'periodic_transfer_bundle_required'});await assert.rejects((await import('../postgres-backup-receiver.mjs')).createPeriodicPostgresBackupReceiver({storedBundle:{...materialized}}),{code:'periodic_transfer_bundle_required'});}finally{releasePeriodicTransferIndex(index);await objectStore.closePeriodicObjectStore(store);}
+    const {digestFile:automaticDigest}=await import('../migration-artifacts.mjs'),automaticExpected={...expected,handoffDigest:await automaticDigest(join(indexDirectory,'handoff.enc'))};
+    const automatic=JSON.parse((await promisify(execFile)(process.execPath,[new URL('../storage-periodic-restore.mjs',import.meta.url).pathname,...selection],{timeout:record.profile.processTimeoutMs,maxBuffer:65536,env:{PATH:'/usr/bin:/bin'}})).stdout),automaticPayload=verifyStorageReceiverPeriodicAttestation(automatic,publicKey,{expected:automaticExpected});
+    assert.equal(automaticPayload.pointId,handoff.pointId);assert.equal(automaticPayload.checks.applicationMaterialsVerified,true);assert.equal(automaticPayload.checks.deploymentAllowed,false);assert.equal(automaticPayload.checks.offhostDatabaseVerified,false);
+    await assert.rejects(storagePeriodicRestoreCommand(selection,{signal:AbortSignal.abort()}),{name:'AbortError'});
+    await writeFile(periodicProfile,JSON.stringify({...dynamicProfile,sourceMachine:'0'.repeat(64)}),{mode:0o600});await assert.rejects(storagePeriodicRestoreCommand(selection),{code:'backup_receiver_periodic_store_binding'});
+    await writeFile(periodicProfile,JSON.stringify(periodicConfiguration),{mode:0o600});
     assert.deepEqual(await readFile('/etc/harbor-storage-receiver.json'),manualProfile,'periodic restore never rewrites the manual migration profile');
     assert.deepEqual(await readdir(workDirectory),[]);assert.deepEqual(await readdir(recoveryDirectory),[]);assert.deepEqual(await loadPeriodicApplicationPolicy(),{version:1,enabled:false});
     assert.equal((await storageBackupCommand(['verify-periodic-receiver',handoff.backupId,handoff.pointId])).state,'periodic_receiver_verification_disabled');

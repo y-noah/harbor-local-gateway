@@ -149,6 +149,17 @@ async function controlOperation(store,signal,callback){
  const value=storeValue(store);if(value.pending)fail('periodic_transfer_busy');const cancellation=new AbortController(),combined=AbortSignal.any([signal,cancellation.signal].filter(Boolean));value.cancellation=cancellation;const pending=Promise.resolve().then(()=>{combined.throwIfAborted();storeValue(store);return callback(value,combined);});value.pending=pending;let result;try{result=await pending;}finally{value.pending=null;value.cancellation=null;}combined.throwIfAborted();storeValue(store);return result;
 }
 const incomingOwnership=new WeakMap();
+const materializedBundles=new WeakMap();
+// Only an authenticated store operation can mint a bundle binding. Copying its
+// public summary does not grant receiver authority.
+export async function inspectPeriodicStoredBundle(bundle,{signal}={}){
+ const saved=materializedBundles.get(bundle);if(!saved)fail('periodic_transfer_bundle_required');
+ const value=storeValue(saved.store);if(!value.formal)fail('periodic_transfer_root_required');signal?.throwIfAborted();
+ const directory=join(value.directory,'points',saved.backupId+'--'+saved.pointId);await trustedDirectory(directory,{root:true});
+ const receipt=await readManifest(join(directory,'received.enc'),value.applicationKey,{signal});
+ if(!same(receipt,saved.receipt)||!bound(value,receipt)||!same(await digestFile(join(saved.bundleDirectory,'handoff.enc'),{signal}),receipt.handoffDigest))fail('periodic_transfer_bundle_changed');
+ return {bundleDirectory:saved.bundleDirectory,handoffDigest:structuredClone(receipt.handoffDigest),sourceMachine:value.sourceMachine,expectedCluster:value.expectedCluster,keyVersion:value.keyVersion,applicationKeyVersion:value.applicationKeyVersion,applicationKeyDigest:value.applicationKeyDigest};
+}
 async function ownInbox(store,directory){const owned=incomingOwnership.get(store)?.get(directory);if(!owned)fail('periodic_transfer_inbox_required');const info=await lstat(directory);if(!info.isDirectory()||info.isSymbolicLink()||info.dev!==owned.dev||info.ino!==owned.ino||info.uid!==process.getuid()||info.mode&0o077)fail('periodic_transfer_inbox_changed');return owned;}
 export async function writePeriodicTransferControl(store,directory,name,bytes,digest,{signal}={}){
  const value=storeValue(store);if(typeof directory!=='string'||dirname(directory)!==join(value.directory,'incoming')||!/^i-[a-f0-9]{24}$/.test(directory.slice(directory.lastIndexOf('/')+1))||!/^handoff(?:-catalog-\d+)?\.enc$/.test(name)||!Buffer.isBuffer(bytes)||!periodicCipherDigest(digest)||bytes.length!==digest.bytes||bytes.length>1048576||createHash('sha256').update(bytes).digest('hex')!==digest.sha256)fail('periodic_transfer_control_invalid');
@@ -232,6 +243,6 @@ export async function materializePeriodicStoredBundle(store,backupId,pointId,{si
   let bytesCopied=0;for(const row of files){combined.throwIfAborted();const path=join(target,row.path);
    if(row.path.startsWith('backup/')||row.path.startsWith('wal/')){if(!await objectPresent(value,row.digest))fail('periodic_transfer_object_missing');}
    bytesCopied+=await publishBundleCopy(value,row,path,usage,combined);
-  }await verifyLayout(target);combined.throwIfAborted();return {state:'periodic_bundle_materialized',backupId,pointId,bundleDirectory:target,handoffDigest:structuredClone(receipt.handoffDigest),bytesCopied,restoreVerified:false,offhostVerified:false,deploymentAllowed:false};
+  }await verifyLayout(target);combined.throwIfAborted();const result={state:'periodic_bundle_materialized',backupId,pointId,bundleDirectory:target,handoffDigest:structuredClone(receipt.handoffDigest),bytesCopied,restoreVerified:false,offhostVerified:false,deploymentAllowed:false};materializedBundles.set(result,{store,backupId,pointId,bundleDirectory:target,receipt:structuredClone(receipt)});return result;
  }finally{await lease.release();}})();value.pending=operation;let result;try{result=await operation;}finally{value.pending=null;value.cancellation=null;}combined.throwIfAborted();storeValue(store);return result;
 }

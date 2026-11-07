@@ -155,6 +155,16 @@ harbor_backup ALL=(root) NOPASSWD: /usr/bin/python3 -I -B /usr/local/lib/harbor/
 
 此入口不自动跨机传输包或签名，不做增量运输，也不直接恢复激活8092。真正异机正向、自动交付／增量复用和完整恢复发布仍需分别完成；旧pending-final／OCI／activation消费者继续拒绝新目的，不能以周期签名替代原目标库角色、候选和设备证明。
 
+### 已接收周期点的固定恢复入口
+
+`node storage-periodic-restore.mjs verify <base UUID> <point UUID>` 在接收机以真实root运行，只选择固定 `/etc/harbor-storage-periodic-transfer.json` 对象缓存中已经认证、传输完成的周期点。它先物化独立完整包，再复用既有周期receiver实际恢复数据库、原应用材料及降权后的Gateway／Worker／publisher，成功后才用既有固定root签名key输出独立周期签名JSON。完整包占用第二份物理空间，仍受对象缓存配额约束。该命令不接收配置路径、密钥、机器声明或任意恢复命令；手动迁移入口及其 `/etc/harbor-storage-receiver.json` 不变。
+
+独立root／0600、单链接的 `/etc/harbor-storage-periodic-restore.json` 缺失或仅配置 `{"version":1,"enabled":false}` 时返回关闭状态，在加载对象缓存和密钥之前结束。启用时沿用周期receiver的 `handoffKind:"periodic-application"`、`workDirectory`、`recoveryDirectory`、两把密钥的配置、批准source／cluster／版本、恢复UID／GID、PG工具路径及文件／容量／进程预算，增加 `enabled:true`；动态模式须省略 `bundleDirectory` 和 `handoffDigest`，这两项只能从本次认证 `received.enc` 对应的真实物化能力取得。固定配置的source、cluster、归档key版本和应用key版本／摘要必须与缓存批准值一致；不能根据收到的未认证内容选择信任或密钥，也不能配置candidateRuntime。已有带固定包路径／摘要的周期profile仍可由原周期receiver入口使用，但固定自动恢复CLI拒绝混用这种静态绑定。
+
+一次任务的互斥覆盖物化、实际恢复、签名及清理；总超时来自周期profile的 `processTimeoutMs`。SIGINT／SIGTERM和超时沿既有取消链等待所启动恢复进程退出并清理本次私有恢复目录，再释放资源；不得把发出取消信号当作已完成清理。恢复与签名前重核固定profile、认证接收收据、包摘要和实际恢复receipt，复制DTO、关闭能力、配置变化或损坏材料都不能产生签名。失败不升级传输收据、不清理缓存或覆盖未知材料；排查后可对同一点重试。
+
+本入口不安装或启用timer，不由收包SSH包装器启动，不扩大专用收包账号权限，也不自动把签名取回源端。签名安全交付到源端所选点的 `receiver-attestation.json` 后，仍须运行上文 `verify-periodic-receiver` 独立验签消费；同机root恢复只能证明恢复链路，不能冒充真实异机或授予部署激活资格。
+
 ### 独立的备份保留入口
 
 保留不随 `schedule` 自动启用。`storage-backup.mjs` 的 `retention-prepare`、`retention-plan` 和 `retention-apply <计划UUID>` 只读取固定 root/0600 `/etc/harbor-storage-retention.json`；缺少配置或 `enabled:false` 时不连接数据库、不新增计划、不清理文件。模板为 `retention.example.json`：启用前必须自行填写正整数 `keepDatabaseCount`、`keepApplicationCount` 和 `minAgeMs`，没有默认保留天数。`pinnedBackupIds` 与 `operatorStateFiles` 也须显式给出；后者只列使用同一备份密钥、仍有外部引用的既有 `operator.enc`，不接收 HTTP 配置或任意命令行路径。

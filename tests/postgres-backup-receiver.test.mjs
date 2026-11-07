@@ -35,3 +35,43 @@ test('periodic fixed receiver rejects caller profiles and nonperiodic signing co
  for(const command of ['restore-and-attest','restore-and-attest-application','shell'])await assert.rejects(storagePeriodicReceiverCommand([command]),{code:'backup_receiver_command_invalid'});
  if(process.getuid()!==0)await assert.rejects(createPeriodicPostgresBackupReceiver(),{code:'backup_receiver_root_profile_required'});
 });
+
+test('periodic restore CLI cannot select caller paths, profiles or migration commands',async()=>{
+ const {storagePeriodicRestoreCommand}=await import('../storage-periodic-restore.mjs');
+ for(const args of [[],['verify'],['restore-and-attest','x','y'],['verify','/etc','/tmp'],['verify','00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000000000','/tmp/profile']])await assert.rejects(storagePeriodicRestoreCommand(args),{code:'periodic_restore_arguments_invalid'});
+ const {inspectPeriodicStoredBundle}=await import('../postgres-periodic-object-store.mjs');await assert.rejects(inspectPeriodicStoredBundle({bundleDirectory:'/etc',handoffDigest:{}}),{code:'periodic_transfer_bundle_required'});
+});
+
+test('periodic restore publishes no signature after cancellation or timeout during awaited cleanup',async()=>{
+ const {execFile}=await import('node:child_process'),{promisify}=await import('node:util');
+ const fixture=String.raw`
+ import assert from 'node:assert/strict';
+ import {readFile,mkdtemp,rm} from 'node:fs/promises';
+ import {tmpdir} from 'node:os';
+ import {join} from 'node:path';
+ import {pathToFileURL} from 'node:url';
+ import {SourceTextModule,SyntheticModule,createContext} from 'node:vm';
+ const source=await readFile(process.argv[1],'utf8'),{acquireInstance:actualAcquire}=await import(new URL('./instance.mjs',pathToFileURL(process.argv[1])));
+ for(const mode of ['success','cancel','timeout']){
+  const directory=await mkdtemp(join(tmpdir(),'harbor-periodic-cancel-')),cancel=new AbortController(),timeout=new AbortController(),events=[];let entered,release;
+  const cleanupEntered=new Promise(resolve=>entered=resolve),cleanupGate=new Promise(resolve=>release=resolve),signature={payload:{purpose:'synthetic-periodic-result'},signature:'synthetic'};
+  const context=createContext({process:{argv:[]},AbortSignal:{any:AbortSignal.any.bind(AbortSignal),timeout(ms){assert.equal(ms,1000);return timeout.signal;}}});
+  const bindings={
+   './postgres-periodic-object-store.mjs':{loadPeriodicObjectStore:async()=>({}),closePeriodicObjectStore:async()=>events.push('store-closed'),materializePeriodicStoredBundle:async()=>({}),periodicObjectStoreSettings:()=>({directory})},
+   './postgres-backup-receiver.mjs':{periodicPostgresReceiverPolicy:async()=>({enabled:true,processTimeoutMs:1000}),createPeriodicPostgresBackupReceiver:async()=>({}),closePostgresBackupReceiver:async()=>{entered();await cleanupGate;events.push('receiver-closed');}},
+   './storage-receiver.mjs':{restorePostgresReceiver:async()=>({})},
+   './storage-receiver-periodic-attestation.mjs':{attestStorageReceiverPeriodic:async()=>{events.push('signed');return signature;}},
+   './instance.mjs':{acquireInstance:async path=>{const lease=await actualAcquire(path);return {release:async()=>{await lease.release();events.push('lease-released');}};}},
+   './migration-artifacts.mjs':{transferError:code=>Object.assign(new Error(code),{code})}
+  };
+  const module=new SourceTextModule(source,{context,initializeImportMeta(meta){meta.url='file:///synthetic/storage-periodic-restore.mjs';}});
+  await module.link(async name=>{const values=bindings[name]??await import(name),names=Object.keys(values);return new SyntheticModule(names,function(){for(const key of names)this.setExport(key,values[key]);},{context});});await module.evaluate();
+  const pending=module.namespace.storagePeriodicRestoreCommand(['verify','00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000000000'],{signal:cancel.signal});
+  await cleanupEntered;assert.deepEqual(events,['signed']);
+  if(mode==='cancel')cancel.abort(new Error('synthetic_cancel'));if(mode==='timeout')timeout.abort(new Error('synthetic_timeout'));
+  release();if(mode==='success')assert.equal(await pending,signature);else await assert.rejects(pending,{message:'synthetic_'+mode});
+  assert.deepEqual(events,['signed','receiver-closed','store-closed','lease-released']);const reacquired=await actualAcquire(join(directory,'.periodic-restore'));await reacquired.release();await rm(directory,{recursive:true});
+ }
+ `;
+ await promisify(execFile)(process.execPath,['--experimental-vm-modules','--input-type=module','-e',fixture,new URL('../storage-periodic-restore.mjs',import.meta.url).pathname],{timeout:10000,maxBuffer:8192});
+});
