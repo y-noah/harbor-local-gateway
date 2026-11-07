@@ -15,6 +15,7 @@ ExecStart=/usr/bin/python3 -I -B /usr/local/lib/harbor/gateway-legacy-transparen
 ExecStartPost=+/usr/bin/nsenter --mount=/proc/1/ns/mnt --root=/proc/1/root --wd=/ -- /bin/sh -ec 'i=0; while [ ! -S /run/harbor-entry/candidate.sock ]; do i=$((i+1)); test "$i" -lt 100; sleep 0.05; done; exec /usr/bin/python3 -I -B /usr/local/lib/harbor/entry-runtime.py candidate-post'
 BindReadOnlyPaths=/usr /lib /lib64
 BindReadOnlyPaths=/etc/harbor-entry/candidate:/etc
+TemporaryFileSystem=/run:mode=0755
 BindPaths=/run/harbor-entry:/run/harbor-entry
 ProtectSystem=strict
 ReadWritePaths=/run/harbor-entry
