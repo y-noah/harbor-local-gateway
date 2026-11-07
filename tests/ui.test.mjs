@@ -55,7 +55,7 @@ test('paged member detail late credentials cannot replace another dialog',async(
   let release;const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response({member:memberPage().rows[0],rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}}));}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot())+';tab="members";');const pending=page.click('member-detail','member-one');await new Promise(setImmediate);await page.click('close');page.run('modal("another dialog")');release();await pending;assert.equal(page.node('#modal-content').innerHTML,'another dialog');
 });
 test('总览只读紧凑状态，进入使用数据后才分页读取Key用量',async()=>{
-  const paths=[],state={...pagedSnapshot(),accounts:[],daily:[],requests:[],busy:0,queue:0,totals:{requests:0,success:0}};const page=await ui(path=>{paths.push(path);return response(path.startsWith('/api/admin/state')?state:{rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}});});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview";');assert.equal(await page.run('refresh()'),true);assert.ok(paths.includes('/api/admin/state?people=none'));assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));assert.deepEqual(page.run('state.keys'),[]);page.run('setTab("usage")');await new Promise(setImmediate);assert.ok(paths.some(path=>path.startsWith('/api/admin/keys?')));assert.equal(page.run('tab'),'requests');
+  const paths=[],state={...pagedSnapshot(),accounts:[],daily:[],requests:[],busy:0,queue:0,totals:{requests:0,success:0}};const page=await ui(path=>{paths.push(path);return response(path.startsWith('/api/admin/state')?state:{rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}});});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview";');assert.equal(await page.run('refresh()'),true);assert.ok(paths.includes('/api/admin/state?people=none'));assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));assert.deepEqual(page.run('state.keys'),[]);page.run('setTab("usage")');await new Promise(setImmediate);assert.equal(page.run('tab'),'sessions');assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));await page.click('record-view','usage');await new Promise(setImmediate);assert.ok(paths.some(path=>path.startsWith('/api/admin/keys?')));assert.equal(page.run('tab'),'requests');
 });
 
 const deferredKeyUsage=name=>({id:'synthetic-key-'+name,member_id:'member-'+name,member_name:name,member_enabled:1,prefix:'hg_test_'+name,enabled:1,expires:null,credentials_deferred:true});
@@ -526,10 +526,12 @@ test('侧栏按使用数据与系统管理归类，保留内部页面的真实�
  const html=readFileSync(new URL('../public/index.html',import.meta.url),'utf8'),navigation=html.match(/<nav>([\s\S]*?)<\/nav>/)[1];
  assert.match(navigation,/data-tab="usage"[^>]*>[\s\S]*?使用数据/);assert.match(navigation,/data-tab="system"[^>]*>[\s\S]*?系统管理/);
  assert.doesNotMatch(navigation,/data-tab="(?:sessions|requests|history|playground)"/);
- const page=await ui(()=>response({...snapshot(),sessions:[]}));page.run('admin=true;state='+JSON.stringify({...snapshot(),sessions:[]})+';tab="overview";setTab("system")');
- assert.equal(page.run('tab'),'playground');assert.equal(page.run('navigationTab()'),'system');assert.equal(page.run('automaticRefreshScope()'),'');
- page.run('setTab("usage")');assert.equal(page.run('tab'),'requests');assert.equal(page.run('navigationTab()'),'usage');
- await page.click('record-view','sessions');assert.equal(page.run('tab'),'sessions');assert.equal(page.run('automaticRefreshScope()'),'state:sessions');page.run('setTab("usage")');assert.equal(page.run('tab'),'sessions');
+ const page=await ui(()=>response({...snapshot(),sessions:[],endpoint:'http://localhost/v1'}));page.run('admin=true;state='+JSON.stringify({...snapshot(),sessions:[],endpoint:'http://localhost/v1'})+';tab="overview";setTab("system")');
+ assert.equal(page.run('tab'),'playground');assert.equal(page.run('connectionView'),'guide');assert.equal(page.run('navigationTab()'),'system');assert.equal(page.run('automaticRefreshScope()'),'');
+ await page.click('connection-view','test');page.run('setTab("system")');assert.equal(page.run('connectionView'),'test','组内导航保留手动选择');
+ page.run('setTab("usage")');assert.equal(page.run('tab'),'sessions');assert.equal(page.run('navigationTab()'),'usage');assert.equal(page.run('automaticRefreshScope()'),'state:sessions');
+ await page.click('record-view','usage');assert.equal(page.run('tab'),'requests');page.run('setTab("usage")');assert.equal(page.run('tab'),'requests','组内导航保留手动子页');
+ page.run('setTab("overview");setTab("history")');assert.equal(page.run('tab'),'history','显式历史入口保持');page.run('setTab("overview");setTab("requests")');assert.equal(page.run('tab'),'requests','显式Key用量入口保持');page.run('setTab("overview");setTab("guide")');assert.equal(page.run('connectionView'),'guide','显式接入说明入口保持');
 });
 test('系统管理组内切换保留请求草稿，迟到历史不覆盖接入页，发送中不清理当前页面',async()=>{
  let release;const page=await ui(path=>path.startsWith('/api/admin/history?')?new Promise(resolve=>release=()=>resolve(response({rows:[],accounts:[],pagination:{page:1,total:0,totalPages:1}}))):response({}));
