@@ -133,11 +133,59 @@ def verify_source(config,running=True):
  return row
 
 
+CANDIDATE_NETWORK_KEYS=('candidateNetworkIdentity','candidateNetworkContainerIds')
+DYNAMIC_KEYS=('allowDynamicBridgePeers','localAssuranceReleaseId','localAssuranceProfileIdentityDigest','dynamicBridgeIdentity','dynamicPeerDeviceIndices','dynamicSourceNamespace')
+
+def dynamic_bridge_policy(config,state=None):
+ if state is None:
+  if not STATE.exists():return None
+  state=private_json(STATE)
+ if state.get('allowDynamicBridgePeers') is not True:return None
+ return state if local_assurance_module().allow_dynamic_bridge_peers(config,state) else None
+
+def verify_source_bridge_owners(config,policy):
+ ids=execute(['/usr/bin/docker','container','ls','--all','--no-trunc','--filter','label=com.aistrong.project=harbor-local-gateway','--format','{{.ID}}']).splitlines()
+ for cid in ids:
+  require(re.fullmatch('[a-f0-9]{64}',cid),'dynamic_owned_inventory')
+  row=inspect_container(cid);require(row.get('Config',{}).get('Labels',{}).get('com.aistrong.project')=='harbor-local-gateway','dynamic_owned_inventory_changed')
+  attached=any(v.get('NetworkID')==policy['dynamicBridgeIdentity']['networkId'] and v.get('IPAddress') for v in row.get('NetworkSettings',{}).get('Networks',{}).values())
+  require(not attached or cid==config['source']['containerId'],'unexpected_harbor_source_bridge_peer')
+
+
+def verify_bridge_peers(config,ports,removed_ports=(),additional_ports=(),state=None):
+ policy=dynamic_bridge_policy(config,state)
+ if policy is None:
+  require({v['ifname'] for v in ports}==set(config['bridge']['ports'])-set(removed_ports)|set(additional_ports),'bridge_ports_changed');return
+ verify_source_bridge_owners(config,policy)
+ live={v['ifname']:v['ifindex'] for v in ports};critical={}
+ source=policy.get('source',{})
+ if config['source']['containerId']==source.get('containerId') and policy.get('sourceBridgePort') not in removed_ports:
+  dev=policy.get('sourceBridgePort')
+  if dev:critical[dev]=policy['dynamicPeerDeviceIndices'].get(dev)
+ for dev,index in critical.items():require(index is not None and live.get(dev)==index,'critical_bridge_port_changed')
+
+
+def verify_candidate_bridge(state):
+ identity=state.get('candidateNetworkIdentity')
+ if identity is None:return
+ rows=json.loads(execute(['/usr/sbin/ip','-j','link','show','dev',identity['bridge']]))
+ require(len(rows)==1 and rows[0]['ifindex']==identity['ifindex'] and rows[0]['address']==identity['mac'],'candidate_bridge_identity_changed')
+ ports=json.loads(execute(['/usr/sbin/ip','-j','link','show','master',identity['bridge']]))
+ require({v['ifname']:v['ifindex'] for v in ports}==identity['ports'],'candidate_bridge_ports_changed')
+ network=json.loads(execute(['/usr/bin/docker','network','inspect',identity['id']]))
+ require(len(network)==1 and network[0]['Id']==identity['id'] and network[0]['Name']==identity['name'] and set(network[0].get('Containers',{}))==set(state['candidateNetworkContainerIds']),'candidate_network_members_changed')
+
+
 def verify_environment(config,removed_ports=(),additional_ports=(),bridge_index=None):
  require(config['bypassProcesses'],'bypass_configuration')
  bridge=config['bridge'];rows=json.loads(execute(['/usr/sbin/ip','-j','link','show','dev',bridge['name']]))
  require(len(rows)==1 and (rows[0]['ifindex']==bridge_index if bridge_index is not None else rows[0]['address']==bridge['mac']),'bridge_changed')
- ports=json.loads(execute(['/usr/sbin/ip','-j','link','show','master',bridge['name']]));require({v['ifname'] for v in ports}==set(bridge['ports'])-set(removed_ports)|set(additional_ports),'bridge_ports_changed')
+ ports=json.loads(execute(['/usr/sbin/ip','-j','link','show','master',bridge['name']]));verify_bridge_peers(config,ports,removed_ports,additional_ports)
+ policy=dynamic_bridge_policy(config)
+ if policy:
+  require(rows[0]['ifindex']==policy['dynamicBridgeIdentity']['ifindex'] and rows[0]['address']==policy['dynamicBridgeIdentity']['mac'],'dynamic_bridge_identity_changed')
+  if policy.get('sourceBridgePort') not in removed_ports:
+   info=Path('/proc',str(config['source']['pid']),'ns/net').stat();require([info.st_dev,info.st_ino]==policy['dynamicSourceNamespace'],'dynamic_source_namespace_changed')
  for proc in config['bypassProcesses']:
   require(process_ticks(proc['pid'])==str(proc['startTicks']) and process_cgroup(proc['pid'])==proc['cgroup'],'bypass_process_changed')
   status=Path('/proc/'+str(proc['pid'])+'/status').read_text();require(next(line.split()[1] for line in status.splitlines() if line.startswith('Uid:'))=='0','bypass_uid')
@@ -224,8 +272,15 @@ def mangle_digest():
 
 def verify_resources(state,config,fenced=False):
  require(state.get('rulesDigest')==state_rules_digest() and state.get('mangleDigest')==mangle_digest(),'rules_changed')
+ policy=dynamic_bridge_policy(config,state)
+ live={v['ifname']:v['ifindex'] for v in json.loads(execute(['/usr/sbin/ip','-j','link','show']))} if policy else {}
  for dev,digest in state.get('tcDigests',{}).items():
   if fenced and dev==state.get('sourceBridgePort'):continue
+  if policy:
+   owned=state.get('candidateDeviceIndices',{});critical=dev in owned or dev not in state['dynamicPeerDeviceIndices'] or dev==state.get('sourceBridgePort')
+   expected=owned.get(dev,state['dynamicPeerDeviceIndices'].get(dev))
+   if not critical and live.get(dev)!=expected:continue
+   require(expected is not None and live.get(dev)==expected,'tc_device_identity_changed')
   require(tc_digest(dev)==digest,'tc_rules_changed')
  sets=json.loads(execute(['/usr/sbin/nft','--json','list','set','inet',TABLE,'enabled_ports']))
  actual=next(item['set'].get('elem',[]) for item in sets['nftables'] if 'set' in item)
@@ -386,7 +441,7 @@ class EntryDeployment:
  def check(self,approval=None):
   require(os.geteuid()==0,'root_required');require(fingerprint(private_json(PROFILE))==self.state['configDigest'],'configuration_changed')
   current=private_json(STATE);require(current.get('configDigest')==self.state['configDigest'] and current.get('phase') in ['holding','candidate-binding','candidate-bound','activating','activated'],'deployment_phase')
-  require(current.get('drainReceipt')==self.state.get('drainReceipt'),'deployment_guard_changed');verify_resources(current,current.get('activeRuntimeConfig',self.config),fenced='activeRuntimeConfig' not in current)
+  require(current.get('drainReceipt')==self.state.get('drainReceipt'),'deployment_guard_changed');verify_resources(current,current.get('activeRuntimeConfig',self.config),fenced='activeRuntimeConfig' not in current);verify_candidate_bridge(current)
   if approval is not None:
    for key in ['contract','deploymentId','receiptDigest','configDigest','manifestDigest','revision','sourceFence']:require(approval.get(key)==self.approval.get(key),'activation_changed')
    require(approval.get('state') in ['pending','active'] or approval.get('state')=='failed' and current.get('candidateCleanupVerified') is True and not current.get('candidate'),'activation_state')
@@ -404,7 +459,7 @@ class EntryDeployment:
    present={row['ifname'] for row in ports};base=set(self.config['bridge']['ports'])-{old_port};extras=present-base
    # Every extra interface must belong to the signed new gateway/worker, never
    # an unrelated new container on the shared Docker bridge.
-   if extras:
+   if extras and dynamic_bridge_policy(self.config,current) is None:
     expected_indices=set()
     for role in ['gateway','worker']:
      name='harbor-local-gateway'+('' if role=='gateway' else '-worker')
@@ -435,6 +490,7 @@ class EntryDeployment:
   labels=row.get('Config',{}).get('Labels',{})
   require(row.get('Image') in [self.approval.get('configDigest'),self.approval.get('manifestDigest')] and row.get('Config',{}).get('Image')==self.image,'candidate_image_changed')
   require(labels.get('com.aistrong.project')=='harbor-local-gateway' and labels.get('com.harbor.activation-deployment-id')==self.approval.get('deploymentId') and labels.get('com.harbor.activation-receipt')==self.approval.get('receiptDigest'),'candidate_activation_changed')
+  if self.approval.get('contract')=='harbor-local-assurance-deploy-v1':local_assurance_module().verify_candidate_network(row)
   state=row.get('State',{});require(state.get('Running') and not state.get('Restarting') and not state.get('Paused'),'candidate_not_running')
 
  def endpoint(self,row):
@@ -471,6 +527,11 @@ class EntryDeployment:
   # old MAC. Replace only this verified candidate endpoint's neighbor entry.
   execute(['/usr/sbin/ip','neigh','replace',address,'lladdr',peer_mac,'nud','reachable','dev',bridge_name])
   ports=json.loads(execute(['/usr/sbin/ip','-j','link','show','master',bridge_name]));added=[]
+  if self.approval.get('contract')=='harbor-local-assurance-deploy-v1':
+   expected=local_assurance_module().candidate_network();worker=json.loads(execute(['/usr/bin/docker','container','inspect','harbor-local-gateway-worker']))[0];self.verify_candidate_row(worker)
+   members={*expected['infrastructureContainerIds'],row['Id'],worker['Id']}
+   require(network['Id']==expected['id'] and network['Name']==expected['name'] and bridge_name==expected['bridge'] and bridge_rows[0]['ifindex']==expected['bridgeIfindex'] and bridge_rows[0]['address']==expected['bridgeMac'] and set(network.get('Containers',{}))==members,'candidate_isolated_network_changed')
+   self.state['candidateNetworkIdentity']={'id':network['Id'],'name':network['Name'],'bridge':bridge_name,'ifindex':bridge_rows[0]['ifindex'],'mac':bridge_rows[0]['address'],'ports':{v['ifname']:v['ifindex'] for v in ports}};self.state['candidateNetworkContainerIds']=sorted(members);save_state(self.state)
   # The old profile's bridge ports remain guarded. New candidate/worker ports
   # receive only the same two target-specific routing filters.
   for item in ports:
@@ -537,7 +598,7 @@ class EntryDeployment:
      execute(['/usr/sbin/tc','qdisc','del','dev',dev,'clsact'])
   if state.get('candidateTargetAdded'):nft(f'delete element inet {TABLE} targets {{ {target["address"]} . {target["port"]} }}')
   baseline=state['candidateBaseline'];save_json(CANDIDATE_PROFILE,baseline['profile'])
-  for key in ['candidate','candidateIntent','candidateOperations','candidateDeviceIndices','candidateTargetAdded','candidateBaseline','candidateBridgeProfileDigest','candidateAddedPorts']:state.pop(key,None)
+  for key in ['candidate','candidateIntent','candidateOperations','candidateDeviceIndices','candidateTargetAdded','candidateBaseline','candidateBridgeProfileDigest','candidateAddedPorts',*CANDIDATE_NETWORK_KEYS]:state.pop(key,None)
   state['phase']='holding';state['candidateCleanupVerified']=True;state['tcDigests']=baseline['tcDigests'];state['rulesDigest']=state_rules_digest();state['mangleDigest']=mangle_digest();save_state(state)
   self.state=state;self.candidate=None;self.check(activation);return {'phase':'holding','candidateUnbound':True,'sourceStopped':True,'entryEpoch':entry['epoch']}
 
@@ -639,7 +700,7 @@ def deployment_inventory(approval):
  require(all(re.fullmatch('[a-f0-9]{64}',value) for value in values),'deployment_inventory_invalid');return values
 
 
-def network_snapshot(state):return {key:copy.deepcopy(state.get(key)) for key in ['rulesDigest','mangleDigest','tcDigests','sourceBridgePort','configDigest']}
+def network_snapshot(state):return {key:copy.deepcopy(state.get(key)) for key in ['rulesDigest','mangleDigest','tcDigests','sourceBridgePort','configDigest',*DYNAMIC_KEYS,*CANDIDATE_NETWORK_KEYS] if key in state}
 
 
 def candidate_mounts(row,approval=None):
@@ -651,7 +712,7 @@ def candidate_mounts(row,approval=None):
 
 
 def active_record():
- active=private_json(ACTIVE);config=validate(private_json(PROFILE))
+ active=private_json(ACTIVE);config=validate(private_json(PROFILE));verify_candidate_bridge(active.get('networkSnapshot',{}))
  require(active.get('version')==1 and active.get('configDigest')==fingerprint(config),'active_configuration_changed')
  marker=STORAGE_MARKER
  if active.get('approval',{}).get('contract')=='harbor-local-assurance-deploy-v1':marker=local_assurance_module().verified_marker_path(active['image'],active)
@@ -747,6 +808,7 @@ def prepare_active_network():
  peer_mac=attachment.get('MacAddress','');require(re.fullmatch('(?:[a-f0-9]{2}:){5}[a-f0-9]{2}',peer_mac),'active_candidate_mac');execute(['/usr/sbin/ip','neigh','replace',runtime['source']['address'],'lladdr',peer_mac,'nud','reachable','dev',name])
  entry_config=private_json(ENTRY_CONFIG);entry_config['initialSlot']='candidate';save_json(ENTRY_CONFIG,entry_config)
  state={'version':1,'configDigest':fingerprint(original),'phase':'active-prepared','source':original['source'],'sourceBridgePort':None,'candidate':active['candidate'],'candidateBridgeProfileDigest':active['candidateProfileDigest'],'activeRuntimeConfig':runtime,'drainReceipt':{'entryEpoch':0},'rulesDigest':state_rules_digest(),'mangleDigest':mangle_digest(),'tcDigests':{dev:tc_digest(dev) for dev in runtime['bridge']['ports']}}
+ state.update({key:copy.deepcopy(active.get('networkSnapshot',{})[key]) for key in CANDIDATE_NETWORK_KEYS if key in active.get('networkSnapshot',{})})
  save_state(state);active['networkSnapshot']=copy.deepcopy(state);save_json(ACTIVE,active);return state
 
 

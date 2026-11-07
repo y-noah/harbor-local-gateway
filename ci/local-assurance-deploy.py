@@ -18,6 +18,7 @@ def private_json(path):
 
 def validate_profile(profile,image,config):
  if profile.get('enabled') is not True:raise ValueError('Local assurance release is disabled')
+ if type(profile.get('allowDynamicBridgePeers',False)) is not bool:raise ValueError('Dynamic peer flag must be boolean')
  if profile.get('version')!=1 or profile.get('mode')!='local-assurance' or profile.get('releaseId')!=RELEASE or profile.get('businessRevision')!=REVISION:raise ValueError('Local assurance release identity changed')
  if not isinstance(profile.get('businessConfigDigest'),str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',profile['businessConfigDigest']):raise ValueError('Business config digest is required')
  if config.get('port')!=8092 or config.get('storage_engine')!='postgres' or image!=config['image_prefix']+':'+REVISION or str(RUN)!=profile.get('runDirectory'):raise ValueError('Local assurance target changed')
@@ -50,6 +51,38 @@ def binding(value):return {k:value[k] for k in ['contract','deploymentId','recei
 def validate_authorization(image,approval,active=False):
  profile=private_json(PROFILE);saved=private_json(STATE)
  return bool((active or profile.get('enabled') is True) and profile.get('releaseId')==RELEASE and image.endswith(':'+REVISION) and saved.get('image')==image and approval.get('contract')==CONTRACT and binding(saved['approval'])==binding(approval) and saved.get('offhostVerified') is False and saved.get('profileIdentityDigest')==profile_identity(profile))
+
+def allow_dynamic_bridge_peers(config,state):
+ if state.get('allowDynamicBridgePeers') is not True:return False
+ profile=private_json(PROFILE);root=private_json('/etc/harbor-gateway-deploy.json')
+ if profile.get('allowDynamicBridgePeers') is not True or profile.get('enabled') is not True or root.get('local_assurance_release') is not True:return False
+ validate_profile(profile,root['image_prefix']+':'+REVISION,root)
+ if state.get('localAssuranceReleaseId')!=RELEASE or state.get('localAssuranceProfileIdentityDigest')!=profile_identity(profile):raise ValueError('Dynamic peer policy identity changed')
+ original=state.get('source',{});expected=profile['source']
+ if any(original.get(k)!=expected.get(v) for k,v in [('containerId','containerId'),('imageId','imageId'),('startedAt','startedAt')]):raise ValueError('Dynamic peer source identity changed')
+ identity=state.get('dynamicBridgeIdentity',{})
+ if config['bridge']['name']!=identity.get('name') or config['source'].get('containerId')!=expected['containerId']:return False
+ if config['bridge']['mac']!=identity.get('mac') or type(identity.get('ifindex')) is not int or not isinstance(state.get('dynamicPeerDeviceIndices'),dict) or not isinstance(state.get('dynamicSourceNamespace'),list):raise ValueError('Dynamic peer bridge identity changed')
+ return True
+
+
+def candidate_network(verify_live=False):
+ profile=private_json(PROFILE);root=private_json('/etc/harbor-gateway-deploy.json');operator=private_json('/etc/harbor-storage-operator.json')
+ validate_profile(profile,root['image_prefix']+':'+REVISION,root)
+ expected=profile.get('candidateNetwork',{});name=operator.get('candidate',{}).get('network')
+ if not isinstance(name,str) or name=='bridge' or root.get('postgres_network')!=name or expected.get('name')!=name or not re.fullmatch('[a-f0-9]{64}',expected.get('id','')):raise ValueError('Local candidate requires the approved isolated PostgreSQL network')
+ if verify_live:
+  result=subprocess.run(['/usr/bin/docker','network','inspect',name],capture_output=True,text=True,timeout=15,check=True);rows=json.loads(result.stdout)
+  if len(rows)!=1 or rows[0].get('Id')!=expected['id'] or rows[0].get('Name')!=name or rows[0].get('Driver')!='bridge' or rows[0].get('Internal') is not False or set(rows[0].get('Containers',{}))!=set(expected['infrastructureContainerIds']):raise ValueError('Approved PostgreSQL network has changed or has foreign members')
+  links=json.loads(subprocess.run(['/usr/sbin/ip','-j','link','show','dev',expected['bridge']],capture_output=True,text=True,timeout=10,check=True).stdout)
+  if len(links)!=1 or links[0]['ifindex']!=expected['bridgeIfindex'] or links[0]['address']!=expected['bridgeMac']:raise ValueError('Approved PostgreSQL bridge identity changed')
+ return expected
+
+def verify_candidate_network(row):
+ expected=candidate_network();networks=row.get('NetworkSettings',{}).get('Networks',{})
+ if set(networks)!={expected['name']} or networks[expected['name']].get('NetworkID')!=expected['id']:raise ValueError('Candidate isolated network identity changed')
+ return expected
+
 
 def active_authorization(image):
  saved=private_json(STATE)
@@ -93,11 +126,13 @@ def device_gate_snapshot(entry):
 
 def device_gate_install(entry,port):
  if type(port)!=int or not 1<=port<=65535 or port==8092:raise ValueError('Device gate port is invalid')
+ bridge=candidate_network()['bridge']
+ if not isinstance(bridge,str) or not re.fullmatch('[a-zA-Z0-9_-]{1,15}',bridge):raise ValueError('Candidate bridge name is invalid')
  entry.require(not entry.execute(['/usr/bin/ss','-lntH','sport = :'+str(port)]).strip(),'local_device_port_occupied')
  # An existing table belongs to an earlier/unknown attempt and is never adopted.
  tables=json.loads(entry.execute(['/usr/sbin/nft','--json','list','tables']))
  entry.require(not any(v.get('table',{}).get('name')==DEVICE_TABLE for v in tables.get('nftables',[])),'local_device_gate_exists')
- entry.execute(['/usr/sbin/nft','-f','-'],body=f'add table inet {DEVICE_TABLE}\nadd chain inet {DEVICE_TABLE} ingress {{ type filter hook prerouting priority -110; policy accept; }}\nadd rule inet {DEVICE_TABLE} ingress iifname != "lo" tcp dport {port} drop comment "{RELEASE}"\n')
+ entry.execute(['/usr/sbin/nft','-f','-'],body=f'add table inet {DEVICE_TABLE}\nadd chain inet {DEVICE_TABLE} ingress {{ type filter hook prerouting priority -110; policy accept; }}\nadd rule inet {DEVICE_TABLE} ingress iifname != "lo" tcp dport {port} drop comment "{RELEASE}"\nadd chain inet {DEVICE_TABLE} candidate_backend {{ type filter hook forward priority -110; policy accept; }}\nadd rule inet {DEVICE_TABLE} candidate_backend oifname "{bridge}" tcp dport 8092 drop comment "{RELEASE}"\n')
  snapshot=device_gate_snapshot(entry);entry.save_json(RUN/'device-gate.json',{'releaseId':RELEASE,'port':port,'snapshot':snapshot})
  return snapshot
 
@@ -118,7 +153,7 @@ def run_release(image,config,archive,api):
  entry_config=entry.validate(entry.private_json(entry.PROFILE));original=entry.verify_source(entry_config)
  initial=entry.private_json(entry.STATE)
  if initial.get('phase') not in ['prepared','withdrawn','routed']:raise ValueError('Entry topology must be prepared before local release')
- operator=private_json('/etc/harbor-storage-operator.json')
+ operator=private_json('/etc/harbor-storage-operator.json');candidate_network(verify_live=True)
  if operator['source'].get('supervisorKind')!='docker-restart':raise ValueError('This local release only supports the existing Docker supervisor')
  if original['Id']!=profile['source']['containerId'] or original['Image']!=profile['source']['imageId']:raise ValueError('Original source identity changed')
  # Leave the SSH/logind session before the first source-affecting operation.

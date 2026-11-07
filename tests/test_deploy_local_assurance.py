@@ -51,7 +51,7 @@ class Tests(unittest.TestCase):
    if failure=='preflight-run-unknown':
     def attempted(local_api,*args):local_api['docker']('run','synthetic');raise Unknown('outcome unknown')
     comp.image_proof=attempted
-   with patch.object(m,'RUN',run),patch.object(m,'STATE',run/'release.json'),patch.object(m,'private_json',side_effect=private),patch.object(m,'load_file',side_effect=load),patch.object(m,'helper',side_effect=helper),patch.object(m,'reclaim_before_public',side_effect=lambda *a:calls.append('reclaim')),patch.object(m,'restore_publisher',side_effect=lambda db:calls.append('restore-publisher')),patch.object(m,'recover_local_source',side_effect=lambda *a:calls.append('recover') or {'sourceRunning':True}),patch.object(m,'device_gate_install',return_value={}),patch.object(m,'device_gate_remove'):
+   with patch.object(m,'RUN',run),patch.object(m,'STATE',run/'release.json'),patch.object(m,'private_json',side_effect=private),patch.object(m,'load_file',side_effect=load),patch.object(m,'helper',side_effect=helper),patch.object(m,'reclaim_before_public',side_effect=lambda *a:calls.append('reclaim')),patch.object(m,'restore_publisher',side_effect=lambda db:calls.append('restore-publisher')),patch.object(m,'recover_local_source',side_effect=lambda *a:calls.append('recover') or {'sourceRunning':True}),patch.object(m,'device_gate_install',return_value={}),patch.object(m,'device_gate_remove'),patch.object(m,'candidate_network',return_value={}):
     if failure is None:m.run_release(image,config,None,api)
     else:
      with self.assertRaises(RuntimeError):m.run_release(image,config,None,api)
@@ -171,8 +171,8 @@ class DeviceGateTests(unittest.TestCase):
    if args[0]=='/usr/bin/ss':return ''
    return json.dumps({'nftables':[]} if args[-1]=='tables' else snapshot)
   entry=types.SimpleNamespace(execute=execute,require=lambda ok,code:self.assertTrue(ok,code),save_json=Mock())
-  result=m.device_gate_install(entry,8443)
-  rule=calls[2][1]['body'];self.assertIn('table inet '+m.DEVICE_TABLE,rule);self.assertIn('hook prerouting priority -110',rule);self.assertIn('iifname != "lo" tcp dport 8443 drop',rule);self.assertEqual(result,snapshot)
+  with patch.object(m,'candidate_network',return_value={'bridge':'br-approved'}):result=m.device_gate_install(entry,8443)
+  rule=calls[2][1]['body'];self.assertIn('table inet '+m.DEVICE_TABLE,rule);self.assertIn('hook prerouting priority -110',rule);self.assertIn('iifname != "lo" tcp dport 8443 drop',rule);self.assertIn('hook forward priority -110',rule);self.assertIn('oifname "br-approved" tcp dport 8092 drop',rule);self.assertNotIn('dport 5432',rule);self.assertNotIn('hook output',rule);self.assertEqual(result,snapshot)
   m.device_gate_remove(entry,result);self.assertIn((['/usr/sbin/nft','delete','table','inet',m.DEVICE_TABLE],{}),calls)
  def test_changed_gate_is_retained(self):
   commands=[]
@@ -191,3 +191,31 @@ class PublisherRestoreTests(unittest.TestCase):
     with patch.object(m,'RUN',root),patch.object(m,'PUBLISHER',publisher),patch.object(m,'private_json',side_effect=lambda p:json.loads(Path(p).read_text())):m.restore_publisher('new')
    finally:os.umask(old_umask)
    self.assertEqual(json.loads(publisher.read_text()),before);self.assertEqual(stat.S_IMODE(publisher.stat().st_mode),0o644);self.assertEqual(publisher.stat().st_uid,os.getuid())
+
+class DynamicRootPolicyTests(unittest.TestCase):
+ def fixture(self):
+  source={'containerId':'source','imageId':'old','startedAt':'start'};config={'port':8092,'storage_engine':'postgres','image_prefix':'registry.test/app','local_assurance_release':True,'postgres_network':'isolated'}
+  profile={'enabled':True,'version':1,'mode':'local-assurance','releaseId':m.RELEASE,'businessRevision':m.REVISION,'businessConfigDigest':'sha256:'+'a'*64,'runDirectory':str(m.RUN),'source':source,'allowDynamicBridgePeers':True,'candidateNetwork':{'name':'isolated','id':'a'*64}}
+  state={'allowDynamicBridgePeers':True,'localAssuranceReleaseId':m.RELEASE,'localAssuranceProfileIdentityDigest':m.profile_identity(profile),'source':source,'dynamicBridgeIdentity':{'name':'docker0','mac':'aa','ifindex':2},'dynamicPeerDeviceIndices':{},'dynamicSourceNamespace':[4,5]}
+  view={'source':source,'bridge':{'name':'docker0','mac':'aa'}}
+  return config,profile,state,view
+ def test_default_and_disabled_root_flags_cannot_relax_peers(self):
+  config,profile,state,view=self.fixture()
+  self.assertFalse(m.allow_dynamic_bridge_peers(view,{}))
+  for p,r in [({**profile,'allowDynamicBridgePeers':False},config),(profile,{**config,'local_assurance_release':False}),({**profile,'enabled':False},config)]:
+   with patch.object(m,'private_json',side_effect=lambda path:p if Path(path)==m.PROFILE else r):self.assertFalse(m.allow_dynamic_bridge_peers(view,state))
+ def test_only_exact_source_bridge_uses_dynamic_policy_active_candidate_stays_strict(self):
+  config,profile,state,view=self.fixture()
+  with patch.object(m,'private_json',side_effect=lambda path:profile if Path(path)==m.PROFILE else config):
+   self.assertTrue(m.allow_dynamic_bridge_peers(view,state))
+   self.assertFalse(m.allow_dynamic_bridge_peers({**view,'source':{**view['source'],'containerId':'candidate'}},state))
+   self.assertFalse(m.allow_dynamic_bridge_peers({**view,'bridge':{'name':'br-candidate','mac':'aa'}},state))
+   with self.assertRaisesRegex(ValueError,'identity changed'):m.allow_dynamic_bridge_peers(view,{**state,'localAssuranceReleaseId':'other'})
+ def test_candidate_network_requires_root_operator_agreement_and_actual_single_membership(self):
+  config,profile,state,view=self.fixture()
+  def private(path):return profile if Path(path)==m.PROFILE else {'candidate':{'network':'isolated'}} if str(path)=='/etc/harbor-storage-operator.json' else config
+  with patch.object(m,'private_json',side_effect=private):
+   row={'NetworkSettings':{'Networks':{'isolated':{'NetworkID':'a'*64}}}};self.assertEqual(m.verify_candidate_network(row)['name'],'isolated')
+   with self.assertRaisesRegex(ValueError,'network identity changed'):m.verify_candidate_network({'NetworkSettings':{'Networks':{'bridge':{'NetworkID':'a'*64}}}})
+   config.pop('postgres_network')
+   with self.assertRaisesRegex(ValueError,'approved isolated'):m.candidate_network()

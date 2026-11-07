@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import copy
 import unittest
 import stat
@@ -101,3 +102,49 @@ class LocalMaterialBindingTests(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,'candidate_material_mounts'):controller.candidate_mounts(row)
    row['Mounts'][0]['Source']='/tmp/other'
    with self.assertRaisesRegex(RuntimeError,'candidate_material_mounts'):controller.candidate_mounts(row,{'contract':'harbor-local-assurance-deploy-v1'})
+
+class DynamicSourcePeerTests(unittest.TestCase):
+ def config(self):return {'source':{'containerId':'source'},'bridge':{'ports':['source-veth','old-peer']}}
+ def policy(self):return {'allowDynamicBridgePeers':True,'source':{'containerId':'source'},'sourceBridgePort':'source-veth','dynamicPeerDeviceIndices':{'source-veth':10,'old-peer':20}}
+ def test_background_peer_churn_allowed_but_source_missing_or_reused_rejected(self):
+  config=self.config();policy=self.policy()
+  with patch.object(controller,'dynamic_bridge_policy',return_value=policy),patch.object(controller,'verify_source_bridge_owners'):
+   controller.verify_bridge_peers(config,[{'ifname':'source-veth','ifindex':10},{'ifname':'new-peer','ifindex':30}])
+   for ports in [[{'ifname':'new-peer','ifindex':30}],[{'ifname':'source-veth','ifindex':99}]]:
+    with self.assertRaisesRegex(RuntimeError,'critical_bridge_port_changed'):controller.verify_bridge_peers(config,ports)
+ def test_strict_default_rejects_same_background_change(self):
+  with patch.object(controller,'dynamic_bridge_policy',return_value=None),self.assertRaisesRegex(RuntimeError,'bridge_ports_changed'):controller.verify_bridge_peers(self.config(),[{'ifname':'source-veth','ifindex':10},{'ifname':'new-peer','ifindex':30}])
+ def test_disappeared_background_tc_skipped_and_live_original_tc_still_checked(self):
+  policy={**self.policy(),'phase':'prepared','rulesDigest':'rules','mangleDigest':'mangle','tcDigests':{'source-veth':'a','old-peer':'b'}}
+  def execute(args):return json.dumps({'nftables':[{'set':{'elem':[]}}]}) if args[0]=='/usr/sbin/nft' else json.dumps([{'ifname':'source-veth','ifindex':10},{'ifname':'new-peer','ifindex':30}])
+  with patch.object(controller,'dynamic_bridge_policy',return_value=policy),patch.object(controller,'state_rules_digest',return_value='rules'),patch.object(controller,'mangle_digest',return_value='mangle'),patch.object(controller,'execute',side_effect=execute),patch.object(controller,'tc_digest',return_value='a') as tc:
+   controller.verify_resources(policy,self.config());tc.assert_called_once_with('source-veth')
+   policy['tcDigests']['source-veth']='changed'
+   with self.assertRaisesRegex(RuntimeError,'tc_rules_changed'):controller.verify_resources(policy,self.config())
+ def test_candidate_missing_or_name_collision_never_ignored(self):
+  for which in ['candidate','candidate-collision']:
+   policy={**self.policy(),'phase':'prepared','rulesDigest':'rules','mangleDigest':'mangle','tcDigests':{'old-peer':'b'} if which=='candidate-collision' else {'candidate-veth':'b'},'candidateDeviceIndices':{'candidate-veth':40,'old-peer':40}}
+   def execute(args):return json.dumps({'nftables':[{'set':{'elem':[]}}]}) if args[0]=='/usr/sbin/nft' else json.dumps([{'ifname':'old-peer','ifindex':99}])
+   with patch.object(controller,'dynamic_bridge_policy',return_value=policy),patch.object(controller,'state_rules_digest',return_value='rules'),patch.object(controller,'mangle_digest',return_value='mangle'),patch.object(controller,'execute',side_effect=execute),self.assertRaisesRegex(RuntimeError,'tc_device_identity_changed'):controller.verify_resources(policy,self.config())
+ def test_candidate_bridge_membership_remains_exact(self):
+  state={'candidateNetworkIdentity':{'id':'net','name':'approved','bridge':'br-own','ifindex':4,'mac':'aa','ports':{'own':5}},'candidateNetworkContainerIds':['pg','gw','worker']}
+  responses=[json.dumps([{'ifindex':4,'address':'aa'}]),json.dumps([{'ifname':'own','ifindex':5},{'ifname':'foreign','ifindex':8}])]
+  with patch.object(controller,'execute',side_effect=responses),self.assertRaisesRegex(RuntimeError,'candidate_bridge_ports_changed'):controller.verify_candidate_bridge(state)
+
+class DynamicOwnInventoryTests(unittest.TestCase):
+ def test_unexpected_harbor_owned_peer_on_source_network_is_not_background(self):
+  cid='c'*64;row={'Config':{'Labels':{'com.aistrong.project':'harbor-local-gateway'}},'NetworkSettings':{'Networks':{'bridge':{'NetworkID':'source-network','IPAddress':'172.17.0.9'}}}}
+  policy={'dynamicBridgeIdentity':{'networkId':'source-network'}}
+  with patch.object(controller,'execute',return_value=cid+'\n'),patch.object(controller,'inspect_container',return_value=row):
+   with self.assertRaisesRegex(RuntimeError,'unexpected_harbor_source_bridge_peer'):controller.verify_source_bridge_owners({'source':{'containerId':'different'}},policy)
+   controller.verify_source_bridge_owners({'source':{'containerId':cid}},policy)
+
+class DynamicPeerIdentityTransitionTests(unittest.TestCase):
+ def test_recreated_foreign_interface_is_background_but_same_identity_tc_is_pinned(self):
+  policy={'allowDynamicBridgePeers':True,'phase':'prepared','sourceBridgePort':'source','rulesDigest':'r','mangleDigest':'m','tcDigests':{'peer':'expected'},'dynamicPeerDeviceIndices':{'peer':20}}
+  live=[{'ifname':'peer','ifindex':99}]
+  def execute(args):return json.dumps({'nftables':[{'set':{'elem':[]}}]}) if args[0]=='/usr/sbin/nft' else json.dumps(live)
+  with patch.object(controller,'dynamic_bridge_policy',return_value=policy),patch.object(controller,'state_rules_digest',return_value='r'),patch.object(controller,'mangle_digest',return_value='m'),patch.object(controller,'execute',side_effect=execute),patch.object(controller,'tc_digest',return_value='changed') as tc:
+   controller.verify_resources(policy,{});tc.assert_not_called()
+   live[0]['ifindex']=20
+   with self.assertRaisesRegex(RuntimeError,'tc_rules_changed'):controller.verify_resources(policy,{})
