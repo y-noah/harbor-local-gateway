@@ -86,6 +86,21 @@ producer `schedule`、maintainer `maintain-base` 与 sender `send` 使用独立�
 
 停用时先停止并禁用 `harbor-postgres-periodic-ssh.timer`，再将固定 SSH policy 的 `enabled` 设为 `false`，阻止后续发送；若需取消已经开始的任务，再停止对应 `.service` 并等待收尾。只修改 policy 不会撤销已开始任务，它仍沿启动时读取的预算完成或取消。模板与全备维护一样不另设启动／停止强杀期限：`KillMode=mixed` 将 SIGTERM 交给主 CLI，CLI 负责取消本次 SSH、等待真实进程关闭并释放租约；`SendSIGKILL=no` 阻止服务管理器另行强杀。异常挂起时保留状态和材料并排查，不能把发出停止命令或超时当作清理成功。停用不停止 producer／maintainer，不删除已有索引、密文、恢复收据或源备份。模板仅提供可审阅的调度接线，未在真实服务器启用；`transportComplete` 仅表示传输完成，不等于接收端实际恢复、异机身份验证、RPO／RTO 或部署放行证明。
 
+受限 SSH 接收包装器为 `periodic-receive.py`，由管理员核准后安装到 root 所有、不可被其他用户写入的 `/usr/local/lib/harbor/periodic-receive.py`。专用 SSH 账号仅允许公钥认证；下例账号名 `harbor_backup` 须与源端 policy 的 `user` 一致，且具有可执行固定命令的 shell。授权公钥文件及祖先由 root 管理，不允许该账号自行追加其他公钥；不要启用密码、用户环境或用户 rc。公钥行采用以下约束，替换占位公钥后才可使用：
+
+```text
+restrict,command="/usr/bin/python3 -I -B /usr/local/lib/harbor/periodic-receive.py" ssh-ed25519 REPLACE_WITH_SOURCE_PUBLIC_KEY
+```
+
+包装器只接受没有附加参数的 `harbor-periodic-receive` 原始命令，拒绝交互终端。管理员用 `visudo -cf` 核验以下专用 sudoers 规则；权限仅限这一个参数完全匹配的接收入口，不授予任意 Python、Node、shell 或恢复命令：
+
+```sudoers
+Defaults:harbor_backup !use_pty, !requiretty
+harbor_backup ALL=(root) NOPASSWD: /usr/bin/python3 -I -B /usr/local/lib/harbor/periodic-receive.py --root-receive
+```
+
+提权后再次限制为固定接收阶段，并清除调用方环境；检查固定 Node、接收 CLI、工具校验器及其祖先，再复用 installer 的整树属主／权限／链接检查。固定 `/run/harbor-periodic-receive.lock` 的内核互斥覆盖首帧等待到接收进程退出，第二个接收任务立即拒绝，避免并发 SSH 会话在读取控制帧前堆积接收进程；锁文件由 root 管理并保留，不在运行时删除。仅执行 `/opt/harbor-storage-tools/node/bin/node /opt/harbor-storage-tools/app/storage-periodic-transfer.mjs receive`，从既有固定 `/etc/harbor-storage-periodic-transfer.json` 取得接收配置；该配置缺失或关闭时不加载密钥、不接收内容。标准输入输出专用于有界密文协议，错误只输出固定代码。包装器不会创建账号、安装公钥、写 sudoers、修改 sshd 或启用接收配置；真实接收主机须单独核实安装及信任，源端必须严格校验该主机公钥。停用接收配置可阻止后续收包，撤销专用公钥可阻止新 SSH 登录；已有任务按原生命周期收尾。仅收包不执行数据库恢复、不签名，也不取得部署权限。
+
 独立全备维护模板为 `maintain-base.service.example` 和 `maintain-base.timer.example`，管理员核实际工具路径、资源预算及固定配置后，分别安装为 `harbor-postgres-maintain-base.service` 和同名 `.timer`。计时器每分钟检查一次，实际是否全备仍由 `fullIntervalMs`、源数据库代次和现有认证状态判断；同一服务执行中不会被计时器并行启动。它与 `schedule` 独立，不能同时启用旧的每日 `backup.timer` 来代替应用维护。模板不自动安装或启用；关闭时先停止计时器，再停止服务并等待取消收尾，保留已有密文与状态。首次备份尚未成功前，轻点仍报告未就绪，不承诺恢复能力。维护的启动及停止不另设强杀期限，沿固定备份配置和子进程取消机制收尾；异常挂起需管理员排查，不能强杀后把未确认清理当作成功。
 
 应用周期默认关闭，仅 root 固定的 `/etc/harbor-storage-application.json` 显式启用后接入原 `schedule`。配置版本1，完整字段为 `enabled`、数据库 `name/oid`、`data/runtime/secrets` 三个材料根（可另设库中路径前缀 `databasePrefix`）、原 HTTP/设备 TLS origin、材料字节及文件数预算；配置不由 HTTP 调用方提交。捕获包含原加密 Key、上游密文对应密钥、正文密钥、账号目录及设备 CA/TLS/report 材料，仍需按实际部署配置完整根目录；配置启用本身不证明备份或恢复完成。
