@@ -108,3 +108,7 @@
 .action-loading::after{content:'';display:inline-block;width:12px;height:12px;margin-left:7px;vertical-align:middle;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:loading-spin .8s linear infinite}.connection-error{background:#fbece7;color:#ae5949}@media(prefers-reduced-motion:reduce){.action-loading::after{animation:none}}
 
 .page.overview-page{max-width:none}.overview-page .two-col{align-items:start}
+
+/* Account lists keep operational summaries; detailed budgets live in management. */
+.account-status-line{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.account-quota-window{padding:3px 0}.account-quota-window strong{font-size:13px}.account-quota-window small{font-size:11px}.account-management-section .account-card{border:0;padding:0;box-shadow:none}.initial-state-error{padding:48px 24px;text-align:center}.account-pool-table{min-width:850px}.account-pool-table td{vertical-align:middle}.account-management-section .quota{max-width:100%}
+@media(max-width:760px){.account-pool-table{min-width:0}}
