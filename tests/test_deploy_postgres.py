@@ -13,6 +13,36 @@ spec=importlib.util.spec_from_file_location('wrapper',ROOT/'ci/deploy-wrapper.py
 IMAGE='registry.test/harbor/gateway:'+40*'a';OLD='registry.test/harbor/gateway:'+40*'b';NAME='harbor-local-gateway';CONFIG={'storage_engine':'postgres','port':43127,'origin':'http://gateway.test:43127','device_tls_port':43128,'device_origin':'https://gateway.test:43128'}
 PROOF={'revision':40*'a','contract':pg.CONTRACT,'extra_usage_dispatch_contract':pg.EXTRA_USAGE_DISPATCH_CONTRACT,'schema_digest':64*'c','database_digest':64*'d','source_digest':64*'e','storage_verified':True,'credentials_verified':True,'device_tls_verified':True,'device_ca_digest':64*'1','shutdown':{'contract':pg.SHUTDOWN_CONTRACT,**pg.SHUTDOWN_DEFAULTS}}
 class PostgreSQLDeploymentTests(unittest.TestCase):
+ def test_preflight_budget_defaults_and_rejects_invalid_values_before_docker(self):
+  self.assertEqual(pg.preflight_timeout_seconds(),30)
+  for value in [30,180,300]:self.assertEqual(pg.preflight_timeout_seconds(value),value)
+  for value in [None,True,False,29,301,30.0,'300',{},[]]:
+   with self.subTest(value=value),self.assertRaises(ValueError):pg.preflight_timeout_seconds(value)
+   api={'postgres_preflight_timeout_seconds':value,'docker':Mock(),'inspect_image':Mock()}
+   with self.assertRaises(ValueError):pg.image_proof_content(api,IMAGE,[])
+   api['docker'].assert_not_called();api['inspect_image'].assert_not_called()
+ def test_preflight_budget_covers_candidate_and_both_old_source_proofs(self):
+  for budget in [None,180,300]:
+   with self.subTest(budget=budget),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    self.prepare(directory);api,calls,state=self.api(directory);original=api['docker'];timeouts=[]
+    def docker(*args,**kwargs):
+     if args[0]=='run' and '--rm' in args:timeouts.append(kwargs['timeout'])
+     return original(*args,**kwargs)
+    api['docker']=docker
+    if budget is not None:api['postgres_preflight_timeout_seconds']=budget
+    result=pg.deploy(IMAGE,CONFIG,None,api)
+    self.assertEqual(timeouts,[30 if budget is None else budget]*3)
+    self.assertEqual(result['shutdown_contract'],pg.SHUTDOWN_CONTRACT)
+ def test_configured_preflight_timeout_keeps_unknown_proof_fail_closed(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory);original=api['docker']
+   def docker(*args,**kwargs):
+    if args[0]=='run' and '--rm' in args:raise subprocess.TimeoutExpired('preflight',kwargs['timeout'])
+    return original(*args,**kwargs)
+   api.update(docker=docker,postgres_preflight_timeout_seconds=300)
+   with self.assertRaises(pg.ShutdownUnconfirmed) as caught:pg.deploy(IMAGE,CONFIG,None,api)
+   self.assertIsInstance(caught.exception.__cause__,subprocess.TimeoutExpired);self.assertEqual(caught.exception.__cause__.timeout,300)
+   self.assertFalse(any(call[0] in ('stop','rename','rm','start') for call in calls))
  def test_secure_material_checks_real_permissions_owner_type_and_symlink(self):
   with tempfile.TemporaryDirectory() as directory:
    path=Path(directory)/'key';path.write_bytes(b'test');path.chmod(0o600);pg.secure(path,os.getuid(),0o600)

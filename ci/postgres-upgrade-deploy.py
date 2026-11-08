@@ -184,8 +184,9 @@ def deploy(image,config,archive,api):
 
 def run_upgrade(image,config,api,ticket,entry):
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
+ preflight_timeout=pg.preflight_timeout_seconds(config.get('postgres_preflight_timeout_seconds',30))
  active,original,gateway=entry.active_record();worker=api['inspect_container'](api['NAME']+'-worker');verify_source(ticket,active,gateway,worker);check_storage(ticket)
- pg_api={**api,'STACK':ticket['materialsDirectory']};common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);proof=pg.image_proof(pg_api,image,common)
+ pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout};common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);proof=pg.image_proof(pg_api,image,common)
  need(all(proof[k]==ticket[v] for k,v in [('database_digest','databaseDigest'),('schema_digest','schemaDigest'),('device_ca_digest','deviceCaDigest')]),'new image changed database/schema/device identity')
  network_snapshot(ticket,entry,gateway,worker)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)

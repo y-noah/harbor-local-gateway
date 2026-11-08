@@ -24,6 +24,11 @@ def target(t,role='gateway'):
  return {'Id':('c' if role=='gateway' else 'd')*64,'Image':t['to']['configDigest'],'Config':{'Image':IMAGE,'Cmd':['node','/app/postgres-'+role+'.mjs'],'Labels':{'com.aistrong.project':NAME,'com.harbor.activation-deployment-id':t['deploymentId'],'com.harbor.activation-receipt':authorization['receiptDigest']}},'State':{'Running':True,'Health':{'Status':'healthy'}},'Mounts':[{'Source':MATERIALS+'/pg-data','Destination':'/app/data','RW':True},{'Source':MATERIALS+'/runtime','Destination':'/app/runtime','RW':True}],'NetworkSettings':{'Networks':{'owned-pg-net':{'NetworkID':'6'*64,'IPAddress':'192.0.2.3'}}}}
 
 class RuntimeUpgradeTests(unittest.TestCase):
+ def test_invalid_root_preflight_budget_rejects_before_source_or_entry_operations(self):
+  for value in [None,True,False,29,301,30.0,'300',{},[]]:
+   entry=Mock()
+   with self.subTest(value=value),patch.object(upgrade,'load',return_value=pg),self.assertRaises(ValueError):upgrade.run_upgrade(IMAGE,{**CONFIG,'postgres_preflight_timeout_seconds':value},{},ticket(),entry)
+   entry.active_record.assert_not_called();entry.entry_state.assert_not_called()
  def test_ticket_binds_same_database_materials_network_source_and_ci_target(self):
   t=ticket();self.assertIs(upgrade.validate_ticket(t,IMAGE,CONFIG),t)
   mutations=[lambda x:x.update(approved=False),lambda x:x['to'].update(image=OLD),lambda x:x['to'].update(configDigest='latest'),lambda x:x.update(materialsDirectory='/tmp/untrusted'),lambda x:x['database'].update(oid='unknown'),lambda x:x['network'].update(name='bridge'),lambda x:x['from'].update(containerId='unknown'),lambda x:x.update(hostToolsRevision='main')]
@@ -127,8 +132,9 @@ class RuntimeUpgradeTests(unittest.TestCase):
      return dict(control)
     entry.entry_state.side_effect=entry_state
     if outcome=='commit-unknown':entry.restore_active.side_effect=RuntimeError('publication outcome unknown')
-    composition=Mock();composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']}
+    composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']}
     def deploy(*args):
+     self.assertEqual(args[-1]['postgres_preflight_timeout_seconds'],300)
      if outcome=='pg-rollback':raise RuntimeError('candidate failed and old PG pair restored')
      if outcome=='unknown-stop':old_gateway['State']['Running']=False;raise pg.ShutdownUnconfirmed('unknown shutdown')
      if outcome=='unknown-stop-healthy':raise pg.ShutdownUnconfirmed('stop timed out but daemon may stop late')
@@ -137,16 +143,17 @@ class RuntimeUpgradeTests(unittest.TestCase):
     composition.deploy.side_effect=deploy
     def docker(*args):
      docker_calls.append(args);self.assertEqual(args[0],'rename');key=next(k for k,v in rows.items() if v['Id']==args[1]);rows[args[2]]=rows.pop(key)
-    api={'NAME':NAME,'inspect_container':rows.get,'inspect_image':Mock(),'docker':docker}
+    api={'NAME':NAME,'inspect_container':rows.get,'inspect_image':Mock(),'docker':docker,'postgres_preflight_timeout_seconds':999};config={**CONFIG,'postgres_preflight_timeout_seconds':300}
     with patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot',return_value={'candidateNetworkIdentity':{'id':'6'*64}}),patch.object(upgrade,'gate_install',return_value={'owned':True}),patch.object(upgrade,'gate_remove') as remove_gate,patch.object(upgrade,'verify_installed_tools'):
      if outcome=='success':
-      result=upgrade.run_upgrade(IMAGE,CONFIG,api,t,entry);self.assertEqual(result['contract'],upgrade.CONTRACT);self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64);self.assertEqual(control['phase'],'active');self.assertEqual(len(docker_calls),2);remove_gate.assert_called_once()
+      result=upgrade.run_upgrade(IMAGE,config,api,t,entry);self.assertEqual(result['contract'],upgrade.CONTRACT);self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64);self.assertEqual(control['phase'],'active');self.assertEqual(len(docker_calls),2);remove_gate.assert_called_once()
      else:
-      with self.assertRaises(RuntimeError):upgrade.run_upgrade(IMAGE,CONFIG,api,t,entry)
+      with self.assertRaises(RuntimeError):upgrade.run_upgrade(IMAGE,config,api,t,entry)
       if outcome=='pg-rollback':entry.refresh_active.assert_called_once();remove_gate.assert_called_once();self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
       else:entry.refresh_active.assert_not_called();remove_gate.assert_not_called()
       if outcome=='unknown-stop-healthy':self.assertTrue(old_gateway['State']['Running']);self.assertTrue(old_worker['State']['Running']);composition.verify_started_composition.assert_not_called();self.assertEqual(data[str(upgrade.release_path(t['deploymentId'])/'release.json')]['phase'],'stop-unknown')
       if outcome=='commit-unknown':self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64)
+     self.assertEqual(composition.image_proof.call_args.args[0]['postgres_preflight_timeout_seconds'],300)
      self.assertTrue(all(call[0]=='rename' for call in docker_calls));self.assertFalse(any('sqlite' in str(call) for call in docker_calls))
 
  def test_publish_commits_real_candidate_then_rebuilds_current_network_and_activates(self):

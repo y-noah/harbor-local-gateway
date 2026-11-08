@@ -28,6 +28,10 @@ def shutdown_configuration(value=None):
     if not isinstance(value,dict) or set(value)!=set(SHUTDOWN_DEFAULTS) or any(type(value[key])!=int or not SHUTDOWN_RANGES[key][0]<=value[key]<=SHUTDOWN_RANGES[key][1] for key in SHUTDOWN_DEFAULTS):raise ValueError('PostgreSQL shutdown configuration is invalid')
     return dict(value)
 
+def preflight_timeout_seconds(value=30):
+    if type(value)!=int or not 30<=value<=300:raise ValueError('PostgreSQL preflight timeout must be an integer from 30 to 300 seconds')
+    return value
+
 def confirmed_container_state(instance):
     state=instance.get('State',{})
     if type(state.get('Running'))!=bool or state.get('Paused') or state.get('Restarting') or state.get('Dead') or not instance.get('Id'):raise ShutdownUnconfirmed('PostgreSQL container state is not verified')
@@ -206,6 +210,7 @@ def configuration(config,stack):
     return common,budgets
 
 def image_proof_content(api,image,common):
+    timeout=preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30))
     candidate=image_inspection(api,image,[])
     labels=(candidate or {}).get('Config',{}).get('Labels',{})
     if labels.get('com.harbor.ci-validation-only')=='true' or labels.get('com.harbor.storage.postgres')!=CONTRACT or labels.get('com.harbor.postgres-preflight')!='v1' or labels.get('com.harbor.extra-usage-dispatch')!=EXTRA_USAGE_DISPATCH_CONTRACT or labels.get('org.opencontainers.image.revision')!=image.rsplit(':',1)[-1]:raise ValueError('Candidate does not provide the PostgreSQL image capability')
@@ -214,7 +219,7 @@ def image_proof_content(api,image,common):
     if container_inspection(api,check_name,[]):raise ValueError('PostgreSQL preflight container requires administrator inspection')
     args=['run','--rm','--name',check_name,'--label','com.aistrong.project='+api['NAME'],'--label','com.harbor.preflight=true','--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=64m',*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data,readonly','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime,readonly',image,'node','/app/ci/postgres-preflight.mjs']
     try:
-        value=json.loads(api['docker'](*args,timeout=30).stdout)
+        value=json.loads(api['docker'](*args,timeout=timeout).stdout)
     finally:
         check=container_inspection(api,check_name,[])
         if check and check.get('Image')==candidate.get('Id') and check.get('Config',{}).get('Image')==image and check.get('Config',{}).get('Labels',{}).get('com.harbor.preflight')=='true':api['docker']('rm','-f',check_name,check=False,timeout=10)
