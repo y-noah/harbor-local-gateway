@@ -8,7 +8,7 @@ import {PostgresStore} from '../postgres-store.mjs';
 import {createTaskPostgresBackupContext,closePostgresBackupContext,postgresBackupContext} from '../postgres-backup-context.mjs';
 import {createPostgresBaseBackup,checkpointPostgresBackup} from '../postgres-backup.mjs';
 import {capturePostgresBackupRecoveryPoint,postgresBackupRecoveryPointSource} from '../postgres-backup-recovery-point.mjs';
-import {capturePeriodicApplicationMaterials,verifyPeriodicApplicationCapture,periodicApplicationCaptureSource} from '../postgres-periodic-application-materials.mjs';
+import {capturePeriodicApplicationMaterials,verifyPeriodicApplicationCapture,authenticatePeriodicApplicationCapture,periodicApplicationCaptureSource} from '../postgres-periodic-application-materials.mjs';
 
 test('disabled application capture does not inspect a database and copied descriptions grant no capability',async()=>{
   assert.equal((await capturePeriodicApplicationMaterials(null,null,{version:1,enabled:false})).state,'periodic_application_disabled');
@@ -40,6 +40,17 @@ test('private PG pre-checkpoint capture authenticates material coverage, rejects
   await writeFile(join(runtime,'auth.json'),'BBBB',{mode:0o600});
   await assert.rejects(verifyPeriodicApplicationCapture(context,proof,policy,capture.captureId),{code:'transfer_files_changed'});
   assert.deepEqual(await readFile(join(source.directory,'capture.enc')),original);
+  await writeFile(join(runtime,'auth.json'),'AAAA',{mode:0o600});
+  const cachePolicy={...policy,runtimeSqliteCaches:['**/state_*.sqlite']};
+  await writeFile(join(runtime,'state_5.sqlite'),'synthetic rebuildable cache',{mode:0o600});
+  const filtered=await capturePeriodicApplicationMaterials(context,proof,cachePolicy);
+  assert.equal(periodicApplicationCaptureSource(filtered).manifest.files.files,5);
+  await writeFile(join(runtime,'state_5.sqlite'),'updated cache',{mode:0o600});await writeFile(join(runtime,'state_5.sqlite-wal'),'new sidecar',{mode:0o600});
+  assert.equal((await verifyPeriodicApplicationCapture(context,proof,cachePolicy,filtered.captureId)).captureId,filtered.captureId);
+  assert.equal((await authenticatePeriodicApplicationCapture(context,proof,filtered.captureId)).captureId,filtered.captureId);
+  await assert.rejects(verifyPeriodicApplicationCapture(context,proof,policy,filtered.captureId),{code:'periodic_application_capture_binding'});
+  await writeFile(join(runtime,'auth.json'),'CCCC',{mode:0o600});
+  await assert.rejects(verifyPeriodicApplicationCapture(context,proof,cachePolicy,filtered.captureId),{code:'transfer_files_changed'});
   await writeFile(join(runtime,'auth.json'),'AAAA',{mode:0o600});
   const id=randomUUID(),running=capturePeriodicApplicationMaterials(context,proof,policy,{captureId:id}),record=postgresBackupContext(context);
   assert.equal(record.busy,true);const rejection=assert.rejects(running,{name:'AbortError'});

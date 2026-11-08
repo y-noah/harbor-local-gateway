@@ -3,7 +3,7 @@ import {createReadStream,createWriteStream} from 'node:fs';
 import {mkdir,lstat,open,readFile,writeFile,rename,rm,link,opendir} from 'node:fs/promises';
 import {pipeline} from 'node:stream/promises';
 import {Readable,Transform,Writable} from 'node:stream';
-import {resolve,join,dirname} from 'node:path';
+import {resolve,join,dirname,matchesGlob} from 'node:path';
 import {AppError} from './store.mjs';
 
 const magic=Buffer.from('HBRART01');
@@ -48,34 +48,50 @@ export async function syncDirectory(path){const handle=await open(path,'r');try{
 export async function digestOpenedFile(source,key,{signal}={}){signal?.throwIfAborted();artifactKey(key);const info=await regularFile(source);if(info.size<36)throw transferError('transfer_artifact_invalid');const file=await open(source,'r'),header=Buffer.alloc(20),tag=Buffer.alloc(16);try{await file.read(header,0,20,0);await file.read(tag,0,16,info.size-16);}finally{await file.close();}signal?.throwIfAborted();if(!header.subarray(0,8).equals(magic))throw transferError('transfer_artifact_invalid');const decipher=createDecipheriv('aes-256-gcm',key,header.subarray(8));decipher.setAAD(magic);decipher.setAuthTag(tag);const hash=createHash('sha256');let bytes=0;try{await pipeline(info.size===36?Readable.from([]):createReadStream(source,{start:20,end:info.size-17,signal}),decipher,new Writable({write(chunk,encoding,callback){hash.update(chunk);bytes+=chunk.length;callback();}}),{signal});}catch{if(signal?.aborted)throw signal.reason;throw transferError('transfer_artifact_authentication_failed');}signal?.throwIfAborted();return {sha256:hash.digest('hex'),bytes};}
 
 const safeRelative=value=>typeof value==='string'&&value.length<=4096&&!value.includes('\\')&&!value.includes('\0')&&!value.startsWith('/')&&value.split('/').every(part=>part!=='.'&&part!=='..'&&part!=='');
-async function* walkFiles(root,relative='',{signal,maxEntries=1000000}={}){
-  signal?.throwIfAborted();const path=relative?join(root,...relative.split('/')):root,info=await lstat(path);
+export function fileSetExclusions(value=[]){
+  if(!Array.isArray(value)||value.length>64)throw transferError('transfer_file_exclusions_invalid');
+  const seen=new Set();return Object.freeze(value.map(item=>{
+    if(!item||Object.keys(item).sort().join(',')!=='pattern,root'||typeof item.root!=='string'||!/^[a-z][a-z0-9-]{0,79}$/.test(item.root)||!safeRelative(item.pattern)||item.pattern.length>256||!/^[A-Za-z0-9_./*-]+$/.test(item.pattern))throw transferError('transfer_file_exclusions_invalid');
+    const key=item.root+':'+item.pattern;if(seen.has(key))throw transferError('transfer_file_exclusions_invalid');seen.add(key);return Object.freeze({root:item.root,pattern:item.pattern});
+  }));
+}
+const excludedPath=(root,relative,selection)=>selection.some(item=>item.root===root&&matchesGlob(relative,item.pattern));
+const excludedFile=(root,entry,selection)=>entry.kind==='file'&&excludedPath(root,entry.relative,selection);
+// Directory allocation size can change when an explicitly excluded cache is
+// created or removed. Its selected children, mode and path remain verified.
+const selectedEntry=(root,entry,selection)=>entry.kind==='directory'&&selection.some(item=>item.root===root)?{...entry,bytes:0}:entry;
+async function* walkFiles(root,relative='',{signal,maxEntries=1000000,onVisit,allowMissingFile,expectedFile=false}={}){
+  signal?.throwIfAborted();if(relative)onVisit?.();const path=relative?join(root,...relative.split('/')):root;let info;
+  try{info=await lstat(path);}catch(error){if(error.code==='ENOENT'&&expectedFile&&allowMissingFile?.(relative))return;throw error;}
   if(info.isSymbolicLink()||!info.isFile()&&!info.isDirectory())throw transferError('transfer_unsupported_file_type');
   if(relative)yield {relative,kind:info.isDirectory()?'directory':'file',mode:info.mode&0o777,bytes:info.size};
   if(info.isDirectory()){
     const names=[],directory=await opendir(path);
-    for await(const entry of directory){signal?.throwIfAborted();if(names.length>=maxEntries)throw transferError('transfer_file_capacity');names.push(entry.name);}
-    for(const name of names.sort())yield* walkFiles(root,relative?relative+'/'+name:name,{signal,maxEntries});
+    for await(const entry of directory){signal?.throwIfAborted();if(names.length>=maxEntries)throw transferError('transfer_file_capacity');names.push(entry);}
+    for(const entry of names.sort((a,b)=>a.name<b.name?-1:a.name>b.name?1:0))yield* walkFiles(root,relative?relative+'/'+entry.name:entry.name,{signal,maxEntries,onVisit,allowMissingFile,expectedFile:entry.isFile()});
   }
 }
-export async function captureFileSet({roots,directory,key,maxFiles=100000,maxFileBytes=1073741824,maxTotalBytes=274877906944,exclude=[],beforeFile,afterFile,signal}={}){
+export async function captureFileSet({roots,directory,key,maxFiles=100000,maxFileBytes=1073741824,maxTotalBytes=274877906944,exclude=[],excludeFiles=[],beforeFile,afterFile,signal}={}){
   signal?.throwIfAborted();await privateDirectory(directory);artifactKey(key);if(!Array.isArray(roots)||roots.length<1||roots.length>32||!Number.isSafeInteger(maxFiles)||maxFiles<1||maxFiles>1000000||!Number.isSafeInteger(maxFileBytes)||maxFileBytes<1||!Number.isSafeInteger(maxTotalBytes)||maxTotalBytes<maxFileBytes||!Array.isArray(exclude))throw transferError('transfer_file_configuration_invalid');
   const configured=[],seen=new Set();for(const root of roots){if(!root||!/^[a-z][a-z0-9-]{0,79}$/.test(root.id)||seen.has(root.id)||typeof root.source!=='string')throw transferError('transfer_file_root_invalid');seen.add(root.id);const source=resolve(root.source);await regularDirectory(source);if(resolve(directory)===source||resolve(directory).startsWith(source+'/'))throw transferError('transfer_artifact_inside_source');if(configured.some(value=>source===value.source||source.startsWith(value.source+'/')||value.source.startsWith(source+'/')))throw transferError('transfer_overlapping_roots');configured.push({id:root.id,source});}
-  const catalog=[],fingerprints=new Map();let chunk=[],chunkBytes=0,count=0,bytes=0;
+  const selection=fileSetExclusions(excludeFiles);if(selection.some(item=>!seen.has(item.root)))throw transferError('transfer_file_exclusions_invalid');
+  const coverage=selection.length?{excludeFiles:selection}:{},catalog=[],fingerprints=new Map();let chunk=[],chunkBytes=0,count=0,bytes=0,visited=0;
   const saveChunk=async()=>{if(!chunk.length)return;const name='file-catalog-'+catalog.length+'.enc';await writeManifest(join(directory,name),{version:1,entries:chunk},key);catalog.push({name,entries:chunk.length,digest:await digestFile(join(directory,name))});chunk=[];chunkBytes=0;};
-  for(const root of configured){signal?.throwIfAborted();const hash=createHash('sha256');for await(const entry of walkFiles(root.source,'',{signal,maxEntries:maxFiles+exclude.length})){
+  for(const root of configured){signal?.throwIfAborted();const hash=createHash('sha256'),walk=selection.length?{onVisit:()=>{if(++visited>maxFiles+exclude.length)throw transferError('transfer_file_capacity');},allowMissingFile:relative=>excludedPath(root.id,relative,selection)}:{};for await(const raw of walkFiles(root.source,'',{signal,maxEntries:maxFiles+exclude.length,...walk})){
+      const entry=selectedEntry(root.id,raw,selection);if(excludedFile(root.id,entry,selection))continue;
       if(exclude.some(item=>item.root===root.id&&item.relative===entry.relative))continue;
       if(!safeRelative(entry.relative)||++count>maxFiles||entry.kind==='file'&&(entry.bytes>maxFileBytes||(bytes+=entry.bytes)>maxTotalBytes))throw transferError('transfer_file_capacity');
       const record={...entry,root:root.id};if(entry.kind==='file'){await beforeFile?.({root:root.id,relative:entry.relative});record.artifact='file-'+count+'.enc';const sealed=await sealFile(join(root.source,...entry.relative.split('/')),join(directory,record.artifact),key,{maxBytes:Math.min(maxFileBytes,maxTotalBytes-bytes+entry.bytes),signal});record.content=sealed.plaintext;record.encrypted={sha256:sealed.sha256,bytes:sealed.bytes};if(record.content.bytes!==entry.bytes)throw transferError('transfer_files_changed');await afterFile?.({root:root.id,relative:entry.relative});}hash.update(canonical({...entry,...(record.content?{content:record.content}:{})})+'\n');
       const size=Buffer.byteLength(JSON.stringify(record));if(chunkBytes+size>524288)await saveChunk();chunk.push(record);chunkBytes+=size;
     }fingerprints.set(root.id,hash.digest('hex'));}
-  signal?.throwIfAborted();await saveChunk();await verifyFileSetSources({roots:configured.map(root=>({...root,sha256:fingerprints.get(root.id)})),files:count},{exclude,signal,maxFiles,maxFileBytes,maxTotalBytes});
-  signal?.throwIfAborted();const manifest={version:1,roots:configured.map(root=>({...root,sha256:fingerprints.get(root.id)})),catalog,files:count,bytes,created:Date.now()};await writeManifest(join(directory,'files.enc'),manifest,key);signal?.throwIfAborted();return {files:count,bytes,roots:configured.length,manifestDigest:await digestFile(join(directory,'files.enc'),{signal})};
+  signal?.throwIfAborted();await saveChunk();await verifyFileSetSources({...coverage,roots:configured.map(root=>({...root,sha256:fingerprints.get(root.id)})),files:count},{exclude,excludeFiles:selection,signal,maxFiles,maxFileBytes,maxTotalBytes});
+  signal?.throwIfAborted();const manifest={version:1,...coverage,roots:configured.map(root=>({...root,sha256:fingerprints.get(root.id)})),catalog,files:count,bytes,created:Date.now()};await writeManifest(join(directory,'files.enc'),manifest,key);signal?.throwIfAborted();return {files:count,bytes,roots:configured.length,manifestDigest:await digestFile(join(directory,'files.enc'),{signal})};
 }
-export async function verifyFileSetSources(manifest,{exclude=[],signal,maxFiles=1000000,maxFileBytes=Number.MAX_SAFE_INTEGER,maxTotalBytes=Number.MAX_SAFE_INTEGER}={}){
+export async function verifyFileSetSources(manifest,{exclude=[],excludeFiles=[],signal,maxFiles=1000000,maxFileBytes=Number.MAX_SAFE_INTEGER,maxTotalBytes=Number.MAX_SAFE_INTEGER}={}){
   signal?.throwIfAborted();if(!Number.isSafeInteger(maxFiles)||maxFiles<0||maxFiles>1000000||![maxFileBytes,maxTotalBytes].every(value=>Number.isSafeInteger(value)&&value>=0)||!Array.isArray(exclude))throw transferError('transfer_file_configuration_invalid');
   if(!Array.isArray(manifest?.roots)||!Number.isSafeInteger(manifest.files)||manifest.files<0||manifest.files>maxFiles)throw transferError('transfer_file_manifest_invalid');let count=0,bytes=0;
-  for(const root of manifest.roots){signal?.throwIfAborted();await regularDirectory(root.source);const hash=createHash('sha256');for await(const entry of walkFiles(root.source,'',{signal,maxEntries:maxFiles+exclude.length})){if(exclude.some(item=>item.root===root.id&&item.relative===entry.relative))continue;if(++count>manifest.files)throw transferError('transfer_files_changed');let content;if(entry.kind==='file'){if(entry.bytes>maxFileBytes||entry.bytes>maxTotalBytes-bytes)throw transferError('transfer_file_capacity');content=await digestFile(join(root.source,...entry.relative.split('/')),{signal,maxBytes:Math.min(maxFileBytes,maxTotalBytes-bytes)});bytes+=content.bytes;}hash.update(canonical({...entry,...(content?{content}:{})})+'\n');}if(hash.digest('hex')!==root.sha256)throw transferError('transfer_files_changed');}
+  const selection=fileSetExclusions(excludeFiles);if(canonical(fileSetExclusions(manifest.excludeFiles))!==canonical(selection)||selection.some(item=>!manifest.roots.some(root=>root.id===item.root)))throw transferError('transfer_file_selection_mismatch');let visited=0;
+  for(const root of manifest.roots){signal?.throwIfAborted();await regularDirectory(root.source);const hash=createHash('sha256'),walk=selection.length?{onVisit:()=>{if(++visited>maxFiles+exclude.length)throw transferError('transfer_file_capacity');},allowMissingFile:relative=>excludedPath(root.id,relative,selection)}:{};for await(const raw of walkFiles(root.source,'',{signal,maxEntries:maxFiles+exclude.length,...walk})){const entry=selectedEntry(root.id,raw,selection);if(excludedFile(root.id,entry,selection)||exclude.some(item=>item.root===root.id&&item.relative===entry.relative))continue;if(++count>manifest.files)throw transferError('transfer_files_changed');let content;if(entry.kind==='file'){if(entry.bytes>maxFileBytes||entry.bytes>maxTotalBytes-bytes)throw transferError('transfer_file_capacity');content=await digestFile(join(root.source,...entry.relative.split('/')),{signal,maxBytes:Math.min(maxFileBytes,maxTotalBytes-bytes)});bytes+=content.bytes;}hash.update(canonical({...entry,...(content?{content}:{})})+'\n');}if(hash.digest('hex')!==root.sha256)throw transferError('transfer_files_changed');}
   signal?.throwIfAborted();if(count!==manifest.files)throw transferError('transfer_files_changed');return true;
 }
 async function regularDirectory(path){const info=await lstat(path);if(!info.isDirectory()||info.isSymbolicLink())throw transferError('transfer_file_root_invalid');}

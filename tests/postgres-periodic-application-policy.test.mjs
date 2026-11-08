@@ -1,8 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {periodicApplicationPolicy,loadPeriodicApplicationPolicy} from '../postgres-periodic-application-policy.mjs';
+import {periodicApplicationPolicy,periodicApplicationFileExclusions,loadPeriodicApplicationPolicy} from '../postgres-periodic-application-policy.mjs';
 
 const configuration=()=>({version:1,enabled:true,database:{name:'harbor_private',oid:'16384'},materialRoots:[{id:'data',directory:'/srv/private/data'},{id:'runtime',directory:'/srv/private/runtime'},{id:'secrets',directory:'/srv/private/secrets'}],publicOrigin:'http://127.0.0.1:18094',deviceOrigin:'https://127.0.0.1:18095',maxBytes:1073741824,maxFiles:100000});
+
+test('runtime SQLite cache exclusions are explicit, frozen and include both sidecars without excluding JSON or keys',()=>{
+  const input={...configuration(),runtimeSqliteCaches:['**/state_*.sqlite','**/logs_*.sqlite']},policy=periodicApplicationPolicy(input);
+  input.runtimeSqliteCaches.push('changed.sqlite');assert.equal(policy.runtimeSqliteCaches.length,2);assert.ok(Object.isFrozen(policy.runtimeSqliteCaches));
+  const selection=periodicApplicationFileExclusions(policy);assert.equal(selection.length,6);assert.ok(selection.every(row=>row.root==='runtime'&&Object.isFrozen(row)));
+  assert.deepEqual(selection.slice(0,3).map(row=>row.pattern),['**/state_*.sqlite','**/state_*.sqlite-wal','**/state_*.sqlite-shm']);
+  assert.equal(Object.hasOwn(periodicApplicationPolicy(configuration()),'runtimeSqliteCaches'),false);
+  for(const runtimeSqliteCaches of [null,'state.sqlite',['**/auth.json'],['../state.sqlite'],['/state.sqlite'],['state.sqlite','state.sqlite'],Array.from({length:22},(_,i)=>'cache_'+i+'.sqlite')])assert.throws(()=>periodicApplicationPolicy({...configuration(),runtimeSqliteCaches}),{code:'periodic_application_policy_invalid'});
+});
 
 test('periodic application backup is opt-in and preserves an explicitly disabled complete configuration',()=>{
   assert.deepEqual(periodicApplicationPolicy({version:1,enabled:false}),{version:1,enabled:false});

@@ -1,7 +1,7 @@
 import {constants} from 'node:fs';
 import {open} from 'node:fs/promises';
 import {resolve} from 'node:path';
-import {canonical,transferError} from './migration-artifacts.mjs';
+import {canonical,transferError,fileSetExclusions} from './migration-artifacts.mjs';
 
 const fail=()=>{throw transferError('periodic_application_policy_invalid');};
 const exact=(value,keys)=>value!==null&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(key=>keys.includes(key));
@@ -20,7 +20,7 @@ function origin(value,{tls=false}={}){
 // must load its own fixed profile, never accept roots from an HTTP caller.
 export function periodicApplicationPolicy(value){
   if(installedPolicies.has(value))return value;
-  if(!exact(value,['version','enabled','database','materialRoots','publicOrigin','deviceOrigin','maxBytes','maxFiles'])||value.version!==1||typeof value.enabled!=='boolean')fail();
+  if(!exact(value,['version','enabled','database','materialRoots','publicOrigin','deviceOrigin','maxBytes','maxFiles','runtimeSqliteCaches'])||value.version!==1||typeof value.enabled!=='boolean')fail();
   if(!value.enabled&&Object.keys(value).length===2)return Object.freeze({version:1,enabled:false});
   const database=value.database;
   if(!exact(database,['name','oid'])||typeof database.name!=='string'||!database.name||Buffer.byteLength(database.name)>63||/[\0\r\n]/.test(database.name)||typeof database.oid!=='string'||!/^[1-9]\d{0,9}$/.test(database.oid)||BigInt(database.oid)>4294967295n)fail();
@@ -32,9 +32,18 @@ export function periodicApplicationPolicy(value){
     if(root.directory==='/etc'||'/etc/harbor-storage-activation.key'.startsWith(root.directory+'/'))fail();
     ids.add(root.id);roots.push(Object.freeze({id:root.id,directory:root.directory,...(root.databasePrefix!==undefined?{databasePrefix:root.databasePrefix}:{})}));
   }
+  const caches=value.runtimeSqliteCaches??[];
+  if(value.runtimeSqliteCaches===null||!Array.isArray(caches)||caches.some(pattern=>typeof pattern!=='string'||!pattern.endsWith('.sqlite')))fail();
+  try{periodicApplicationFileExclusions({runtimeSqliteCaches:caches});}catch{fail();}
   const publicOrigin=origin(value.publicOrigin),deviceOrigin=origin(value.deviceOrigin,{tls:true});
   if(publicOrigin===deviceOrigin)fail();
-  return Object.freeze({version:1,enabled:value.enabled,database:Object.freeze({name:database.name,oid:database.oid}),materialRoots:Object.freeze(roots),publicOrigin,deviceOrigin,maxBytes:value.maxBytes,maxFiles:value.maxFiles});
+  return Object.freeze({version:1,enabled:value.enabled,database:Object.freeze({name:database.name,oid:database.oid}),materialRoots:Object.freeze(roots),publicOrigin,deviceOrigin,maxBytes:value.maxBytes,maxFiles:value.maxFiles,...(caches.length?{runtimeSqliteCaches:Object.freeze([...caches])}:{})});
+}
+
+// Only operator-declared rebuildable SQLite caches in the runtime root. Each
+// cache and its two SQLite sidecars are selected together; JSON and keys stay.
+export function periodicApplicationFileExclusions(policy){
+  return fileSetExclusions((policy.runtimeSqliteCaches??[]).flatMap(pattern=>['','-wal','-shm'].map(suffix=>({root:'runtime',pattern:pattern+suffix}))));
 }
 
 export async function loadPeriodicApplicationPolicy(){

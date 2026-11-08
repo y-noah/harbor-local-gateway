@@ -113,6 +113,8 @@ harbor_backup ALL=(root) NOPASSWD: /usr/bin/python3 -I -B /usr/local/lib/harbor/
 
 应用周期默认关闭，仅 root 固定的 `/etc/harbor-storage-application.json` 显式启用后接入原 `schedule`。配置版本1，完整字段为 `enabled`、数据库 `name/oid`、`data/runtime/secrets` 三个材料根（可另设库中路径前缀 `databasePrefix`）、原 HTTP/设备 TLS origin、材料字节及文件数预算；配置不由 HTTP 调用方提交。捕获包含原加密 Key、上游密文对应密钥、正文密钥、账号目录及设备 CA/TLS/report 材料，仍需按实际部署配置完整根目录；配置启用本身不证明备份或恢复完成。
 
+可选 `runtimeSqliteCaches` 声明已经核实可以重建的运行时 SQLite 缓存，例如 `["**/logs_*.sqlite"]`，默认缺省或空列表时仍完整捕获。每项只接受 runtime 根内的相对文件 glob，必须以 `.sqlite` 结束；对应 `-wal`、`-shm` 一起排除，不改变 data／secrets 根，也不能匹配 JSON 登录文件或密钥。采用 Node glob 语义，隐藏目录须在模式中显式写出；不得把登录或业务状态数据库列为缓存，依赖本机 SQLite 会话状态的旧通道须保持完整覆盖或另用一致性快照。未知 SQLite 默认保留。选择规则进入加密文件清单并与应用策略摘要交叉核验；排除文件仍计遍历预算。仅过滤根的目录分配字节数不参与指纹，目录路径、权限、入选子项和文件内容仍严格核验，新增普通文件或凭据变化照常拒绝。启用前更新源端和恢复端工具并核对覆盖范围；旧策略及旧点保持原语义，旧工具拒绝含新策略字段的点。回退移除该配置恢复全量捕获，保留新点、工具及独立密钥用于恢复，不删除缓存或中断模型请求。
+
 应用材料与控制清单使用独立 root-only 32字节密钥，PG 持有的 WAL key 不能解密。固定 `/etc/harbor-storage-backup.json` 可选增加以下 `applicationEncryption` 段；不配置时 DB-only 备份与保留照常可用，应用入口拒绝。`keyDigest` 为 `SHA256("harbor-periodic-application-key-v1\0" 的UTF-8字节 + 原32字节密钥)`；key文件及祖先须root控制，文件0600、单链接，不能位于任何被捕获的材料根内，也不能与WAL key内容相同。只将该可选段从原数据库配置摘要中分离，原DB字段仍完整校验；每个应用能力、清单、报告与交付独立绑定应用密钥版本及摘要，不为配置应用key强制重做大base。历史verify读取该固定备份配置，应用生产开关关闭或策略文件缺失不影响其密钥入口。
 
 ```json
