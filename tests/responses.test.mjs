@@ -282,3 +282,14 @@ test('JSON response resource configuration rejects invalid bounds and keeps exac
  for(const maxJsonResponseBytes of [0,255,1.5,512*1024*1024+1])assert.throws(()=>createResponsesTransport({maxJsonResponseBytes}),{code:'upstream_configuration'});
  const body=JSON.stringify({data:[{b64_json:'x'.repeat(500)}],usage:{input_tokens:1,output_tokens:0}}),transport=createResponsesTransport({maxJsonResponseBytes:Buffer.byteLength(body),credentials:async()=>({token:'synthetic',accountId:'synthetic'}),version:async()=>'test',fetchImpl:async()=>new Response(body)});const result=await transport.runJson({path:'/images/generations',payload:imagePayload});assert.equal(result.input,1);assert.equal(result.usageKnown,true);
 });
+
+test('upstream request identifier follows response headers through success and failures without using response IDs',async()=>{
+ const run=async(response,json=false)=>{const {transport}=fixtureTransport(()=>response);return json?transport.runJson({path:'/images/generations',payload:imagePayload}):transport.run({payload:{model,input:'synthetic'}});};
+ const successful=eventStream([complete()]);successful.headers.set('x-request-id','req_synthetic-123');assert.equal((await run(successful)).upstreamRequestId,'req_synthetic-123');
+ assert.equal((await run(eventStream([complete()]))).upstreamRequestId,undefined);
+ for(const id of ['sk-synthetic-secret','hg_synthetic-secret','x'.repeat(129)]){const response=eventStream([complete()]);response.headers.set('x-request-id',id);assert.equal((await run(response)).upstreamRequestId,undefined);}
+ await assert.rejects(run(Response.json({error:{message:'synthetic'}},{status:429,headers:{'x-request-id':'req_rejected'}})),e=>e.code==='upstream_rate_limit'&&e.upstreamRequestId==='req_rejected');
+ await assert.rejects(run(new Response('data: broken\n\n',{headers:{'content-type':'text/event-stream','x-request-id':'req_broken'}})),e=>e.code==='upstream_protocol'&&e.upstreamRequestId==='req_broken');
+ const image=Response.json({data:[{b64_json:'synthetic'}],usage:{input_tokens:1,output_tokens:0}},{headers:{'x-request-id':'req_image'}});assert.equal((await run(image,true)).upstreamRequestId,'req_image');
+ await assert.rejects(run(new Response('invalid',{headers:{'x-request-id':'req_bad_json'}}),true),e=>e.code==='upstream_protocol'&&e.upstreamRequestId==='req_bad_json');
+});

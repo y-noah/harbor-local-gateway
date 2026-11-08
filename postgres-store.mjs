@@ -1,4 +1,5 @@
 import pg from 'pg';
+import {requestParameters,safeUpstreamRequestId} from './request-parameters.mjs';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {readFile} from 'node:fs/promises';
 import {createHash,randomUUID} from 'node:crypto';
@@ -161,7 +162,7 @@ export class PostgresStore{
     const book=revision?await this.#operationBook(revision,books):null;
     return book?quoteReference(row,book,revision):emptyReferenceQuote('unpriced',row.billing_model||row.model,revision);
   }
-  async observe(member,ip,agent,model,{at=Date.now(),channel='responses',device}={}){
+  async observe(member,ip,agent,model,{at=Date.now(),channel='responses',device,parameters}={}){
     return this.transaction(async()=>{
       const currentMember=await this.get('SELECT id,usage_type_id,usage_type_version FROM harbor.members WHERE id=$1 FOR SHARE',member.id);
       const type=currentMember?.usage_type_id?await this.get('SELECT id,code,name FROM harbor.member_types WHERE id=$1 FOR SHARE',currentMember.usage_type_id):null;
@@ -172,9 +173,9 @@ export class PostgresStore{
       const revision=JSON.parse((await this.get("SELECT value FROM harbor.gateway_settings WHERE name='pricing.state'"))?.value||'{}').active;
       const books=new Map();
       if(!revision||!await this.#operationBook(revision,books))throw new AppError(503,'计价版本尚未准备好','pricing_unavailable');
-      const request=randomUUID();
-      const row=await this.get(`INSERT INTO harbor.requests(id,member_id,key_id,started,received_at,status,business_status,ip,agent,model,price_version,tracking_only,predicted,source_channel,recording_state,phase,phase_at,phase_history,usage_type_id,usage_type_code,usage_type_name,usage_type_version,device_id,device_name,device_system,device_generation,device_auth_state)
-        VALUES($1,$2,$3,$4,$4,'queued','queued',$5,$6,$7,$8,1,0,$9,'disabled','queued',$4,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,request,member.id,member.key_id,at,ip,agent,model,revision,channel,JSON.stringify([{phase:'queued',at}]),type?.id??null,type?.code??null,type?.name??null,currentMember?.usage_type_version??null,device?.deviceId??null,device?.deviceName??null,device?.deviceSystem??null,device?.generation??null,device?.authState??'historical_unknown');
+      const request=randomUUID(),observedParameters=requestParameters(parameters);
+      const row=await this.get(`INSERT INTO harbor.requests(id,member_id,key_id,started,received_at,status,business_status,ip,agent,model,price_version,tracking_only,predicted,source_channel,recording_state,phase,phase_at,phase_history,usage_type_id,usage_type_code,usage_type_name,usage_type_version,device_id,device_name,device_system,device_generation,device_auth_state,effort,service_tier)
+        VALUES($1,$2,$3,$4,$4,'queued','queued',$5,$6,$7,$8,1,0,$9,'disabled','queued',$4,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,request,member.id,member.key_id,at,ip,agent,model,revision,channel,JSON.stringify([{phase:'queued',at}]),type?.id??null,type?.code??null,type?.name??null,currentMember?.usage_type_version??null,device?.deviceId??null,device?.deviceName??null,device?.deviceSystem??null,device?.generation??null,device?.authState??'historical_unknown',observedParameters.effort,observedParameters.service_tier);
       await this.#projectLockedPrice(row,at,books);return request;
     });
   }
@@ -213,7 +214,7 @@ export class PostgresStore{
       let history;try{history=JSON.parse(row.phase_history);}catch{}if(!Array.isArray(history))history=[];
       history.push({phase:status,at});
       const settledRow=await this.get(`UPDATE harbor.requests SET ended=$1,status=$2,business_status=$2,input=$3,output=$4,cached=$5,usage_unknown=$6,billing_model=$7,price_version=$8,
-        reserved=CASE WHEN $6=0 THEN 0 ELSE reserved END,phase=$2,phase_at=$1,phase_history=$9 WHERE id=$10 RETURNING *`,at,status,input,output,cached,next.usage_unknown,actualModel,next.price_version,JSON.stringify(history.slice(-32)),requestId);
+        reserved=CASE WHEN $6=0 THEN 0 ELSE reserved END,phase=$2,phase_at=$1,phase_history=$9,upstream_request_id=COALESCE($11,upstream_request_id) WHERE id=$10 RETURNING *`,at,status,input,output,cached,next.usage_unknown,actualModel,next.price_version,JSON.stringify(history.slice(-32)),requestId,safeUpstreamRequestId(result.upstreamRequestId));
       const total=(BigInt(input)+BigInt(output)).toString();
       await this.run('UPDATE harbor.members SET used=used+$1 WHERE id=$2',total,row.member_id);
       await this.run('UPDATE harbor.keys SET used=used+$1,unmetered=unmetered+$2 WHERE id=$3',total,row.tracking_only&&!usageKnown?1:0,row.key_id);

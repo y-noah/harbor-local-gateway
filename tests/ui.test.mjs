@@ -797,6 +797,23 @@ test('访问批次刷新失败禁用执行，迟到结果不能污染新弹窗',
 test('请求设备列与详情只读当时快照，不将来源IP推断为设备',async()=>{
  const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));const html=page.run('requestTable([{id:"request",started:1,ended:2,ip:"sensitive-network",device_name:"当时设备",device_system:"合成系统",device_auth_state:"authenticated",device_id:"11111111-1111-1111-1111-111111111111",standard:{}}])');assert.match(html,/当时设备/);assert.match(html,/设备已认证/);assert.ok(!html.includes('sensitive-network'));const unknown=page.run('phaseDetail({id:"r",ip:"sensitive-network",timeline:[]})');assert.match(unknown,/历史未记录/);assert.ok(!unknown.includes('sensitive-network'));
 });
+test('请求身份缺项区分未认证与历史未知，列表和详情不显示空字段',async()=>{
+ const page=await ui(()=>response({}));
+ for(const [row,expected] of [[{status:'rejected',device_auth_state:'compatible_unverified'},['未记录账号','未认证设备','兼容模式未认证']],[{},['未记录账号','未记录设备','历史未记录']],[{account_id:'account',device_id:'device',device_auth_state:'authenticated'},['账号名称未记录','设备名称未记录','设备已认证']]]){
+  page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,standard:{},ip:'never-display-network',...row}));
+  const list=page.run('requestTable([record])'),detail=page.run('phaseDetail(record)');
+  for(const value of expected){assert.ok(list.includes(value));assert.ok(detail.includes(value));}
+  assert.ok(!list.includes('<small> ·'));assert.ok(!detail.includes('Key：—…'));assert.ok(!list.includes('never-display-network'));assert.ok(!detail.includes('never-display-network'));
+  assert.match(detail,/Key：未记录 Key/);assert.match(detail,/客户端：未记录客户端/);
+ }
+ const compatible=page.run('phaseDetail({device_auth_state:"compatible_unverified"})');assert.match(compatible,/设备系统：未认证，无法确认/);assert.match(compatible,/凭据代次：不适用/);
+});
+test('请求身份保留已有历史字段和零代次，全部文本继续转义',async()=>{
+ const page=await ui(()=>response({}));page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,member_name:'员工<one>',account_name:'账号<one>',model:'模型<one>',device_id:'device',device_name:'设备<one>',device_system:'系统<one>',device_auth_state:'authenticated',device_generation:0,key_prefix:'key<one>',key_removed_at:1,agent:'客户端<one>',standard:{}}));
+ const list=page.run('requestTable([record])'),detail=page.run('phaseDetail(record)');
+ for(const value of ['员工','账号','模型','设备','系统']){assert.ok(list.includes(value+'&lt;one&gt;'));assert.ok(detail.includes(value+'&lt;one&gt;'));}
+ assert.match(detail,/凭据代次：0/);assert.match(detail,/key&lt;one&gt;…（已删除）/);assert.match(detail,/客户端&lt;one&gt;/);assert.ok(!detail.includes('<one>'));
+});
 test('Key设备范围409保留跨页选择，读取新版本前禁止重发，翻页失败显示原因',async()=>{
  const id='11111111-1111-1111-1111-111111111111',old='22222222-2222-2222-2222-222222222222';let keyReads=0,deviceReads=0;const writes=[];
  const page=await ui((path,options)=>{if(options.method==='PATCH'){writes.push(JSON.parse(options.body));return response({error:{message:'Key设备策略已变化'}},409);}if(path.includes('/keys?'))return response({rows:[{id:'key-one',device_ids:[old],device_policy_version:++keyReads===1?2:5}],pagination:{page:1,totalPages:1}});if(++deviceReads===3)return response({error:{message:'设备分页暂不可用'}},503);return response(deviceDirectory({rows:[{...deviceDirectory().rows[0],state:'approved'}]}));});
@@ -1089,4 +1106,24 @@ test('额度详情仅展示与刷新官方观测，不读取全局许可或覆�
 
 test('Claude账号管理不显示Codex权重入口，混合账号池只在Codex账号提供入口',async()=>{
  const page=await ui(()=>response({})),value=packageSnapshot();value.accounts.push({...value.accounts[0],id:'claude-a',name:'合成Claude',kind:'claude'});page.run('admin=true;state='+JSON.stringify(value)+';tab="accounts"');await page.click('manage-account','claude-a');assert.doesNotMatch(page.node('#modal-content').innerHTML,/data-action="routing-weights"/);await page.click('manage-account','account-a');assert.match(page.node('#modal-content').innerHTML,/data-action="routing-weights"/);await page.click('routing-weights','account-a');assert.match(page.node('#modal-content').innerHTML,/Codex 账号池权重/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/合成Claude/);page.run('state.accounts=state.accounts.filter(a=>a.kind==="claude")');await page.click('manage-account','claude-a');assert.doesNotMatch(page.node('#modal-content').innerHTML,/data-action="routing-weights"/);
+});
+
+
+test('返回请求明细保留筛选页码与快照，主动刷新重新开始',async()=>{
+ const paths=[];
+ const page=await ui(path=>{const q=new URL(path,'http://localhost').searchParams;paths.push(q);return response({rows:[],snapshot:q.get('snapshot')||'fresh',pagination:{page:Number(q.get('page')),pageSize:50,total:150,totalPages:3,nextCursor:'next'},summary:{requests:0,success:0,standard:{},average_ms:0},models:[],members:[],byModel:[],byMember:[]});});
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),sessions:[],keys:[]})+';tab="accounts";recordView="requests";requestsFilters={member:"member-one",model:"model-one",status:"success",device:"",page:2,pageSize:50};requestsPageSnapshot="fixed";requestsCursors=new Map([[1,""],[2,"page-two"]]);setTab("requests");');await new Promise(setImmediate);
+ for(const [key,value] of Object.entries({page:'2',page_size:'50',member:'member-one',model:'model-one',status:'success',snapshot:'fixed',cursor:'page-two'}))assert.equal(paths.at(-1).get(key),value);
+ await page.click('record-view','usage');await page.click('record-view','requests');assert.equal(paths.at(-1).get('page'),'2');assert.equal(paths.at(-1).get('snapshot'),'fixed');assert.equal(paths.at(-1).get('cursor'),'page-two');
+ await page.click('requests-reload');assert.equal(paths.at(-1).get('page'),'1');assert.equal(paths.at(-1).has('snapshot'),false);assert.equal(paths.at(-1).has('cursor'),false);assert.equal(paths.at(-1).get('member'),'member-one');
+});
+
+
+test('请求详情区分请求参数与费用口径，列表只展示采集状态而不读取正文',async()=>{
+ let reads=0;const page=await ui(()=>{reads++;return response({});});const row={id:'metadata',started:1,ended:2,status:'ok',source_channel:'responses',effort:'high',service_tier:'auto',upstream_request_id:'req_synthetic',recording_state:'partial'};
+ const detail=page.run('phaseDetail('+JSON.stringify(row)+')');assert.match(detail,/上游请求编号：req_synthetic/);assert.match(detail,/接口通道：responses/);assert.match(detail,/请求推理强度：high/);assert.match(detail,/请求服务档位：auto/);assert.doesNotMatch(detail,/实际.*档位/);
+ assert.match(page.run('requestTable('+JSON.stringify([row])+')'),/部分缺失/);assert.equal(reads,0);
+ for(const [state,label] of Object.entries({complete:'采集完成',pending:'采集中',disabled:'未启用正文采集',historical:'历史记录未保存正文',expired:'正文已过保留期',truncated:'已截断'}))assert.ok(page.run('requestTable('+JSON.stringify([{...row,recording_state:state}])+')').includes(label));
+ const old=page.run('phaseDetail({id:"old",started:1})');assert.match(old,/上游请求编号：未记录/);assert.match(old,/请求推理强度：未记录/);assert.match(old,/请求服务档位：未记录/);
+ const escaped=page.run('phaseDetail('+JSON.stringify({...row,effort:'<high>',service_tier:'<tier>',source_channel:'<channel>'})+')');assert.match(escaped,/&lt;high&gt;/);assert.match(escaped,/&lt;tier&gt;/);assert.match(escaped,/&lt;channel&gt;/);
 });

@@ -1,3 +1,4 @@
+import {safeUpstreamRequestId} from './request-parameters.mjs';
 import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
 import {readFileSync,lstatSync} from 'node:fs';
 import {join} from 'node:path';
@@ -142,26 +143,28 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     onDispatch();stage?.emit('dispatch');
     try{result=await fetchImpl((apiKeyMode?'https://api.openai.com/v1':upstreamOrigin)+path,{method:payload?'POST':'GET',headers,body,signal,redirect:'error'});}
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
-    if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?Object.assign(new AppError(429,'官方API额度不足，请在官方账单后台核对','upstream_quota_exhausted'),{routeFailure:'quota_exhausted'}):[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
+    if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?Object.assign(new AppError(429,'官方API额度不足，请在官方账单后台核对','upstream_quota_exhausted'),{routeFailure:'quota_exhausted'}):[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{upstreamRequestId:safeUpstreamRequestId(result.headers.get('x-request-id')),usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
   }
   async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,output,onPhase=()=>{},beforeDispatch,onDispatch=()=>{}}){
     if(apiKeyMode)throw Object.assign(new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route'),{usageKnown:true});
     if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
-    const stage=stages.capture();let usage=null,actualModel,dispatched=false;
+    const stage=stages.capture();let usage=null,actualModel,upstreamRequestId,dispatched=false;
     try{
       const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json',onPhase,beforeDispatch,stage,onDispatch:()=>{dispatched=true;onDispatch();}});
+      upstreamRequestId=safeUpstreamRequestId(result.headers.get('x-request-id'));
       onPhase('streaming');
       const response=await jsonResponse(result,output);
       if(!response||typeof response!=='object'||Array.isArray(response))throw new AppError(502,'上游工具响应无效','upstream_protocol');
       usage=responseUsage(response);
       actualModel=typeof response.model==='string'?response.model:undefined;
       if(!Array.isArray(response.data)||!response.data.length||response.data.some(image=>typeof image?.b64_json!=='string'||!image.b64_json))throw new AppError(502,'上游图片响应缺少图片数据','upstream_protocol');
-      return {input:0,output:0,cached:0,...usage,usageKnown:!!usage,...(actualModel?{actualModel}:{}),response};
+      return {input:0,output:0,cached:0,...usage,usageKnown:!!usage,...(actualModel?{actualModel}:{}),...(upstreamRequestId?{upstreamRequestId}:{}),response};
     }catch(error){
+      upstreamRequestId??=safeUpstreamRequestId(error.upstreamRequestId);
       if(signal?.aborted)error=new AppError(499,'客户端已取消或服务停止','request_cancelled');
       if(!(error instanceof AppError))error=new AppError(502,'上游工具连接中断','upstream_connection');
-      throw Object.assign(error,usage||{},{actualModel,usageKnown:!!usage||error.usageKnown===true||!dispatched});
+      throw Object.assign(error,usage||{},{actualModel,...(upstreamRequestId?{upstreamRequestId}:{}),usageKnown:!!usage||error.usageKnown===true||!dispatched});
     }finally{stage.emit('transport-end');}
   }
   async function models({binary,home,signal,force=false}){
@@ -175,10 +178,11 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
   }
   async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,output,onEvent=async()=>{},onPhase=()=>{},beforeDispatch,onDispatch=()=>{}}){
     const stage=stages.capture(),controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
-    let completed=null,knownUsage=null,dispatched=false,actualModel;
+    let completed=null,knownUsage=null,dispatched=false,actualModel,upstreamRequestId;
     const finishedItems=new Map();let retainedItems=0;
     try{
       const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal,onPhase,beforeDispatch,stage,onDispatch:()=>{dispatched=true;onDispatch();}});
+      upstreamRequestId=safeUpstreamRequestId(response.headers.get('x-request-id'));
       // Some Codex subscription responses omit Content-Type; validate their SSE frames below.
       const contentType=response.headers.get('content-type');
       if(contentType&&!contentType.includes('text/event-stream')){await response.body?.cancel();throw new AppError(502,'上游未返回 Responses 事件流','upstream_protocol');}
@@ -214,11 +218,12 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
       const responseBody=(!completed.response?.output?.length&&finishedItems.size)
         ?{...completed.response,output:[...finishedItems].sort(([a],[b])=>a-b).map(([,entry])=>entry.item)}:completed.response;
       if(completed.response?.output?.length){finishedItems.clear();output?.resize('sse:items',0);}
-      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,...(actualModel?{actualModel}:{}),terminal:completed,response:responseBody};
+      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,...(actualModel?{actualModel}:{}),...(upstreamRequestId?{upstreamRequestId}:{}),terminal:completed,response:responseBody};
     }catch(error){
+      upstreamRequestId??=safeUpstreamRequestId(error.upstreamRequestId);
       if(controller.signal.aborted)error=signal?.aborted?new AppError(499,'客户端已取消或服务停止','request_cancelled'):controller.signal.reason;
       if(!(error instanceof AppError))error=new AppError(502,'上游连接中断','upstream_connection');
-      throw Object.assign(error,knownUsage||{},{actualModel,usageKnown:!!knownUsage||error.usageKnown===true||!dispatched});
+      throw Object.assign(error,knownUsage||{},{actualModel,...(upstreamRequestId?{upstreamRequestId}:{}),usageKnown:!!knownUsage||error.usageKnown===true||!dispatched});
     }finally{stage.emit('transport-end');signal?.removeEventListener('abort',abort);}
   }
   const transport={run,runJson,models,supportsDispatchAuthorization:true,stageObserverStatus:stages.status};dispatchSources.set(transport,{run,runJson});return transport;

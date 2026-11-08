@@ -17,12 +17,12 @@ test('billing recovery has independent disk/queue/encryption and survives a corr
   t.after(async()=>{await recovery.close();await buffer.close();await rm(root,{recursive:true,force:true});});
   buffer.start('recording-one','known');buffer.start('recording-two','known');await buffer.flush();assert.equal(buffer.status().files,1);assert.equal(buffer.status().queued,1);
   const recordFile=(await readdir(buffer.directory))[0];await writeFile(join(buffer.directory,recordFile),Buffer.alloc(40),{mode:0o600});
-  const at=123456789,result={status:'ok',input:123,output:45,cached:20,usageKnown:true,actualModel:'gpt-6.1-sol',response:{text:'NEVER-PERSIST-REPLY'},error:'NEVER-PERSIST-ERROR'};
+  const at=123456789,result={status:'ok',input:123,output:45,cached:20,usageKnown:true,actualModel:'gpt-6.1-sol',upstreamRequestId:'req_synthetic_recovery',response:{text:'NEVER-PERSIST-REPLY'},error:'NEVER-PERSIST-ERROR'};
   assert.equal(recovery.settle('synthetic-request',result,at),true);await recovery.flush();assert.equal(recovery.status().queued,0);assert.equal(recovery.status().files,1);assert.equal(calls.length,0);
   const file=(await readdir(recovery.directory))[0],bytes=await readFile(join(recovery.directory,file));
   assert.ok(!bytes.includes(Buffer.from('synthetic-request')));assert.ok(!bytes.includes(Buffer.from('NEVER-PERSIST')));
   assert.throws(()=>recordings.open(bytes,file));
-  const saved=recovery.buffer.repository.open(bytes,file);assert.deepEqual(saved,{type:'settle',requestId:'synthetic-request',at,result:{status:'ok',input:123,output:45,cached:20,usageKnown:true,actualModel:'gpt-6.1-sol'}});
+  const saved=recovery.buffer.repository.open(bytes,file);assert.deepEqual(saved,{type:'settle',requestId:'synthetic-request',at,result:{status:'ok',input:123,output:45,cached:20,usageKnown:true,actualModel:'gpt-6.1-sol',upstreamRequestId:'req_synthetic_recovery'}});
   await recovery.close();unavailable=false;recovery=await MeteringRecovery.create(store,{encryptionKey:key,directory:recovery.directory,flushMs:10000});
   await recovery.flush();assert.equal(recovery.status().files,0);assert.deepEqual(calls,[['synthetic-request',saved.result,at]]);
   await buffer.flush();assert.ok(buffer.status().files>0);assert.ok(buffer.status().queued>0);assert.deepEqual(calls,[['synthetic-request',saved.result,at]]);
@@ -34,7 +34,7 @@ test('billing recovery exposes bounded persistence failure, rejects invalid iden
   t.after(async()=>{await recovery.close();await rm(root,{recursive:true,force:true});});
   assert.throws(()=>recovery.settle('invalid/id',{input:1}),{code:'metering_recovery_invalid'});
   assert.throws(()=>recovery.settle('one',{status:'nonterminal'}),{code:'metering_recovery_invalid'});
-  assert.equal(recovery.settle('one',{input:10,output:1,cached:11},123),true);
+  assert.equal(recovery.settle('one',{input:10,output:1,cached:11,upstreamRequestId:'hg_synthetic_secret'},123),true);
   assert.equal(recovery.settle('two',{input:0,output:0,cached:0,usageKnown:true},124),true);
   assert.equal(recovery.settle('three',{input:0,output:0},125),false);
   let state=await recovery.flush();assert.equal(state.files,1);assert.equal(state.queued,1);assert.ok(state.diskBytes<=1024);assert.ok(state.memoryBytes<=1024);

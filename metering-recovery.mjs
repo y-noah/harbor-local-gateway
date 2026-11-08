@@ -1,3 +1,4 @@
+import {safeUpstreamRequestId} from './request-parameters.mjs';
 import {createCipheriv,createDecipheriv,randomBytes,hkdfSync} from 'node:crypto';
 import {realpath} from 'node:fs/promises';
 import {canonicalChatFacts} from './chat-facts.mjs';
@@ -11,8 +12,9 @@ function facts(command){
   let {input=0,output=0,cached=0,usageKnown=true}=result;
   if(![input,output,cached].every(n=>Number.isSafeInteger(n)&&n>=0)||cached>input){input=0;output=0;cached=0;usageKnown=false;}
   const actualModel=typeof result.actualModel==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(result.actualModel)?result.actualModel:undefined;
+  const upstreamRequestId=safeUpstreamRequestId(result.upstreamRequestId);
   const chat=canonicalChatFacts(result.chat);if(command.type==='settle-chat'&&chat===undefined)throw new AppError(503,'文本会话恢复游标缺失','metering_recovery_invalid');
-  return {type:'settle',requestId:command.requestId,at:command.at,result:{status,input,output,cached,usageKnown:!!usageKnown,...(actualModel===undefined?{}:{actualModel}),...(chat===undefined?{}:{chat})}};
+  return {type:'settle',requestId:command.requestId,at:command.at,result:{status,input,output,cached,usageKnown:!!usageKnown,...(actualModel===undefined?{}:{actualModel}),...(upstreamRequestId?{upstreamRequestId}:{}),...(chat===undefined?{}:{chat})}};
 }
 
 // Same bounded, fsynced spool mechanism, but a separate directory, encryption
