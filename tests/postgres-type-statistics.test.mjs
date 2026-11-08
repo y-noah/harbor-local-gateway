@@ -47,6 +47,19 @@ test('type filters validate exact IDs, bounded dates, pagination, missing identi
   assert.throws(()=>typeStatisticsConditions({}, {at,alias:'r;DROP'}),{code:'type_statistics_invalid'});
 });
 
+test('type version budget avoids redundant request scans without rejecting unused catalogue versions',integration,async()=>fixture(async({store,record})=>{
+  const request=await record(),original=store.all.bind(store),queries=[];store.all=async(sql,...args)=>{queries.push(sql);return original(sql,...args);};
+  const reader=createPostgresTypeStatistics(store,{clock:()=>at,maxVersions:1});
+  try{
+    const initial=await reader.read();assert.equal(initial.summary.requests,1);assert.equal(queries.filter(sql=>sql.startsWith('SELECT DISTINCT p.revision')).length,0);
+    const version=await store.get('SELECT price_version FROM harbor.requests WHERE id=$1',request);
+    await store.run('INSERT INTO harbor.pricing_versions SELECT $1,created,book FROM harbor.pricing_versions WHERE id=$2','synthetic-unused-version',version.price_version);
+    queries.length=0;const withUnused=await reader.read();assert.deepEqual(withUnused.summary,initial.summary);assert.deepEqual(withUnused.rows,initial.rows);assert.equal(queries.filter(sql=>sql.startsWith('SELECT DISTINCT p.revision')).length,1);
+    const second=await record();await store.run('UPDATE harbor.requests SET price_version=$1 WHERE id=$2','synthetic-unused-version',second);await store.run('UPDATE harbor.request_prices SET revision=$1 WHERE request_id=$2','synthetic-unused-version',second);
+    await assert.rejects(reader.read(),{code:'type_statistics_capacity'});
+  }finally{await reader.close();store.all=original;}
+}));
+
 test('query admission is bounded and shared queue remains available when the type reader closes',async()=>{
   let release;const gate=new Promise(resolve=>{release=resolve;}),queue=createPostgresQueryQueue({maxConcurrent:1,maxQueued:0}),store={get:async()=>{},all:async()=>{},transaction:async()=>{await gate;throw new AppError(503,'synthetic','fixture_stop');}},reader=createPostgresTypeStatistics(store,{queryQueue:queue});
   const first=assert.rejects(reader.read(),{code:'fixture_stop'});await assert.rejects(reader.read(),{code:'query_queue_full'});const closing=reader.close();await assert.rejects(reader.read(),{code:'query_closed'});release();await Promise.all([first,closing]);assert.equal(queue.status().closed,false);assert.equal(await queue.run(async()=>7),7);await queue.close();

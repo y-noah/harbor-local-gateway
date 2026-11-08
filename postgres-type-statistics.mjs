@@ -55,7 +55,12 @@ export function createPostgresTypeStatistics(store,{clock=Date.now,queryQueue,pa
     const at=clock(),scope=typeStatisticsConditions(query,{at}),args=scope.values,key=groupKeys[query.groupBy];
     return store.transaction(async()=>{
       const visibility=(await store.get('SELECT pg_current_snapshot()::text visibility')).visibility;
-      const versions=await store.all(`SELECT DISTINCT p.revision FROM harbor.requests r${joins} WHERE ${scope.where} AND ${validPrice} AND p.total_atoms IS NOT NULL ORDER BY p.revision LIMIT $${args.length+1}`,...args,maxVersions+1);if(versions.length>maxVersions)capacity();
+      // Valid projections reference an existing catalogue row in this same
+      // snapshot, so the bounded catalogue is an upper bound for used versions.
+      const catalog=await store.all('SELECT id FROM harbor.pricing_versions LIMIT $1',maxVersions+1);
+      if(catalog.length>maxVersions){
+        const versions=await store.all(`SELECT DISTINCT p.revision FROM harbor.requests r${joins} WHERE ${scope.where} AND ${validPrice} AND p.total_atoms IS NOT NULL ORDER BY p.revision LIMIT $${args.length+1}`,...args,maxVersions+1);if(versions.length>maxVersions)capacity();
+      }
       const data=`WITH data AS (SELECT ${typeKey} type_key,r.usage_type_id type_id,r.usage_type_code snapshot_code,r.usage_type_name snapshot_name,r.member_id,COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model,r.business_status status,r.started,r.ended,
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,CASE WHEN ${validPrice} THEN p.revision END revision,
         ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}

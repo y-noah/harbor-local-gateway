@@ -178,7 +178,7 @@ PostgreSQL Codex新请求记录显式传入的推理强度与服务档位，详�
 
 PostgreSQL请求列表／统计已接入`GET /api/admin/requests`，复用原筛选参数及`view=list|summary|all`，列表只取当前页及下一页标识，汇总用同一读事务的SQL分组精确计算，不在应用层复制整窗请求。读取固定价格投影，投影／版本缺失显示缺价，不能当0；原始计量和数据库内部事务标识不进入DTO。`002-request-queries.sql`只追加插入事务标识及短期分页快照表，既有001校验和不变。
 
-类型统计适配器`postgres-type-statistics-admin.mjs`提供管理员`GET /api/admin/type-statistics`，按请求受理时保存的类型归属统计，支持`group_by=type|model|member`、类型／员工／模型／业务结果组合筛选和有界分页。只查近7个北京时间自然日，同一事务中的总计和分组保持相同水位；新请求的未分类与历史无类型快照分开。失败率仅使用已确认成功与失败，取消／拒绝／中断／未知单列，人工核对费用不改变业务结果；金额继续使用固定费率版本的精确Standard参考USD，不输出原始Token统计。
+类型统计适配器`postgres-type-statistics-admin.mjs`提供管理员`GET /api/admin/type-statistics`，按请求受理时保存的类型归属统计，支持`group_by=type|model|member`、类型／员工／模型／业务结果组合筛选和有界分页。只查近7个北京时间自然日，同一事务中的总计和分组保持相同水位；新请求的未分类与历史无类型快照分开。失败率仅使用已确认成功与失败，取消／拒绝／中断／未知单列，人工核对费用不改变业务结果；金额继续使用固定费率版本的精确Standard参考USD，不输出原始Token统计。 价格版本预算先在同一只读快照中查询有界的版本目录；目录总数未超限时不重复扫描请求，目录超限才按原条件检查实际使用版本。未使用的历史版本不会误拒绝查询，实际版本超限仍整笔拒绝；无数据库迁移或统计口径变化。
 
 PG请求解析器通过服务端`usageTypes`能力接受`type`、`device`、`outcome`、`from/to`及缺失模型／员工筛选，旧SQLite解析器保持原契约；设备仅可指定稳定UUID或`unknown`，不是IP。`outcome`查业务结果，旧`status`查原记录状态，两者不能混用；新版PG查询构造时显式启用`businessOutcomes`，旧库适配器默认保持旧汇总语义。类型统计每行的`requestFilters`可用于请求页和显式正文后台导出，筛选身份纳入持久分页快照，改变类型、设备或时间须重新读取第一页。导出追加`type_snapshot_version/type_source`，明确未分类／历史未知，保留CSV防公式与两位参考USD。适配器已接共享PG网关及类型统计页面；总览类型请求与全公司健康指标分开，费用核对不改判业务结果。默认SQLite保留原查询契约，正式容量与发布仍须验收。
 
