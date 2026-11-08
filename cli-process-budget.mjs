@@ -1,7 +1,11 @@
 import {spawn} from 'node:child_process';
 import {AppError} from './store.mjs';
 
-const rejected=(message,code)=>Object.assign(new AppError(503,message,code),{usageKnown:true,notDispatched:true});
+const rejectedBeforeSpawn=new WeakSet();
+// Only errors created before this budget starts a child prove no CLI dispatch.
+// Public flags and copied error fields do not carry that proof.
+export const isCliProcessNotDispatched=error=>rejectedBeforeSpawn.has(error);
+const rejected=(message,code)=>{const error=Object.assign(new AppError(503,message,code),{usageKnown:true,notDispatched:true});rejectedBeforeSpawn.add(error);return error;};
 // Reservations cover the entire child lifetime, including asynchronous shutdown
 // after an RPC has already returned. No stdout, command, owner or env is exposed.
 export function createCliProcessBudget({maxConcurrent=8,maxPerAccount=Math.min(2,maxConcurrent),maxMaintenance=Math.min(4,maxConcurrent),killGraceMs=2000}={}, {spawnProcess=spawn}={}){
@@ -16,7 +20,8 @@ export function createCliProcessBudget({maxConcurrent=8,maxPerAccount=Math.min(2
     const release=()=>{if(closed)return;closed=true;clearTimeout(killTimer);signal?.removeEventListener('abort',abort);leases.delete(lease);const count=accounts.get(accountId)-1;if(count)accounts.set(accountId,count);else accounts.delete(accountId);if(kind==='maintenance')maintenance--;if(started)running--;resolveDone();for(const listener of [...listeners])try{listener();}catch{}};
     const abort=()=>{if(child)child.kill();else release();};
     const lease={done,release:()=>{if(!started)release();},stop:abort,spawn(binary,args,options){
-      if(started||closed||stopping)throw rejected('CLI进程预约已结束','service_stopping');
+      if(started)throw new AppError(503,'CLI进程预约已结束','service_stopping');
+      if(closed||stopping)throw rejected('CLI进程预约已结束','service_stopping');
       if(signal?.aborted){release();throw rejected('CLI操作已取消','request_cancelled');}
       try{child=spawnProcess(binary,args,{...options,detached:process.platform!=='win32'});}catch(error){release();throw error;}
       started=true;running++;const nativeKill=child.kill.bind(child);

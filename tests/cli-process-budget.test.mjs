@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {once} from 'node:events';
-import {createCliProcessBudget} from '../cli-process-budget.mjs';
+import {createCliProcessBudget,isCliProcessNotDispatched} from '../cli-process-budget.mjs';
 const wait=async predicate=>{const end=Date.now()+5000;while(!predicate()){assert.ok(Date.now()<end,'CLI lifecycle timeout');await new Promise(resolve=>setTimeout(resolve,5));}};
 const child=(budget,owner='synthetic',context={})=>budget.spawn(owner,process.execPath,['-e',"process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)"],{stdio:['ignore','pipe','pipe']},context);
 const clear=budget=>{for(const field of ['inUse','running','maintenance','accounts'])assert.equal(budget.status()[field],0,field);};
@@ -26,4 +26,21 @@ test('CLI budget validates resource configuration, ownership, classes and alread
 
 test('CLI version uses one real process for concurrent reads and cached success has no further spawn',{timeout:5000},async()=>{
  const {installedVersion}=await import('../responses.mjs');const budget=createCliProcessBudget({maxConcurrent:1});let calls=0;const binary='synthetic-version-'+Date.now(),spawnProcess=(_binary,_args,options)=>{calls++;return budget.spawn('version',process.execPath,['-e',"setTimeout(()=>console.log('codex-cli 0.160.1'),30)"],options);};try{const values=await Promise.all(Array.from({length:5},()=>installedVersion(binary,{spawnProcess})));assert.deepEqual(values,Array(5).fill('0.160.1'));assert.equal(calls,1);clear(budget);assert.equal(await installedVersion(binary,{spawnProcess}),'0.160.1');assert.equal(calls,1);}finally{await budget.close();}
+});
+
+test('only original pre-spawn budget rejections prove no CLI dispatch',async()=>{
+ let calls=0;const budget=createCliProcessBudget({maxConcurrent:1},{spawnProcess:()=>{calls++;throw Error('unexpected spawn');}}),held=budget.reserve('synthetic-held');
+ try{
+  assert.throws(()=>budget.spawn('synthetic-other','synthetic',[],{}),error=>{assert.equal(isCliProcessNotDispatched(error),true);assert.equal(isCliProcessNotDispatched({...error}),false);assert.equal(isCliProcessNotDispatched(Object.assign(Error(error.message),{code:error.code,usageKnown:true,notDispatched:true})),false);return error.code==='cli_capacity_busy';});
+  assert.equal(calls,0);held.release();assert.throws(()=>budget.reserve('synthetic-aborted',{signal:AbortSignal.abort()}),error=>error.code==='request_cancelled'&&isCliProcessNotDispatched(error));
+  const aborted=new AbortController(),unused=budget.reserve('synthetic-unused',{signal:aborted.signal});aborted.abort();assert.throws(()=>unused.spawn('synthetic',[],{}),error=>isCliProcessNotDispatched(error));assert.equal(calls,0);
+  assert.throws(()=>budget.spawn('synthetic-spawn','synthetic',[],{}),error=>{assert.equal(isCliProcessNotDispatched(error),false);return error.message==='unexpected spawn';});assert.equal(calls,1);
+  for(const error of [undefined,null,'not-dispatched',{},Error('ordinary')])assert.equal(isCliProcessNotDispatched(error),false);
+ }finally{held.release();await budget.close();}
+});
+
+test('a lease that already started a child cannot prove a repeated spawn was never dispatched',{timeout:5000},async()=>{
+ const budget=createCliProcessBudget({maxConcurrent:1}),lease=budget.reserve('synthetic-started'),running=lease.spawn(process.execPath,['-e',"console.log('ready');setInterval(()=>{},1000)"],{stdio:['ignore','pipe','pipe']});
+ try{await once(running.stdout,'data');assert.throws(()=>lease.spawn(process.execPath,[],{}),error=>error.code==='service_stopping'&&!isCliProcessNotDispatched(error)&&error.notDispatched!==true);assert.equal(budget.status().running,1);running.kill('SIGKILL');await once(running,'close');assert.throws(()=>lease.spawn(process.execPath,[],{}),error=>!isCliProcessNotDispatched(error));clear(budget);}
+ finally{await budget.close();}
 });

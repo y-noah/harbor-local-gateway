@@ -1,3 +1,4 @@
+import {isCliProcessNotDispatched} from './cli-process-budget.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {recordingCaptureDecision,recordingBufferWrite,recordingFinishReason} from './postgres-recording-storage.mjs';
 import {writeOutput} from './output-budget.mjs';
@@ -70,7 +71,7 @@ export function createPostgresPlatformService({store,queryStore=store,queryQueue
         await writeOutput(res,{...common,object:'chat.completion.chunk',choices:[{index:0,delta:{},finish_reason:result.finishReason||'stop'}],usage},{output,signal:controller.signal,prefix:'data: ',suffix:'\n\ndata: [DONE]\n\n'});res.end();
       }else{await writeOutput(res,{...common,object:'chat.completion',choices:[{index:0,message:{role:'assistant',content:result.text},finish_reason:result.finishReason||'stop'}],usage},{output,signal:controller.signal,headers:{'Content-Type':'application/json; charset=utf-8'}});res.end();}return true;
     }catch(error){
-      const boundaryStatus=extraBoundary?.status();dispatched||=boundaryStatus?.dispatched===true;if(error.notDispatched===true&&!boundaryStatus?.dispatched&&!boundaryStatus?.uncertain)dispatched=false;
+      const boundaryStatus=extraBoundary?.status();dispatched||=boundaryStatus?.dispatched===true;if(!boundaryStatus?.uncertain&&(isCliProcessNotDispatched(error)||error.notDispatched===true&&!boundaryStatus?.dispatched))dispatched=false;
       if(route){record(()=>capture?.finish());flush();if(recordStarted&&!writeRecording('finish',route.requestId,{state:dispatched||recordFailed?'partial':'complete',...recordingFinishReason(recordFailed?recordFailureReason??'capture_failed':dispatched?'upstream_interrupted':null)}))recordFailed=true;
         if(!settlementAttempted){const measured=error.usageKnown===true&&['input','output','cached'].every(name=>Number.isSafeInteger(error[name])&&error[name]>=0)&&error.cached<=error.input;await settle({input:measured?error.input:0,output:measured?error.output:0,cached:measured?error.cached:0,actualModel:measured?error.actualModel:undefined,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':dispatched?(measured?(controller.signal.aborted?'cancelled':'failed'):'unknown'):controller.signal.aborted?'cancelled':'rejected',usageKnown:!dispatched||measured}).catch(()=>{});}}
       if(error instanceof AppError)throw error;throw fail(502,'平台请求失败；用量需核对','platform_upstream_error');
