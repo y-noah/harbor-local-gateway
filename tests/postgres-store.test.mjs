@@ -470,7 +470,7 @@ test('PostgreSQL new-session routing shares the original multi-account weighted 
   await store.run('UPDATE harbor.sessions SET enabled=0 WHERE id=$1',repeat.session.id);await assert.rejects(route('synthetic-0'),{code:'session_disabled'});
 });
 
-test('PostgreSQL routing serializes same-client creation, protects in-flight moves and requires explicit extra authorization for manual exhausted-account weights',integration,async t=>{
+test('PostgreSQL routing serializes same-client creation, protects in-flight moves and honors manual positive exhausted-account weights without extra authorization',integration,async t=>{
   const {store}=await fixture(t);await store.migrate();await store.initializePricing();const {member}=await legacyMember(t,store),person=await store.authenticate(member.secret);let at=Date.now();
   await store.run('UPDATE harbor.keys SET expires=NULL WHERE id=$1',member.keyId);
   for(const aid of ['a','b'])await store.run("INSERT INTO harbor.accounts(id,name,home,state,quota_json) VALUES($1,$1,$1,'ready',$2)",aid,JSON.stringify({plan:'synthetic-plan',checked:at,remaining:50,windows:[{used:50,minutes:10080,reset:at+24*3600000}],limitReached:false}));
@@ -480,11 +480,9 @@ test('PostgreSQL routing serializes same-client creation, protects in-flight mov
   const admit=client=>store.transaction(async()=>{const result=await router.resolve(person,{prompt_cache_key:client,model:'gpt-6.1-sol'});const request=await store.observe(person,'fixture','fixture','gpt-6.1-sol',{at});await store.run('UPDATE harbor.requests SET account_id=$1,session_id=$2,route_version=$3 WHERE id=$4',result.account.id,result.session.id,result.session.route_version,request);return {...result,request};});
   const concurrent=await Promise.all(Array.from({length:8},()=>admit('same-client')));assert.equal(new Set(concurrent.map(r=>r.session.id)).size,1);assert.ok(concurrent.every(r=>r.account.id==='a'));
   const stale=concurrent[0].account;assert.equal(await router.block(stale,'quota_exhausted'),true);assert.equal(await router.block(stale,'login_expired'),false);
-  await assert.rejects(admit('manual-extra-quota'),{code:'no_account'});
-  await assert.rejects(admit('same-client'),{code:'session_busy'});
-  const {createPostgresAccountExtraUsage}=await import('../postgres-account-extra-usage.mjs'),extra=createPostgresAccountExtraUsage(store,{clock:()=>at,readEntitlement:async account=>({capability:{supported:true,platform:account.kind,auth_mode:account.auth_mode},entitlement:{state:'verified',source:'official',remaining_atoms:'100',unit:'credits',models:['gpt-6.1-sol'],protocols:['responses'],verified_at:at,valid_until:at+60000,expires_at:null}})}),admin={session_ref:createHash('sha256').update('synthetic-routing-policy-admin').digest('hex')};
-  await extra.savePolicy({enabled:true,expected_version:0},admin);await extra.saveAccount('a',{mode:'inherit',budget:{basis:'reference_estimate',unit:'reference_usd_atoms',limit_atoms:'1000000000000',request_reserve_atoms:'10000000000'},expected_version:0,expected_identity_epoch:1},admin);await extra.refresh('a');
-  const permitted=await admit('licensed-manual-extra');assert.equal(permitted.account.id,'a');await store.finish(permitted.request,{input:1,usageKnown:true},at+1);
+  const permitted=await admit('manual-extra-quota');assert.equal(permitted.account.id,'a');await store.finish(permitted.request,{input:1,usageKnown:true},at+1);
+  const reused=await admit('same-client');assert.equal(reused.account.id,'a');assert.equal(reused.session.route_version,0);await store.finish(reused.request,{input:1,usageKnown:true},at+1);
+  assert.equal((await store.get('SELECT enabled FROM harbor.extra_usage_policy')).enabled,false);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.account_extra_holds')).n,0);
   await put('routing_weights',{mode:'manual',weights:{a:0,b:100},expires:nextWeightReset(at),version:2});
   await assert.rejects(admit('same-client'),{code:'session_busy'});
   await Promise.all(concurrent.map(r=>store.finish(r.request,{input:1,usageKnown:true},at+1)));
@@ -497,7 +495,6 @@ test('PostgreSQL routing serializes same-client creation, protects in-flight mov
   await assert.rejects(admit('same-client'),{code:'session_account_blocked'});
   await put('balancing',{failover:true,nightly:false,quietMinutes:30});
   await put('routing_weights',{mode:'manual',weights:{a:100,b:0},expires:nextWeightReset(at),version:3});
-  await extra.refresh('a');
   const recovered=await admit('same-client');assert.equal(recovered.account.id,'a');assert.equal(recovered.session.route_version,2);
   await store.run("UPDATE harbor.accounts SET enabled=0 WHERE id='a'");await assert.rejects(admit('disabled-account'),{code:'no_account'});
 });

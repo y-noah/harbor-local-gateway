@@ -1,3 +1,4 @@
+import {codexQuotaDenials} from './codex-entitlements.mjs';
 import {isDeepStrictEqual as equal} from 'node:util';
 import {AppError,id} from './store.mjs';
 import {sanitizeRecord} from './record-redaction.mjs';
@@ -113,20 +114,21 @@ export function createPostgresAccountExtraUsage(store,{clock=Date.now,readEntitl
  const dispatchPermits=new WeakMap();
  // Own the outer transaction so identity locks precede account/budget locks,
  // and no permission is exposed before COMMIT has actually returned.
- async function authorizeRequestDispatch(requestId,{prepare,assess,candidateAccountIds}={}){
+ async function authorizeRequestDispatch(requestId,{prepare,assess,candidateAccountIds,allowExtraLedger=true}={}){
   if(!identifier(requestId)||typeof prepare!=='function'||typeof assess!=='function')fail(503,'extra_dispatch_configuration');let callbackCompleted=false;
   try{
    const grant=await top(async()=>{
     let request=await store.get('SELECT * FROM harbor.requests WHERE id=$1 FOR UPDATE',requestId);if(!request||request.ended!==null||request.status!=='queued')fail(409,'extra_request_no_longer_dispatchable');
     const finalCheck=await prepare(request);request=await store.get('SELECT * FROM harbor.requests WHERE id=$1',requestId);if(!request||request.ended!==null||!['queued','running'].includes(request.status))fail(409,'extra_request_no_longer_dispatchable');
-    const global=await policy(true);let candidates=[];
+    const global=allowExtraLedger||candidateAccountIds?await policy(true):null;let candidates=[];
     if(candidateAccountIds){const context=Object.freeze(Object.create(null));candidatePolicyContexts.set(context,{store,transaction:store.context.getStore(),callback:candidateAccountIds,policy:Object.freeze({enabled:global.enabled,version:global.version})});try{candidates=await candidateAccountIds(request,context);}finally{candidatePolicyContexts.delete(context);}}
     if(!Array.isArray(candidates)||candidates.length>maxDecisionAccounts||candidates.some(value=>!identifier(value)))fail(503,'extra_dispatch_candidates_invalid');const prior=await store.get('SELECT account_id FROM harbor.account_extra_holds WHERE request_id=$1',requestId),owners=new Map();
     for(const accountId of [...new Set([request.account_id,...(prior?[prior.account_id]:[]),...candidates])].sort())owners.set(accountId,await account(accountId,true));
-    const owner=owners.get(request.account_id),selected=await assess(owner,request);if(!selected||!['package','package_compatibility','api','extra'].includes(selected.mode)||!identifier(selected.protocol))fail(503,'extra_dispatch_assessment_invalid');
+    const owner=owners.get(request.account_id),selected=await assess(owner,request);if(!selected||!['package','package_compatibility','api','extra','manual_extra'].includes(selected.mode)||!identifier(selected.protocol))fail(503,'extra_dispatch_assessment_invalid');
     const previous=await hold(requestId);if(previous&&!owners.has(previous.account_id))fail(409,'extra_request_binding_conflict');if(previous&&!['reserved','released'].includes(previous.state))fail(409,'extra_already_dispatched_or_terminal');
     let result;
     if(selected.mode==='extra'){
+     if(!allowExtraLedger)fail(503,'manual_positive_weight_required');
      if(previous&&previous.account_id!==owner.id){
       if(previous.state!=='reserved')fail(409,'extra_request_binding_conflict');
       await releaseUndispatched(requestId,{confirmed:true});
@@ -139,8 +141,21 @@ export function createPostgresAccountExtraUsage(store,{clock=Date.now,readEntitl
      const state={global,owner,row:await ledger(owner.id),snapshot:await entitlement(owner.id)};result=await authorizeHeld(state,await hold(requestId),requestId);if(!result.allowed)fail(503,result.reason||'extra_unavailable');
     }else{
      if(owner.auth_mode==='openai_api'){if(selected.mode!=='api'||!owner.enabled||owner.removed_at||!['ready','degraded'].includes(owner.state)||owner.route_block)fail(503,'extra_account_unavailable');}
-     else{if(selected.mode==='api')fail(503,'extra_dispatch_assessment_invalid');const valid=accountExtraUsageDecision({account:owner,packageAvailable:true,at:at()});if(!valid.allowed)fail(503,valid.reason);}
-     if(previous?.state==='reserved')await releaseUndispatched(requestId,{confirmed:true});result={allowed:true,mode:selected.mode,estimated:false};
+     else{if(selected.mode==='api')fail(503,'extra_dispatch_assessment_invalid');
+      if(selected.mode==='manual_extra'){
+       // The runtime rechecks the active human weight in this transaction.
+       // No permission/balance/budget document authorizes or reserves this call.
+       let quota;try{quota=typeof owner.quota_json==='string'?JSON.parse(owner.quota_json):owner.quota_json;}catch{}
+       const denied=codexQuotaDenials(quota);if(owner.kind!=='codex'||owner.auth_mode!=='subscription'||!owner.enabled||owner.removed_at||!['ready','degraded'].includes(owner.state)||owner.route_block&&owner.route_block!=='quota_exhausted'||denied.spend_control||denied.workspace)fail(503,'extra_account_unavailable');
+      }else{const valid=accountExtraUsageDecision({account:owner,packageAvailable:true,at:at()});if(!valid.allowed)fail(503,valid.reason);}
+     }
+     if(previous?.state==='reserved'){
+      // Both old and new owners are already locked. Releasing a historical
+      // never-dispatched hold needs no global permission or entitlement lock.
+      await ledger(previous.account_id);
+      await store.run('UPDATE harbor.account_extra_usage SET reserved_atoms=reserved_atoms-$1,updated=$2 WHERE account_id=$3',previous.reserve_atoms,at(),previous.account_id);
+      await store.run("UPDATE harbor.account_extra_holds SET state='released',settled_at=$1,settlement_source='confirmed_not_dispatched' WHERE request_id=$2",at(),requestId);
+     }result={allowed:true,mode:selected.mode,estimated:false};
     }
     if(typeof finalCheck==='function')finalCheck();await store.run("UPDATE harbor.requests SET status='running',business_status='running' WHERE id=$1",requestId);if(typeof finalCheck==='function')finalCheck();callbackCompleted=true;
     return {...result,mode:selected.mode,account_id:owner.id,identity_epoch:owner.route_epoch,request_id:requestId};

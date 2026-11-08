@@ -1,7 +1,7 @@
 import {AppError,id,usageWindow} from './store.mjs';
 import {accountCapacity} from './rates.mjs';
 import {createPostgresAccountPackages} from './postgres-account-packages.mjs';
-import {createPostgresExtraRuntime,classifyExtraPackage} from './postgres-extra-runtime.mjs';
+import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {accountPackageBudget} from './account-package-budget.mjs';
 import {createPostgresRouter,lockPostgresRouting} from './postgres-routing.mjs';
 import {digestChatMessages,validateLegacyChat} from './chat-facts.mjs';
@@ -26,12 +26,12 @@ export function createPostgresChatState(store,{checkLimits,clock=Date.now,reserv
   }
   async function capacities(accounts,predicted,exclude=''){
     const pending=new Map((await store.all("SELECT account_id,COALESCE(SUM(predicted),0)::text n FROM harbor.requests WHERE account_id=ANY($1::text[]) AND id<>$2 AND status IN ('queued','running','unknown','interrupted') GROUP BY account_id",accounts.map(a=>a.id),exclude)).map(r=>[r.account_id,Number(r.n)]));
-    const packagePolicy=await packages.policy(),usePackages=accounts.some(account=>account.kind==='codex')&&packagePolicy.enabled,decorated=usePackages?new Map((await packages.decorate(accounts.filter(account=>account.kind==='codex'))).map(account=>[account.id,account])):new Map(),classifications=new Map(accounts.map(account=>[account.id,classifyExtraPackage(decorated.get(account.id)??account,{at:clock(),protocol:'chat',model:account.kind,packagePolicy})])),views=accounts.length?await extraRuntime.service.evaluateAccounts(accounts,{model:accounts[0].kind,protocol:'chat',...(exclude?{requestId:exclude}:{}),packageAvailability:new Map(accounts.map(account=>[account.id,classifications.get(account.id).packageAvailable]))}):{accounts:[]},decisions=new Map(views.accounts.map(row=>[row.account_id,row]));
-    return accounts.map(account=>{let capacity=accountCapacity(account,predicted,pending.get(account.id)||0,clock());const configured=decorated.get(account.id),budget=configured?accountPackageBudget(configured,{at:clock(),enabled:true,protocol:'chat',model:'codex'}):null,classification=classifications.get(account.id),extra=classification.mode==='extra'&&decisions.get(account.id)?.decision.allowed===true;
+    const packagePolicy=await packages.policy(),usePackages=accounts.some(account=>account.kind==='codex')&&packagePolicy.enabled,decorated=usePackages?new Map((await packages.decorate(accounts.filter(account=>account.kind==='codex'))).map(account=>[account.id,account])):new Map(),classifications=await extraRuntime.classifyAccounts(accounts,{model:accounts[0]?.kind,protocol:'chat'});
+    return accounts.map(account=>{let capacity=accountCapacity(account,predicted,pending.get(account.id)||0,clock());const configured=decorated.get(account.id),budget=configured?accountPackageBudget(configured,{at:clock(),enabled:true,protocol:'chat',model:'codex'}):null,classification=classifications.get(account.id),extra=classification.mode==='manual_extra';
       // Local token reserves remain independent of official absolute/extra units.
       if(classification.mode==='blocked'||classification.mode==='extra'&&!extra)capacity={eligible:false,score:-1,source:'official_exhausted',remaining:0};
-      else if(extra||budget?.eligible&&budget.windows.some(window=>window.source==='official_absolute')){const local=accountCapacity({...account,quota_json:null},predicted,pending.get(account.id)||0,clock());capacity=account.token_budget!==null&&!local.eligible?local:{eligible:true,score:local.source==='local'?local.score:extra?Number(decisions.get(account.id).allocation.available_atoms):budget.score,source:extra?'authorized_extra':'official_absolute',remaining:null};}
-      return {account,capacity,extra,allocation:decisions.get(account.id)?.allocation};});
+      else if(extra||budget?.eligible&&budget.windows.some(window=>window.source==='official_absolute')){const local=accountCapacity({...account,quota_json:null},predicted,pending.get(account.id)||0,clock());capacity=account.token_budget!==null&&!local.eligible?local:{eligible:true,score:local.source==='local'?local.score:extra?local.score:budget.score,source:extra?'authorized_extra':'official_absolute',remaining:null};}
+      return {account,capacity,extra,allocation:null};});
   }
   async function admit(secret,body,{headers={},ip='unknown',agent='unknown',recordingEnabled=true,authorizeDevice}={}){
     const payload=validateLegacyChat(body),sessionId=payload.session_id||headers['x-harbor-session'];
@@ -47,7 +47,7 @@ export function createPostgresChatState(store,{checkLimits,clock=Date.now,reserv
       if(session&&accounts[0]?.kind!==payload.model)fail(409,'会话已绑定另一种模型，请创建新会话','session_provider_mismatch');
       if(session&&(!accounts[0]?.enabled||accounts[0].removed_at!==null||accounts[0].auth_mode!=='subscription'||!['ready','degraded'].includes(accounts[0].state)))fail(503,'会话绑定账号不可用；会话不会自动换号','session_account_unavailable');
       let candidates=(await capacities(accounts,predicted)).filter(row=>row.capacity.eligible);if(!session&&payload.model!=='codex'){const normal=candidates.filter(row=>!row.extra);if(normal.length)candidates=normal;else if(candidates.length>1&&candidates.some(row=>row.allocation?.basis!=='reference_estimate'||row.allocation?.unit!=='reference_usd_atoms'))fail(503,'多个账号的额外额度单位不可比较，请明确配置分配方式','extra_budget_incomparable');}
-      const ranked=candidates.sort((a,b)=>(a.extra&&b.extra?Number(b.allocation.available_atoms)-Number(a.allocation.available_atoms):b.capacity.score-a.capacity.score)||a.account.last_used-b.account.last_used||a.account.id.localeCompare(b.account.id));if(!ranked.length)fail(session?429:503,'没有预计额度足够的账号；请刷新官方额度或设置本地预算',session?'session_quota_exhausted':'no_account_capacity');let account;if(!session&&payload.model==='codex')account=await router.selectAccount({at,protocol:'chat',model:'codex',accountIds:new Set(ranked.map(row=>row.account.id)),legacyOrder:ranked.map(row=>row.account.id)});else account=ranked[0]?.account;
+      const ranked=candidates.sort((a,b)=>(b.capacity.score-a.capacity.score)||a.account.last_used-b.account.last_used||a.account.id.localeCompare(b.account.id));if(!ranked.length)fail(session?429:503,'没有预计额度足够的账号；请刷新官方额度或设置本地预算',session?'session_quota_exhausted':'no_account_capacity');let account;if(!session&&payload.model==='codex')account=await router.selectAccount({at,protocol:'chat',model:'codex',accountIds:new Set(ranked.map(row=>row.account.id)),legacyOrder:ranked.map(row=>row.account.id)});else account=ranked[0]?.account;
       if(!account)fail(session?429:503,'没有预计额度足够的账号；请刷新官方额度或设置本地预算',session?'session_quota_exhausted':'no_account_capacity');
       await checkManualWeight(account);await checkPackageScope(account);
       let delta=payload.messages;

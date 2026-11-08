@@ -1,11 +1,11 @@
 import {AppError} from './store.mjs';
 import {planningAccountGroup} from './balancing.mjs';
 import {classifyExtraPackage} from './postgres-extra-runtime.mjs';
-import {createPostgresAccountExtraUsage,isExtraUsageScopeIdentifier} from './postgres-account-extra-usage.mjs';
+import {isExtraUsageScopeIdentifier} from './postgres-account-extra-usage.mjs';
 
 // Verification uses persisted request scope and the original comparison groups.
 // This is a read-only snapshot, never an upstream refresh or a reservation.
-export async function annotateExtraPlanning(store,{accounts,workloads,at,packagePolicy,requestBoundary=false,service=createPostgresAccountExtraUsage(store,{clock:()=>at})}={}){
+export async function annotateExtraPlanning(store,{accounts,workloads,at,packagePolicy,requestBoundary=false,service}={}){
  if(!store.context.getStore())return store.transaction(()=>annotateExtraPlanning(store,{accounts,workloads,at,packagePolicy,requestBoundary,service}),{level:'REPEATABLE READ',readOnly:true});
  const accountGroups=new Map(accounts.map(account=>[account.id,planningAccountGroup(account,{at,packagePolicy})])),groups=new Map();
  for(const workload of workloads){
@@ -25,9 +25,10 @@ export async function annotateExtraPlanning(store,{accounts,workloads,at,package
   const classification=assessments.find(value=>value.mode==='blocked')??assessments.find(value=>value.mode==='extra')??assessments[0];classifications.set(account.id,classification);
   const reason=!group.key?'extra_planning_group_unknown':scope?.reason??(!models.length?'extra_scope_unknown':models.length>200?'extra_scope_capacity':null);scopeReasons.set(account.id,reason);modelScopes.set(account.id,reason?[]:models);
  }
- const views=new Map();
- for(let start=0;start<accounts.length;start+=1000){const batch=accounts.slice(start,start+1000),decision=await service.evaluateAccounts(batch,{protocol:'responses',modelScopes:new Map(batch.map(account=>[account.id,modelScopes.get(account.id)])),packageAvailability:new Map(batch.map(account=>[account.id,classifications.get(account.id).packageAvailable]))});for(const row of decision.accounts)views.set(row.account_id,row);}
- return accounts.map(account=>{const classification=classifications.get(account.id),view=views.get(account.id),models=modelScopes.get(account.id),normal=['package','package_compatibility'].includes(classification.mode),extra=classification.mode==='extra'&&view?.decision.allowed===true,reason=normal||extra?null:classification.mode==='blocked'?classification.reason:view?.decision.reason&&!view.decision.reason.startsWith('extra_scope_')?view.decision.reason:scopeReasons.get(account.id)??view?.decision.reason??'extra_unavailable';return {...account,dispatch_planning:{mode:normal?classification.mode:extra?'extra':'blocked',allowed:normal||extra,reason,models,allocation:extra?view.allocation:null,...(extra?{identity_epoch:view.identity_epoch,policy_version:view.policy_version,configuration_version:view.configuration_version,entitlement_version:view.entitlement_version}:{})}};});
+ // Automatic plans only use ordinary package capacity. A manual positive
+ // weight permits an individual upstream attempt; it is not an extra-budget
+ // pool and must not create automatic migrations from historical permissions.
+ return accounts.map(account=>{const classification=classifications.get(account.id),models=modelScopes.get(account.id),normal=['package','package_compatibility'].includes(classification.mode);return {...account,dispatch_planning:{mode:normal?classification.mode:'blocked',allowed:normal,reason:normal?null:classification.mode==='extra'?'manual_positive_weight_required':classification.reason??scopeReasons.get(account.id)??'extra_unavailable',models,allocation:null}};});
 }
 
 export function planningDispatchIdentity(account){const value=account.dispatch_planning;if(!value)throw new AppError(409,'计划缺少统一派发资格','nightly_plan_changed');return JSON.stringify(value.mode==='extra'?[value.mode,value.allocation?.basis,value.allocation?.unit,value.allocation?.available_atoms,value.models,value.identity_epoch,value.policy_version,value.configuration_version,value.entitlement_version]:[['package','package_compatibility'].includes(value.mode)?'package':value.mode]);}
