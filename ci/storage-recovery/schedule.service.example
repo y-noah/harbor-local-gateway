@@ -10,10 +10,14 @@ Type=simple
 User=root
 Group=root
 UMask=0077
-ExecStart=/usr/local/lib/harbor/node/bin/node /usr/local/lib/harbor/storage-backup.mjs schedule
+ExecStart=/opt/harbor-storage-tools/node/bin/node /opt/harbor-storage-tools/app/storage-backup.mjs schedule
 Restart=on-failure
 RestartSec=30
-TimeoutStopSec=60
+TimeoutStopSec=infinity
+KillSignal=SIGTERM
+KillMode=mixed
+SendSIGKILL=no
+# CLI取消当前操作后等待实际子进程退出及租约释放；不对整个进程组提前发送停止信号。
 
 [Install]
 WantedBy=multi-user.target

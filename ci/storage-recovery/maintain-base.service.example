@@ -8,8 +8,11 @@ Type=oneshot
 User=root
 Group=root
 UMask=0077
-ExecStart=/usr/local/lib/harbor/node/bin/node /usr/local/lib/harbor/storage-backup.mjs maintain-base
+ExecStart=/opt/harbor-storage-tools/node/bin/node /opt/harbor-storage-tools/app/storage-backup.mjs maintain-base
 TimeoutStartSec=infinity
 TimeoutStopSec=infinity
+KillSignal=SIGTERM
+KillMode=mixed
+SendSIGKILL=no
 # 操作预算由固定备份配置约束；停止时等待取消与本次子进程收尾，不强杀后遗留明文。
 # 与schedule独立运行；不安装或启用本模板，不修改已有备份及业务服务。
