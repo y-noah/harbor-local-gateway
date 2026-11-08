@@ -9,6 +9,7 @@ import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 
 export function stateQuery(params){
   const value={sessionPage:1,sessionPageSize:25};
+  if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
   if(params.has('people')){if(params.getAll('people').length!==1||!['all','none'].includes(params.get('people')))throw new AppError(400,'员工加载模式无效');value.people=params.get('people');}
   for(const [name,field] of [['session_page','sessionPage'],['session_page_size','sessionPageSize']]){
     const entries=params.getAll(name);
@@ -24,11 +25,23 @@ export function stateQuery(params){
 export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,queryQueue,balancingReader,maxPeople=1000}={}){
   const queue=queryQueue||createPostgresQueryQueue();
   if(!Number.isSafeInteger(maxPeople)||maxPeople<1||maxPeople>10000)throw new AppError(503,'兼容员工状态容量无效','state_configuration');
-  async function execute({sessionPage=1,sessionPageSize=25,people='all'}={}){
+  async function execute({sessionPage=1,sessionPageSize=25,people='all',view='full'}={}){
+    if(!['full','overview'].includes(view))throw new AppError(400,'状态视图无效');
     if(!['all','none'].includes(people))throw new AppError(400,'员工加载模式无效');
     if(!Number.isSafeInteger(sessionPage)||sessionPage<1||!Number.isSafeInteger(sessionPageSize)||sessionPageSize<1||sessionPageSize>100)throw new AppError(400,'会话分页参数无效');
     const at=clock(),window=usageWindow(at),recentUsageWindow={start:at-12*3600000,end:at,hours:12};
     return store.transaction(async()=>{
+      if(view==='overview'){
+        const counts=await store.get('SELECT COUNT(*) member_count FROM harbor.members WHERE removed_at IS NULL');
+        const accounts=await store.all('SELECT id,name,kind,auth_mode,enabled,state FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id');
+        const rows=await store.all(`SELECT to_char(to_timestamp(usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
+          COUNT(*) requests,COUNT(*) FILTER(WHERE status='ok') success FROM harbor.requests
+          WHERE usage_at>=$1 AND usage_at<$2 GROUP BY 1 ORDER BY 1`,window.start,window.end);
+        return {view:'overview',usageWindow:window,observedAt:at,peopleLoaded:false,memberCount:counts.member_count,
+          accounts,members:[],keys:[],sessions:[],requests:[],audit:[],
+          totals:rows.reduce((total,row)=>({requests:total.requests+Number(row.requests),success:total.success+Number(row.success)}),{requests:0,success:0}),
+          daily:rows.map(row=>({day:row.day,requests:Number(row.requests)}))};
+      }
       const members=people==='none'?[]:await store.all('SELECT m.id,m.name,m.enabled,m.created,m.removed_at,m.usage_limits,m.usage_limits_version,m.usage_type_id,m.usage_type_version,m.defaults_version,m.configuration_source,m.default_models_set,m.default_models,t.code usage_type_code,t.name usage_type_name FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE m.removed_at IS NULL ORDER BY m.created DESC,m.id DESC LIMIT $1',maxPeople+1);
       const keys=people==='none'?[]:await store.all('SELECT id,member_id,digest,prefix,secret_cipher,expires,allowed_models,model_policy_version,model_source,enabled,created FROM harbor.keys WHERE removed_at IS NULL ORDER BY created DESC,id DESC LIMIT $1',maxPeople+1);
       if(members.length>maxPeople||keys.length>maxPeople)throw new AppError(503,'兼容状态超过员工或Key容量，请使用分页接口','state_people_capacity');

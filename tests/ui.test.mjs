@@ -55,7 +55,36 @@ test('paged member detail late credentials cannot replace another dialog',async(
   let release;const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response({member:memberPage().rows[0],rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}}));}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot())+';tab="members";');const pending=page.click('member-detail','member-one');await new Promise(setImmediate);await page.click('close');page.run('modal("another dialog")');release();await pending;assert.equal(page.node('#modal-content').innerHTML,'another dialog');
 });
 test('总览只读紧凑状态，进入使用数据后才分页读取Key用量',async()=>{
-  const paths=[],state={...pagedSnapshot(),accounts:[],daily:[],requests:[],busy:0,queue:0,totals:{requests:0,success:0}};const page=await ui(path=>{paths.push(path);return response(path.startsWith('/api/admin/state')?state:{rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}});});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview";');assert.equal(await page.run('refresh()'),true);assert.ok(paths.includes('/api/admin/state?people=none'));assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));assert.deepEqual(page.run('state.keys'),[]);page.run('setTab("usage")');await new Promise(setImmediate);assert.equal(page.run('tab'),'sessions');assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));await page.click('record-view','usage');await new Promise(setImmediate);assert.ok(paths.some(path=>path.startsWith('/api/admin/keys?')));assert.equal(page.run('tab'),'requests');
+  const paths=[],state={...pagedSnapshot(),accounts:[],daily:[],requests:[],busy:0,queue:0,totals:{requests:0,success:0}};const page=await ui(path=>{paths.push(path);return response(path.startsWith('/api/admin/state')?state:{rows:[],pagination:{page:1,pageSize:25,total:0,totalPages:1}});});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview";');assert.equal(await page.run('refresh()'),true);assert.ok(paths.includes('/api/admin/state?people=none&view=overview'));assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));assert.deepEqual(page.run('state.keys'),[]);page.run('setTab("usage")');await new Promise(setImmediate);assert.equal(page.run('tab'),'sessions');assert.ok(!paths.some(path=>path.startsWith('/api/admin/keys?')));await page.click('record-view','usage');await new Promise(setImmediate);assert.ok(paths.some(path=>path.startsWith('/api/admin/keys?')));assert.equal(page.run('tab'),'requests');
+});
+
+test('轻总览切到会话页立即补全状态，迟到响应不能覆盖其他页面',async()=>{
+  const paths=[],pending=[];const compact={...pagedSnapshot(),view:'overview',accounts:[],daily:[],requests:[],sessions:[],totals:{requests:0,success:0}};
+  const full={...compact};delete full.view;
+  const page=await ui(path=>{paths.push(path);return new Promise(resolve=>pending.push(()=>resolve(response(full))));});
+  page.run('admin=true;state='+JSON.stringify(compact)+';tab="overview";setTab("sessions");');
+  assert.ok(paths.some(path=>path.startsWith('/api/admin/state?')&&!path.includes('view=overview')));
+  assert.match(page.node('#content').innerHTML,/正在读取页面数据/);
+  page.run('setTab("overview")');pending.shift()();await new Promise(setImmediate);
+  assert.equal(page.run('state.view'),'overview');
+  page.run('setTab("sessions")');pending.shift()();await new Promise(setImmediate);
+  assert.equal(page.run('state.view'),undefined);assert.doesNotMatch(page.node('#content').innerHTML,/正在读取页面数据/);
+});
+
+test('首屏轻状态到达前切页只补读一次完整状态，失败后可重试',async()=>{
+  const compact={...pagedSnapshot(),view:'overview',accounts:[],daily:[],requests:[],sessions:[],totals:{requests:0,success:0}},full={...pagedSnapshot(),accounts:[],daily:[],requests:[],totals:{requests:0,success:0}};
+  let release,reads=0;
+  const page=await ui(path=>{if(!path.startsWith('/api/admin/state'))return response({});reads++;if(reads===1)return new Promise(resolve=>release=()=>resolve(response(compact)));return reads===2?response({error:{message:'合成临时失败'}},503):response(full);});
+  page.run('admin=true;state=null;tab="overview";');const first=page.run('refresh()');page.run('setTab("sessions")');assert.equal(reads,1);release();await first;
+  assert.equal(reads,2);assert.match(page.node('#content').innerHTML,/重新读取/);assert.equal(page.run('pageRefreshing()'),false);
+  await page.click('retry-workspace');assert.equal(reads,3);assert.equal(page.run('state.view'),undefined);assert.match(page.node('#content').innerHTML,/近7天活动会话/);
+});
+
+test('轻总览进入独立分页请求页不补读全局状态或重置当前页',async()=>{
+  const paths=[],compact={...pagedSnapshot(),view:'overview',accounts:[],daily:[],requests:[],sessions:[],totals:{requests:0,success:0}};
+  const page=await ui(path=>{paths.push(path);return response({rows:[],snapshot:'preserved',pagination:{page:2,pageSize:25,total:30,totalPages:2}});});
+  page.run('admin=true;state='+JSON.stringify(compact)+';tab="overview";recordView="requests";requestsFilters.page=2;requestsPageSnapshot="preserved";requestsCursors.set(2,"cursor");setTab("requests");');await new Promise(setImmediate);
+  assert.ok(paths.some(path=>path.includes('/api/admin/requests?')&&path.includes('page=2')));assert.ok(!paths.some(path=>path.startsWith('/api/admin/state')));
 });
 
 const deferredKeyUsage=name=>({id:'synthetic-key-'+name,member_id:'member-'+name,member_name:name,member_enabled:1,prefix:'hg_test_'+name,enabled:1,expires:null,credentials_deferred:true});

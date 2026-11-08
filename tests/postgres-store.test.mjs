@@ -750,6 +750,15 @@ test('PostgreSQL overview batches exact seven-day and twelve-hour usage, preserv
   await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)','fixture-audit',at-1,'account.update','Bearer never-return-audit');
   const reader=createPostgresStateQueries(store,{clock:()=>at,encryptionKey:legacy.encryptionKey});t.after(()=>reader.close());
   const value=await reader.read({sessionPageSize:2}),old=legacy.snapshot(at,{sessionPageSize:2});
+  const compact=await reader.read({view:'overview'});
+  assert.equal(compact.view,'overview');assert.deepEqual(compact.totals,{requests:value.totals.requests,success:value.totals.success});
+  assert.deepEqual(compact.daily,value.daily.map(({day,requests})=>({day,requests})));
+  assert.deepEqual(compact.accounts,value.accounts.map(({id,name,kind,auth_mode,enabled,state})=>({id,name,kind,auth_mode,enabled,state})));
+  assert.equal(compact.memberCount,value.memberCount);assert.deepEqual(compact.sessions,[]);assert.deepEqual(compact.keys,[]);assert.deepEqual(compact.requests,[]);
+  assert.equal(compact.totals.standard,undefined);
+  for(const params of ['view=invalid','view=overview&view=full'])assert.throws(()=>stateQuery(new URLSearchParams(params)),{status:400});
+  await assert.rejects(reader.read({view:'invalid'}),{status:400});
+
   for(const field of ['usageMetric','usageWindow','recentUsageWindow','sessionsPagination','totals','daily'])assert.deepEqual(value[field],old[field],field);
   assert.deepEqual(value.sessions,old.sessions);
   assert.deepEqual(value.members.map(({usage_type_id,usage_type_version,usage_type_code,usage_type_name,defaults_version,configuration_source,default_models_set,default_models,...legacy})=>{assert.equal(usage_type_id,null);assert.equal(usage_type_version,0);assert.equal(defaults_version,0);assert.equal(default_models_set,0);assert.equal(default_models,null);assert.deepEqual(configuration_source,{models:{kind:'legacy'},limits:{kind:'legacy'}});return legacy;}),old.members);
