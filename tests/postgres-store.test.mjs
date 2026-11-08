@@ -769,6 +769,21 @@ test('PostgreSQL overview batches exact seven-day and twelve-hour usage, preserv
   assert.equal(value.requests[0].input,undefined);assert.equal(value.keys[0].digest,undefined);assert.equal(value.accounts[0].api_secret_digest,undefined);assert.equal(value.sessions[0].nightly_enabled,1);
   const second=await reader.read({sessionPage:99,sessionPageSize:2});assert.equal(second.sessionsPagination.page,2);assert.deepEqual(second.sessions.map(s=>s.id),old.sessionsPagination.total===4?['fixture-session-2','fixture-session-3']:[]);
   assert.ok(second.sessions.every(s=>s.standard.requests>0));
+  const typeA=(await store.get("SELECT id FROM harbor.member_types WHERE code='A'")).id,typeB=(await store.get("SELECT id FROM harbor.member_types WHERE code='B'")).id;
+  await store.run('UPDATE harbor.members SET usage_type_id=$1,usage_type_version=1,name=$2 WHERE id=$3',typeA,'筛选员工',member.memberId);
+  await store.run("UPDATE harbor.sessions SET enabled=0,account_id='fixture-b',client_session_id='Client-Needle' WHERE id='fixture-session-1'");
+  const filtered=await reader.read({people:'none',sessionQ:' client-needle ',sessionType:typeA,sessionAccount:'fixture-b',sessionStatus:'disabled',sessionPage:99,sessionPageSize:1});
+  assert.equal(filtered.sessionsPagination.total,1);assert.equal(filtered.sessionsPagination.page,1);assert.deepEqual(filtered.sessions.map(row=>row.id),['fixture-session-1']);assert.deepEqual(filtered.totals,value.totals);
+  assert.equal((await reader.read({people:'none',sessionQ:'筛选员工',sessionStatus:'enabled'})).sessionsPagination.total,3);
+  assert.equal((await reader.read({people:'none',sessionQ:member.memberId})).sessionsPagination.total,4);
+  for(const filters of [{sessionQ:"' OR TRUE --"},{sessionQ:'%'},{sessionType:'unclassified'},{sessionAccount:'missing-account'}])assert.equal((await reader.read({people:'none',...filters})).sessionsPagination.total,0);
+  await store.run('UPDATE harbor.members SET usage_type_id=$1 WHERE id=$2',typeB,member.memberId);
+  assert.equal((await reader.read({people:'none',sessionType:typeA})).sessionsPagination.total,0);assert.equal((await reader.read({people:'none',sessionType:typeB})).sessionsPagination.total,4);
+  await store.run('UPDATE harbor.members SET usage_type_id=NULL,usage_type_version=0 WHERE id=$1',member.memberId);
+  assert.equal((await reader.read({people:'none',sessionType:'unclassified'})).sessionsPagination.total,4);
+  for(const params of ['session_q=a&session_q=b','session_type=bad%27','session_account=bad%2Fid','session_status=active','session_q='+encodeURIComponent('x'.repeat(101)),'session_q=%00'])assert.throws(()=>stateQuery(new URLSearchParams(params)),{status:400});
+  assert.deepEqual(stateQuery(new URLSearchParams('session_q=%20hello%20&session_status=enabled')),{sessionPage:1,sessionPageSize:25,sessionQ:'hello',sessionStatus:'enabled'});
+  await assert.rejects(reader.read({sessionQ:null}),{status:400});
   await assert.rejects(reader.read({sessionPageSize:101}),{status:400});
   for(const params of ['session_page=0','session_page=1&session_page=2','session_page_size=101','session_page=9007199254740992'])assert.throws(()=>stateQuery(new URLSearchParams(params)),{status:400});
   assert.deepEqual(stateQuery(new URLSearchParams('session_page=2&session_page_size=10')),{sessionPage:2,sessionPageSize:10});
@@ -776,6 +791,17 @@ test('PostgreSQL overview batches exact seven-day and twelve-hour usage, preserv
   await store.run('UPDATE harbor.keys SET allowed_models=$1 WHERE id=$2',JSON.stringify(['gpt-6.1-sol']),member.keyId);
   await store.run("UPDATE harbor.members SET usage_limits='{}' WHERE id=$1",member.memberId);await assert.rejects(reader.read(),{code:'member_limits_invalid'});
 });
+
+test('PostgreSQL session filters use authenticated HTTP and the current employee type',integration,async t=>withGateway(t,async({store,member,password,open})=>{
+ const app=await open(),origin=await listenGateway(app),at=Date.now(),cookie=await gatewayLogin(origin,password);
+ await store.run("UPDATE harbor.members SET name='筛选HTTP员工',usage_type_id='usage-a',usage_type_version=1 WHERE id=$1",member.memberId);
+ for(let i=0;i<3;i++)await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,created,updated,protocol,enabled,client_session_id) VALUES($1,$2,'synthetic-runtime',$3,$3,'responses',$4,$5)",'filter-http-'+i,member.memberId,at-i,i===1?0:1,'filter-client-'+i);
+ const path='/api/admin/state?people=none&session_q=filter-client-1&session_type=usage-a&session_account=synthetic-runtime&session_status=disabled&session_page=9&session_page_size=1';
+ assert.equal((await fetch(origin+path)).status,401);
+ const response=await fetch(origin+path,{headers:{cookie}});assert.equal(response.status,200);const data=await response.json();assert.equal(data.capabilities.sessionFilters,true);assert.equal(data.sessionsPagination.total,1);assert.equal(data.sessionsPagination.page,1);assert.deepEqual(data.sessions.map(row=>row.id),['filter-http-1']);assert.deepEqual(data.keys,[]);assert.ok(!JSON.stringify(data).includes(member.secret));
+ await store.run("UPDATE harbor.members SET usage_type_id='usage-b' WHERE id=$1",member.memberId);assert.equal((await (await fetch(origin+path,{headers:{cookie}})).json()).sessionsPagination.total,0);
+ assert.equal((await fetch(origin+'/api/admin/state?session_status=invalid',{headers:{cookie}})).status,400);
+}));
 
 test('PostgreSQL employee and Key management uses authenticated HTTP, atomic creation and shared limits without interrupting dispatched work',integration,async t=>{
   const {store}=await fixture(t);await store.migrate();await store.initializePricing();

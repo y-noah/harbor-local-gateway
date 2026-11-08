@@ -87,6 +87,44 @@ test('轻总览进入独立分页请求页不补读全局状态或重置当前�
   assert.ok(paths.some(path=>path.includes('/api/admin/requests?')&&path.includes('page=2')));assert.ok(!paths.some(path=>path.startsWith('/api/admin/state')));
 });
 
+test('会话筛选提交后从第一页读取，分页和返回页面保留条件',async()=>{
+ const paths=[],base={...handoffSnapshot(),capabilities:{sessionFilters:true},sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};
+ const page=await ui(path=>{paths.push(path);return response(base);});page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsPage=5;render();globalThis.FormData=class{get(key){return {q:" 合成员工 ",type:"usage-a",account:"a",status:"enabled"}[key];}};');
+ await page.node('#session-filter-form').onsubmit({preventDefault(){},target:{}});const params=new URL(paths[0],'http://test').searchParams;
+ assert.equal(params.get('session_q'),'合成员工');assert.equal(params.get('session_type'),'usage-a');assert.equal(params.get('session_account'),'a');assert.equal(params.get('session_status'),'enabled');assert.equal(page.run('sessionsPage'),1);
+ await page.click('sessions-page','2');assert.equal(new URL(paths.at(-1),'http://test').searchParams.get('session_q'),'合成员工');assert.equal(new URL(paths.at(-1),'http://test').searchParams.get('session_page'),'2');
+ page.run('setTab("overview");setTab("sessions")');await new Promise(setImmediate);assert.equal(new URL(paths.at(-1),'http://test').searchParams.get('session_type'),'usage-a');assert.equal(page.run('sessionsLoading'),false);
+ assert.doesNotMatch(page.node('#content').innerHTML,/历史类型未知|未分类（新请求）/);
+ await page.click('sessions-filter-reset');assert.equal(new URL(paths.at(-1),'http://test').searchParams.has('session_q'),false);
+});
+test('会话筛选失败恢复已展示范围，离开后迟到结果不能改写条件和数据',async()=>{
+ let fail=false,release;const base={...handoffSnapshot(),capabilities:{sessionFilters:true},sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};
+ const page=await ui(()=>fail?response({error:{message:'合成筛选失败'}},503):new Promise(resolve=>release=()=>resolve(response(base))));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsFilters={q:"old",type:"",account:"",status:""};sessionsConfirmedFilters={...sessionsFilters};render();globalThis.FormData=class{get(key){return key==="q"?"new":"";}};');
+ fail=true;await page.node('#session-filter-form').onsubmit({preventDefault(){},target:{}});assert.equal(page.run('sessionsFilters.q'),'old');assert.equal(page.run('sessionsLoading'),false);assert.match(page.node('#toast').textContent,/合成筛选失败/);
+ fail=false;const pending=page.node('#session-filter-form').onsubmit({preventDefault(){},target:{}});page.run('setTab("overview")');release();await pending;assert.equal(page.run('sessionsConfirmedFilters.q'),'old');assert.equal(page.run('state.sessions[0].id'),'session');
+});
+test('会话筛选成功后账号页刷新，再返回失败仍恢复会话原条件页码和行集合',async()=>{
+ const paths=[],filtered={...handoffSnapshot(),capabilities:{sessionFilters:true},sessionsPagination:{page:2,pageSize:25,total:26,totalPages:2}},unfiltered={...filtered,sessions:[{...filtered.sessions[0],id:'another-session'}],sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};let reads=0;
+ const page=await ui(path=>{paths.push(path);reads++;return reads===1?response(filtered):reads===2?response(unfiltered):response({error:{message:'合成返回失败'}},503);});page.run('admin=true;state='+JSON.stringify(filtered)+';tab="sessions";sessionsPage=2;sessionsFilters={q:"Alice",type:"",account:"",status:""};');await page.run('refresh()');page.run('setTab("accounts")');await page.run('refresh()');assert.equal(page.run('state.sessions[0].id'),'another-session');page.run('setTab("sessions")');await new Promise(setImmediate);
+ assert.equal(page.run('sessionsFilters.q'),'Alice');assert.equal(page.run('sessionsPage'),2);assert.equal(page.run('state.sessions[0].id'),'session');assert.equal(new URL(paths.at(-1),'http://test').searchParams.get('session_page'),'2');assert.match(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.match(page.node('#content').innerHTML,/data-action="session-actions"[^>]+disabled/);
+});
+test('会话自动刷新失败显示旧结果提示，相同数据恢复也解除错误和禁用',async()=>{
+ let fail=false;const base={...handoffSnapshot(),capabilities:{sessionFilters:true},sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};const page=await ui(()=>fail?response({error:{message:'合成自动失败'}},503):response(base));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";');await page.run('refresh()');fail=true;await page.run('automaticRefresh()');assert.match(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.match(page.node('#content').innerHTML,/data-action="session-actions"[^>]+disabled/);fail=false;await page.run('automaticRefresh()');assert.doesNotMatch(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.doesNotMatch(page.node('#content').innerHTML,/data-action="session-actions"[^>]+disabled/);
+});
+test('会话快照可在轻总览刷新后恢复展示，保留其他页面需要完整状态的标记',async()=>{
+ const base={...handoffSnapshot(),capabilities:{sessionFilters:true,pagedMembers:true},sessionsPagination:{page:2,pageSize:25,total:26,totalPages:2}},compact={...base,view:'overview',sessions:[]};delete compact.sessionsPagination;let reads=0;
+ const page=await ui(()=>++reads===1?response(base):reads===2?response(compact):response({error:{message:'合成返回失败'}},503));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsPage=2;sessionsFilters={q:"Alice",type:"",account:"",status:""};');await page.run('refresh()');page.run('setTab("overview")');await page.run('refresh()');page.run('setTab("sessions")');await new Promise(setImmediate);
+ assert.equal(page.run('state.view'),'overview');assert.equal(page.run('sessionsFilters.q'),'Alice');assert.equal(page.run('sessionsPage'),2);assert.match(page.node('#content').innerHTML,/id="session-filter-form"/);assert.match(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.doesNotMatch(page.node('#content').innerHTML,/id="state-page-results"/);page.run('tab="accounts";render()');assert.match(page.node('#content').innerHTML,/id="state-page-results"/);
+});
+test('已筛选账号从账号池移除后选项仍保留，避免界面误显示为全部账号',async()=>{
+ const base={...handoffSnapshot(),capabilities:{sessionFilters:true},accounts:[],sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};const page=await ui(()=>response(base));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsFilters={q:"",type:"",account:"removed-account",status:""};');await page.run('refresh()');assert.match(page.node('#content').innerHTML,/value="removed-account" selected>已选账号/);assert.equal(page.run('sessionsConfirmedFilters.account'),'removed-account');
+});
+test('会话类型目录迟到只更新选项，保留未提交搜索内容和当前类型',async()=>{
+ let release;const base={...handoffSnapshot(),capabilities:{sessionFilters:true,typeStatistics:true}};const page=await ui(()=>new Promise(resolve=>release=()=>resolve(response({types:[{id:'usage-a',code:'A',name:'复杂研发'}]}))));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";render();');
+ page.node('#session-filter-form [name="type"]').value='unclassified';page.node('#session-filter-form [name="q"]').value='draft';const before=page.node('#content').innerHTML;const pending=page.run('loadTypeCatalog()');release();await pending;
+ assert.equal(page.node('#content').innerHTML,before);assert.equal(page.node('#session-filter-form [name="q"]').value,'draft');assert.match(page.node('#session-filter-form [name="type"]').innerHTML,/usage-a/);assert.match(page.node('#session-filter-form [name="type"]').innerHTML,/value="unclassified" selected/);assert.doesNotMatch(page.node('#session-filter-form [name="type"]').innerHTML,/historical_unknown/);
+});
+
 const deferredKeyUsage=name=>({id:'synthetic-key-'+name,member_id:'member-'+name,member_name:name,member_enabled:1,prefix:'hg_test_'+name,enabled:1,expires:null,credentials_deferred:true});
 test('R45 changing a paged usage filter immediately removes the previous range while its response is delayed',async()=>{
   let release;const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response({rows:[deferredKeyUsage('Bob')],pagination:{page:1,pageSize:25,total:1,totalPages:1}}));}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot())+';tab="requests";recordView="usage";keyUsageScope="requests:";keyUsageData='+JSON.stringify({rows:[deferredKeyUsage('Alice')],pagination:{page:1,pageSize:25,total:1,totalPages:1}})+';render();');assert.match(page.node('#content').innerHTML,/Alice/);page.node('#request-filter').onchange({target:{value:'bob'}});await new Promise(setImmediate);assert.doesNotMatch(page.node('#content').innerHTML,/Alice/);assert.match(page.node('#content').innerHTML,/正在读取/);release();await new Promise(setImmediate);assert.match(page.node('#content').innerHTML,/Bob/);

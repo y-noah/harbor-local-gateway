@@ -16,8 +16,16 @@ export function stateQuery(params){
     if(entries.length>1||entries.length&&(!/^[1-9]\d*$/.test(entries[0])||!Number.isSafeInteger(Number(entries[0]))))throw new AppError(400,'会话分页参数无效');
     if(entries.length)value[field]=Number(entries[0]);
   }
+  for(const [name,field] of [['session_q','sessionQ'],['session_type','sessionType'],['session_account','sessionAccount'],['session_status','sessionStatus']]){
+    if(params.has(name)){if(params.getAll(name).length!==1)throw new AppError(400,'会话筛选参数无效');value[field]=params.get(name).trim();}
+  }
+  validateSessionFilters(value);
   if(value.sessionPageSize>100)throw new AppError(400,'每页最多100个会话');
   return value;
+}
+
+function validateSessionFilters({sessionQ='',sessionType='',sessionAccount='',sessionStatus=''}={}){
+  if(typeof sessionQ!=='string'||sessionQ.length>100||sessionQ.includes('\0')||typeof sessionType!=='string'||sessionType&&!/^[a-zA-Z0-9-]{1,100}$/.test(sessionType)||typeof sessionAccount!=='string'||sessionAccount&&!/^[a-zA-Z0-9-]{1,100}$/.test(sessionAccount)||!['','enabled','disabled'].includes(sessionStatus))throw new AppError(400,'会话筛选参数无效');
 }
 
 // The page identities and every usage dimension share one read snapshot. Only
@@ -25,7 +33,8 @@ export function stateQuery(params){
 export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,queryQueue,balancingReader,maxPeople=1000}={}){
   const queue=queryQueue||createPostgresQueryQueue();
   if(!Number.isSafeInteger(maxPeople)||maxPeople<1||maxPeople>10000)throw new AppError(503,'兼容员工状态容量无效','state_configuration');
-  async function execute({sessionPage=1,sessionPageSize=25,people='all',view='full'}={}){
+  async function execute({sessionPage=1,sessionPageSize=25,people='all',view='full',sessionQ='',sessionType='',sessionAccount='',sessionStatus=''}={}){
+    validateSessionFilters({sessionQ,sessionType,sessionAccount,sessionStatus});sessionQ=sessionQ.trim();
     if(!['full','overview'].includes(view))throw new AppError(400,'状态视图无效');
     if(!['all','none'].includes(people))throw new AppError(400,'员工加载模式无效');
     if(!Number.isSafeInteger(sessionPage)||sessionPage<1||!Number.isSafeInteger(sessionPageSize)||sessionPageSize<1||sessionPageSize>100)throw new AppError(400,'会话分页参数无效');
@@ -47,9 +56,15 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       if(members.length>maxPeople||keys.length>maxPeople)throw new AppError(503,'兼容状态超过员工或Key容量，请使用分页接口','state_people_capacity');
       const counts=await store.get('SELECT (SELECT COUNT(*) FROM harbor.members WHERE removed_at IS NULL) member_count,(SELECT COUNT(*) FROM harbor.keys WHERE removed_at IS NULL) key_count');
       const packages=createPostgresAccountPackages(store,{clock}),packagePolicy=await packages.policy(),accounts=await packages.decorate(await store.all('SELECT id,name,kind,auth_mode,route_epoch,platform_config,platform_models,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id'));
-      const from='FROM harbor.sessions s JOIN harbor.members m ON m.id=s.member_id JOIN harbor.accounts a ON a.id=s.account_id WHERE s.updated>=$1 AND s.updated<$2';
-      const total=(await store.get('SELECT COUNT(*) n '+from,window.start,window.end)).n,totalPages=Math.max(1,Math.ceil(total/sessionPageSize)),page=Math.min(sessionPage,totalPages);
-      const sessions=await store.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${from} ORDER BY s.updated DESC,s.id DESC LIMIT $3 OFFSET $4`,window.start,window.end,sessionPageSize,(page-1)*sessionPageSize);
+      const sessionArgs=[window.start,window.end],conditions=['s.updated>=$1','s.updated<$2'];
+      const filter=(sql,value)=>{sessionArgs.push(value);conditions.push(sql.replaceAll('?',String(sessionArgs.length)));};
+      if(sessionQ)filter("(position(lower($?::text) in lower(m.name))>0 OR position(lower($?::text) in lower(m.id))>0 OR position(lower($?::text) in lower(COALESCE(s.client_session_id,'')))>0 OR position(lower($?::text) in lower(s.id))>0)",sessionQ);
+      if(sessionType==='unclassified')conditions.push('m.usage_type_id IS NULL');else if(sessionType)filter('m.usage_type_id=$?',sessionType);
+      if(sessionAccount)filter('s.account_id=$?',sessionAccount);
+      if(sessionStatus)filter('s.enabled=$?',sessionStatus==='enabled'?1:0);
+      const from='FROM harbor.sessions s JOIN harbor.members m ON m.id=s.member_id JOIN harbor.accounts a ON a.id=s.account_id WHERE '+conditions.join(' AND '),n=sessionArgs.length;
+      const total=(await store.get('SELECT COUNT(*) n '+from,...sessionArgs)).n,totalPages=Math.max(1,Math.ceil(total/sessionPageSize)),page=Math.min(sessionPage,totalPages);
+      const sessions=await store.all(`SELECT s.id,s.client_session_id,s.member_id,s.account_id,s.upstream_id,s.state,s.created,s.updated,s.protocol,s.enabled,s.route_version,s.nightly_enabled,s.nightly_expires,s.upstream_thread,m.name member_name,a.name account_name ${from} ORDER BY s.updated DESC,s.id DESC LIMIT $${n+1} OFFSET $${n+2}`,...sessionArgs,sessionPageSize,(page-1)*sessionPageSize);
       // The paged UI omits people. Its DTO uses only seven-day company,
       // account, visible-session and day totals; no twelve-hour groups escape.
       const loadPeople=people==='all',usageArgs=loadPeople?

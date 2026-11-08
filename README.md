@@ -99,6 +99,8 @@ PG18.6基础镜像可用默认关闭的 `HARBOR_CACHE_POSTGRES_BASE=1` 显式显
 
 PostgreSQL 首页使用 `GET /api/admin/state?view=overview`，仅查询近7天请求数、每日趋势、员工人数和账号连接状态，不读取会话、Key、请求正文或计价投影；不返回未计算的参考消耗。未指定视图时保持原完整状态接口。离开首页后按需补全页面状态，切页时拒绝迟到响应，无数据库变更。
 
+会话绑定页支持员工／会话标识搜索、员工当前类型、绑定账号及访问状态筛选。`/api/admin/state` 接受 `session_q`、`session_type`、`session_account`、`session_status=enabled|disabled`，在同一数据库快照内先筛选再计数、分页；未传参数沿用原范围。类型按员工当前配置查询，与请求发生时类型统计区分。筛选不改变全公司汇总或会话绑定，会话页独立保留最后成功的条件、分页与数据，失败时整组恢复并提示重试，旧行管理暂不可用；其他页面刷新不覆盖该范围，离开后返回重新核验当前绑定。旧服务未声明 `sessionFilters` 时不显示筛选入口。
+
 PG 开发入口新增“使用类型默认配置”：A—F 分别表示复杂研发、日常开发、按方案开发、开发辅助、方案与原型及文档处理，不表示职级或权限继承。六类初始均待配置；管理员明确保存允许模型和员工共享限额（参考 USD，滚动24／168小时），也可明确选择全部模型或不限额。复制其他类型仅作为编辑起点，保存后各自独立。默认保存只供后续新增或显式应用使用，不修改现有员工。
 
 管理接口为 `GET /api/admin/member-types` 和 `PATCH /api/admin/member-types/:id`，修改携带 `expected_version`，默认规则同时提供 `allowed_models` 与 `usage_limits`。新建员工明确选择类型，提交 `type_id`、`expected_type_version`、`expected_template_version`；模型与限额分别选择 `models_mode`／`limits_mode` 的 `template` 或 `custom`，自定义才提交对应字段。版本冲突返回409，页面保留草稿并要求核对最新配置；待配置类型必须明确自定义两部分，不能隐式获得全部权限或无限额。
