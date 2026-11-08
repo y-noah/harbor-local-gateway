@@ -169,7 +169,8 @@ def deploy_entry_postgres(image,config,archive=None):
     if type(local_assurance) is not bool:raise ValueError('Local assurance flag must be a root boolean')
     if local_assurance:
         if config.get('entry_installed_release') is not True or archive is not None:raise ValueError('Local assurance requires the installed entry image')
-        helper=Path(LOCAL_ASSURANCE_HELPER)
+        # A committed PG installation must never enter SQLite migration again.
+        helper=Path('/usr/local/lib/harbor/postgres-upgrade-deploy.py') if os.path.lexists('/var/lib/harbor-entry/active.json') else Path(LOCAL_ASSURANCE_HELPER)
         for target in [*reversed(helper.parents),helper]:
             info=target.lstat()
             if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('Local assurance helper is not root controlled')

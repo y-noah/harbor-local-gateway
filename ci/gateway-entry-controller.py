@@ -491,6 +491,7 @@ class EntryDeployment:
   require(row.get('Image') in [self.approval.get('configDigest'),self.approval.get('manifestDigest')] and row.get('Config',{}).get('Image')==self.image,'candidate_image_changed')
   require(labels.get('com.aistrong.project')=='harbor-local-gateway' and labels.get('com.harbor.activation-deployment-id')==self.approval.get('deploymentId') and labels.get('com.harbor.activation-receipt')==self.approval.get('receiptDigest'),'candidate_activation_changed')
   if self.approval.get('contract')=='harbor-local-assurance-deploy-v1':local_assurance_module().verify_candidate_network(row)
+  if self.approval.get('contract')=='harbor-postgres-runtime-upgrade-v1':runtime_upgrade_module().verify_candidate_network(row,self.approval)
   state=row.get('State',{});require(state.get('Running') and not state.get('Restarting') and not state.get('Paused'),'candidate_not_running')
 
  def endpoint(self,row):
@@ -706,6 +707,7 @@ def network_snapshot(state):return {key:copy.deepcopy(state.get(key)) for key in
 def candidate_mounts(row,approval=None):
  root='/opt/product-development/harbor-local-gateway'
  if (approval or {}).get('contract')=='harbor-local-assurance-deploy-v1':root=str(local_assurance_module().RUN)
+ if (approval or {}).get('contract')=='harbor-postgres-runtime-upgrade-v1':root=runtime_upgrade_module().materials_directory(approval)
  mounts=[{'source':v.get('Source'),'destination':v.get('Destination'),'readWrite':v.get('RW')} for v in row.get('Mounts',[]) if v.get('Destination') in ['/app/data','/app/runtime']]
  require({v['destination']:v['source'] for v in mounts}=={'/app/data':root+'/pg-data','/app/runtime':root+'/runtime'},'candidate_material_mounts')
  return sorted(mounts,key=lambda v:v['destination'])
@@ -716,6 +718,7 @@ def active_record():
  require(active.get('version')==1 and active.get('configDigest')==fingerprint(config),'active_configuration_changed')
  marker=STORAGE_MARKER
  if active.get('approval',{}).get('contract')=='harbor-local-assurance-deploy-v1':marker=local_assurance_module().verified_marker_path(active['image'],active)
+ if active.get('approval',{}).get('contract')=='harbor-postgres-runtime-upgrade-v1':marker=runtime_upgrade_module().verified_marker_path(active['image'],active)
  require(active.get('storageMarkerDigest')==fingerprint(private_json(marker)),'active_material_marker_changed')
  temporary=object.__new__(EntryDeployment);temporary.image=active['image'];temporary.approval=active['approval']
  row=inspect_container(active['candidate']['containerId']);temporary.verify_candidate_row(row)
@@ -736,7 +739,14 @@ def local_assurance_module():
  spec=importlib.util.spec_from_file_location('harbor_local_assurance',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 
 
+def runtime_upgrade_module():
+ path=Path('/usr/local/lib/harbor/postgres-upgrade-deploy.py')
+ trusted_parents(path);info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'runtime_upgrade_helper_untrusted')
+ spec=importlib.util.spec_from_file_location('harbor_pg_upgrade',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+
 def read_active_authorization(image):
+ if ACTIVE.exists() and private_json(ACTIVE).get('approval',{}).get('contract')=='harbor-postgres-runtime-upgrade-v1':return runtime_upgrade_module().active_authorization(image)
  if ACTIVE.exists() and private_json(ACTIVE).get('approval',{}).get('contract')=='harbor-local-assurance-deploy-v1':return local_assurance_module().active_authorization(image)
  node=Path('/opt/harbor-storage-tools/node/bin/node');helper=Path('/usr/local/lib/harbor/gateway-entry-activation-status.mjs');business=Path('/opt/harbor-storage-tools/app/storage-activation-deploy.mjs')
  for path in [node,helper,business]:

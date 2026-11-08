@@ -130,6 +130,59 @@ class EntryRuntimeTests(unittest.TestCase):
    result=runtime.candidate_post(Boundary)
   self.assertEqual(result['phase'],'active-prepared');self.assertFalse(result['sourceStarted']);self.assertEqual(refresh.call_count,2);self.assertGreaterEqual(guard.call_count,3)
 
+ def test_entry_post_waits_for_real_control_and_listener_before_restore(self):
+  class Boundary:
+   ACTIVE=type('Active',(),{'exists':lambda _:True})()
+   @staticmethod
+   def restore_active():return {'phase':'activated','candidateOnly':True}
+  with patch.object(runtime,'verify_start_guard') as guard,patch.object(runtime,'entry_listener_ready',side_effect=[False,False,False,True]) as ready,patch.object(runtime.time,'sleep') as sleep,patch.object(Boundary,'restore_active',wraps=Boundary.restore_active) as restore:
+   value=runtime.entry_post(Boundary)
+  self.assertEqual(value['phase'],'activated');self.assertEqual(ready.call_count,4);self.assertEqual(sleep.call_count,3);restore.assert_called_once();self.assertEqual(guard.call_count,5)
+
+ def test_entry_post_identity_and_authorization_errors_are_not_readiness(self):
+  class Boundary:
+   ACTIVE=type('Active',(),{'exists':lambda _:True})()
+   restore_active=staticmethod(lambda:(_ for _ in ()).throw(AssertionError('restore must not run')))
+  with patch.object(runtime,'verify_start_guard'),patch.object(runtime,'entry_listener_ready',side_effect=RuntimeError('entry_runtime_entry_control_identity')),patch.object(runtime.time,'sleep') as sleep:
+   with self.assertRaisesRegex(RuntimeError,'entry_control_identity'):runtime.entry_post(Boundary)
+   sleep.assert_not_called()
+  with patch.object(runtime,'verify_start_guard',side_effect=RuntimeError('entry_controller_active_database_authorization_changed')),patch.object(runtime,'entry_listener_ready') as ready:
+   with self.assertRaisesRegex(RuntimeError,'active_database_authorization_changed'):runtime.entry_post(Boundary)
+   ready.assert_not_called()
+
+ def test_entry_post_rechecks_authority_before_each_readiness_attempt(self):
+  class Boundary:
+   ACTIVE=type('Active',(),{'exists':lambda _:True})()
+  for code in ['entry_controller_active_database_authorization_changed','entry_runtime_actual_guard_changed']:
+   with self.subTest(code=code),patch.object(runtime,'verify_start_guard',side_effect=[None,RuntimeError(code)]),patch.object(runtime,'entry_listener_ready',return_value=False) as ready,patch.object(runtime.time,'sleep') as sleep:
+    with self.assertRaisesRegex(RuntimeError,code):runtime.entry_post(Boundary)
+    self.assertEqual(ready.call_count,1);self.assertEqual(sleep.call_count,1)
+
+ def test_entry_listener_only_retries_uncreated_or_refused_control(self):
+  class Boundary:
+   PROFILE=Path('/fixed/profile');ENTRY_CONFIG=Path('/fixed/process');CONTROL='/fixed/control'
+   validate=staticmethod(lambda value:value)
+   private_json=staticmethod(lambda path:{'entryPort':18093,'entryCgroup':'/fixed/group'} if path==Boundary.PROFILE else {'listenPort':18093})
+   socket_owner=staticmethod(lambda path:1)
+   process_cgroup=staticmethod(lambda pid:'/fixed/group')
+   entry_state=staticmethod(lambda:{'slot':'candidate','phase':'active'})
+  for error in [FileNotFoundError(),ConnectionRefusedError()]:
+   with self.subTest(error=type(error).__name__),patch.object(Boundary,'socket_owner',side_effect=error):self.assertFalse(runtime.entry_listener_ready(Boundary))
+  with patch.object(Boundary,'private_json',side_effect=FileNotFoundError('missing configuration')),patch.object(Boundary,'socket_owner') as owner:
+   with self.assertRaisesRegex(FileNotFoundError,'missing configuration'):runtime.entry_listener_ready(Boundary)
+   owner.assert_not_called()
+  with patch.object(Boundary,'process_cgroup',side_effect=FileNotFoundError('identified owner disappeared')):
+   with self.assertRaisesRegex(FileNotFoundError,'identified owner disappeared'):runtime.entry_listener_ready(Boundary)
+  with patch.object(runtime.Path,'iterdir',side_effect=FileNotFoundError('identified owner fd disappeared')):
+   with self.assertRaisesRegex(FileNotFoundError,'identified owner fd disappeared'):runtime.entry_listener_ready(Boundary)
+
+ def test_entry_post_readiness_has_a_bounded_deadline(self):
+  class Boundary:
+   ACTIVE=type('Active',(),{'exists':lambda _:True})()
+  clock=[0.0]
+  with patch.object(runtime,'verify_start_guard'),patch.object(runtime,'entry_listener_ready',return_value=False),patch.object(runtime.time,'monotonic',side_effect=lambda:clock[0]),patch.object(runtime.time,'sleep',side_effect=lambda _:clock.__setitem__(0,runtime.CANDIDATE_WAIT_SECONDS+1)):
+   with self.assertRaisesRegex(RuntimeError,'entry_readiness_timeout'):runtime.entry_post(Boundary)
+
  def test_persistent_units_require_runtime_before_consumers(self):
   names=['harbor-entry-runtime','harbor-entry-deploy','harbor-entry-legacy','harbor-entry-candidate','harbor-gateway-entry']
   for name in names:
@@ -137,6 +190,8 @@ class EntryRuntimeTests(unittest.TestCase):
    if name!='harbor-entry-runtime':self.assertIn('harbor-entry-runtime.service',unit)
   self.assertIn('RemainAfterExit=yes',(ROOT/'ci/harbor-entry-runtime.service.example').read_text())
   self.assertIn('entry-runtime.py entry-pre',(ROOT/'ci/harbor-gateway-entry.service.example').read_text())
+  entry_unit=(ROOT/'ci/harbor-gateway-entry.service.example').read_text();self.assertIn('entry-runtime.py entry-post',entry_unit);self.assertNotIn('gateway-entry-controller.py restore-active',entry_unit)
+  self.assertGreaterEqual(int(next(line.split('=',1)[1] for line in entry_unit.splitlines() if line.startswith('TimeoutStartSec='))),2*runtime.CANDIDATE_WAIT_SECONDS+5)
   self.assertIn('entry-runtime.py candidate-post',(ROOT/'ci/harbor-entry-candidate.service.example').read_text())
   candidate=(ROOT/'ci/harbor-entry-candidate.service.example').read_text();self.assertIn('entry-runtime.py candidate-pre',candidate)
   timeout=int(next(line.split('=',1)[1] for line in candidate.splitlines() if line.startswith('TimeoutStartSec=')));self.assertGreaterEqual(timeout,2*runtime.CANDIDATE_WAIT_SECONDS+5)

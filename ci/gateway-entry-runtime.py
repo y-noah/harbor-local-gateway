@@ -99,19 +99,49 @@ def wait_candidate(c,operation):
 def candidate_pre(c):return wait_candidate(c,lambda:c.slot_start('candidate'))
 def candidate_post(c):return wait_candidate(c,lambda:candidate_post_once(c))
 
+def entry_listener_ready(c):
+ config=c.validate(c.private_json(c.PROFILE));process_config=c.private_json(c.ENTRY_CONFIG);port=process_config.get('listenPort')
+ need(type(port) is int and port==config['entryPort'],'entry_listener_configuration')
+ try:pid=c.socket_owner(Path(c.CONTROL))
+ except (FileNotFoundError,ConnectionRefusedError):return False
+ need(c.process_cgroup(pid)==config['entryCgroup'],'entry_control_identity')
+ state=c.entry_state();need(state.get('slot')=='candidate' and state.get('phase')=='active','entry_control_state')
+ inodes=set()
+ for fd in Path('/proc',str(pid),'fd').iterdir():
+  try:value=os.readlink(fd)
+  except FileNotFoundError:continue
+  if value.startswith('socket:[') and value.endswith(']'):inodes.add(value[8:-1])
+ for family in ['tcp','tcp6']:
+  path=Path('/proc',str(pid),'net',family)
+  if not path.exists():continue
+  for row in path.read_text().splitlines()[1:]:
+   fields=row.split()
+   if len(fields)>9 and fields[3]=='0A' and int(fields[1].split(':')[1],16)==port and fields[9] in inodes:return True
+ return False
+
+def entry_post(c):
+ if not c.ACTIVE.exists():return {'candidateOnly':False,'sourceStarted':False}
+ deadline=time.monotonic()+CANDIDATE_WAIT_SECONDS
+ while True:
+  verify_start_guard(c);ready=entry_listener_ready(c)
+  if ready:
+   verify_start_guard(c);return c.restore_active()
+  need(time.monotonic()<deadline,'entry_readiness_timeout');time.sleep(min(.1,max(0,deadline-time.monotonic())))
+
+
 def entry_pre(c):
  verify_start_guard(c);inspect_entry(c);return c.assert_start()
 def main():
- need(os.geteuid()==0 and len(sys.argv)==2 and sys.argv[1] in ['boot-guard','candidate-pre','candidate-post','entry-pre'],'fixed_root_action')
+ need(os.geteuid()==0 and len(sys.argv)==2 and sys.argv[1] in ['boot-guard','candidate-pre','candidate-post','entry-pre','entry-post'],'fixed_root_action')
  c=module('fixed_entry_controller',ROOT/'gateway-entry-controller.py');ensure_run(c)
  fd=os.open(c.STATE.with_suffix('.lock'),os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
  try:
   info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'runtime_lock');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
   action=sys.argv[1]
-  if action in ['candidate-pre','candidate-post']:
-   def expired(*args):raise RuntimeError('entry_runtime_candidate_readiness_timeout')
+  if action in ['candidate-pre','candidate-post','entry-pre','entry-post']:
+   def expired(*args):raise RuntimeError('entry_runtime_entry_readiness_timeout' if action.startswith('entry-') else 'entry_runtime_candidate_readiness_timeout')
    signal.signal(signal.SIGALRM,expired);signal.setitimer(signal.ITIMER_REAL,CANDIDATE_WAIT_SECONDS)
-  value=boot_guard(c) if action=='boot-guard' else candidate_pre(c) if action=='candidate-pre' else candidate_post(c) if action=='candidate-post' else entry_pre(c)
+  value=boot_guard(c) if action=='boot-guard' else candidate_pre(c) if action=='candidate-pre' else candidate_post(c) if action=='candidate-post' else entry_pre(c) if action=='entry-pre' else entry_post(c)
   print(json.dumps(value,separators=(',',':')))
  finally:signal.setitimer(signal.ITIMER_REAL,0);os.close(fd)
 if __name__=='__main__':

@@ -303,7 +303,8 @@ def deploy(image,config,archive,api):
     if not callable(api.get('activation')):raise ValueError('PostgreSQL activation consumer is required')
     approval=api['activation']('check',image)
     if entry_deployment is not None:entry_deployment.check(approval)
-    expected_contract='harbor-local-assurance-deploy-v1' if api.get('local_assurance') is True and config.get('local_assurance_release') is True else 'harbor-storage-activation-deploy-v1'
+    if type(api.get('runtime_upgrade',False)) is not bool or type(api.get('retain_previous',False)) is not bool:raise ValueError('Internal PostgreSQL deployment modes must be boolean')
+    expected_contract='harbor-postgres-runtime-upgrade-v1' if api.get('runtime_upgrade') is True else ('harbor-local-assurance-deploy-v1' if api.get('local_assurance') is True and config.get('local_assurance_release') is True else 'harbor-storage-activation-deploy-v1')
     if approval.get('contract')!=expected_contract or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',approval.get('deploymentId','')) or not re.fullmatch(r'[a-f0-9]{64}',approval.get('receiptDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('configDigest','')) or not re.fullmatch(r'sha256:[a-f0-9]{64}',approval.get('manifestDigest','')) or approval.get('revision')!=image.rsplit(':',1)[-1]:raise ValueError('Activation approval is invalid')
     def activate(action):
         value=api['activation'](action,image)
@@ -423,7 +424,7 @@ def deploy(image,config,archive,api):
             try:revoke_reclaimed(reclaimed)
             except Exception as cleanup_error:raise ShutdownUnconfirmed('Activation revocation unconfirmed; retain PG data and migration material') from cleanup_error
         raise
-    if entry_deployment is None:
+    if entry_deployment is None and not api.get('retain_previous',False):
         for target in stopped:docker('rm',target+'-previous')
     return {'shutdown_contract':SHUTDOWN_CONTRACT,'shutdown':shutdown_rows,'activation':{'state':'active','resumed':False}}
 
