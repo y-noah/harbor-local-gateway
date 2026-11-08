@@ -6,6 +6,9 @@ const kinds=new Set(['user','assistant','tool_call','tool_result','attachment','
 const origins=new Set(['client','upstream','gateway']);
 const states=new Set(['complete','partial','truncated']);
 const atomicCommits=new WeakMap();
+const previewCharacters=200;
+// A JSON UTF-16 code unit needs at most six bytes, plus the object and AES-GCM IV/tag.
+const previewCipherBytes=previewCharacters*6+Buffer.byteLength('{"text":""}')+12+16;
 export function consumeRecordingAtomicCommit(receipt,commands,repository){const saved=receipt&&atomicCommits.get(receipt);if(!saved||saved.commands!==commands||saved.repository!==repository)return false;atomicCommits.delete(receipt);return true;}
 const validateTurnState=value=>{if(!['known','uncertain'].includes(value))throw new AppError(400,'本轮识别状态无效');};
 export class RecordingStore{
@@ -61,7 +64,7 @@ export class RecordingStore{
         if(event.bytes>this.maxEventBytes||bytes+event.bytes>this.maxBytes){truncated=true;break;}
         const aad=requestId+':'+sequence+':'+event.sourceKey,cipher=this.seal(event.content,aad);
         insertions.push({sequence,sourceKey:event.sourceKey,kind:event.kind,provenance:event.provenance,created:this.clock(),cipher});existing.add(event.sourceKey);
-        if(!preview&&event.kind==='user'&&typeof event.content?.text==='string')preview=this.seal({text:event.content.text.slice(0,200)},requestId+':preview');
+        if(!preview&&event.kind==='user'&&typeof event.content?.text==='string')preview=this.seal({text:event.content.text.slice(0,previewCharacters)},requestId+':preview');
         bytes+=event.bytes;sequence++;accepted++;
       }
       if(insertions.length)await this.store.run(`INSERT INTO harbor.conversation_events(request_id,sequence,source_key,kind,provenance,created,content_cipher)
@@ -97,6 +100,24 @@ export class RecordingStore{
   async finish(requestId,{state='complete',reason=null,storageReason}={}){
     if(!states.has(state)||reason!==null&&!['upstream_interrupted','capture_failed','queue_limit','size_limit','process_interrupted'].includes(reason)||storageReason!==undefined&&(reason!=='capture_failed'||state!=='partial'||!['storage_low','storage_unknown'].includes(storageReason)))throw new AppError(400,'正文完成状态无效');
     await this.store.run(`UPDATE harbor.requests SET recording_state=CASE WHEN recording_reason IS NOT NULL AND $1='complete' THEN 'partial' ELSE $1 END,recording_reason=COALESCE($2,recording_reason) WHERE id=$3 AND recording_state='pending'`,state,storageReason??reason,requestId);
+  }
+  async previews(requestIds){
+    if(!Array.isArray(requestIds)||requestIds.length>100||requestIds.some(id=>typeof id!=='string'||!id.length||id.length>100))throw new AppError(400,'输入摘要分页无效');
+    const result=new Map(requestIds.map(id=>[id,{input_preview:null,input_preview_state:'unavailable'}]));if(!requestIds.length)return result;
+    const at=this.clock(),rows=await this.store.all(`SELECT r.id request_id,c.turn_state,c.expires_at,r.recording_state,
+      octet_length(c.preview_cipher) preview_bytes,
+      CASE WHEN c.expires_at>$2 AND r.recording_state<>'expired' AND octet_length(c.preview_cipher)<=$3 THEN c.preview_cipher END preview_cipher
+      FROM harbor.requests r LEFT JOIN harbor.recordings c ON c.request_id=r.id WHERE r.id=ANY($1::text[])`,requestIds,at,previewCipherBytes);
+    for(const row of rows){
+      let text=null,state='unavailable';
+      if(row.recording_state==='expired'||row.expires_at!==null&&row.expires_at<=at)state='expired';
+      else if(row.preview_bytes!==null){
+        state='unreadable';
+        if(row.preview_cipher)try{const value=this.open(row.preview_cipher,row.request_id+':preview');if(typeof value?.text==='string'){text=value.text.slice(0,previewCharacters);state=row.turn_state==='known'?'available':'uncertain';}}catch{}
+      }
+      result.set(row.request_id,{input_preview:text,input_preview_state:state});
+    }
+    return result;
   }
   async read(requestId,{after=0,limit=32}={}){
     if(!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>100)throw new AppError(400,'正文分页无效');

@@ -112,3 +112,4 @@
 /* Account lists keep operational summaries; detailed budgets live in management. */
 .account-status-line{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}.account-quota-window{padding:3px 0}.account-quota-window strong{font-size:13px}.account-quota-window small{font-size:11px}.account-management-section .account-card{border:0;padding:0;box-shadow:none}.initial-state-error{padding:48px 24px;text-align:center}.account-pool-table{min-width:850px}.account-pool-table td{vertical-align:middle}.account-management-section .quota{max-width:100%}
 @media(max-width:760px){.account-pool-table{min-width:0}}
+.request-input-preview{max-width:28ch;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere;white-space:normal}

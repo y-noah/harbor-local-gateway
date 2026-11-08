@@ -116,6 +116,7 @@ test('HTTP Responses uses the original Key, PostgreSQL ownership, shared model p
   response=await fetch(origin+'/api/admin/state?session_page=0',{headers:{authorization:'Bearer fixture-admin'}});assert.equal(response.status,400);
   response=await fetch(origin+'/api/admin/requests?view=list',{headers:{authorization:'Bearer '+member.secret}});assert.equal(response.status,401);
   response=await fetch(origin+'/api/admin/requests?view=list',{headers:{authorization:'Bearer fixture-admin'}});const listing=await response.json();assert.equal(response.status,200);assert.equal(listing.rows[0].id,request);assert.equal(listing.rows[0].inserted_xid,undefined);assert.equal(listing.rows[0].q_total,undefined);
+  assert.match(listing.rows[0].input_preview,/本轮合成提问/);assert.ok(['available','uncertain'].includes(listing.rows[0].input_preview_state));assert.ok(!JSON.stringify(listing).includes('opaque-secret'));assert.equal(listing.rows[0].preview_cipher,undefined);
   response=await fetch(origin+'/api/admin/requests?view=summary&snapshot='+listing.snapshot,{headers:{authorization:'Bearer fixture-admin'}});const statistics=await response.json();assert.equal(response.status,200);assert.equal(statistics.summary.standard.total_exact,observation.standard.total_exact);assert.equal(statistics.summary.requests,1);assert.equal(statistics.byModel[0].standard.total_exact,observation.standard.total_exact);assert.equal(statistics.watermarkKind,'postgres_visibility');
   response=await send({model:'gpt-6.1-sol',input:'流式合成提问',stream:true});assert.equal(response.status,200);const streamed=await response.text();assert.ok(streamed.includes('response.completed'));assert.ok(!streamed.includes('event: error'));await buffer.flush();
   const finish=store.finish.bind(store);store.finish=async()=>{throw Error('injected settlement outage');};
@@ -185,6 +186,30 @@ test('R21 slow uploads protect routing until every same-member body completes or
   response=await send();assert.equal(response.status,409);await response.json();assert.equal((await store.get('SELECT route_version FROM harbor.sessions WHERE id=$1',before.id)).route_version,0);
   uploads[1].destroy();await wait(()=>handler.status().preparing===0);
   response=await send();assert.equal(response.status,200);await response.json();const after=await store.get('SELECT * FROM harbor.sessions WHERE id=$1',before.id);assert.equal(after.account_id,'b');assert.equal(after.route_version,1);assert.equal(calls,2);
+});
+
+test('request input previews are page bounded, encrypted, expiration aware and isolated from damaged ciphertext',integration,async t=>{
+  const {store}=await fixture(t);await store.migrate();await store.initializePricing();const {member}=await legacyMember(t,store),person=await store.authenticate(member.secret),at=Date.now();
+  const recording=new RecordingStore(store,{encryptionKey:randomBytes(32),clock:()=>at});
+  const make=async(text,turnState='known')=>{const id=await store.observe(person,'fixture','fixture','gpt-6.1-sol');await recording.start(id,{turnState});await recording.append(id,[{sourceKey:'input',kind:text===null?'assistant':'user',provenance:text===null?'upstream':'client',content:{text:text??'只收到输出'}}]);await recording.finish(id);return id;};
+  const available=await make('问题 Bearer fixture-private '+ '界'.repeat(300)),uncertain=await make('上下文中的输入','uncertain'),expired=await make('已过期的输入'),broken=await make('损坏的输入'),oversized=await make('异常大的密文'),empty=await make(null);
+  await store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',at,expired);
+  await store.run('UPDATE harbor.recordings SET preview_cipher=$1 WHERE request_id=$2',Buffer.alloc(80),broken);
+  await store.run('UPDATE harbor.recordings SET preview_cipher=$1 WHERE request_id=$2',Buffer.alloc(4096),oversized);
+  const previews=await recording.previews([available,uncertain,expired,broken,oversized,empty]);
+  assert.equal(previews.get(available).input_preview_state,'available');assert.ok(previews.get(available).input_preview.length<=200);assert.ok(!previews.get(available).input_preview.includes('fixture-private'));
+  assert.equal(previews.get(uncertain).input_preview_state,'uncertain');
+  for(const [id,state] of [[expired,'expired'],[broken,'unreadable'],[oversized,'unreadable'],[empty,'unavailable']])assert.deepEqual(previews.get(id),{input_preview:null,input_preview_state:state});
+  const {createPostgresRecordingJobs}=await import('../postgres-recording-jobs.mjs'),jobs=createPostgresJobs(store),backend=createPostgresRecordingJobs(store,{jobs,recordingKey:recording.key,clock:()=>at,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
+  await jobs.enqueue('recording.purge',{id:'recording.purge:'+Math.floor(at/60000),payload:{}});const purge=await jobs.claim(['recording.purge']);assert.ok(purge);await jobs.complete(purge,await backend.handlers[purge.kind](purge));
+  assert.equal(await store.get('SELECT request_id FROM harbor.recordings WHERE request_id=$1',expired),undefined);assert.deepEqual((await recording.previews([expired])).get(expired),{input_preview:null,input_preview_state:'expired'});
+  const historical=await store.observe(person,'fixture','fixture','gpt-6.1-sol');assert.deepEqual((await recording.previews([historical])).get(historical),{input_preview:null,input_preview_state:'unavailable'});
+  const ids=[],sql=[],originalAll=store.all.bind(store);store.all=async(query,...args)=>{sql.push(query);return originalAll(query,...args);};
+  const reader=createPostgresRequestQueries(store,{clock:()=>at,readInputPreviews:page=>{ids.push(page);return recording.previews(page);}});t.after(()=>reader.close());
+  const first=await reader.read(requestsQuery(new URLSearchParams({view:'list',page_size:'2'})));assert.deepEqual(ids,[first.rows.map(row=>row.id)]);assert.equal(sql.filter(query=>query.includes('preview_cipher')).length,1);assert.ok(sql.every(query=>!query.includes('conversation_events')));assert.ok(first.rows.every(row=>!('preview_cipher' in row)));
+  await reader.read(requestsQuery(new URLSearchParams({view:'summary',snapshot:first.snapshot})));assert.equal(ids.length,1);
+  const afterPurge=await reader.read(requestsQuery(new URLSearchParams({view:'list',page_size:'100'})));assert.equal(afterPurge.rows.find(row=>row.id===expired).input_preview_state,'expired');assert.equal(afterPurge.rows.find(row=>row.id===expired).input_preview,null);
+  await assert.rejects(recording.previews(Array(101).fill(available)),{status:400});
 });
 
 test('recording pages bound fetched ciphertext bytes, advance past a large single event and retain separate metadata visibility',integration,async t=>{

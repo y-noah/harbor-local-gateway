@@ -60,7 +60,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const sessionHandoffs=createSessionRequestHandoff({maxTickets:maxConcurrent,maxPending:maxPendingHandoffs,maxWaiting:Math.max(1,Math.floor(maxConcurrent/2)),maxWaitingPerMember:Math.max(1,Math.floor(maxPerMember/2)),stageObserver});
   const queryQueue=requestQueries?.queue||createPostgresQueryQueue();
   const handoffAdmin=createPostgresSessionHandoffs(store,{gate:sessionHandoffs,readStore:queryStore,queryQueue,clock,isStopping:()=>stopping,validateTarget:async(account,model,signal)=>{if(!model)return true;const transport=await transportForAccount(account);if(typeof transport.models!=='function')return false;const models=await transport.models({binary:codexBinary,home:account.auth_mode==='openai_api'?account.id:account.home,signal});return models.some(item=>item.slug===model);}});
-  const queries=requestQueries||createPostgresRequestQueries(queryStore,{clock,queryQueue,businessOutcomes:true});
+  const queries=requestQueries||createPostgresRequestQueries(queryStore,{clock,queryQueue,businessOutcomes:true,readInputPreviews:typeof recordingReader?.previews==='function'?ids=>recordingReader.previews(ids):undefined});
   const adminRouter=createPostgresRouter(store,{clock,isStopping:()=>stopping,extraRuntime}),readRouter=createPostgresRouter(queryStore,{clock});
   const states=createPostgresStateQueries(queryStore,{clock,encryptionKey:keyEncryptionKey,queryQueue,balancingReader:at=>readRouter.readView({at})});
   const sessionAdmin=createPostgresSessionAdmin(store,{clock,preparation,isPreparing:memberId=>preparing.has(memberId),isStopping:()=>stopping});

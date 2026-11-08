@@ -7,7 +7,7 @@ import {typeStatisticsConditions} from './postgres-type-statistics.mjs';
 const invalid=()=>{throw new AppError(400,'请求分页快照已失效，请刷新列表','invalid_request_snapshot');};
 const encode=value=>Buffer.from(JSON.stringify(value)).toString('base64url');
 function cursor(value){try{if(typeof value!=='string'||value.length>2048||!/^[A-Za-z0-9_-]+$/.test(value))invalid();return JSON.parse(Buffer.from(value,'base64url'));}catch{invalid();}}
-export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs=3600000,maxSnapshots=4096,maxConcurrent=2,maxQueued=8,queueTimeoutMs=15000,queryQueue,businessOutcomes=false}={}){
+export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs=3600000,maxSnapshots=4096,maxConcurrent=2,maxQueued=8,queueTimeoutMs=15000,queryQueue,businessOutcomes=false,readInputPreviews}={}){
   if(typeof businessOutcomes!=='boolean'||!Number.isSafeInteger(snapshotTtlMs)||snapshotTtlMs<60000||snapshotTtlMs>86400000||!Number.isInteger(maxSnapshots)||maxSnapshots<8||maxSnapshots>65536||!Number.isInteger(maxConcurrent)||maxConcurrent<1||maxConcurrent>8||!Number.isInteger(maxQueued)||maxQueued<0||maxQueued>64||!Number.isInteger(queueTimeoutMs)||queueTimeoutMs<100||queueTimeoutMs>60000)throw new AppError(503,'管理查询资源配置无效','query_configuration');
   const queue=queryQueue||createPostgresQueryQueue({maxConcurrent,maxQueued,queueTimeoutMs});
   async function scope(query,at){
@@ -38,8 +38,8 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
       p.model_source projected_source,p.revision projected_revision,v.id IS NOT NULL book_exists,${fields.map(f=>'p.'+f+'_atoms::text q_'+f).join(',')}
       FROM harbor.requests r LEFT JOIN harbor.members m ON m.id=r.member_id LEFT JOIN harbor.accounts a ON a.id=r.account_id${joins}${where}${seek}
       ORDER BY r.started DESC,r.id DESC LIMIT ${limit}${query.cursor?'':' OFFSET $'+values.length}`,...values);
-    const selected=rows.slice(0,query.pageSize),last=selected.at(-1);
-    return {pagination:{page,pageSize:query.pageSize,total,totalPages,cursorMode:!!query.cursor,nextCursor:rows.length>query.pageSize?encode({snapshot,started:last.started,id:last.id}):null},rows:selected.map(r=>decorate(r,window.start))};
+    const selected=rows.slice(0,query.pageSize),last=selected.at(-1),previews=readInputPreviews?await readInputPreviews(selected.map(row=>row.id)):null;
+    return {pagination:{page,pageSize:query.pageSize,total,totalPages,cursorMode:!!query.cursor,nextCursor:rows.length>query.pageSize?encode({snapshot,started:last.started,id:last.id}):null},rows:selected.map(r=>({...decorate(r,window.start),...previews?.get(r.id)}))};
   }
   async function statistics(query,scope){
     const rows=await store.all(`WITH data AS (

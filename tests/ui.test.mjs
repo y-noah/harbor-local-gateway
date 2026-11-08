@@ -1119,11 +1119,19 @@ test('返回请求明细保留筛选页码与快照，主动刷新重新开始',
 });
 
 
-test('请求详情区分请求参数与费用口径，列表只展示采集状态而不读取正文',async()=>{
+test('请求详情区分请求参数与费用口径，列表不另行读取正文',async()=>{
  let reads=0;const page=await ui(()=>{reads++;return response({});});const row={id:'metadata',started:1,ended:2,status:'ok',source_channel:'responses',effort:'high',service_tier:'auto',upstream_request_id:'req_synthetic',recording_state:'partial'};
  const detail=page.run('phaseDetail('+JSON.stringify(row)+')');assert.match(detail,/上游请求编号：req_synthetic/);assert.match(detail,/接口通道：responses/);assert.match(detail,/请求推理强度：high/);assert.match(detail,/请求服务档位：auto/);assert.doesNotMatch(detail,/实际.*档位/);
  assert.match(page.run('requestTable('+JSON.stringify([row])+')'),/部分缺失/);assert.equal(reads,0);
  for(const [state,label] of Object.entries({complete:'采集完成',pending:'采集中',disabled:'未启用正文采集',historical:'历史记录未保存正文',expired:'正文已过保留期',truncated:'已截断'}))assert.ok(page.run('requestTable('+JSON.stringify([{...row,recording_state:state}])+')').includes(label));
  const old=page.run('phaseDetail({id:"old",started:1})');assert.match(old,/上游请求编号：未记录/);assert.match(old,/请求推理强度：未记录/);assert.match(old,/请求服务档位：未记录/);
  const escaped=page.run('phaseDetail('+JSON.stringify({...row,effort:'<high>',service_tier:'<tier>',source_channel:'<channel>'})+')');assert.match(escaped,/&lt;high&gt;/);assert.match(escaped,/&lt;tier&gt;/);assert.match(escaped,/&lt;channel&gt;/);
+});
+
+test('请求列表展示已返回的输入摘要并转义，缺失和过期不伪造正文',async()=>{
+ let reads=0;const page=await ui(()=>{reads++;return response({});});
+ const row={id:'preview',started:1,ended:2,status:'ok',input_preview:'<img src=x onerror="bad()">输入',input_preview_state:'uncertain'};
+ const html=page.run('requestTable('+JSON.stringify([row])+')');assert.match(html,/request-input-preview/);assert.match(html,/&lt;img/);assert.doesNotMatch(html,/<img/);assert.match(html,/本轮识别不确定/);assert.equal(reads,0);
+ for(const [state,label] of Object.entries({unavailable:'无输入摘要',expired:'摘要已过期',unreadable:'摘要暂不可读'}))assert.ok(page.run('requestPreview('+JSON.stringify({...row,input_preview:null,input_preview_state:state})+')').includes(label));
+ assert.equal(page.run('requestPreview({})'),'');assert.equal(reads,0);
 });
