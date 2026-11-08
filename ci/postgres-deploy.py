@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import tempfile
 import time
@@ -215,14 +216,15 @@ def image_proof_content(api,image,common):
     labels=(candidate or {}).get('Config',{}).get('Labels',{})
     if labels.get('com.harbor.ci-validation-only')=='true' or labels.get('com.harbor.storage.postgres')!=CONTRACT or labels.get('com.harbor.postgres-preflight')!='v1' or labels.get('com.harbor.extra-usage-dispatch')!=EXTRA_USAGE_DISPATCH_CONTRACT or labels.get('org.opencontainers.image.revision')!=image.rsplit(':',1)[-1]:raise ValueError('Candidate does not provide the PostgreSQL image capability')
     stack=api['STACK']
-    check_name=api['NAME']+'-postgres-check'
+    nonce=secrets.token_hex(16)
+    check_name=api['NAME']+'-postgres-check-'+nonce
     if container_inspection(api,check_name,[]):raise ValueError('PostgreSQL preflight container requires administrator inspection')
-    args=['run','--rm','--name',check_name,'--label','com.aistrong.project='+api['NAME'],'--label','com.harbor.preflight=true','--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=64m',*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data,readonly','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime,readonly',image,'node','/app/ci/postgres-preflight.mjs']
+    args=['run','--rm','--name',check_name,'--label','com.aistrong.project='+api['NAME'],'--label','com.harbor.preflight=true','--label','com.harbor.preflight-nonce='+nonce,'--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=64m',*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data,readonly','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime,readonly',image,'node','/app/ci/postgres-preflight.mjs']
     try:
         value=json.loads(api['docker'](*args,timeout=timeout).stdout)
     finally:
         check=container_inspection(api,check_name,[])
-        if check and check.get('Image')==candidate.get('Id') and check.get('Config',{}).get('Image')==image and check.get('Config',{}).get('Labels',{}).get('com.harbor.preflight')=='true':api['docker']('rm','-f',check_name,check=False,timeout=10)
+        if check and check.get('Name')=='/'+check_name and check.get('Image')==candidate.get('Id') and check.get('Config',{}).get('Image')==image and check.get('Config',{}).get('Labels',{}).get('com.harbor.preflight')=='true' and check['Config']['Labels'].get('com.aistrong.project')==api['NAME'] and check['Config']['Labels'].get('com.harbor.preflight-nonce')==nonce:api['docker']('rm','-f',check_name,check=False,timeout=10)
     if not isinstance(value,dict) or value.get('contract')!=CONTRACT or value.get('extra_usage_dispatch_contract')!=EXTRA_USAGE_DISPATCH_CONTRACT or value.get('storage_verified') is not True or value.get('credentials_verified') is not True or value.get('device_tls_verified') is not True or value.get('revision')!=image.rsplit(':',1)[-1] or any(not isinstance(value.get(key),str) or not re.fullmatch('[a-f0-9]{64}',value[key]) for key in ['schema_digest','database_digest','source_digest','device_ca_digest']):raise ValueError('Candidate PostgreSQL preflight proof is invalid')
     requested={key:int(next(item.split('=',1)[1] for item in common if item.startswith(name+'='))) for key,name in SHUTDOWN_ENV.items()}
     if 'shutdown' not in value:raise ShutdownContractUnsupported('Validated legacy PostgreSQL image has no shutdown contract')

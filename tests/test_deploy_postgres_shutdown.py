@@ -200,7 +200,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
    self.prepare(directory);api,calls,state=self.api(directory);state[base.NAME]['State'].update(Running=False,Status='exited');original=api['inspect_container'];checks=0
    def inspect(name):
     nonlocal checks
-    if name==base.NAME+'-postgres-check':
+    if name.startswith(base.NAME+'-postgres-check-'):
      checks+=1
      if checks==3:raise RuntimeError('synthetic old preflight inspection failure')
     return original(name)

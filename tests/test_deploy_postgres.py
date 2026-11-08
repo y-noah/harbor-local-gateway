@@ -13,6 +13,38 @@ spec=importlib.util.spec_from_file_location('wrapper',ROOT/'ci/deploy-wrapper.py
 IMAGE='registry.test/harbor/gateway:'+40*'a';OLD='registry.test/harbor/gateway:'+40*'b';NAME='harbor-local-gateway';CONFIG={'storage_engine':'postgres','port':43127,'origin':'http://gateway.test:43127','device_tls_port':43128,'device_origin':'https://gateway.test:43128'}
 PROOF={'revision':40*'a','contract':pg.CONTRACT,'extra_usage_dispatch_contract':pg.EXTRA_USAGE_DISPATCH_CONTRACT,'schema_digest':64*'c','database_digest':64*'d','source_digest':64*'e','storage_verified':True,'credentials_verified':True,'device_tls_verified':True,'device_ca_digest':64*'1','shutdown':{'contract':pg.SHUTDOWN_CONTRACT,**pg.SHUTDOWN_DEFAULTS}}
 class PostgreSQLDeploymentTests(unittest.TestCase):
+ def test_preflight_names_are_unique_and_do_not_touch_previous_runs(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);old_name=NAME+'-postgres-check';state[old_name]={'Id':'stale-preflight','State':{'Status':'removing'}};inspections=[];original=api['inspect_container']
+   def inspect(name):inspections.append(name);return original(name)
+   api['inspect_container']=inspect
+   pg.image_proof(api,IMAGE,common);pg.image_proof(api,IMAGE,common)
+   names=[args[args.index('--name')+1] for args in calls if args[0]=='run']
+   self.assertEqual(len(set(names)),2)
+   for name in names:self.assertRegex(name,'^'+NAME+'-postgres-check-[a-f0-9]{32}$')
+   self.assertNotIn(old_name,inspections);self.assertEqual(state[old_name]['Id'],'stale-preflight');self.assertFalse(any(args[0]=='rm' for args in calls))
+ def test_preflight_cleanup_requires_exact_name_image_project_and_nonce(self):
+  for variant in ['owned','name','image-id','image-reference','project','nonce','preflight']:
+   with self.subTest(variant=variant),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);original=api['docker'];names=[]
+    def docker(*args,**kwargs):
+     if args[0]=='run' and '--rm' in args:
+      name=args[args.index('--name')+1];names.append(name);labels=dict(args[i+1].split('=',1) for i,value in enumerate(args[:-1]) if value=='--label');row={'Name':'/'+name,'Image':state[IMAGE]['Id'],'Config':{'Image':IMAGE,'Labels':labels}}
+      if variant=='name':row['Name']='/another-preflight'
+      elif variant=='image-id':row['Image']='sha256:'+'0'*64
+      elif variant=='image-reference':row['Config']['Image']=OLD
+      elif variant=='project':labels['com.aistrong.project']='another-service'
+      elif variant=='nonce':labels['com.harbor.preflight-nonce']='0'*32
+      elif variant=='preflight':labels['com.harbor.preflight']='false'
+      state[name]=row
+     return original(*args,**kwargs)
+    api['docker']=docker;pg.image_proof(api,IMAGE,common)
+    removals=[args for args in calls if args[0]=='rm'];self.assertEqual(removals,[('rm','-f',names[0])] if variant=='owned' else [])
+ def test_preflight_nonce_collision_never_runs_or_removes_existing_container(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'),patch.object(pg.secrets,'token_hex',return_value='0'*32):
+   self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);state[NAME+'-postgres-check-'+'0'*32]={'Id':'existing'}
+   with self.assertRaises(pg.ShutdownUnconfirmed):pg.image_proof(api,IMAGE,common)
+   self.assertEqual(calls,[])
  def test_preflight_budget_defaults_and_rejects_invalid_values_before_docker(self):
   self.assertEqual(pg.preflight_timeout_seconds(),30)
   for value in [30,180,300]:self.assertEqual(pg.preflight_timeout_seconds(value),value)
