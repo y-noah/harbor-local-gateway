@@ -18,7 +18,7 @@ export function createPostgresRecordingContextQueries(store,{crypto,clock=Date.n
   const rows=await store.all(`SELECT o.id object_id,o.kind context_kind,p.ordinal,p.payload_cipher,d.source_revision,d.format_version,d.indexed_at,w.revision current_revision,source.*
    FROM harbor.recording_context_document_parts p JOIN harbor.recording_context_documents d ON d.object_id=p.object_id
    JOIN harbor.recording_context_objects o ON o.id=d.object_id LEFT JOIN harbor.recording_context_work w ON w.object_id=o.id
-   JOIN LATERAL (SELECT r.id request_id,r.member_id,r.session_id,r.started,r.model,r.billing_model,r.usage_type_id,r.usage_type_name${devices?',r.device_id,r.device_name,r.device_system,r.device_auth_state':''}
+   JOIN LATERAL (SELECT r.id request_id,r.member_id,r.session_id,r.started,r.model,r.billing_model,r.usage_type_id,r.usage_type_code,r.usage_type_name,r.usage_type_version,LEAST(s.expires_at,c.expires_at) expires_at${devices?',r.device_id,r.device_name,r.device_system,r.device_auth_state':''}
     FROM harbor.recording_context_references ref JOIN harbor.recording_context_snapshots s ON s.request_id=ref.request_id
     JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id LEFT JOIN harbor.sessions session ON session.id=r.session_id
     WHERE ref.object_id=o.id AND s.scope_digest=o.scope_digest AND s.key_version=o.key_version

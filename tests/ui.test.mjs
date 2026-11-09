@@ -1264,3 +1264,29 @@ test('账号轻视图返回请求第2页保留snapshot和cursor，主动刷新�
  assert.ok(paths.length>0);
  await page.run('refresh()');assert.equal(paths.at(-1).get('page'),'1');assert.equal(paths.at(-1).has('snapshot'),false);assert.equal(paths.at(-1).has('cursor'),false);
 });
+
+const enableContextUi=page=>page.run('state.capabilities.recordingContext=true;state.capabilities.recordingContextSearch=true;');
+const contextPage=(patch={})=>({state:'complete',components:1,expiresAt:Date.now()+3600000,parts:[{component:1,part:1,parts:1,objectId:'synthetic-context',kind:'history',text:JSON.stringify({text:'<img src=x onerror=alert(1)>上下文'})}],next:{component:1,part:1},hasMore:false,...patch});
+test('上下文入口由能力声明控制，默认不读取，查询不发送前端source字段',async()=>{
+ const paths=[],page=await ui(path=>{paths.push(path);return response(recordingSearchPage({items:[{request_id:'request-context',object_id:'object',association:'shared_context',context_kind:'history',snippet:'上下文命中',expires_at:Date.now()+10000}]}));});prepareRecordingAdmin(page);page.run('render()');assert.ok(!page.node('#content').innerHTML.includes('name="source"'));enableContextUi(page);page.run('render()');assert.ok(page.node('#content').innerHTML.includes('上下文与指令'));assert.deepEqual(paths,[]);
+ page.run('recordingAdminFilters.source="context";recordingAdminFilters.q="上下文";');await page.run('loadRecordingAdminQuery(true)');assert.ok(paths[0].startsWith('/api/admin/recordings/context/search?'));assert.equal(new URL(paths[0],'http://localhost').searchParams.has('source'),false);assert.match(page.node('#content').innerHTML,/查看上下文/);
+ page.run('openRecordingSession("session-from-context")');assert.equal(page.run('recordingAdminFilters.source'),'current');assert.equal(paths.length,1);
+});
+test('上下文分块分页可按顺序拼接并转义，自动刷新不读取上下文',async()=>{
+ const text=JSON.stringify({text:'中文<script>不得执行</script>'}),calls=[],page=await ui(path=>{calls.push(path);return response(calls.length===1?contextPage({parts:[{component:1,part:1,parts:2,objectId:'o',kind:'history',text:text.slice(0,10)}],next:{component:1,part:1},hasMore:true}):contextPage({parts:[{component:1,part:2,parts:2,objectId:'o',kind:'history',text:text.slice(10)}],next:{component:1,part:2}}));});prepareRecordingAdmin(page);enableContextUi(page);
+ await page.run('showRecordingDocument({request_id:"request-context",association:"shared_context",started:1})');assert.match(page.node('#recording-document-content').innerHTML,/分段未读完/);await page.click('recording-document-more');assert.equal(page.run('recordingDocumentView.items.length'),1);assert.match(page.node('#recording-document-content').innerHTML,/&lt;script&gt;/);assert.ok(!page.node('#recording-document-content').innerHTML.includes('<script>'));assert.equal(new URL(calls[1],'http://localhost').searchParams.get('after_part'),'1');
+ for(const timer of page.intervals)timer.fn();await new Promise(setImmediate);assert.equal(calls.length,2);
+});
+test('上下文页异常不污染已加载前缀，关闭弹窗后迟到结果不写回',async()=>{
+ const prefix='{"text":"前缀',page=await ui(()=>response(contextPage({parts:[{component:1,part:1,parts:2,objectId:'o',kind:'history',text:prefix}],hasMore:true})));prepareRecordingAdmin(page);enableContextUi(page);await page.run('showRecordingDocument({request_id:"context-request",association:"shared_context"})');await page.click('recording-document-more');assert.equal(page.run('recordingDocumentView.items[0].text'),prefix);assert.match(page.node('#recording-document-content').innerHTML,/不连续/);
+ let release;const late=await ui(()=>new Promise(resolve=>release=()=>resolve(response(contextPage()))));prepareRecordingAdmin(late);enableContextUi(late);const pending=late.run('showRecordingDocument({request_id:"late",association:"shared_context"})');await new Promise(setImmediate);await late.click('close');release();await pending;assert.equal(late.run('recordingDocumentView'),null);
+});
+test('本轮与上下文按需切换，过期后立即清除内容且不自动重读',async()=>{
+ const calls=[],page=await ui(path=>{calls.push(path);return response(path.includes('/context?')?contextPage():recordingDocumentPage());});prepareRecordingAdmin(page);enableContextUi(page);await page.run('showRecordingDocument({id:"request-one"})');assert.equal(calls.length,1);assert.ok(!calls[0].includes('/context?'));await page.click('recording-document-source','context');assert.equal(calls.length,2);assert.match(calls[1],/\/requests\/request-one\/context\?/);assert.match(page.node('#recording-document-content').innerHTML,/历史消息/);
+ page.run('recordingDocumentView.expires=Date.now()-1;renderRecordingDocument(recordingDocumentView)');assert.equal(page.run('recordingDocumentView.items.length'),0);assert.match(page.node('#recording-document-content').innerHTML,/已过期/);assert.ok(!page.node('#recording-document-content').innerHTML.includes('onerror'));
+ await page.click('recording-document-source','current');assert.equal(calls.length,3);assert.ok(!calls[2].includes('/context?'));
+});
+test('上下文组件数量缺失不能显示为已完整加载，空关键词不发起请求',async()=>{
+ const paths=[],page=await ui(path=>{paths.push(path);return response(contextPage({components:2}));});prepareRecordingAdmin(page);enableContextUi(page);page.run('recordingAdminFilters.source="context";recordingAdminFilters.session="session";');await page.run('loadRecordingAdminQuery(true)');assert.deepEqual(paths,[]);assert.match(page.node('#content').innerHTML,/上下文检索请输入关键词/);
+ await page.run('showRecordingDocument({request_id:"request",association:"shared_context"})');assert.equal(page.run('recordingDocumentView.items.length'),0);assert.match(page.node('#recording-document-content').innerHTML,/组件数量不完整/);assert.ok(!page.node('#recording-document-content').innerHTML.includes('已加载 1／2'));
+});

@@ -77,7 +77,7 @@ test('真实Worker：24结构自动接索引，低空间不消耗尝试次数，
 test('真实PG：上下文检索按共享对象去重、按实际来源筛选，到期和归属变化立即不可见',integration,async t=>{
  const f=await fixture(t),content={text:'检索精确代码 readFile("业务.json")'},first=await f.request(content),second=await f.request(content);await f.backend.schedule();await f.run();
  const query=extra=>recordingQuery(new URLSearchParams({q:'readFile("业务.json")',...extra}),{clock:f.clock,search:true});
- let found=await f.backend.contextQueries.search(query());assert.equal(found.items.length,1);assert.equal(found.items[0].association,'shared_context');assert.equal(found.association,'shared_object_once_per_part');
+ let found=await f.backend.contextQueries.search(query());assert.equal(found.items.length,1);assert.equal(found.items[0].association,'shared_context');assert.equal(found.association,'shared_object_once_per_part');assert.ok(Number.isSafeInteger(found.items[0].expires_at)&&found.items[0].expires_at>f.clock());assert.equal(Object.hasOwn(found.items[0],'usage_type_version'),true);
  const member=(await f.store.get('SELECT member_id FROM harbor.requests WHERE id=$1',first)).member_id;found=await f.backend.contextQueries.search(query({member}));assert.equal(found.items.length,1);
  assert.equal((await f.backend.contextQueries.search(query({model:'not-a-model'}))).items.length,0);
  await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock()-1,first);assert.equal((await f.backend.contextQueries.search(query())).items.length,1);
