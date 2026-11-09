@@ -18,7 +18,7 @@ export function currentInput(payload,{maxEvents=256,maxNodes=1024}={}){
   const events=[];let unsupportedItems=0,unsupportedContentParts=0,truncated=start>0&&input.length-start===maxEvents||nodes>=maxNodes;
   outer:for(let itemIndex=start;itemIndex<input.length;itemIndex++){const item=input[itemIndex];
     if(resultTypes.has(item?.type)){
-      events.push({kind:'tool_result',content:{callId:item.call_id||null,output:item.output,...(item.type==='custom_tool_call_output'?{toolType:'custom_tool_call'}:{}),...(typeof item.name==='string'?{name:item.name}:{})}});continue;
+      events.push({kind:'tool_result',content:{callId:item.call_id||null,output:item.output,...(item.type==='custom_tool_call_output'?{toolType:'custom_tool_call'}:{}),...(typeof item.name==='string'?{name:item.name}:{}),...(typeof item.namespace==='string'?{namespace:item.namespace}:{})}});continue;
     }
     if(unknownToolResult(item)){unsupportedItems++;continue;}
     for(const part of textOf(item.content)){
@@ -164,7 +164,7 @@ export class ConversationCapture{
       if(event.kind==='user'){
         const text=filtered.parts[userIndex++]||'';if(text)this.sendText('user',{field:'input:'+(event.group??'0')+':'+position,position,mode:'append'},text,'client');
       }else if(event.kind==='tool_result'){
-        this.result('input-tool:'+(++this.inputSequence),{callId:event.content.callId,toolType:event.content.toolType||'function_call',...(typeof event.content.name==='string'?{name:event.content.name}:{})},event.content.output,'client');
+        this.result('input-tool:'+(++this.inputSequence),{callId:event.content.callId,toolType:event.content.toolType||'function_call',...(typeof event.content.name==='string'?{name:event.content.name}:{}),...(typeof event.content.namespace==='string'?{namespace:event.content.namespace}:{})},event.content.output,'client');
       }else this.send(event.kind,{...event.content,position},'client');
     }
     for(const [field,category] of [['unsupportedItems','items'],['unsupportedContentParts','contentParts']])for(let i=0;i<Math.min(this.maxFields,current[field]||0);i++)this.unsupportedItem(category,'input:'+i);
@@ -225,7 +225,7 @@ export class ConversationCapture{
     field.resultHash=hash;field.closed=true;field.hash=null;if(clipped)this.truncated=true;
   }
   toolMetadata(item,id,type){
-    return {item:id,toolType:type,callId:typeof item.call_id==='string'?item.call_id:null,...(typeof item.name==='string'?{name:item.name}:{})};
+    return {item:id,toolType:type,callId:typeof item.call_id==='string'?item.call_id:null,...(typeof item.name==='string'?{name:item.name}:{}),...(typeof item.namespace==='string'?{namespace:item.namespace}:{})};
   }
   item(item,index){
     if(this.closed||this.truncated)return;if(this.remainingNodes--<=0){this.truncated=true;return;}
@@ -255,8 +255,9 @@ export class ConversationCapture{
     const content=Array.isArray(item.content)?item.content:[];if(item.content!==undefined&&!Array.isArray(item.content))this.unsupportedItem('contentParts',key+':content');
     for(let i=0;i<content.length&&!this.truncated;i++){
       if(this.remainingNodes<=0){this.truncated=true;break;}this.remainingNodes--;const part=content[i];
-      if(part?.type==='output_text')this.complete(key+':'+i+':text','assistant',{item:id},part.text);
-      else if(part?.type==='refusal')this.complete(key+':'+i+':refusal','assistant',{item:id,refusal:true},part.refusal);
+      const metadata={item:id,...(typeof item.phase==='string'?{phase:item.phase}:{})};
+      if(part?.type==='output_text')this.complete(key+':'+i+':text','assistant',metadata,part.text);
+      else if(part?.type==='refusal')this.complete(key+':'+i+':refusal','assistant',{...metadata,refusal:true},part.refusal);
       else this.unsupportedItem('contentParts',key+':'+i);
     }
   }

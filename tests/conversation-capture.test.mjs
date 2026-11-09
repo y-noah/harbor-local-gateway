@@ -1,5 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+
+test('命名空间贯穿工具调用及回传，流式正文从终态补齐phase不重复正文',async()=>{
+ const {assembleRecording}=await import('../recording-search-index.mjs'),c=capture();
+ c.collector.input({input:[{type:'custom_tool_call_output',call_id:'previous',namespace:'functions',output:'previous result'}]});
+ c.collector.event({type:'response.output_item.done',output_index:0,item:{type:'custom_tool_call',id:'tool',call_id:'call',name:'exec',namespace:'functions',input:'synthetic command'}});
+ c.collector.event({type:'response.output_text.delta',output_index:1,item_id:'message',content_index:0,delta:'visible answer'});
+ c.collector.finish({output:[{type:'message',id:'message',role:'assistant',phase:'final',content:[{type:'output_text',text:'visible answer'}]}]});
+ const values=assembleRecording(c.events.map((event,index)=>({...event,sequence:index+1})));
+ assert.equal(values.find(item=>item.kind==='tool_call').metadata.namespace,'functions');assert.equal(values.find(item=>item.kind==='tool_result').metadata.namespace,'functions');
+ const answer=values.filter(item=>item.kind==='assistant');assert.equal(answer.length,1);assert.equal(answer[0].text,'visible answer');assert.equal(answer[0].metadata.phase,'final');
+});
 import {ConversationCapture,currentInput} from '../conversation-capture.mjs';
 import {redactRecordText,sanitizeRecord} from '../record-redaction.mjs';
 import {JsonRecordRedactor} from '../record-json.mjs';

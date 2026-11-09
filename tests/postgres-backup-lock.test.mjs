@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,rm,writeFile,rename,symlink,link,chmod,lstat} from 'node:fs/promises';
+import {mkdtemp,mkdir,rm,writeFile,rename,symlink,link,chmod,lstat,readFile,copyFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
@@ -45,3 +45,15 @@ test('private directory, mode and cancellation are enforced before callbacks run
  await writeFile(join(path,backupCoordinationFiles.lock),'',{mode:0o640});await assert.rejects(withBackupArchiveLock({directory:path},()=>true),{code:'backup_coordination_lock_changed'});
  const cancellation=new AbortController(),reason=Error('synthetic-lock-cancellation');cancellation.abort(reason);await assert.rejects(withBackupArchiveLock({directory:path,signal:cancellation.signal},()=>assert.fail('cancelled callback ran')),error=>error===reason);
 });
+
+ test('备份协调身份覆盖上下文恢复依赖，单个元信息模块变化使旧身份失效',async t=>{
+ const path=await directory(t),original=new URL('../postgres-backup-lock.mjs',import.meta.url),source=await readFile(original,'utf8');
+ const names=[...source.matchAll(/'([a-zA-Z0-9/.-]+\.mjs)'/g)].map(match=>match[1]);
+ for(const name of new Set(names)){await mkdir(join(path,name,'..'),{recursive:true,mode:0o700});await copyFile(new URL('../'+name,import.meta.url),join(path,name));}
+ // Reuse the real artifact helpers without copying their unrelated dependency tree.
+ await writeFile(join(path,'migration-artifacts.mjs'),'export * from '+JSON.stringify(new URL('../migration-artifacts.mjs',import.meta.url).href)+';');
+ const module=await import(new URL('file://'+join(path,'postgres-backup-lock.mjs')).href),before=await module.backupCoordinationCodeDigest();
+ for(const name of ['recording-request-context.mjs','recording-text-metadata.mjs','recording-attachment.mjs','recording-literal.mjs','conversation-capture.mjs']){
+  const target=join(path,name),previous=await readFile(target);await writeFile(target,Buffer.concat([previous,Buffer.from('\n// synthetic identity change\n')]));assert.notEqual(await module.backupCoordinationCodeDigest(),before,name);await writeFile(target,previous);assert.equal(await module.backupCoordinationCodeDigest(),before);
+ }
+ });

@@ -2,12 +2,13 @@ import {sanitizeRecord,recordRedactionSummary,redactRecordParts,restoreAuthentic
 import {safeToolOutput} from './conversation-capture.mjs';
 import {recordingAttachment} from './recording-attachment.mjs';
 import {recordingLiteral} from './recording-literal.mjs';
+import {recordingTextMetadata,finalizeRecordingTokens} from './recording-text-metadata.mjs';
 
 const media=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
-const itemTypes=new Set(['message','function_call','function_call_output','custom_tool_call','custom_tool_call_output','item_reference','compaction']);
+const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','item_reference','compaction']);
 const textTypes=new Set(['text','input_text','output_text','summary_text','refusal']);
-const scalarFields=new Set(['role','id','call_id','name','status','channel','tool_call_id','input','arguments']);
-const itemFields={function_call:['type','id','call_id','name','arguments','status'],custom_tool_call:['type','id','call_id','name','input','status'],function_call_output:['type','id','call_id','name','output','status'],custom_tool_call_output:['type','id','call_id','name','output','status'],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
+const scalarFields=new Set(['role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments']);
+const itemFields={additional_tools:['type','id','role','tools'],function_call:['type','id','call_id','name','namespace','arguments','status'],custom_tool_call:['type','id','call_id','name','namespace','input','status'],function_call_output:['type','id','call_id','name','namespace','output','status'],custom_tool_call_output:['type','id','call_id','name','namespace','output','status'],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
 const schemaBranches=new Set(['allOf','anyOf','oneOf','not','items','prefixItems','contains','additionalProperties','unevaluatedProperties','unevaluatedItems','propertyNames','if','then','else','additionalItems','contentSchema']);
 export const requestContextReasons=Object.freeze(['invalid_payload','unsupported_tools','unsupported_input','unsupported_instructions','ambiguous_input','unsupported_content','unsupported_field','schema_name_collision','size_limit']);
 
@@ -17,16 +18,17 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
   if(!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxComponents)||maxComponents<1||!Number.isSafeInteger(maxNodes)||maxNodes<1)throw TypeError('Invalid request context budget');
   const redactions=new Set(),onRedact=category=>redactions.add(category);
   const components=[],reasons=new Set();let bytes=2,nodes=maxNodes,opaqueReasoningExcluded=0;
-  let attachmentBytes=maxBytes;
+  let attachmentBytes=maxBytes,tokenSequence=[];
   const attachment=value=>recordingAttachment(value,{maxBytes:maxBytes-bytes,onTruncate:cut,onRedact,maxContentBytes:attachmentBytes,onInspect:count=>{attachmentBytes=Math.max(0,attachmentBytes-count);},fingerprint:attachmentFingerprint});
-  const cut=()=>{reasons.add('size_limit');return '[已截断]';};
+  const cut=()=>{tokenSequence.incomplete=true;reasons.add('size_limit');return '[已截断]';};
   const literal=(value,depth)=>depth>24?cut():recordingLiteral(value,{maxBytes:maxBytes-bytes,maxDepth:24-depth,onNodes:count=>{nodes-=count;return nodes>=0;},onTruncate:cut,onRedact});
   const visible=(value,depth=0,protocol=true,slot=null,sensitiveDefinition=false,schema=false)=>{
     if(--nodes<0||depth>24)return cut();
+    if(schema==='tools'&&!Array.isArray(value)){reasons.add('unsupported_tools');return '[未支持的工具定义已省略]';}
     if(protocol&&(slot==='function'&&(!value||typeof value!=='object'||Array.isArray(value))||slot==='conversation'&&value!==null&&typeof value!=='string'&&(typeof value!=='object'||Array.isArray(value)))){reasons.add('unsupported_content');return '[未支持的上下文结构已省略]';}
     if(value instanceof ArrayBuffer||ArrayBuffer.isView(value)){onRedact('attachment_data');return {type:'binary',bytes:value.byteLength,content:'[附件数据已省略]'};}
     if(Array.isArray(value)){
-      const result=[];for(const child of value){if(nodes<=0){result.push(cut());break;}if(protocol&&slot&&(!child||typeof child!=='object'||Array.isArray(child))){nodes--;reasons.add('unsupported_content');result.push({content:'[未支持的上下文结构已省略]'});continue;}result.push(visible(child,depth+1,protocol,slot,sensitiveDefinition,schema));}
+      const result=[];for(const child of value){if(nodes<=0){result.push(cut());break;}if((protocol&&slot||schema==='tools')&&(!child||typeof child!=='object'||Array.isArray(child))){nodes--;reasons.add(schema==='tools'?'unsupported_tools':'unsupported_content');result.push({content:'[未支持的上下文结构已省略]'});continue;}result.push(visible(child,depth+1,protocol,slot,sensitiveDefinition,schema==='tools'?'envelope':schema));}
       const positions=[],texts=[];for(let i=0;i<result.length;i++){const field=result[i]?.type==='refusal'?'refusal':'text';if(textTypes.has(result[i]?.type)&&typeof result[i][field]==='string'){positions.push([i,field]);texts.push(result[i][field]);}}
       const filtered=redactRecordParts(texts,{maxBytes,maxParts:maxNodes,onTruncate:cut,onRedact}).parts;
       for(let i=0;i<positions.length;i++){const [position,field]=positions[i];result[position]={...result[position],[field]:filtered[i]??''};}return result;
@@ -42,12 +44,14 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
       return {type:'reasoning',...(typeof value.id==='string'?{id:value.id}:{}),...(Array.isArray(value.summary)?{summary:visible(value.summary,depth+1,true,'summary')}:{})};
     }
     if(protocol&&['content','summary'].includes(slot)&&!textTypes.has(value.type)){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
-    const slotFields=slot==='function'?['name','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','function','mode','tools']:null;
-    const fields=slotFields||itemFields[value.type]||(value.role!==undefined||value.type==='message'?['type','role','id','content','name','status','channel',...(value.role==='assistant'?['tool_calls','refusal']:[]),...(value.role==='tool'?['tool_call_id']:[])]:null);
+    if(protocol&&textTypes.has(value.type)&&typeof value[value.type==='refusal'?'refusal':'text']==='string'&&value[value.type==='refusal'?'refusal':'text'].length&&(value.type!=='output_text'||!Array.isArray(value.logprobs)||!value.logprobs.length))tokenSequence.incomplete=true;
+    const slotFields=slot==='function'?['name','namespace','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','namespace','function','mode','tools']:null;
+    const fields=slotFields||itemFields[value.type]||(value.role!==undefined||value.type==='message'?['type','role','id','content','name','status','channel','phase',...(value.role==='assistant'?['tool_calls','refusal']:[]),...(value.role==='tool'?['tool_call_id']:[])]:null);
     if(protocol&&!slotFields&&value.type!==undefined&&!itemTypes.has(value.type)&&!textTypes.has(value.type)&&value.type!=='function'){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     const result=Object.create(null);
     const messagePositions=[],messageTexts=[];
     if(protocol&&value.role==='assistant'&&typeof value.refusal==='string'){
+      if(value.refusal.length)tokenSequence.incomplete=true;
       if(typeof value.content==='string'){messagePositions.push({field:'content'});messageTexts.push(value.content);}
       else if(Array.isArray(value.content))for(let index=0;index<value.content.length;index++){
         if(--nodes<0){cut();break;}const part=value.content[index],field=part?.type==='refusal'?'refusal':'text';
@@ -62,10 +66,17 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
       // Never retain opaque compaction/reasoning blobs, even as redacted data.
       if(protocol&&['encrypted_content','reasoning_content','thinking'].includes(key)){opaqueReasoningExcluded++;continue;}
       if(protocol&&fields&&!fields.includes(key)){reasons.add('unsupported_field');continue;}
-      if(protocol&&slotFields&&['id','type','name','arguments','mode'].includes(key)&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
-      if(protocol&&(value.role!==undefined||itemTypes.has(value.type))&&scalarFields.has(key)&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
+      const nullableMetadata=['phase','namespace'].includes(key)&&value[key]===null;
+      if(protocol&&slotFields&&['id','type','name','namespace','arguments','mode'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
+      if(protocol&&(value.role!==undefined||itemTypes.has(value.type))&&scalarFields.has(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
       if(protocol&&key==='tool_calls'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
-      if(protocol&&textTypes.has(value.type)&&!['type',value.type==='refusal'?'refusal':'text'].includes(key)){reasons.add('unsupported_field');continue;}
+      if(protocol&&textTypes.has(value.type)&&!['type',value.type==='refusal'?'refusal':'text',...(value.type==='output_text'?['annotations','logprobs']:[])].includes(key)){reasons.add('unsupported_field');continue;}
+      if(protocol&&value.type==='output_text'&&['annotations','logprobs'].includes(key)){
+        result[key]=recordingTextMetadata(key,value[key],{maxBytes:maxBytes-bytes,onNodes:count=>{nodes-=count;return nodes>=0;},onTruncate:cut,onRedact,tokenSequence,expectedText:value.text,onUnsupported:reason=>reasons.add(reason)});continue;
+      }
+      if(protocol&&value.type==='additional_tools'&&key==='tools'){
+        result.tools=visible(value.tools,depth+1,false,null,false,'tools');continue;
+      }
       if(protocol&&textTypes.has(value.type)&&['text','refusal'].includes(key)&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='refusal'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='content'&&value[key]!==null&&typeof value[key]!=='string'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
@@ -84,7 +95,7 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
         Object.defineProperty(result,key,{value:restoreAuthenticatedRecord(definitions),enumerable:true});continue;
       }
       const nextSlot=!protocol?null:['content','summary'].includes(key)?key:key==='tool_calls'?'tool_call':key==='function'?'function':key==='tools'&&slot==='tool_choice'?'tool_choice':key==='value'&&['conversation','tool_choice'].includes(value.source)?value.source:null;
-      const nextSchema=schema==='envelope'?['parameters','input_schema','schema'].includes(key)?'definition':['value','function','format'].includes(key)?'envelope':false:schema==='definition'&&schemaBranches.has(key)?'definition':false;
+      const nextSchema=schema==='envelope'?['parameters','input_schema','schema'].includes(key)?'definition':key==='tools'?'tools':['value','function','format'].includes(key)?'envelope':false:schema==='definition'&&schemaBranches.has(key)?'definition':false;
       if(schema==='definition'&&sensitiveDefinition&&['default','examples','const','enum'].includes(key))onRedact('sensitive_field');
       let child=schema==='definition'&&sensitiveDefinition&&['default','examples','const','enum'].includes(key)?'[已脱敏]':schema&&!nextSchema?literal(value[key],depth+1):visible(value[key],depth+1,protocol&&!['input','output','arguments'].includes(key),nextSlot,sensitiveDefinition,nextSchema);
       for(let index=0;index<messagePositions.length;index++){
@@ -99,7 +110,8 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
   const add=(kind,content)=>{
     if(components.length>=maxComponents||bytes>=maxBytes||nodes<=0){cut();return false;}
     // Sanitize before returning anything to a queue, cache, or persistence API.
-    const prepared=visible(content,0,kind!=='tool_schema',null,false,kind==='tool_schema'?'envelope':false);let budget=maxBytes-bytes,component,size;
+    tokenSequence=[];const envelope=kind==='tool_schema'&&content.source==='tools',prepared=visible(content,0,!envelope,null,false,envelope?'envelope':false);let budget=maxBytes-bytes,component,size;
+    finalizeRecordingTokens(tokenSequence,{maxBytes:budget,onTruncate:cut,onRedact});
     for(;;){
       const safe=sanitizeRecord(prepared,{maxBytes:budget,maxNodes,onTruncate:cut,onRedact});component={kind,content:safe};size=Buffer.byteLength(JSON.stringify(component))+(components.length?1:0);
       if(bytes+size<=maxBytes||budget===0)break;cut();budget=Math.floor(budget/2);
@@ -119,7 +131,7 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
       if(--nodes<0){cut();break;}
       const item=input[index];
       if(!item||typeof item!=='object'||Array.isArray(item)||!(itemTypes.has(item.type)||item.type==='reasoning'||['user','assistant','system','developer','tool'].includes(item.role))){reasons.add('unsupported_input');continue;}
-      if(!add(['system','developer'].includes(item.role)?'instruction':'context',{source,index,value:item}))break;
+      if(!add(item.type==='additional_tools'?'tool_schema':['system','developer'].includes(item.role)?'instruction':'context',{source,index,value:item}))break;
     }
   }else if(input!==undefined)reasons.add('unsupported_input');
   // Relationships are protocol evidence only; no inference about ancestry.

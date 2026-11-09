@@ -4,6 +4,32 @@ import {captureRequestContext} from '../recording-request-context.mjs';
 import {RecordingStore} from '../recording-store.mjs';
 import {randomBytes} from 'node:crypto';
 
+test('内联工具目录保留来源与命名空间，嵌套schema仍只保留定义而不泄漏敏感默认值',()=>{
+ const input=[{type:'additional_tools',id:'catalog',role:'developer',tools:[{type:'namespace',name:'functions',tools:[{type:'function',name:'lookup',parameters:{type:'object',properties:{api_key:{type:'string',default:'private-default'},query:{type:'string'}}}},{type:'custom',name:'exec',format:{type:'grammar',syntax:'lark',definition:'start: "ok"'}}]}]},
+ {type:'message',role:'assistant',phase:'commentary',content:[{type:'output_text',text:'准备查询',annotations:[],logprobs:[]}]},
+ {type:'custom_tool_call',id:'tool',call_id:'call',name:'exec',namespace:'functions',input:'合成命令'},
+ {type:'custom_tool_call_output',call_id:'call',namespace:'functions',output:'合成结果'}];
+ const original=structuredClone(input),view=captureRequestContext({input,tool_choice:{type:'function',name:'lookup',namespace:'functions'}});
+ assert.equal(view.state,'complete');assert.equal(view.components[0].kind,'tool_schema');assert.equal(view.components[0].content.source,'input');assert.equal(view.components[0].content.index,0);
+ const catalog=view.components[0].content.value;assert.equal(catalog.type,'additional_tools');assert.equal(catalog.tools[0].tools[0].parameters.properties.api_key.type,'string');assert.ok(!JSON.stringify(view).includes('private-default'));assert.deepEqual(input,original);
+ assert.equal(view.components[1].content.value.phase,'commentary');assert.equal(view.components[2].content.value.namespace,'functions');assert.equal(view.components[3].content.value.namespace,'functions');assert.equal(view.components.at(-1).content.value.namespace,'functions');
+ for(const tools of [null,{},[null],[1]])assert.equal(captureRequestContext({input:[{type:'additional_tools',role:'developer',tools}]}).state,'incomplete');
+ for(const input of [[{role:'assistant',phase:{data:'private-phase'},content:'x'}],[{type:'custom_tool_call',call_id:'c',namespace:{data:'private-namespace'},input:'x'}]]){const result=captureRequestContext({input});assert.equal(result.state,'incomplete');assert.ok(!JSON.stringify(result).includes('private-'));}
+ const nullable=[{role:'assistant',phase:null,content:[{type:'output_text',text:'x',annotations:null,logprobs:null}]},{type:'custom_tool_call',call_id:'c',namespace:null,input:'x'}];const result=captureRequestContext({input:nullable});assert.equal(result.state,'complete');assert.deepEqual(result.components.map(item=>item.content.value),nullable);
+});
+
+test('正文引用与概率元信息有类型边界，token连续脱敏且原始字节不能绕过过滤',()=>{
+ const part={type:'output_text',text:'公开正文',annotations:[{type:'url_citation',url:'https://private.example/?token=private-url',title:'公开来源',start_index:0,end_index:2},{type:'file_citation',file_id:'private-reference',filename:'report.txt',index:0}],
+  logprobs:[{token:'sk-',logprob:-0.5,bytes:[115,107,45],top_logprobs:[{token:' ',logprob:-1,bytes:[32]}]},{token:'synthetic-secret',logprob:-0.3,bytes:[1,2,3],top_logprobs:[]}]};
+ const view=captureRequestContext({input:[{role:'assistant',phase:'final',content:[part]}]});assert.equal(view.state,'complete');const saved=view.components[0].content.value.content[0];
+ assert.equal(saved.annotations[0].title,'公开来源');assert.equal(saved.annotations[1].filename,'report.txt');assert.equal(saved.annotations[0].url,'[引用已省略]');assert.equal(saved.logprobs[0].logprob,-0.5);assert.deepEqual(saved.logprobs[0].bytes,{omitted:true,elements:3});
+ for(const secret of ['synthetic-secret','private.example','private-url','private-reference','115,107,45'])assert.ok(!JSON.stringify(view).includes(secret));
+ const ordinary=captureRequestContext({input:[{role:'assistant',content:[{type:'output_text',text:'hello',logprobs:[{token:'hello',logprob:-1,top_logprobs:[{token:'world',logprob:-2}]}]}]}]});assert.equal(ordinary.components[0].content.value.content[0].logprobs[0].token,'hello');
+ const malformed=[{annotations:{type:'url_citation'}},{annotations:[{type:['url_citation'],title:'private-hidden'}]},{annotations:[{type:'url_citation',title:{data:'private-hidden'}}]},{annotations:[{type:'file_citation',file_id:'private-reference',file_data:'private-hidden'}]},{logprobs:[{token:{data:'private-hidden'},bytes:{data:'private-hidden'}}]},{logprobs:[{token:'ok',logprob:{data:'private-hidden'},extra:'private-hidden'}]}];
+ for(const extra of malformed){const result=captureRequestContext({input:[{role:'assistant',content:[{type:'output_text',text:'body',...extra}]}]});assert.equal(result.state,'incomplete');assert.ok(!JSON.stringify(result).includes('private-hidden'));}
+ const bounded=captureRequestContext({input:[{role:'assistant',content:[{type:'output_text',text:'body',logprobs:Array.from({length:1000},()=>({token:'word',logprob:-1,top_logprobs:[]}))}]}]},{maxNodes:60});assert.ok(bounded.reasons.includes('size_limit'));
+});
+
 test('上下文保存可见指令、schema、完整输入顺序和协议续接，不冒充本轮或执行证明',()=>{
  const payload={instructions:'系统说明',tools:[{type:'function',name:'read',parameters:{type:'object'}}],input:[{role:'developer',content:'开发者说明'},{role:'user',content:'重复问题'},{role:'assistant',content:'历史回答'},{role:'user',content:'重复问题'},{type:'custom_tool_call',call_id:'c1',input:'cat a\n'},{type:'custom_tool_call_output',call_id:'c1',output:'  原始结果\n'}],previous_response_id:'previous'};
  const result=captureRequestContext(payload);assert.equal(result.state,'complete');assert.equal(result.components.length,9);
@@ -130,3 +156,26 @@ test('schema字面量没有定义豁免，枚举和默认值保留所有普通�
  const crypto=new RecordingStore(null,{encryptionKey:randomBytes(32)}),roundtrip=crypto.open(crypto.seal(result,'synthetic-literal'),'synthetic-literal');assert.deepEqual(roundtrip,result);
  const dependent={type:'object',dependentRequired:{api_key:['token']},dependencies:{password:['name']}};assert.deepEqual(captureRequestContext({tools:[{type:'function',name:'f',parameters:dependent}]}).components[0].content.value.parameters,dependent);
 });
+
+ test('概率token跨正文块连续脱敏，互斥候选不能用空白截断过滤状态',()=>{
+ const parts=[{type:'output_text',text:'Authorization: Bearer ',logprobs:[{token:'Authorization: Bearer ',logprob:-1}]},{type:'output_text',text:'synthetic-suffix',logprobs:[{token:'synthetic-suffix',logprob:-1}]}];
+ const result=captureRequestContext({input:[{role:'assistant',content:parts}]});assert.equal(result.state,'complete');assert.ok(!JSON.stringify(result).includes('synthetic-suffix'));
+ const candidates=captureRequestContext({input:[{role:'assistant',content:[{type:'output_text',text:'safe',logprobs:[{token:'ok',top_logprobs:[{token:'sk-'},{token:' '}]},{token:'ok',top_logprobs:[{token:'synthetic-suffix'}]}]}]}]});assert.equal(candidates.state,'complete');assert.ok(!JSON.stringify(candidates).includes('synthetic-suffix'));assert.equal(candidates.components[0].content.value.content[0].logprobs[0].top_logprobs[0].token,'[已脱敏]');
+ });
+
+ test('概率序列预算缺口不泄漏跨块后缀，候选省略不消耗实际token预算',()=>{
+ const payload={input:[{role:'assistant',content:[{type:'output_text',text:'safe',logprobs:[{token:'sk',top_logprobs:[{token:'x'.repeat(3000)}]},{token:'-'}]},{type:'output_text',text:'safe',logprobs:[{token:'synthetic-private-suffix'}]}]}]};
+ const complete=captureRequestContext(payload,{maxBytes:2000});assert.equal(complete.state,'complete');assert.ok(!JSON.stringify(complete).includes('synthetic-private-suffix'));
+ payload.input[0].content[0].logprobs[0].token='sk'+ 'x'.repeat(3000);
+ const cut=captureRequestContext(payload,{maxBytes:2000});assert.equal(cut.state,'incomplete');assert.ok(cut.reasons.includes('size_limit'));assert.ok(!JSON.stringify(cut).includes('synthetic-private-suffix'));
+ const independent=captureRequestContext({input:[...payload.input,{role:'assistant',content:[{type:'output_text',text:'ordinary',logprobs:[{token:'ordinary',logprob:-1}]}]}]},{maxBytes:2000});assert.equal(independent.components.at(-1).content.value.content[0].logprobs[0].token,'ordinary');
+ });
+
+ test('消息正文概率缺省或不对齐时整组token脱敏，合法空值不使上下文失败',()=>{
+ for(const metadata of [{},{logprobs:null},{logprobs:[]}]){
+  const result=captureRequestContext({input:[{role:'assistant',content:[{type:'output_text',text:'Authorization: Bearer ',...metadata},{type:'output_text',text:'synthetic-gap-suffix',logprobs:[{token:'synthetic-gap-suffix'}]}]},{role:'assistant',content:[{type:'output_text',text:'ordinary',logprobs:[{token:'ordinary'}]}]}]});assert.equal(result.state,'complete');assert.ok(!JSON.stringify(result).includes('synthetic-gap-suffix'));assert.equal(result.components.at(-1).content.value.content[0].logprobs[0].token,'ordinary');
+ }
+ for(const first of [{type:'text',text:'Authorization: Bearer '},{type:'refusal',refusal:'Authorization: Bearer '}]){const result=captureRequestContext({input:[{role:'assistant',content:[first,{type:'output_text',text:'synthetic-mixed-suffix',logprobs:[{token:'synthetic-mixed-suffix'}]}]}]});assert.ok(!JSON.stringify(result).includes('synthetic-mixed-suffix'));}
+ const invalid=captureRequestContext({input:[{role:'assistant',content:[{type:'output_text',text:'Authorization: Bearer synthetic-invalid-suffix',logprobs:[{}, {token:'synthetic-invalid-suffix'}]}]}]});assert.equal(invalid.state,'incomplete');assert.ok(invalid.reasons.includes('unsupported_content'));assert.ok(!JSON.stringify(invalid).includes('synthetic-invalid-suffix'));
+ const mismatch=captureRequestContext({input:[{role:'assistant',content:[{type:'output_text',text:'Authorization: Bearer synthetic-mismatch-suffix',logprobs:[{token:'synthetic-mismatch-suffix'}]}]}]});assert.ok(!JSON.stringify(mismatch).includes('synthetic-mismatch-suffix'));
+ });
