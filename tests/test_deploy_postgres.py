@@ -12,6 +12,7 @@ spec=importlib.util.spec_from_file_location('pg_guard',ROOT/'ci/postgres-deploy.
 spec=importlib.util.spec_from_file_location('wrapper',ROOT/'ci/deploy-wrapper.py');wrapper=importlib.util.module_from_spec(spec);spec.loader.exec_module(wrapper)
 IMAGE='registry.test/harbor/gateway:'+40*'a';OLD='registry.test/harbor/gateway:'+40*'b';NAME='harbor-local-gateway';CONFIG={'storage_engine':'postgres','port':43127,'origin':'http://gateway.test:43127','device_tls_port':43128,'device_origin':'https://gateway.test:43128'}
 PROOF={'revision':40*'a','contract':pg.CONTRACT,'extra_usage_dispatch_contract':pg.EXTRA_USAGE_DISPATCH_CONTRACT,'schema_digest':64*'c','database_digest':64*'d','source_digest':64*'e','storage_verified':True,'credentials_verified':True,'device_tls_verified':True,'device_ca_digest':64*'1','shutdown':{'contract':pg.SHUTDOWN_CONTRACT,**pg.SHUTDOWN_DEFAULTS}}
+PROOF['context_capture_guard_contract']='v1'
 class PostgreSQLDeploymentTests(unittest.TestCase):
  def test_preflight_names_are_unique_and_do_not_touch_previous_runs(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -22,14 +23,14 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
    names=[args[args.index('--name')+1] for args in calls if args[0]=='run']
    self.assertEqual(len(set(names)),2)
    for name in names:self.assertRegex(name,'^'+NAME+'-postgres-check-[a-f0-9]{32}$')
-   self.assertNotIn(old_name,inspections);self.assertEqual(state[old_name]['Id'],'stale-preflight');self.assertFalse(any(args[0]=='rm' for args in calls))
+   self.assertNotIn(old_name,inspections);self.assertEqual(state[old_name]['Id'],'stale-preflight');self.assertEqual(len([args for args in calls if args[0]=='rm']),2)
  def test_preflight_cleanup_requires_exact_name_image_project_and_nonce(self):
   for variant in ['owned','name','image-id','image-reference','project','nonce','preflight']:
    with self.subTest(variant=variant),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
     self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);original=api['docker'];names=[]
     def docker(*args,**kwargs):
-     if args[0]=='run' and '--rm' in args:
-      name=args[args.index('--name')+1];names.append(name);labels=dict(args[i+1].split('=',1) for i,value in enumerate(args[:-1]) if value=='--label');row={'Name':'/'+name,'Image':state[IMAGE]['Id'],'Config':{'Image':IMAGE,'Labels':labels}}
+     if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:
+      name=args[args.index('--name')+1];names.append(name);labels=dict(args[i+1].split('=',1) for i,value in enumerate(args[:-1]) if value=='--label');row={'Name':'/'+name,'Image':state[IMAGE]['Id'],'Config':{'Image':IMAGE,'Labels':labels},'State':{'Running':False,'Status':'exited','ExitCode':0}}
       if variant=='name':row['Name']='/another-preflight'
       elif variant=='image-id':row['Image']='sha256:'+'0'*64
       elif variant=='image-reference':row['Config']['Image']=OLD
@@ -38,8 +39,31 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
       elif variant=='preflight':labels['com.harbor.preflight']='false'
       state[name]=row
      return original(*args,**kwargs)
-    api['docker']=docker;pg.image_proof(api,IMAGE,common)
-    removals=[args for args in calls if args[0]=='rm'];self.assertEqual(removals,[('rm','-f',names[0])] if variant=='owned' else [])
+    api['docker']=docker
+    if variant=='owned':pg.image_proof(api,IMAGE,common)
+    else:
+     with self.assertRaises(pg.ShutdownUnconfirmed):pg.image_proof(api,IMAGE,common)
+    removals=[args for args in calls if args[0]=='rm'];self.assertEqual(removals,[('rm',names[0])] if variant=='owned' else [])
+ def test_completed_probe_cleanup_timeout_keeps_valid_proof_and_retains_identity(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);original=api['docker']
+   def docker(*args,**kwargs):
+    if args[0]=='rm':
+     self.assertNotIn('-f',args);raise subprocess.TimeoutExpired('cleanup',10)
+    return original(*args,**kwargs)
+   api['docker']=docker;self.assertEqual(pg.image_proof(api,IMAGE,common),PROOF)
+   probes=[v for k,v in state.items() if k.startswith(NAME+'-postgres-check-')]
+   self.assertEqual(len(probes),1);self.assertFalse(probes[0]['State']['Running']);self.assertNotIn('--rm',calls[0])
+ def test_successful_output_without_confirmed_exit_is_rejected(self):
+  for status in [{'Running':True,'Status':'running','ExitCode':0},{'Running':False,'Status':'exited','ExitCode':1},{'Running':False,'Status':'removing','ExitCode':0}]:
+   with self.subTest(status=status),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);original=api['docker']
+    def docker(*args,**kwargs):
+     result=original(*args,**kwargs)
+     if args[0]=='run':state[args[args.index('--name')+1]]['State']=status
+     return result
+    api['docker']=docker
+    with self.assertRaises(pg.ShutdownUnconfirmed):pg.image_proof(api,IMAGE,common)
  def test_preflight_nonce_collision_never_runs_or_removes_existing_container(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'),patch.object(pg.secrets,'token_hex',return_value='0'*32):
    self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);state[NAME+'-postgres-check-'+'0'*32]={'Id':'existing'}
@@ -58,7 +82,7 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
    with self.subTest(budget=budget),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
     self.prepare(directory);api,calls,state=self.api(directory);original=api['docker'];timeouts=[]
     def docker(*args,**kwargs):
-     if args[0]=='run' and '--rm' in args:timeouts.append(kwargs['timeout'])
+     if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:timeouts.append(kwargs['timeout'])
      return original(*args,**kwargs)
     api['docker']=docker
     if budget is not None:api['postgres_preflight_timeout_seconds']=budget
@@ -69,7 +93,7 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state=self.api(directory);original=api['docker']
    def docker(*args,**kwargs):
-    if args[0]=='run' and '--rm' in args:raise subprocess.TimeoutExpired('preflight',kwargs['timeout'])
+    if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:raise subprocess.TimeoutExpired('preflight',kwargs['timeout'])
     return original(*args,**kwargs)
    api.update(docker=docker,postgres_preflight_timeout_seconds=300)
    with self.assertRaises(pg.ShutdownUnconfirmed) as caught:pg.deploy(IMAGE,CONFIG,None,api)
@@ -86,7 +110,19 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
    with self.assertRaises(ValueError):pg.secure(path,os.getuid()+1,0o600)
  def prepare(self,directory):
   path=Path(directory);(path/'secrets').mkdir();(path/'secrets/postgres.env').write_text('HARBOR_DATABASE_URL=postgresql://synthetic:synthetic@database.test/harbor?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.crt\nHARBOR_RECORDING_STORAGE_MODE=report\n')
+  (path/'pg-data').mkdir();settings=path/'pg-data/settings.json';settings.write_text(json.dumps({'synthetic':'preserved'}));settings.chmod(0o600)
   return path
+ def test_context_capture_flag_is_optional_fixed_and_does_not_change_default(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   path=self.prepare(directory);original=(path/'secrets/postgres.env').read_text();baseline=pg.configuration(CONFIG,directory)
+   for flag in ['0','1']:
+    (path/'secrets/postgres.env').write_text(original+'HARBOR_RECORDING_CONTEXT_ENABLED='+flag+'\n')
+    self.assertEqual(pg.configuration(CONFIG,directory),baseline)
+   for flag in ['true','01','-1','1 ', '']:
+    (path/'secrets/postgres.env').write_text(original+'HARBOR_RECORDING_CONTEXT_ENABLED='+flag+'\n')
+    with self.assertRaises(ValueError):pg.configuration(CONFIG,directory)
+   (path/'secrets/postgres.env').write_text(original+'HARBOR_RECORDING_CONTEXT_ENABLED=0\nHARBOR_RECORDING_CONTEXT_ENABLED=1\n')
+   with self.assertRaises(ValueError):pg.configuration(CONFIG,directory)
  def test_fixed_environment_and_resources_do_not_accept_process_mount_or_tls_overrides(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    path=self.prepare(directory);common,budgets=pg.configuration(CONFIG,directory)
@@ -116,15 +152,17 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
   if old:state.update({NAME:container(OLD),NAME+'-worker':container(OLD,'worker')})
   def docker(*args,**kwargs):
    calls.append(args)
-   if args[0]=='run' and '--rm' in args:
-    image=args[args.index('node')-1];return Mock(stdout=json.dumps(proofs[image]),returncode=0)
+   if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:
+    image=args[args.index('node')-1];name=args[args.index('--name')+1]
+    if name not in state:state[name]={'Name':'/'+name,'Image':state[image]['Id'],'Config':{'Image':image,'Labels':dict(args[i+1].split('=',1) for i,v in enumerate(args[:-1]) if v=='--label')},'State':{'Running':False,'Status':'exited','ExitCode':0}}
+    return Mock(stdout=json.dumps(proofs[image]),returncode=0)
    if args[0]=='run':
     target=args[args.index('--name')+1]
     if fail and target==NAME+'-worker':raise subprocess.CalledProcessError(1,['docker'])
     state[target]=container(IMAGE,'worker' if target.endswith('-worker') else 'gateway')
     state[target]['Config']['Entrypoint']=[] if args[args.index('--entrypoint')+1]=='' else [args[args.index('--entrypoint')+1]]
     state[target]['Config']['StopSignal']=args[args.index('--stop-signal')+1]
-    state[target]['Config']['Env']=[args[i+1] for i,value in enumerate(args[:-1]) if value=='--env']
+    state[target]['Config']['Env']=(Path(directory)/'secrets/postgres.env').read_text().splitlines()+[args[i+1] for i,value in enumerate(args[:-1]) if value=='--env']
     state[target]['Config']['Labels'].update(dict(args[i+1].split('=',1) for i,value in enumerate(args[:-1]) if value=='--label'))
    if args[0]=='stop':state[args[-1]]['State'].update(Running=False,Status='exited')
    if args[0]=='rename':state[args[2]]=state.pop(args[1])
@@ -164,6 +202,85 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
     with self.assertRaises(subprocess.CalledProcessError):pg.deploy(IMAGE,CONFIG,None,api)
     self.assertEqual(('start',NAME) in calls,compatible);self.assertEqual(('start',NAME+'-worker') in calls,compatible)
     self.assertEqual(state[NAME]['Config']['Image'],OLD);self.assertTrue((Path(directory)/'postgres-storage.json').exists())
+ def test_resumed_pair_requires_context_setting_to_match_without_stopping_members(self):
+  for old_flag,new_flag,member in [('1','0',NAME),('1',None,NAME+'-worker'),(None,'1',NAME),('0',None,NAME),(None,'0',NAME),('1','1',NAME)]:
+   with self.subTest(old=old_flag,new=new_flag,member=member),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    path=self.prepare(directory);api,calls,state=self.api(directory)
+    pg.deploy(IMAGE,CONFIG,None,api)
+    env=path/'secrets/postgres.env';base=env.read_text()
+    if old_flag is not None:
+     for target in ([NAME,NAME+'-worker'] if old_flag==new_flag else [member]):state[target]['Config']['Env'].append('HARBOR_RECORDING_CONTEXT_ENABLED='+old_flag)
+    env.write_text(base+('' if new_flag is None else 'HARBOR_RECORDING_CONTEXT_ENABLED='+new_flag+'\n'))
+    calls.clear();api['activation_calls'].clear()
+    if (old_flag or '0')!=(new_flag or '0'):
+     with self.assertRaisesRegex(pg.ShutdownUnconfirmed,'context configuration changed'):pg.deploy(IMAGE,CONFIG,None,api)
+     self.assertNotIn('consume',api['activation_calls']);self.assertNotIn('revoke',api['activation_calls'])
+    else:self.assertTrue(pg.deploy(IMAGE,CONFIG,None,api)['activation']['resumed'])
+    self.assertFalse(any(args[0] in ('stop','rename','start') or args[0]=='run' and '-d' in args for args in calls))
+    self.assertTrue(state[NAME]['State']['Running']);self.assertTrue(state[NAME+'-worker']['State']['Running'])
+ def test_context_environment_rejects_ambiguous_or_invalid_container_values(self):
+  with tempfile.TemporaryDirectory() as directory:
+   self.prepare(directory)
+   for values in [['1','1'],['0','1'],['true'],['']]:
+    with self.subTest(values=values):
+     self.assertFalse(pg.context_environment_matches({'Config':{'Env':['HARBOR_RECORDING_CONTEXT_ENABLED='+value for value in values]}},directory))
+ def test_context_disable_failure_restores_both_original_members_with_durable_veto(self):
+  for requested in ['0',None]:
+   with self.subTest(requested=requested),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    path=self.prepare(directory);api,calls,state=self.api(directory,fail=True)
+    identities={name:state[name]['Id'] for name in [NAME,NAME+'-worker']}
+    for name in identities:state[name]['Config']['Env'].append('HARBOR_RECORDING_CONTEXT_ENABLED=1')
+    env=path/'secrets/postgres.env'
+    if requested is not None:env.write_text(env.read_text()+'HARBOR_RECORDING_CONTEXT_ENABLED='+requested+'\n')
+    with self.assertRaises(subprocess.CalledProcessError):pg.deploy(IMAGE,CONFIG,None,api)
+    settings=json.loads((path/'pg-data/settings.json').read_text());self.assertEqual(settings,{'synthetic':'preserved','recordingContextAllowed':False})
+    for name,identity in identities.items():
+     self.assertEqual(state[name]['Id'],identity);self.assertTrue(state[name]['State']['Running']);self.assertIn(('start',name),calls)
+     self.assertIn('HARBOR_RECORDING_CONTEXT_ENABLED=1',state[name]['Config']['Env'])
+     self.assertTrue(pg.rollback_environment_matches(state[name],directory,guard_supported=True))
+     self.assertFalse(pg.rollback_environment_matches(state[name],directory))
+ def test_context_enable_failure_can_restore_previously_disabled_members(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   path=self.prepare(directory);api,calls,state=self.api(directory,fail=True);env=path/'secrets/postgres.env';env.write_text(env.read_text()+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n')
+   pg.context_capture_guard(directory,False)
+   with self.assertRaises(subprocess.CalledProcessError):pg.deploy(IMAGE,CONFIG,None,api)
+   self.assertFalse(pg.context_capture_guard(directory))
+   self.assertTrue(all(state[name]['State']['Running'] for name in (NAME,NAME+'-worker')))
+   self.assertIn(('start',NAME),calls);self.assertIn(('start',NAME+'-worker'),calls)
+ def test_context_disable_then_failed_enable_preserves_the_original_veto_and_pair(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   path=self.prepare(directory);api,calls,state=self.api(directory,fail=True);env=path/'secrets/postgres.env';base=env.read_text()
+   identities={name:state[name]['Id'] for name in (NAME,NAME+'-worker')}
+   for name in identities:state[name]['Config']['Env'].append('HARBOR_RECORDING_CONTEXT_ENABLED=1')
+   for requested in ['0','1']:
+    env.write_text(base+'HARBOR_RECORDING_CONTEXT_ENABLED='+requested+'\n')
+    with self.assertRaises(subprocess.CalledProcessError):pg.deploy(IMAGE,CONFIG,None,api)
+    self.assertFalse(pg.context_capture_guard(directory))
+    for name,identity in identities.items():self.assertEqual(state[name]['Id'],identity);self.assertTrue(state[name]['State']['Running'])
+ def test_failed_enable_before_stop_restores_a_previously_closed_veto(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   path=self.prepare(directory);api,calls,state=self.api(directory);env=path/'secrets/postgres.env';env.write_text(env.read_text()+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n');pg.context_capture_guard(directory,False)
+   original=api['activation']
+   def activation(action,image):
+    if action=='consume':raise RuntimeError('synthetic consume failure')
+    return original(action,image)
+   api['activation']=activation
+   with self.assertRaisesRegex(RuntimeError,'synthetic consume failure'):pg.deploy(IMAGE,CONFIG,None,api)
+   self.assertFalse(pg.context_capture_guard(directory));self.assertFalse(any(call[0] in ('stop','rename','start') for call in calls));self.assertTrue(state[NAME]['State']['Running'])
+ def test_context_guard_failure_or_unsupported_source_does_not_stop_current_pair(self):
+  for failure in ['source-contract','candidate-contract','guard-write']:
+   with self.subTest(failure=failure),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    path=self.prepare(directory);api,calls,state=self.api(directory)
+    if failure=='candidate-contract':
+     api['proofs'][IMAGE].pop('context_capture_guard_contract');env=path/'secrets/postgres.env';env.write_text(env.read_text()+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n')
+    else:
+     for name in (NAME,NAME+'-worker'):state[name]['Config']['Env'].append('HARBOR_RECORDING_CONTEXT_ENABLED=1')
+     if failure=='source-contract':api['proofs'][OLD].pop('context_capture_guard_contract')
+    with patch.object(pg.os,'replace',side_effect=OSError('synthetic write failure')) if failure=='guard-write' else patch.object(pg.time,'sleep'):
+     with self.assertRaises((ValueError,OSError)):pg.deploy(IMAGE,CONFIG,None,api)
+    self.assertFalse(any(call[0] in ('stop','rename','start') for call in calls));self.assertNotIn('consume',api.get('activation_calls',[]))
+    self.assertTrue(all(state[name]['State']['Running'] for name in (NAME,NAME+'-worker')))
+    self.assertFalse(list((path/'pg-data').glob('.context-capture-*')))
  def test_authentication_failure_removes_candidate_pair_and_preserves_data(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state=self.api(directory,auth=False)
@@ -196,7 +313,7 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
     self.prepare(directory);api,calls,state=self.api(directory);original=api['docker']
     def docker(*args,**kwargs):
      result=original(*args,**kwargs)
-     if args[0]=='run' and '--rm' in args:
+     if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:
       proof=json.loads(result.stdout)
       if contract is None:proof.pop('extra_usage_dispatch_contract')
       else:proof['extra_usage_dispatch_contract']=contract
@@ -218,7 +335,7 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
     self.prepare(directory);api,calls,state=self.api(directory);original=api['docker']
     def docker(*args,**kwargs):
      result=original(*args,**kwargs)
-     if args[0]=='run' and '--rm' in args:
+     if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:
       proof=json.loads(result.stdout)
       if verification is None:proof.pop('credentials_verified',None)
       else:proof['credentials_verified']=verification
@@ -242,7 +359,7 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
      original=api['docker']
      def docker(*args,**kwargs):
       result=original(*args,**kwargs)
-      if args[0]=='run' and '--rm' in args:result.stdout=json.dumps({**PROOF,'storage_verified':False})
+      if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:result.stdout=json.dumps({**PROOF,'storage_verified':False})
       return result
      api['docker']=docker
     with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(IMAGE,CONFIG,None,api)

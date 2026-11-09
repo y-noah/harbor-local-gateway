@@ -1,3 +1,4 @@
+import {recordingContextConfiguration} from './recording-context-configuration.mjs';
 import {postgresShutdownConfiguration,installPostgresGatewayShutdown} from './postgres-shutdown.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {RecordingContextStore} from './recording-context-store.mjs';
@@ -134,11 +135,7 @@ export async function createPostgresGateway(options={}){
     store=new PostgresStore({...database,poolSize:resources.corePoolSize});
     queryStore=new PostgresStore({...database,poolSize:resources.queryPoolSize});recordingStore=new PostgresStore({...database,poolSize:resources.recordingPoolSize});
     try{await store.verifySchema();}catch(e){if(e.code==='42P01')throw new AppError(503,'数据库尚未迁移，请先运行db:migrate','database_migration_required');throw e;}
-    if(env.HARBOR_RECORDING_CONTEXT_ENABLED!==undefined&&!['0','1'].includes(env.HARBOR_RECORDING_CONTEXT_ENABLED))throw new AppError(503,'上下文采集开关须为0或1','recording_configuration');
-    if(options.recording?.contextEnabled!==undefined&&typeof options.recording.contextEnabled!=='boolean')throw new AppError(503,'上下文采集开关须为布尔值','recording_configuration');
-    const contextEnabled=options.recording?.contextEnabled??env.HARBOR_RECORDING_CONTEXT_ENABLED==='1',contextSchemaVersion=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,contextAvailable=[postgresContextSchemaVersions.storage,postgresContextSchemaVersions.index].includes(contextSchemaVersion);
-    if(typeof contextEnabled!=='boolean')throw new AppError(503,'上下文采集开关须为布尔值','recording_configuration');
-    if(contextEnabled&&!contextAvailable)throw new AppError(503,'上下文结构尚未迁移','database_migration_required');
+    const contextSchemaVersion=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,{available:contextAvailable}=recordingContextConfiguration({env,enabled:options.recording?.contextEnabled,schemaVersion:contextSchemaVersion});
     await store.initializePricing();
     const configPath=join(data,'settings.json');
     config=options.config;
@@ -148,6 +145,9 @@ export async function createPostgresGateway(options={}){
     }
     adminCookieName(config);
     if(!validConfig(config))throw new AppError(503,'服务启动配置无效','gateway_configuration');
+    // A deployment may restore an old container with immutable Env=1. The shared
+    // startup policy must still veto capture after an operator has closed it.
+    const {enabled:contextEnabled}=recordingContextConfiguration({env,enabled:options.recording?.contextEnabled,allowed:config.recordingContextAllowed,schemaVersion:contextSchemaVersion});
     deviceSettings=options.devices??await deviceConfiguration(env);if(options.devices===undefined)ownedDeviceIssuer=deviceSettings?.issuer;
     const encrypted=(await store.get("SELECT EXISTS(SELECT 1 FROM harbor.keys WHERE secret_cipher IS NOT NULL) OR EXISTS(SELECT 1 FROM harbor.accounts WHERE api_secret_cipher IS NOT NULL) required")).required;
     const key=await material(join(data,'key-encryption.key'),encrypted||!await missing(join(data,'metering-spool')));

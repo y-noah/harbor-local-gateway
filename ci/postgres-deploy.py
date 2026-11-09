@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import subprocess
 import tempfile
 import time
 import socket
@@ -166,12 +167,13 @@ def configuration(config,stack):
     env=Path(stack)/'secrets/postgres.env';secure(env,0,0o600)
     if env.stat().st_size>65536:raise ValueError('PostgreSQL environment exceeds budget')
     values={}
-    allowed={'HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE','HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES','HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO'}
+    allowed={'HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE','HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES','HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO','HARBOR_RECORDING_CONTEXT_ENABLED'}
     for line in env.read_text().splitlines():
         if not line or line.startswith('#'):continue
         key,separator,value=line.partition('=')
         if not separator or key not in allowed or key in values or not value or '\x00' in value:raise ValueError('PostgreSQL environment is not a fixed configuration')
         values[key]=value
+    if values.get('HARBOR_RECORDING_CONTEXT_ENABLED') not in (None,'0','1'):raise ValueError('PostgreSQL context capture flag must be 0 or 1')
     if values.get('HARBOR_RECORDING_STORAGE_MODE')!='report':raise ValueError('PostgreSQL signed storage reports are required')
     address=urlsplit(values.get('HARBOR_DATABASE_URL',''));query=parse_qs(address.query)
     if address.scheme not in ('postgres','postgresql') or not address.hostname or query.get('sslmode')!=['verify-full'] or query.get('sslrootcert')!=['/run/secrets/postgres-ca.crt']:
@@ -219,12 +221,23 @@ def image_proof_content(api,image,common):
     nonce=secrets.token_hex(16)
     check_name=api['NAME']+'-postgres-check-'+nonce
     if container_inspection(api,check_name,[]):raise ValueError('PostgreSQL preflight container requires administrator inspection')
-    args=['run','--rm','--name',check_name,'--label','com.aistrong.project='+api['NAME'],'--label','com.harbor.preflight=true','--label','com.harbor.preflight-nonce='+nonce,'--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=64m',*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data,readonly','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime,readonly',image,'node','/app/ci/postgres-preflight.mjs']
+    args=['run','--name',check_name,'--label','com.aistrong.project='+api['NAME'],'--label','com.harbor.preflight=true','--label','com.harbor.preflight-nonce='+nonce,'--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=64m',*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data,readonly','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime,readonly',image,'node','/app/ci/postgres-preflight.mjs']
+    completed=False
     try:
         value=json.loads(api['docker'](*args,timeout=timeout).stdout)
+        completed=True
     finally:
         check=container_inspection(api,check_name,[])
-        if check and check.get('Name')=='/'+check_name and check.get('Image')==candidate.get('Id') and check.get('Config',{}).get('Image')==image and check.get('Config',{}).get('Labels',{}).get('com.harbor.preflight')=='true' and check['Config']['Labels'].get('com.aistrong.project')==api['NAME'] and check['Config']['Labels'].get('com.harbor.preflight-nonce')==nonce:api['docker']('rm','-f',check_name,check=False,timeout=10)
+        owned=check and check.get('Name')=='/'+check_name and check.get('Image')==candidate.get('Id') and check.get('Config',{}).get('Image')==image and check.get('Config',{}).get('Labels',{}).get('com.harbor.preflight')=='true' and check['Config']['Labels'].get('com.aistrong.project')==api['NAME'] and check['Config']['Labels'].get('com.harbor.preflight-nonce')==nonce
+        stopped=owned and check.get('State',{}).get('Running') is False and check['State'].get('Status')=='exited' and check['State'].get('ExitCode')==0 and not any(check['State'].get(k) for k in ['Paused','Restarting','Dead','OOMKilled'])
+        if completed and not stopped:raise ShutdownUnconfirmed('PostgreSQL preflight exit identity is not confirmed')
+        if owned:
+            # --rm couples a valid proof to daemon filesystem cleanup. A confirmed
+            # exited probe can be retained when cleanup is slow; never suppress an
+            # unknown/running probe failure or force-remove the successful probe.
+            try:api['docker'](*(['rm',check_name] if stopped else ['rm','-f',check_name]),check=False,timeout=10)
+            except subprocess.TimeoutExpired:
+                if not (completed and stopped):raise
     if not isinstance(value,dict) or value.get('contract')!=CONTRACT or value.get('extra_usage_dispatch_contract')!=EXTRA_USAGE_DISPATCH_CONTRACT or value.get('storage_verified') is not True or value.get('credentials_verified') is not True or value.get('device_tls_verified') is not True or value.get('revision')!=image.rsplit(':',1)[-1] or any(not isinstance(value.get(key),str) or not re.fullmatch('[a-f0-9]{64}',value[key]) for key in ['schema_digest','database_digest','source_digest','device_ca_digest']):raise ValueError('Candidate PostgreSQL preflight proof is invalid')
     requested={key:int(next(item.split('=',1)[1] for item in common if item.startswith(name+'='))) for key,name in SHUTDOWN_ENV.items()}
     if 'shutdown' not in value:raise ShutdownContractUnsupported('Validated legacy PostgreSQL image has no shutdown contract')
@@ -271,7 +284,41 @@ def device_http_code(stack,config,path,headers=None):
                 response=http.client.HTTPResponse(connection);response.begin();return response.status
     except (OSError,ValueError,http.client.HTTPException):return 0
 
-def rollback_environment_matches(instance,stack):
+def context_environment_matches(instance,stack):
+    key='HARBOR_RECORDING_CONTEXT_ENABLED'
+    expected=[line.partition('=')[2] for line in (Path(stack)/'secrets/postgres.env').read_text().splitlines() if line.startswith(key+'=')]
+    actual=[value.partition('=')[2] for value in (instance or {}).get('Config',{}).get('Env',[]) if value.startswith(key+'=')]
+    # Docker environments are immutable. Missing is the supported disabled default,
+    # while duplicate or malformed values must never count as an applied setting.
+    same=len(expected)<=1 and len(actual)<=1 and all(value in ('0','1') for value in expected+actual) and (expected or ['0'])==(actual or ['0'])
+    return same and (expected!=['1'] or context_capture_guard(stack))
+
+def context_flag(values):
+    found=[value.partition('=')[2] for value in values if value.startswith('HARBOR_RECORDING_CONTEXT_ENABLED=')]
+    if len(found)>1 or any(value not in ('0','1') for value in found):raise ValueError('Context capture environment is ambiguous')
+    return found==['1']
+
+def context_capture_guard(stack,enabled=None):
+    path=Path(stack)/'pg-data/settings.json';secure(path,1000,0o600)
+    if path.stat().st_size>65536:raise ValueError('Startup configuration exceeds budget')
+    config=json.loads(path.read_text());allowed=config.get('recordingContextAllowed')
+    if 'recordingContextAllowed' in config and type(allowed) is not bool:raise ValueError('Context capture startup policy is invalid')
+    if enabled is None:return allowed is not False
+    if type(enabled) is not bool:raise ValueError('Context capture startup policy must be boolean')
+    if allowed is enabled:return enabled
+    original=path.stat();descriptor,name=tempfile.mkstemp(prefix='.context-capture-',dir=path.parent)
+    try:
+        with os.fdopen(descriptor,'w') as target:
+            os.fchmod(target.fileno(),0o600);os.fchown(target.fileno(),original.st_uid,original.st_gid)
+            config['recordingContextAllowed']=enabled;json.dump(config,target);target.flush();os.fsync(target.fileno())
+        os.replace(name,path)
+        directory=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(directory)
+        finally:os.close(directory)
+    finally:Path(name).unlink(missing_ok=True)
+    return enabled
+
+def rollback_environment_matches(instance,stack,guard_supported=False):
     # Existing containers keep their original Env even after an env-file changes.
     # The image proof uses the new file, so it cannot authenticate those old Env values.
     expected={}
@@ -279,7 +326,14 @@ def rollback_environment_matches(instance,stack):
         key,separator,value=line.partition('=')
         if separator and key in ('HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE'):expected[key]=value
     values=(instance or {}).get('Config',{}).get('Env',[])
-    return set(expected)=={'HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE'} and all([item for item in values if item.startswith(key+'=')]==[key+'='+value] for key,value in expected.items())
+    same_database=set(expected)=={'HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE'} and all([item for item in values if item.startswith(key+'=')]==[key+'='+value] for key,value in expected.items())
+    if not same_database:return False
+    try:
+        requested=context_flag((Path(stack)/'secrets/postgres.env').read_text().splitlines());previous=context_flag(values)
+        # Rolling back an attempted enable to disabled is safe. A formerly enabled
+        # container may restart after disable only when it implements the durable veto.
+        return not previous or requested or guard_supported and not context_capture_guard(stack)
+    except ValueError:return False
 
 def signed_candidate_image_id(image_id,approval):
     return isinstance(image_id,str) and re.fullmatch(r'sha256:[a-f0-9]{64}',image_id) is not None and image_id in (approval.get('configDigest'),approval.get('manifestDigest'))
@@ -365,6 +419,8 @@ def deploy(image,config,archive,api):
         source=approval.get('sourceFence') or {}
         if previous and (previous.get('Id')!=source.get('sourceContainerId') or previous.get('Image')!=source.get('sourceImageId') or not legacy_sqlite_source(api,previous,'gateway',config)):raise ShutdownUnconfirmed('Previous source generation is not approved')
         if current and not owned(current) or old_worker and not owned(old_worker):raise ShutdownUnconfirmed('Mixed deployment generations require inspection')
+        if any(row and not context_environment_matches(row,stack) for row in (current,old_worker)):
+            raise ShutdownUnconfirmed('Resumed candidate context configuration changed; existing composition retained')
         pair_healthy=owned(current) and owned(old_worker) and all(row.get('State',{}).get('Running') and row['State'].get('Health',{}).get('Status')=='healthy' for row in (current,old_worker))
         if entry_deployment is not None and pair_healthy:entry_deployment.bind_candidate(current)
         if pair_healthy and api['http_code'](port,'/ready')==200 and device_http_code(stack,config,'/ready')==200:
@@ -399,11 +455,20 @@ def deploy(image,config,archive,api):
             except ShutdownContractUnsupported as error:
                 if instance.get('State',{}).get('Running'):raise ShutdownUnconfirmed('Running legacy shutdown contract requires controlled maintenance') from error
         old_proofs.append(previous)
-    rollback=entry_deployment is None and bool(all(rollback_environment_matches(instance,stack) for instance in [current,old_worker]) and all(value is not None for value in old_shutdown) and current and old_worker and current.get('Config',{}).get('Image')==old_worker.get('Config',{}).get('Image') and all(value is not None and all(value[key]==proof[key] for key in ['contract','schema_digest','database_digest','device_ca_digest']) for value in old_proofs))
+    context_requested=context_flag((Path(stack)/'secrets/postgres.env').read_text().splitlines())
+    old_context=any(context_flag((instance or {}).get('Config',{}).get('Env',[])) for instance in (current,old_worker))
+    if context_requested and proof.get('context_capture_guard_contract')!='v1':raise ValueError('Candidate lacks durable context capture policy')
+    if old_context and any(context_flag((instance or {}).get('Config',{}).get('Env',[])) and (old_proof or {}).get('context_capture_guard_contract')!='v1' for instance,old_proof in zip((current,old_worker),old_proofs)):
+        raise ValueError('Enabled source lacks durable context capture policy; source retained')
+    context_guard_before=context_capture_guard(stack) if context_requested or old_context else None
     marker(stack,proof)
-    stopped=[];created=[]
+    stopped=[];created=[];rollback=False
     originals={target:existing['Config']['Image'] for target,existing in [(name,current),(worker,old_worker)] if existing}
     try:
+        # Persist the restrictive policy before any old member is stopped. Both
+        # candidate and rollback containers read the same startup file.
+        if context_requested or old_context:context_capture_guard(stack,context_requested)
+        rollback=entry_deployment is None and bool(all(rollback_environment_matches(instance,stack,(old_proof or {}).get('context_capture_guard_contract')=='v1') for instance,old_proof in zip((current,old_worker),old_proofs)) and all(value is not None for value in old_shutdown) and current and old_worker and current.get('Config',{}).get('Image')==old_worker.get('Config',{}).get('Image') and all(value is not None and all(value[key]==proof[key] for key in ['contract','schema_digest','database_digest','device_ca_digest']) for value in old_proofs))
         if activate('consume').get('state')!='active':raise ValueError('Database activation was not consumed')
         for index,(target,existing) in enumerate([(name,current),(worker,old_worker)]):
             if existing:
@@ -417,6 +482,11 @@ def deploy(image,config,archive,api):
         if entry_deployment is not None:entry_deployment.bind_candidate(inspect(name))
         verify_started_composition(api,image,config,started,approval)
     except Exception as error:
+        # An unsuccessful enable must not undo a prior disable, including when
+        # that disable restored a container whose immutable Env is still 1.
+        if context_requested and context_guard_before is False:
+            try:context_capture_guard(stack,False)
+            except Exception as restore_error:raise ShutdownUnconfirmed('Context capture veto restoration unconfirmed; composition retained') from restore_error
         if isinstance(error,ShutdownUnconfirmed):raise
         # Finish candidate intake and durable cleanup before removing either member.
         # Unknown cleanup retains the whole composition and blocks automatic rollback.
