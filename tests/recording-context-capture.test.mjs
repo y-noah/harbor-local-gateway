@@ -43,3 +43,7 @@ test('真实加密缓冲透传服务端请求限定的附件指纹，不保存�
  const result=createRequestContextCapture(buffer)('synthetic-attachment-request',payload);assert.equal(result.accepted,true);assert.equal(result.state,'complete');await buffer.flush();
  const attachment=saved[0][1][0].content.value.content[0];assert.equal(attachment.fingerprint.value,context.attachmentFingerprint('synthetic-attachment-request',body));assert.equal(attachment.bytes,body.length);assert.ok(!JSON.stringify(saved).includes(body.toString('base64')));
 });
+
+test('脱敏覆盖事实随真实spool保存，覆盖摘要计入队列预算',async t=>{
+ const {buffer,saved}=await fixture(t,{maxBytes:4096,maxMemoryBytes:8192}),outcome=createRequestContextCapture(buffer)('synthetic-redaction',{input:'sk-synthetic-audit'});assert.equal(outcome.accepted,true);await buffer.flush();assert.deepEqual(saved[0][2].coverage.redaction,{version:1,policy:'credentials-v1',categories:['credential']});assert.ok(!JSON.stringify(saved).includes('sk-synthetic-audit'));
+});

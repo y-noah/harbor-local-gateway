@@ -249,3 +249,10 @@ test('真实PG：附件已验证摘要随上下文加密恢复，不能跨请求
  const restarted=new RecordingContextStore(store,{encryptionKey:key,clock:()=>clock.now}),a=(await read(first,restarted)).components[0].content.value.content[0],b=(await read(second,restarted)).components[0].content.value.content[0];
  assert.equal(a.fingerprint.state,'verified');assert.equal(a.fingerprint.value,restarted.attachmentFingerprint(first,body));assert.notEqual(a.fingerprint.value,b.fingerprint.value);assert.equal(a.bytes,body.length);assert.equal(a.declaredBytes,999);assert.equal(a.mime_type,'text/plain');assert.ok(!JSON.stringify(a).includes(body.toString('base64')));
 }));
+
+test('真实PG：脱敏事实独立于内容完整性保存，旧覆盖不伪造脱敏证据',integration,()=>fixture(async({context,request,store,key,clock})=>{
+ const view=captureRequestContext({input:'sk-synthetic-audit'}),coverage={state:view.state,reasons:view.reasons,opaqueReasoningExcluded:view.opaqueReasoningExcluded,redaction:view.redaction},id=await request();await context.writeSnapshot(id,view.components,{coverage});
+ const restarted=new RecordingContextStore(store,{encryptionKey:key,clock:()=>clock.now}),page=await restarted.read(id);assert.equal(page.state,'complete');assert.deepEqual(page.coverage.redaction,{version:1,policy:'credentials-v1',categories:['credential']});await restarted.verifyStoredObjects();
+ const legacy=await request(),old={state:'complete',reasons:[],opaqueReasoningExcluded:0};await context.writeSnapshot(legacy,view.components,{coverage:old});assert.equal(Object.hasOwn((await context.read(legacy)).coverage,'redaction'),false);await restarted.verifyStoredObjects();
+ await assert.rejects(context.writeSnapshot(await request(),view.components,{coverage:{...coverage,redaction:{...view.redaction,categories:['untrusted']}}}),{code:'recording_context_invalid'});
+}));

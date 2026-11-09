@@ -1,6 +1,6 @@
 import {createCipheriv,createDecipheriv,createHash,createHmac,hkdfSync,randomBytes,randomUUID,timingSafeEqual} from 'node:crypto';
 import {AppError} from './store.mjs';
-import {sanitizeRecord,restoreAuthenticatedRecord} from './record-redaction.mjs';
+import {sanitizeRecord,restoreAuthenticatedRecord,validRecordRedaction} from './record-redaction.mjs';
 import {requestContextReasons} from './recording-request-context.mjs';
 
 const kinds=new Set(['instruction','history','tool_schema','context']);
@@ -9,8 +9,8 @@ const fail=(status,message,code='recording_context_invalid')=>{throw new AppErro
 const equal=(a,b)=>Buffer.isBuffer(a)&&Buffer.isBuffer(b)&&a.length===b.length&&timingSafeEqual(a,b);
 function normalizedCoverage(coverage){
    if(coverage!==null){
-    if(!coverage||typeof coverage!=='object'||Array.isArray(coverage)||Object.keys(coverage).some(key=>!['state','reasons','opaqueReasoningExcluded'].includes(key))||!['complete','incomplete'].includes(coverage.state)||!Array.isArray(coverage.reasons)||coverage.reasons.length>captureReasons.size||coverage.reasons.some(reason=>!captureReasons.has(reason))||!Number.isSafeInteger(coverage.opaqueReasoningExcluded)||coverage.opaqueReasoningExcluded<0||coverage.state==='complete'&&coverage.reasons.length||coverage.state==='incomplete'&&!coverage.reasons.length)fail(400,'上下文采集覆盖信息无效');
-    coverage={state:coverage.state,reasons:[...new Set(coverage.reasons)].sort(),opaqueReasoningExcluded:coverage.opaqueReasoningExcluded};
+    if(!coverage||typeof coverage!=='object'||Array.isArray(coverage)||Object.keys(coverage).some(key=>!['state','reasons','opaqueReasoningExcluded','redaction'].includes(key))||!['complete','incomplete'].includes(coverage.state)||!Array.isArray(coverage.reasons)||coverage.reasons.length>captureReasons.size||coverage.reasons.some(reason=>!captureReasons.has(reason))||!Number.isSafeInteger(coverage.opaqueReasoningExcluded)||coverage.opaqueReasoningExcluded<0||coverage.redaction!==undefined&&!validRecordRedaction(coverage.redaction)||coverage.state==='complete'&&coverage.reasons.length||coverage.state==='incomplete'&&!coverage.reasons.length)fail(400,'上下文采集覆盖信息无效');
+    coverage={state:coverage.state,reasons:[...new Set(coverage.reasons)].sort(),opaqueReasoningExcluded:coverage.opaqueReasoningExcluded,...(coverage.redaction!==undefined?{redaction:{version:1,policy:coverage.redaction.policy,categories:[...coverage.redaction.categories].sort()}}:{})};
    }
  return coverage;
 }

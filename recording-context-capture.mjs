@@ -1,7 +1,7 @@
 import {AppError} from './store.mjs';
 import {captureRequestContext,requestContextReasons} from './recording-request-context.mjs';
 import {recordingBufferWrite} from './postgres-recording-storage.mjs';
-import {sanitizeRecord} from './record-redaction.mjs';
+import {sanitizeRecord,recordRedactionSummary,recordRedactionCategories} from './record-redaction.mjs';
 
 const finishReasons=new Set(['capture_failed','queue_limit','size_limit','storage_low','storage_unknown']);
 export function createRequestContextCapture(buffer,{policyBuffer=buffer}={}){
@@ -9,10 +9,10 @@ export function createRequestContextCapture(buffer,{policyBuffer=buffer}={}){
  return (requestId,payload)=>{
   // Reserve the actual command envelope, including the largest possible fixed
   // coverage metadata. The extractor's array budget then fits the same queue.
-  const envelope=Buffer.byteLength(JSON.stringify({type:'context',requestId,components:[],coverage:{state:'incomplete',reasons:requestContextReasons,opaqueReasoningExcluded:Number.MAX_SAFE_INTEGER}}))-2;
+  const envelope=Buffer.byteLength(JSON.stringify({type:'context',requestId,components:[],coverage:{state:'incomplete',reasons:requestContextReasons,opaqueReasoningExcluded:Number.MAX_SAFE_INTEGER,redaction:recordRedactionSummary(recordRedactionCategories)}}))-2;
   const maxBytes=Math.min(buffer.repository.maxBytes,buffer.maxMemoryBytes,buffer.repository.contextRepository.maxSnapshotBytes)-envelope;
   if(maxBytes<256)return {accepted:false,state:'incomplete',reason:'size_limit'};
-  const view=captureRequestContext(payload,{maxBytes,maxComponents:buffer.repository.contextRepository.maxComponents,attachmentFingerprint:typeof buffer.repository.contextRepository.attachmentFingerprint==='function'?bytes=>buffer.repository.contextRepository.attachmentFingerprint(requestId,bytes):undefined}),coverage={state:view.state,reasons:view.reasons,opaqueReasoningExcluded:view.opaqueReasoningExcluded};
+  const view=captureRequestContext(payload,{maxBytes,maxComponents:buffer.repository.contextRepository.maxComponents,attachmentFingerprint:typeof buffer.repository.contextRepository.attachmentFingerprint==='function'?bytes=>buffer.repository.contextRepository.attachmentFingerprint(requestId,bytes):undefined}),coverage={state:view.state,reasons:view.reasons,opaqueReasoningExcluded:view.opaqueReasoningExcluded,redaction:view.redaction};
   // Contents already carry filtered provenance. Validate and mark the aggregate
   // too, so the FIFO's generic walker need not rescan thousands of component
   // wrappers under its smaller default node budget. One array node, then one

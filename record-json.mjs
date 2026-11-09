@@ -3,7 +3,7 @@ import {RecordRedactor,redacted,sensitiveRecordField,redactRecordText} from './r
 // Tool arguments are JSON, not header lines. Decode each string before filtering
 // its contents, then encode safe fragments back into that same JSON string.
 export class JsonRecordRedactor{
-  constructor({maxDepth=24,onTruncate=()=>{}}={}){if(!Number.isInteger(maxDepth)||maxDepth<1||maxDepth>128||typeof onTruncate!=='function')throw TypeError('Invalid recording JSON configuration');this.maxDepth=maxDepth;this.onTruncate=onTruncate;this.truncated=false;this.stack=[];this.string=null;this.skip=null;this.output=[];this.chars=[];this.units=0;this.closed=false;}
+  constructor({maxDepth=24,onTruncate=()=>{},onRedact=()=>{}}={}){if(!Number.isInteger(maxDepth)||maxDepth<1||maxDepth>128||typeof onTruncate!=='function')throw TypeError('Invalid recording JSON configuration');this.onRedact=onRedact;this.maxDepth=maxDepth;this.onTruncate=onTruncate;this.truncated=false;this.stack=[];this.string=null;this.skip=null;this.output=[];this.chars=[];this.units=0;this.closed=false;}
   flushOutput(){if(this.chars.length){this.output.push(this.chars.join(''));this.chars=[];this.units=0;}}
   emit(text){if(!text)return;this.chars.push(text);this.units+=text.length;if(this.units>=4096)this.flushOutput();}
   parentDone(){const parent=this.stack.at(-1);if(parent)parent.expect='comma';}
@@ -28,7 +28,7 @@ export class JsonRecordRedactor{
     if(c!=='"'){this.decoded(c);return;}
     if(value.key){
       const parent=this.stack.at(-1);if(parent){parent.sensitive=value.oversized||sensitiveRecordField(value.text);parent.expect='colon';}
-      this.emit(JSON.stringify(value.oversized?'[字段名已截断]':redactRecordText(value.text)));
+      this.emit(JSON.stringify(value.oversized?'[字段名已截断]':redactRecordText(value.text,{onRedact:this.onRedact})));
     }else{
       this.flushString();const tail=value.filter.finish();if(tail)this.emit(JSON.stringify(tail).slice(1,-1));this.emit('"');this.parentDone();
     }
@@ -54,12 +54,12 @@ export class JsonRecordRedactor{
       if(/\s/.test(c)){this.emit(c);continue;}
       const parent=this.stack.at(-1);
       if(parent?.expect==='value'&&parent.sensitive){
-        parent.sensitive=false;this.emit(JSON.stringify(redacted));this.parentDone();
+        parent.sensitive=false;this.onRedact('sensitive_field');this.emit(JSON.stringify(redacted));this.parentDone();
         this.skip=c==='"'?{kind:'string',quote:true,escape:false,depth:0}:c==='{'||c==='['?{kind:'container',quote:false,escape:false,depth:1}:{kind:'primitive',depth:0};continue;
       }
       if(c==='"'){
         const key=parent?.kind==='object'&&parent.expect==='key';
-        this.string={key,text:'',oversized:false,filter:key?null:new RecordRedactor(),decoded:[],escape:false,unicode:null};if(!key)this.emit('"');continue;
+        this.string={key,text:'',oversized:false,filter:key?null:new RecordRedactor({onRedact:this.onRedact}),decoded:[],escape:false,unicode:null};if(!key)this.emit('"');continue;
       }
       if(c==='{'||c==='['){
         if(this.stack.length>=this.maxDepth){this.truncated=true;this.onTruncate();break;}

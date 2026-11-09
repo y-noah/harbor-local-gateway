@@ -15,16 +15,17 @@ test('unknown actual DB disk disables recording across Responses/Chat/platform w
 
 test('context HTTP: Responses, legacy Chat and platform save their received view with admin-only bounded reads',integration,async t=>{
  const f=await fixture(t,{mode:'healthy',probe:async()=>[{total:1000,free:900}],context:true,schemaContext:true});
- const cases=[['/v1/responses',{model:'gpt-6.1-sol',instructions:'合成系统基线',input:[{role:'user',content:'历史提问'},{role:'assistant',content:'历史回答'},{role:'user',content:'新的提问'}],tools:[{type:'function',name:'synthetic',parameters:{type:'object',properties:{api_key:{type:'string',default:'synthetic-private-default'}}}}],stream:false}],['/v1/chat/completions',{model:'codex',messages:[{role:'system',content:'合成Chat指令'},{role:'user',content:'Chat提问'}]}],['/v1/platform/chat/completions',{model:'deepseek/fixture-platform',messages:[{role:'user',content:'平台提问'}]}]];
+ const cases=[['/v1/responses',{model:'gpt-6.1-sol',instructions:'合成系统基线',input:[{role:'user',content:'历史提问'},{role:'assistant',content:'历史回答'},{role:'user',content:'新的提问 sk-synthetic-audit'}],tools:[{type:'function',name:'synthetic',parameters:{type:'object',properties:{api_key:{type:'string',default:'synthetic-private-default'}}}}],stream:false}],['/v1/chat/completions',{model:'codex',messages:[{role:'system',content:'合成Chat指令'},{role:'user',content:'Chat提问 sk-synthetic-audit'}]}],['/v1/platform/chat/completions',{model:'deepseek/fixture-platform',messages:[{role:'user',content:'平台提问 sk-synthetic-audit'}]}]];
  for(const [path,payload] of cases){
   const response=await f.send(path,payload);assert.equal(response.status,200,await response.text());await f.app.buffer.flush();
   const row=await f.store.get('SELECT id,recording_state,usage_unknown FROM harbor.requests WHERE model=$1',payload.model);assert.equal(row.recording_state,'complete');assert.equal(row.usage_unknown,0);
   const parts=[];let cursor={component:0,part:0};
   for(let i=0;i<30;i++){
-   const pageResponse=await f.admin(`requests/${row.id}/context?limit=1&after_component=${cursor.component}&after_part=${cursor.part}`);assert.equal(pageResponse.status,200);const page=await pageResponse.json();assert.equal(page.state,'complete');assert.equal(page.coverage.state,'complete');parts.push(...page.parts);if(!page.hasMore)break;assert.notDeepEqual(page.next,cursor);cursor=page.next;if(i===29)assert.fail('context pagination did not complete');
+   const pageResponse=await f.admin(`requests/${row.id}/context?limit=1&after_component=${cursor.component}&after_part=${cursor.part}`);assert.equal(pageResponse.status,200);const page=await pageResponse.json();assert.equal(page.state,'complete');assert.equal(page.coverage.state,'complete');assert.deepEqual(page.coverage.redaction,captureRequestContext(payload).redaction);parts.push(...page.parts);if(!page.hasMore)break;assert.notDeepEqual(page.next,cursor);cursor=page.next;if(i===29)assert.fail('context pagination did not complete');
   }
   const restored=new Map();for(const part of parts){const entry=restored.get(part.component)||{kind:part.kind,text:''};entry.text+=part.text;restored.set(part.component,entry);}
   assert.deepEqual([...restored.values()].map(entry=>({kind:entry.kind,content:JSON.parse(entry.text)})),captureRequestContext(payload).components);assert.ok(!JSON.stringify(parts).includes('synthetic-private-default'));
+  const events=await(await f.admin(`requests/${row.id}/recording?limit=100`)).json(),boundary=events.events.find(event=>event.kind==='boundary'&&event.content.section==='coverage');assert.ok(boundary,'all three channels persist coverage');assert.deepEqual(boundary.content.redaction.categories,['credential']);assert.equal(boundary.content.complete,true);assert.ok(!JSON.stringify(events).includes('sk-synthetic-audit'));
   assert.equal((await fetch(f.origin+`/api/admin/requests/${row.id}/context`,{headers:{authorization:'Bearer '+f.member.secret}})).status,401);
   assert.equal((await f.admin(`requests/${row.id}/context?after_component=invalid`)).status,400);assert.equal((await f.admin(`requests/${row.id}/context?limit=1&limit=2`)).status,400);
  }
@@ -112,4 +113,13 @@ test('context HTTP index: 三通道经真实Worker建立索引，管理Cookie可
  assert.equal((await fetch(f.origin+'/api/admin/recordings/context/search?q='+encodeURIComponent('合成'),{headers:{authorization:'Bearer '+f.member.secret}})).status,401);
  assert.equal(f.calls(),3);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.requests WHERE usage_unknown=0')).n,3);
  const createdResponse=await f.admin('recordings/exports',{include_body:true,format:'jsonl',filters:{}});assert.equal(createdResponse.status,202);const created=await createdResponse.json();await condition(async()=> (await(await f.admin('recordings/exports/'+created.id)).json()).download_ready);const downloaded=await f.admin('recordings/exports/'+created.id+'/download');assert.equal(downloaded.status,200);const lines=(await downloaded.text()).trim().split('\n').map(line=>JSON.parse(line));assert.equal(lines.filter(x=>x.kind==='context_snapshot').length,3);assert.equal(lines.filter(x=>x.kind==='context_object').length,3);assert.equal(lines.filter(x=>x.kind==='context_reference').length,3);assert.equal((await fetch(f.origin+'/api/admin/recordings/exports/'+created.id+'/download',{headers:{authorization:'Bearer '+f.member.secret}})).status,401);assert.equal(f.calls(),3);
+});
+
+test('context HTTP: schema22业务失败仍保存三通道脱敏覆盖，不启用上下文',integration,async t=>{
+ const f=await fixture(t,{mode:'healthy',probe:async()=>[{total:1000,free:900}],onModel:async()=>{throw Error('synthetic upstream failure');}});
+ for(const [path,payload] of [['/v1/responses',{model:'gpt-6.1-sol',input:'sk-synthetic-audit',stream:false}],['/v1/chat/completions',{model:'codex',messages:[{role:'user',content:'sk-synthetic-audit'}]}],['/v1/platform/chat/completions',{model:'deepseek/fixture-platform',messages:[{role:'user',content:'sk-synthetic-audit'}]}]]){
+  const response=await f.send(path,payload);await response.text();assert.equal(response.ok,false);await f.app.buffer.flush();
+  const row=await f.store.get('SELECT id,status,recording_state FROM harbor.requests WHERE model=$1',payload.model);assert.notEqual(row.status,'ok');assert.equal(row.recording_state,'partial');const data=await(await f.admin(`requests/${row.id}/recording?limit=100`)).json(),boundary=data.events.find(event=>event.kind==='boundary'&&event.content.section==='coverage');assert.ok(boundary);assert.deepEqual(boundary.content.redaction.categories,['credential']);assert.ok(!JSON.stringify(data).includes('sk-synthetic-audit'));
+ }
+ assert.equal((await f.store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,22);assert.equal(f.calls(),3);
 });

@@ -2,7 +2,7 @@ import {sanitizeRecord} from './record-redaction.mjs';
 
 // Never fetch references or retain bearer URLs, client digests, or media bodies.
 // A fingerprint is evidence about received bytes, not file identity or MIME validity.
-export function recordingAttachment(value,{fingerprint,maxContentBytes=0,onInspect=()=>{},...options}={}){
+export function recordingAttachment(value,{fingerprint,maxContentBytes=0,onInspect=()=>{},onRedact,...options}={}){
  const details=value.type==='file'&&value.file&&typeof value.file==='object'?value.file:value.type==='input_audio'&&value.input_audio&&typeof value.input_audio==='object'?value.input_audio:value;
  const image=typeof value.image_url==='string'?value.image_url:value.image_url?.url;
  const encoded=details.file_data??details.data??(typeof image==='string'&&image.startsWith('data:')?image:undefined);
@@ -39,5 +39,6 @@ export function recordingAttachment(value,{fingerprint,maxContentBytes=0,onInspe
    }
   }
  }
- return sanitizeRecord(result,options);
+ onRedact?.('attachment_data');
+ return sanitizeRecord(result,{...options,onRedact});
 }

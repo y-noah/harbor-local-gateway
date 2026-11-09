@@ -1,4 +1,7 @@
 export const redacted='[已脱敏]';
+export const recordRedactionCategories=Object.freeze(['credential','sensitive_field','private_key','attachment_data']);
+export function recordRedactionSummary(categories){return {version:1,policy:'credentials-v1',categories:[...categories].sort()};}
+export function validRecordRedaction(value){return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===3&&Object.keys(value).every(key=>['version','policy','categories'].includes(key))&&value.version===1&&value.policy==='credentials-v1'&&Array.isArray(value.categories)&&value.categories.length<=recordRedactionCategories.length&&new Set(value.categories).size===value.categories.length&&value.categories.every(category=>recordRedactionCategories.includes(category));}
 const safeRecords=new WeakSet();
 // This provenance lives only in process memory; no request-supplied flag can
 // opt out of filtering. Authenticated decryption is the only restore boundary.
@@ -43,7 +46,7 @@ const plainWordCode=code=>credentialTerminalCodes&&!credentialTerminalCodes.has(
 
 // Raw text is retained only inside this bounded filter, before any recording queue or file.
 export class RecordRedactor{
-  constructor({onEmit}={}){this.onEmit=onEmit;this.source=null;this.wordParts=[];this.word='';this.wordHead='';this.wordTail='';this.wordOffset=0;this.hiddenWord=false;this.output=[];this.outputChars=[];this.outputUnits=0;this.recent='';this.pendingKey=false;this.pendingHeader=false;this.quotedKey=false;this.valuePending=false;this.slashes=0;this.quoted=null;this.unquoted=null;this.jsonSkip=null;this.enclosingQuote=null;this.keyQuote=false;this.closedKey=false;this.jsonValuePending=false;this.unquotedQuote=null;this.quoteEscape=0;this.privateBlock=false;this.binary=false;this.high='';this.closed=false;}
+  constructor({onEmit,onRedact=()=>{}}={}){this.onEmit=onEmit;this.onRedact=onRedact;this.source=null;this.wordParts=[];this.word='';this.wordHead='';this.wordTail='';this.wordOffset=0;this.hiddenWord=false;this.output=[];this.outputChars=[];this.outputUnits=0;this.recent='';this.pendingKey=false;this.pendingHeader=false;this.quotedKey=false;this.valuePending=false;this.slashes=0;this.quoted=null;this.unquoted=null;this.jsonSkip=null;this.enclosingQuote=null;this.keyQuote=false;this.closedKey=false;this.jsonValuePending=false;this.unquotedQuote=null;this.quoteEscape=0;this.privateBlock=false;this.binary=false;this.high='';this.closed=false;}
   // Most characters never inspect the PEM/data-URI lookbehind. Retain the
   // current chunk and its UTF-16 cursor rather than copying 100 units per
   // character. The accessor also preserves the exact view inside onEmit.
@@ -73,9 +76,10 @@ export class RecordRedactor{
     if(/\s/.test(c)&&!this.slashes){this.emit(c);return;}
     this.jsonValuePending=false;this.closedKey=false;
     if(this.valuePending==='header'){
-      this.emit(redacted);this.unquoted='header';this.unquotedQuote=this.enclosingQuote;this.valuePending=false;this.slashes=0;return;
+      this.onRedact('sensitive_field');this.emit(redacted);this.unquoted='header';this.unquotedQuote=this.enclosingQuote;this.valuePending=false;this.slashes=0;return;
     }
     if(c==='\\'){this.slashes++;return;}
+    this.onRedact(this.valuePending==='token'?'credential':'sensitive_field');
     if(quoteCharacter(c)){
       this.emit('\\'.repeat(this.slashes)+c+redacted);this.quoted={quote:c,opening:this.slashes,run:0};this.slashes=0;this.valuePending=false;return;
     }
@@ -135,7 +139,7 @@ export class RecordRedactor{
         continue;
       }
       if(c==='-'&&/-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----$/.test(this.recent)){
-        const hidden=this.quoted||this.unquoted||this.hiddenWord;this.word='';this.wordHead='';this.wordTail='';this.wordOffset=0;this.wordParts=[];this.hiddenWord=false;this.valuePending=false;this.pendingKey=false;if(!hidden)this.emit(redacted);this.privateBlock=true;continue;
+        const hidden=this.quoted||this.unquoted||this.hiddenWord;this.word='';this.wordHead='';this.wordTail='';this.wordOffset=0;this.wordParts=[];this.hiddenWord=false;this.valuePending=false;this.pendingKey=false;if(!hidden)this.emit(redacted);this.onRedact('private_key');this.privateBlock=true;continue;
       }
       if(this.binary){if(/[A-Za-z0-9+/=]/.test(c))continue;this.binary=false;}
       if(this.quoted){
@@ -156,7 +160,7 @@ export class RecordRedactor{
         // Keep detection windows separate from the growing retained word so
         // prefix/suffix checks do not repeatedly flatten its full string.
         this.word+=c;if(this.wordHead.length<3)this.wordHead+=c;this.wordTail=(this.wordTail+c).slice(-16);const part=this.wordParts.at(-1);if(part?.source===this.source)part.text+=c;else this.wordParts.push({source:this.source,text:c});
-        if(this.wordOffset===0&&this.wordHead==='sk_'||credentialWord.test(this.wordTail)){const first=this.wordParts[0]?.source;this.word='';this.wordHead='';this.wordTail='';this.wordOffset=0;this.wordParts=[];this.hiddenWord=true;this.pendingKey=false;this.emit(redacted,first);}
+        if(this.wordOffset===0&&this.wordHead==='sk_'||credentialWord.test(this.wordTail)){const first=this.wordParts[0]?.source;this.word='';this.wordHead='';this.wordTail='';this.wordOffset=0;this.wordParts=[];this.hiddenWord=true;this.pendingKey=false;this.onRedact('credential');this.emit(redacted,first);}
         else if(this.word.length>8192){const length=this.word.length-64;this.wordPrefix(length);this.wordOffset+=length;this.word=this.word.slice(-64);}
         continue;
       }
@@ -167,7 +171,7 @@ export class RecordRedactor{
       if(this.pendingKey&&(c===':'||c==='=')){this.valuePending=this.quotedKey&&c===':'?'json':this.pendingHeader?'header':'field';this.pendingKey=false;this.quotedKey=false;this.emit(c);continue;}
       if(this.pendingKey&&!/[\s\\"']/.test(c))this.pendingKey=false;
       this.emit(c);
-      if(c===','&&/data:[^\s]{0,80};base64,$/i.test(this.recent)){this.binary=true;this.emit('[附件数据已省略]');}
+      if(c===','&&/data:[^\s]{0,80};base64,$/i.test(this.recent)){this.binary=true;this.onRedact('attachment_data');this.emit('[附件数据已省略]');}
     }}finally{
       // A sliced string may retain its entire input in V8. Copy these at most
       // 100 UTF-16 units without an encoding roundtrip (lone surrogates matter).
@@ -182,25 +186,25 @@ export class RecordRedactor{
     this.closed=true;this.flushOutput();const result=prefix+this.output.join('');this.output=[];this.recent='';this.word='';this.wordHead='';this.wordTail='';this.wordParts=[];this.quoted=null;this.unquoted=null;this.jsonSkip=null;this.privateBlock=false;this.slashes=0;return result;
   }
 }
-export function redactRecordText(text){const filter=new RecordRedactor();return filter.push(text)+filter.finish();}
+export function redactRecordText(text,options={}){const filter=new RecordRedactor(options);return filter.push(text)+filter.finish();}
 export function boundedRecordText(text,maxBytes){
   // Inspect at most the remaining budget, never allocate/scan the full raw string.
   let prefix=text.slice(0,maxBytes);if(Buffer.byteLength(prefix)<=maxBytes)return prefix;
   let lo=0,hi=prefix.length;while(lo<hi){const mid=Math.ceil((lo+hi)/2);if(Buffer.byteLength(prefix.slice(0,mid))<=maxBytes)lo=mid;else hi=mid-1;}
   if(lo&&/[\uD800-\uDBFF]/.test(prefix[lo-1]))lo--;return prefix.slice(0,lo);
 }
-export function redactRecordParts(parts,{maxBytes=128*1024,maxParts=4096,onTruncate=()=>{}}={}){
+export function redactRecordParts(parts,{maxBytes=128*1024,maxParts=4096,onTruncate=()=>{},onRedact}={}){
   const count=Math.min(parts.length,maxParts),outputs=Array.from({length:count},()=>({chars:[],units:0,chunks:[]}));let remaining=maxBytes;
   if(count!==parts.length)onTruncate();
   const flush=out=>{if(out.chars.length){out.chunks.push(out.chars.join(''));out.chars=[];out.units=0;}};
-  const filter=new RecordRedactor({onEmit:(text,index)=>{const out=outputs[index];if(!out)return;out.chars.push(text);out.units+=text.length;if(out.units>=4096)flush(out);}});
+  const filter=new RecordRedactor({onRedact,onEmit:(text,index)=>{const out=outputs[index];if(!out)return;out.chars.push(text);out.units+=text.length;if(out.units>=4096)flush(out);}});
   for(let index=0;index<count;index++){
     const raw=parts[index],prefix=boundedRecordText(raw,Math.max(0,remaining));remaining-=Buffer.byteLength(prefix);filter.push(prefix,index);
     if(prefix.length!==raw.length){onTruncate();break;}
   }
   filter.finish();return {parts:outputs.map(out=>{flush(out);return out.chunks.join('');}),bytes:maxBytes-remaining};
 }
-export function sanitizeRecord(value,{maxDepth=24,maxBytes=128*1024,maxNodes=4096,onTruncate=()=>{}}={}){
+export function sanitizeRecord(value,{maxDepth=24,maxBytes=128*1024,maxNodes=4096,onTruncate=()=>{},onRedact=()=>{}}={}){
   let remaining=maxBytes,nodes=maxNodes;
   const cut=()=>{onTruncate();return '[已截断]';};
   const visit=(item,depth)=>{
@@ -211,9 +215,9 @@ export function sanitizeRecord(value,{maxDepth=24,maxBytes=128*1024,maxNodes=409
     if(typeof item==='string'){
       const prefix=boundedRecordText(item,remaining);remaining-=Buffer.byteLength(prefix);
       const clipped=prefix.length!==item.length;if(clipped)onTruncate();
-      return redactRecordText(prefix)+(clipped?'[已截断]':'');
+      return redactRecordText(prefix,{onRedact})+(clipped?'[已截断]':'');
     }
-    if(item instanceof ArrayBuffer||ArrayBuffer.isView(item))return {type:'binary',bytes:item.byteLength,content:'[附件数据已省略]'};
+    if(item instanceof ArrayBuffer||ArrayBuffer.isView(item)){onRedact('attachment_data');return {type:'binary',bytes:item.byteLength,content:'[附件数据已省略]'};}
     if(Array.isArray(item)){
       const result=[],parts=[],positions=[];
       for(const child of item){
@@ -223,13 +227,14 @@ export function sanitizeRecord(value,{maxDepth=24,maxBytes=128*1024,maxNodes=409
           positions.push(result.length);parts.push(prefix);result.push({type:'text',text:''});
         }else result.push(visit(child,depth+1));
       }
-      const safe=redactRecordParts(parts,{maxBytes,maxParts:maxNodes,onTruncate}).parts;for(let i=0;i<safe.length;i++)result[positions[i]].text=safe[i];return result;
+      const safe=redactRecordParts(parts,{maxBytes,maxParts:maxNodes,onTruncate,onRedact}).parts;for(let i=0;i<safe.length;i++)result[positions[i]].text=safe[i];return result;
     }
     if(item&&typeof item==='object'){
-      if(['image','image_url','input_image','input_file','file','audio','input_audio'].includes(item.type))return {type:item.type,...(Number.isSafeInteger(item.size??item.bytes)&&(item.size??item.bytes)>=0?{bytes:item.size??item.bytes}:{}),...(Number.isSafeInteger(item.position)&&item.position>=0?{position:item.position}:{}),...(['low','high','auto'].includes(item.detail)?{detail:item.detail}:{}),content:'[附件数据已省略]'};
+      if(['image','image_url','input_image','input_file','file','audio','input_audio'].includes(item.type)){onRedact('attachment_data');return {type:item.type,...(Number.isSafeInteger(item.size??item.bytes)&&(item.size??item.bytes)>=0?{bytes:item.size??item.bytes}:{}),...(Number.isSafeInteger(item.position)&&item.position>=0?{position:item.position}:{}),...(['low','high','auto'].includes(item.detail)?{detail:item.detail}:{}),content:'[附件数据已省略]'};}
       const result={};for(const key in item){if(!Object.hasOwn(item,key))continue;if(nodes<=0||remaining<=0){Object.defineProperty(result,'recording_truncated',{value:cut(),enumerable:true});break;}
         const keyPrefix=boundedRecordText(key,Math.min(remaining,256));if(keyPrefix.length!==key.length)onTruncate();
-        const safeKey=redactRecordText(keyPrefix);remaining-=Buffer.byteLength(safeKey);
+        const safeKey=redactRecordText(keyPrefix,{onRedact});remaining-=Buffer.byteLength(safeKey);
+        if(keyPrefix.length===key.length&&sensitiveRecordField(keyPrefix))onRedact('sensitive_field');
         Object.defineProperty(result,safeKey,{value:keyPrefix.length!==key.length||sensitiveRecordField(keyPrefix)?redacted:visit(item[key],depth+1),enumerable:true,writable:true,configurable:true});
       }return result;
     }

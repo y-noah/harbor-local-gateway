@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {RecordRedactor,sanitizeRecord,sanitizeToolRecord,boundedRecordText,redactRecordParts,filteredRecordField} from './record-redaction.mjs';
+import {RecordRedactor,recordRedactionSummary,sanitizeRecord,sanitizeToolRecord,boundedRecordText,redactRecordParts,filteredRecordField} from './record-redaction.mjs';
 import {JsonRecordRedactor} from './record-json.mjs';
 
 const digest=text=>createHash('sha256').update(text).digest('hex');
@@ -38,7 +38,7 @@ export function currentInput(payload,{maxEvents=256,maxNodes=1024}={}){
 // Custom results can contain Responses input_text parts as well as MCP text
 // parts. Filter adjacent text before any defensive per-value pass, otherwise a
 // credential split across parts can lose its prefix during that first pass.
-function redactToolJson(raw,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMetadata}){
+function redactToolJson(raw,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMetadata,onRedact}){
   // The caller already validated the JSON. Locate only typed attachment objects
   // and adjacent text values: other source spans pass unchanged to the existing
   // JSON text redactor, including whitespace and numeric literals.
@@ -51,7 +51,7 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMeta
     if(char==='['){
       cursor++;whitespace();const parts=[];
       while(raw[cursor]!==']'){const child=value(depth+1);if(child?.textParts)parts.push(...child.textParts);whitespace();if(raw[cursor]===','){cursor++;continue;}break;}cursor++;
-      const texts=parts.map(part=>JSON.parse(raw.slice(part.start,part.end))),safe=redactRecordParts(texts,{maxBytes,maxParts:maxNodes,onTruncate}).parts;
+      const texts=parts.map(part=>JSON.parse(raw.slice(part.start,part.end))),safe=redactRecordParts(texts,{maxBytes,maxParts:maxNodes,onTruncate,onRedact}).parts;
       for(let i=0;i<safe.length;i++)if(safe[i]!==texts[i])edits.push({...parts[i],replacement:JSON.stringify(safe[i])});return {start,end:cursor};
     }
     if(char==='{'){
@@ -65,7 +65,7 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMeta
         if(['size','bytes','position','detail'].includes(key)&&child.end-child.start<128){const fact=JSON.parse(raw.slice(child.start,child.end));if(key==='detail'&&['low','high','auto'].includes(fact))facts.detail=fact;else if(Number.isSafeInteger(fact)&&fact>=0)facts[key==='size'?'bytes':key]=fact;}
         whitespace();if(raw[cursor]===','){cursor++;continue;}break;
       }cursor++;
-      if(binary)edits.push({start,end:cursor,replacement:JSON.stringify(attachmentMetadata?attachmentMetadata(JSON.parse(raw.slice(start,cursor))):{type,...facts,content:'[附件数据已省略]'})});
+      if(binary){onRedact?.('attachment_data');edits.push({start,end:cursor,replacement:JSON.stringify(attachmentMetadata?attachmentMetadata(JSON.parse(raw.slice(start,cursor))):{type,...facts,content:'[附件数据已省略]'})});}
       return {start,end:cursor,...(!binary&&['text','input_text','output_text'].includes(type)?{textParts}:{})};
     }
     while(cursor<raw.length&&!/[\s,\]}]/.test(raw[cursor]))cursor++;return {start,end:cursor};
@@ -73,25 +73,25 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMeta
   try{value(0);}catch(error){if(error!==limit)throw error;onTruncate();return '[工具结构化内容超限，已省略]';}
   let position=0;const parts=[];
   for(const edit of edits.sort((a,b)=>a.start-b.start||b.end-a.end)){if(edit.start<position)continue;parts.push(raw.slice(position,edit.start),edit.replacement);position=edit.end;}parts.push(raw.slice(position));
-  const filter=new JsonRecordRedactor({onTruncate});return filter.push(parts.join(''))+filter.finish();
+  const filter=new JsonRecordRedactor({onTruncate,onRedact});return filter.push(parts.join(''))+filter.finish();
 }
-export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,onTruncate,onUnsupported=()=>{},onNodes,attachmentMetadata}){
+export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,onTruncate,onUnsupported=()=>{},onNodes,attachmentMetadata,onRedact}){
   if(typeof value==='string'){
     const prefix=boundedRecordText(value,maxBytes);
     if(/^[\[{]/.test(prefix.trimStart())){
       if(prefix.length!==value.length){onTruncate();return '[工具结构化内容超限，已省略]';}
       let valid=false;try{JSON.parse(value);valid=true;}catch{}
-      if(valid)return redactToolJson(value,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMetadata});
+      if(valid)return redactToolJson(value,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMetadata,onRedact});
     }
     if(onNodes?.(1)===false){onTruncate();return '[已截断]';}
-    return sanitizeRecord(value,{maxBytes,onTruncate});
+    return sanitizeRecord(value,{maxBytes,onTruncate,onRedact});
   }
   let nodes=maxNodes,remaining=maxBytes;
   const cut=()=>{onTruncate();return '[已截断]';},text=raw=>{const prefix=boundedRecordText(raw,remaining);remaining-=Buffer.byteLength(prefix);if(prefix.length!==raw.length)onTruncate();return prefix;};
   const visit=(item,depth=0,fragment=false)=>{
     if(onNodes?.(1)===false||--nodes<0||depth>24||remaining<=0)return cut();
     if(typeof item==='string')return text(item);
-    if(item instanceof ArrayBuffer||ArrayBuffer.isView(item))return {type:'binary',bytes:item.byteLength,content:'[附件数据已省略]'};
+    if(item instanceof ArrayBuffer||ArrayBuffer.isView(item)){onRedact?.('attachment_data');return {type:'binary',bytes:item.byteLength,content:'[附件数据已省略]'};}
     if(Array.isArray(item)){
       const result=[],parts=[],positions=[];
       for(const child of item){if(nodes<=0||remaining<=0){result.push(cut());break;}
@@ -103,19 +103,19 @@ export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,
         }
         else result.push(visit(child,depth+1));
       }
-      const safe=redactRecordParts(parts,{maxBytes,maxParts:maxNodes,onTruncate}).parts;
+      const safe=redactRecordParts(parts,{maxBytes,maxParts:maxNodes,onTruncate,onRedact}).parts;
       for(let i=0;i<safe.length;i++)result[positions[i][0]]=filteredRecordField({type:positions[i][1]},'text',safe[i]);return result;
     }
     if(item&&typeof item==='object'){
-      if(mediaTypes.has(item.type))return attachmentMetadata?attachmentMetadata(item):{type:item.type,
+      if(mediaTypes.has(item.type)){onRedact?.('attachment_data');return attachmentMetadata?attachmentMetadata(item):{type:item.type,
         ...(Number.isSafeInteger(item.size??item.bytes)&&(item.size??item.bytes)>=0?{bytes:item.size??item.bytes}:{}),
-        ...(Number.isSafeInteger(item.position)&&item.position>=0?{position:item.position}:{}),...(['low','high','auto'].includes(item.detail)?{detail:item.detail}:{}),content:'[附件数据已省略]'};
+        ...(Number.isSafeInteger(item.position)&&item.position>=0?{position:item.position}:{}),...(['low','high','auto'].includes(item.detail)?{detail:item.detail}:{}),content:'[附件数据已省略]'};}
       const result=Object.create(null);for(const key in item){if(!Object.hasOwn(item,key))continue;if(onNodes?.(1)===false||nodes<=0||remaining<=0){result.recording_truncated=cut();break;}
         const name=boundedRecordText(key,Math.min(remaining,256));remaining-=Buffer.byteLength(name);if(name.length!==key.length){onTruncate();result[name]='[已脱敏]';}else result[name]=visit(item[key],depth+1,key==='content'&&Array.isArray(item[key]));
       }return result;
     }return item;
   };
-  return sanitizeRecord(visit(value,0,contentParts),{maxBytes,maxNodes,onTruncate});
+  return sanitizeRecord(visit(value,0,contentParts),{maxBytes,maxNodes,onTruncate,onRedact});
 }
 
 // emit receives only sanitized copies. Raw text is confined to bounded redactors;
@@ -124,7 +124,7 @@ export class ConversationCapture{
   constructor({emit,maxFields=256,maxBytes=2*1024*1024,maxNodes=1024}={}){
     if(typeof emit!=='function'||!Number.isSafeInteger(maxFields)||maxFields<1||!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxNodes)||maxNodes<1)throw TypeError('Invalid recording capture configuration');
     this.emit=emit;this.maxFields=maxFields;this.maxBytes=maxBytes;this.remainingNodes=maxNodes;this.fields=new Map();this.identities=new Map();this.itemMetadata=new Map();this.bytes=0;this.rawBytes=0;this.sequence=0;this.inputSequence=0;this.truncated=false;this.closed=false;
-    this.observations=new Map();this.unsupported={items:new Set(),events:new Set(),contentParts:new Set()};this.incompleteReasons=new Set();this.opaqueReasoning=new Set();
+    this.redactionCategories=new Set();this.onRedact=category=>this.redactionCategories.add(category);this.observations=new Map();this.unsupported={items:new Set(),events:new Set(),contentParts:new Set()};this.incompleteReasons=new Set();this.opaqueReasoning=new Set();
   }
   unsupportedItem(category,key){
     const entries=this.unsupported[category];if(entries.has(key))return;
@@ -139,7 +139,7 @@ export class ConversationCapture{
   }
   send(kind,content,provenance='upstream'){
     if(this.closed||this.truncated)return false;
-    let clipped=false;const safe=sanitizeRecord(content,{maxBytes:Math.max(0,this.maxBytes-this.bytes),onTruncate:()=>{clipped=true;}}),bytes=Buffer.byteLength(JSON.stringify(safe));
+    let clipped=false;const safe=sanitizeRecord(content,{maxBytes:Math.max(0,this.maxBytes-this.bytes),onRedact:this.onRedact,onTruncate:()=>{clipped=true;}}),bytes=Buffer.byteLength(JSON.stringify(safe));
     if(clipped){this.truncated=true;return;}
     if(this.bytes+bytes>this.maxBytes){this.truncated=true;return;}
     this.bytes+=bytes;let accepted=true;try{if(this.emit({sourceKey:String(++this.sequence),kind,provenance,content:safe})===false)accepted=false;}catch{accepted=false;}if(!accepted)this.failed=true;
@@ -157,7 +157,7 @@ export class ConversationCapture{
   }
   sendText(kind,metadata,text,provenance='upstream'){return this.sendField(kind,metadata,'text',text,provenance);}
   input(payload,current=currentInput(payload)){
-    let clipped=false;const users=current.events.filter(event=>event.kind==='user'),filtered=redactRecordParts(users.map(event=>event.content.text),{maxBytes:Math.max(0,this.maxBytes-this.rawBytes),onTruncate:()=>{clipped=true;}});this.rawBytes+=filtered.bytes;
+    let clipped=false;const users=current.events.filter(event=>event.kind==='user'),filtered=redactRecordParts(users.map(event=>event.content.text),{maxBytes:Math.max(0,this.maxBytes-this.rawBytes),onRedact:this.onRedact,onTruncate:()=>{clipped=true;}});this.rawBytes+=filtered.bytes;
     let userIndex=0;
     for(const [position,event] of current.events.entries()){
       if(this.truncated)break;
@@ -183,8 +183,8 @@ export class ConversationCapture{
     this.observe(key,kind,metadata);let state=this.fields.get(key);
     if(!state&&!this.truncated){
       if(this.fields.size>=this.maxFields){this.truncated=true;return null;}
-      const safe=sanitizeRecord(metadata,{maxBytes:8192,onTruncate:()=>{this.truncated=true;}});if(this.truncated)return null;
-      state={key,kind,metadata:safe,filter:kind==='tool_call'&&metadata.toolType!=='custom_tool_call'?new JsonRecordRedactor({onTruncate:()=>{this.truncated=true;}}):new RecordRedactor(),hash:createHash('sha256'),closed:false};this.fields.set(key,state);
+      const safe=sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}});if(this.truncated)return null;
+      state={key,kind,metadata:safe,filter:kind==='tool_call'&&metadata.toolType!=='custom_tool_call'?new JsonRecordRedactor({onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}}):new RecordRedactor({onRedact:this.onRedact}),hash:createHash('sha256'),closed:false};this.fields.set(key,state);
     }
     return state;
   }
@@ -202,12 +202,12 @@ export class ConversationCapture{
     if(boundedRecordText(text,this.maxBytes).length!==text.length){if(this.fields.get(key)?.closed)this.truncated=true;else this.delta(key,kind,metadata,text);return;}
     const field=this.field(key,kind,metadata);if(!field)return;
     const finalHash=digest(text),same=field.closed?field.finalHash===finalHash:field.hash.copy().digest('hex')===finalHash;
-    const safeMetadata=sanitizeRecord(metadata,{maxBytes:8192,onTruncate:()=>{this.truncated=true;}});if(this.truncated)return;
+    const safeMetadata=sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}});if(this.truncated)return;
     const updates=Object.fromEntries(Object.entries(safeMetadata).filter(([name,value])=>value!==null||field.metadata[name]==null)),changed=Object.entries(updates).some(([name,value])=>field.metadata[name]!==value);field.metadata={...field.metadata,...updates};
     const tail=field.closed?'':field.filter.finish();
     if(same){if(!field.closed||tail||changed)this.sendText(kind,{...field.metadata,field:key,mode:'append'},tail);}
     else{
-      let clipped=false;const options={maxBytes:Math.max(0,this.maxBytes-this.bytes),onTruncate:()=>{clipped=true;}};
+      let clipped=false;const options={maxBytes:Math.max(0,this.maxBytes-this.bytes),onRedact:this.onRedact,onTruncate:()=>{clipped=true;}};
       const safe=kind==='tool_call'&&field.metadata.toolType!=='custom_tool_call'?sanitizeToolRecord(text,options):sanitizeRecord(text,options);this.sendText(kind,{...field.metadata,field:key,mode:'replace'},safe);if(clipped)this.truncated=true;
     }
     field.closed=true;field.hash=null;field.finalHash=finalHash;
@@ -215,8 +215,8 @@ export class ConversationCapture{
   result(key,metadata,value,provenance='upstream'){
     const field=this.field(key,'tool_result',metadata);if(!field)return;
     if(value===undefined){this.incompleteReasons.add('malformed_tool_item');return;}
-    let clipped=false,unsupported=0;const output=safeToolOutput(value,{maxBytes:this.maxBytes,maxNodes:Math.max(1,this.remainingNodes),contentParts:metadata.toolType==='custom_tool_call'&&Array.isArray(value),onTruncate:()=>{clipped=true;},onUnsupported:()=>this.unsupportedItem('contentParts',key+':output:'+(unsupported++))}),encoded=JSON.stringify(output),hash=digest(encoded??'');
-    const safeMetadata=sanitizeRecord(metadata,{maxBytes:8192,onTruncate:()=>{clipped=true;}}),updates=Object.fromEntries(Object.entries(safeMetadata).filter(([name,value])=>value!==null||field.metadata[name]==null)),changed=Object.entries(updates).some(([name,value])=>field.metadata[name]!==value);field.metadata={...field.metadata,...updates};
+    let clipped=false,unsupported=0;const output=safeToolOutput(value,{maxBytes:this.maxBytes,maxNodes:Math.max(1,this.remainingNodes),contentParts:metadata.toolType==='custom_tool_call'&&Array.isArray(value),onRedact:this.onRedact,onTruncate:()=>{clipped=true;},onUnsupported:()=>this.unsupportedItem('contentParts',key+':output:'+(unsupported++))}),encoded=JSON.stringify(output),hash=digest(encoded??'');
+    const safeMetadata=sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{clipped=true;}}),updates=Object.fromEntries(Object.entries(safeMetadata).filter(([name,value])=>value!==null||field.metadata[name]==null)),changed=Object.entries(updates).some(([name,value])=>field.metadata[name]!==value);field.metadata={...field.metadata,...updates};
     if(hash!==field.resultHash){
       const details={...field.metadata,field:key,mode:'replace'};
       if(Buffer.byteLength(encoded)>32*1024)this.sendField('tool_result',{...details,output_format:typeof output==='string'?'string':'json'},'output',typeof output==='string'?output:encoded,provenance);
@@ -267,7 +267,7 @@ export class ConversationCapture{
       if(event.item?.type==='function_call'||event.item?.type==='custom_tool_call'){
         const custom=event.item.type==='custom_tool_call',metadata=this.toolMetadata(event.item,id,event.item.type),field=key+(custom?':input':':arguments');
         this.observe(field,'tool_call',metadata);
-        if(this.itemMetadata.has(key)||this.itemMetadata.size<this.maxFields)this.itemMetadata.set(key,sanitizeRecord(metadata,{maxBytes:8192,onTruncate:()=>{this.truncated=true;}}));else this.truncated=true;
+        if(this.itemMetadata.has(key)||this.itemMetadata.size<this.maxFields)this.itemMetadata.set(key,sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}}));else this.truncated=true;
         const state=this.field(field,'tool_call',this.itemMetadata.get(key)||{item:id,toolType:event.item.type});
         if(state){state.metadata={...state.metadata,...this.itemMetadata.get(key)};this.send('tool_call',{...state.metadata,field,mode:'append',text:''});}
         const value=custom?event.item.input:event.item.arguments;if(typeof value==='string'&&value.length)this.delta(field,'tool_call',this.itemMetadata.get(key),value);return;
@@ -320,7 +320,7 @@ export class ConversationCapture{
     const unsupported=Object.fromEntries(Object.entries(this.unsupported).map(([category,entries])=>[category,entries.size]));
     for(const [category,reason] of [['items','unsupported_item'],['events','unsupported_event'],['contentParts','unsupported_content']])if(unsupported[category])this.incompleteReasons.add(reason);
     if(this.truncated)this.incompleteReasons.add('size_limit');if(this.failed)this.incompleteReasons.add('capture_failed');
-    const incomplete=this.incompleteReasons.size>0,coverage={version:1,complete:!incomplete,seen,captured,unsupported,opaqueReasoningExcluded:this.opaqueReasoning.size,reasons:[...this.incompleteReasons].sort()};
+    const incomplete=this.incompleteReasons.size>0,coverage={version:1,redaction:recordRedactionSummary(this.redactionCategories),complete:!incomplete,seen,captured,unsupported,opaqueReasoningExcluded:this.opaqueReasoning.size,reasons:[...this.incompleteReasons].sort()};
     this.closed=true;this.fields.clear();this.identities.clear();this.itemMetadata.clear();this.observations.clear();for(const values of Object.values(this.unsupported))values.clear();this.opaqueReasoning.clear();
     return {truncated:this.truncated,failed:!!this.failed,bytes:this.bytes,incomplete,coverage};
   }

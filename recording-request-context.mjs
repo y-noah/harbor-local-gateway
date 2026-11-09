@@ -1,4 +1,4 @@
-import {sanitizeRecord,redactRecordParts,restoreAuthenticatedRecord,sensitiveRecordField,boundedRecordText} from './record-redaction.mjs';
+import {sanitizeRecord,recordRedactionSummary,redactRecordParts,restoreAuthenticatedRecord,sensitiveRecordField,boundedRecordText} from './record-redaction.mjs';
 import {safeToolOutput} from './conversation-capture.mjs';
 import {recordingAttachment} from './recording-attachment.mjs';
 import {recordingLiteral} from './recording-literal.mjs';
@@ -15,19 +15,20 @@ export const requestContextReasons=Object.freeze(['invalid_payload','unsupported
 // or local execution. Authentication and scope come from the recording store.
 export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=16384,attachmentFingerprint}={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxComponents)||maxComponents<1||!Number.isSafeInteger(maxNodes)||maxNodes<1)throw TypeError('Invalid request context budget');
+  const redactions=new Set(),onRedact=category=>redactions.add(category);
   const components=[],reasons=new Set();let bytes=2,nodes=maxNodes,opaqueReasoningExcluded=0;
   let attachmentBytes=maxBytes;
-  const attachment=value=>recordingAttachment(value,{maxBytes:maxBytes-bytes,onTruncate:cut,maxContentBytes:attachmentBytes,onInspect:count=>{attachmentBytes=Math.max(0,attachmentBytes-count);},fingerprint:attachmentFingerprint});
+  const attachment=value=>recordingAttachment(value,{maxBytes:maxBytes-bytes,onTruncate:cut,onRedact,maxContentBytes:attachmentBytes,onInspect:count=>{attachmentBytes=Math.max(0,attachmentBytes-count);},fingerprint:attachmentFingerprint});
   const cut=()=>{reasons.add('size_limit');return '[已截断]';};
-  const literal=(value,depth)=>depth>24?cut():recordingLiteral(value,{maxBytes:maxBytes-bytes,maxDepth:24-depth,onNodes:count=>{nodes-=count;return nodes>=0;},onTruncate:cut});
+  const literal=(value,depth)=>depth>24?cut():recordingLiteral(value,{maxBytes:maxBytes-bytes,maxDepth:24-depth,onNodes:count=>{nodes-=count;return nodes>=0;},onTruncate:cut,onRedact});
   const visible=(value,depth=0,protocol=true,slot=null,sensitiveDefinition=false,schema=false)=>{
     if(--nodes<0||depth>24)return cut();
     if(protocol&&(slot==='function'&&(!value||typeof value!=='object'||Array.isArray(value))||slot==='conversation'&&value!==null&&typeof value!=='string'&&(typeof value!=='object'||Array.isArray(value)))){reasons.add('unsupported_content');return '[未支持的上下文结构已省略]';}
-    if(value instanceof ArrayBuffer||ArrayBuffer.isView(value))return {type:'binary',bytes:value.byteLength,content:'[附件数据已省略]'};
+    if(value instanceof ArrayBuffer||ArrayBuffer.isView(value)){onRedact('attachment_data');return {type:'binary',bytes:value.byteLength,content:'[附件数据已省略]'};}
     if(Array.isArray(value)){
       const result=[];for(const child of value){if(nodes<=0){result.push(cut());break;}if(protocol&&slot&&(!child||typeof child!=='object'||Array.isArray(child))){nodes--;reasons.add('unsupported_content');result.push({content:'[未支持的上下文结构已省略]'});continue;}result.push(visible(child,depth+1,protocol,slot,sensitiveDefinition,schema));}
       const positions=[],texts=[];for(let i=0;i<result.length;i++){const field=result[i]?.type==='refusal'?'refusal':'text';if(textTypes.has(result[i]?.type)&&typeof result[i][field]==='string'){positions.push([i,field]);texts.push(result[i][field]);}}
-      const filtered=redactRecordParts(texts,{maxBytes,maxParts:maxNodes,onTruncate:cut}).parts;
+      const filtered=redactRecordParts(texts,{maxBytes,maxParts:maxNodes,onTruncate:cut,onRedact}).parts;
       for(let i=0;i<positions.length;i++){const [position,field]=positions[i];result[position]={...result[position],[field]:filtered[i]??''};}return result;
     }
     if(!value||typeof value!=='object')return value;
@@ -54,7 +55,7 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
       }
       messagePositions.push({field:'refusal'});messageTexts.push(value.refusal);
     }
-    const messageSafe=messageTexts.length?redactRecordParts(messageTexts,{maxBytes:maxBytes-bytes,maxParts:maxNodes,onTruncate:cut}).parts:[];
+    const messageSafe=messageTexts.length?redactRecordParts(messageTexts,{maxBytes:maxBytes-bytes,maxParts:maxNodes,onTruncate:cut,onRedact}).parts:[];
     for(const key in value){
       if(--nodes<0){cut();break;}
       if(!Object.hasOwn(value,key))continue;
@@ -69,21 +70,22 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
       if(protocol&&value.role!==undefined&&key==='refusal'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='content'&&value[key]!==null&&typeof value[key]!=='string'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
       if(protocol&&(key==='output'&&['function_call_output','custom_tool_call_output'].includes(value.type)||key==='content'&&value.role==='tool')){
-        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key]),onTruncate:cut,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
+        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key]),onTruncate:cut,onRedact,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
       }
       if(schema==='definition'&&['properties','patternProperties','$defs','definitions','dependentSchemas','dependentRequired','dependencies'].includes(key)&&value[key]&&typeof value[key]==='object'&&!Array.isArray(value[key])){
         const definitions={};
         for(const name in value[key]){
           if(--nodes<0){cut();break;}if(!Object.hasOwn(value[key],name))continue;
           const prefix=boundedRecordText(name,256);if(prefix!==name){cut();continue;}
-          const safeName=sanitizeRecord(prefix);if(Object.hasOwn(definitions,safeName)){reasons.add('schema_name_collision');continue;}
+          const safeName=sanitizeRecord(prefix,{onRedact});if(Object.hasOwn(definitions,safeName)){reasons.add('schema_name_collision');continue;}
           const definition=key==='dependentRequired'||key==='dependencies'&&Array.isArray(value[key][name])?literal(value[key][name],depth+2):visible(value[key][name],depth+2,false,null,sensitiveDefinition||sensitiveRecordField(name),'definition');
-          Object.defineProperty(definitions,safeName,{value:sanitizeRecord(definition,{maxBytes,maxNodes,onTruncate:cut}),enumerable:true});
+          Object.defineProperty(definitions,safeName,{value:sanitizeRecord(definition,{maxBytes,maxNodes,onTruncate:cut,onRedact}),enumerable:true});
         }
         Object.defineProperty(result,key,{value:restoreAuthenticatedRecord(definitions),enumerable:true});continue;
       }
       const nextSlot=!protocol?null:['content','summary'].includes(key)?key:key==='tool_calls'?'tool_call':key==='function'?'function':key==='tools'&&slot==='tool_choice'?'tool_choice':key==='value'&&['conversation','tool_choice'].includes(value.source)?value.source:null;
       const nextSchema=schema==='envelope'?['parameters','input_schema','schema'].includes(key)?'definition':['value','function','format'].includes(key)?'envelope':false:schema==='definition'&&schemaBranches.has(key)?'definition':false;
+      if(schema==='definition'&&sensitiveDefinition&&['default','examples','const','enum'].includes(key))onRedact('sensitive_field');
       let child=schema==='definition'&&sensitiveDefinition&&['default','examples','const','enum'].includes(key)?'[已脱敏]':schema&&!nextSchema?literal(value[key],depth+1):visible(value[key],depth+1,protocol&&!['input','output','arguments'].includes(key),nextSlot,sensitiveDefinition,nextSchema);
       for(let index=0;index<messagePositions.length;index++){
         const position=messagePositions[index];if(position.field!==key)continue;
@@ -99,12 +101,12 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
     // Sanitize before returning anything to a queue, cache, or persistence API.
     const prepared=visible(content,0,kind!=='tool_schema',null,false,kind==='tool_schema'?'envelope':false);let budget=maxBytes-bytes,component,size;
     for(;;){
-      const safe=sanitizeRecord(prepared,{maxBytes:budget,maxNodes,onTruncate:cut});component={kind,content:safe};size=Buffer.byteLength(JSON.stringify(component))+(components.length?1:0);
+      const safe=sanitizeRecord(prepared,{maxBytes:budget,maxNodes,onTruncate:cut,onRedact});component={kind,content:safe};size=Buffer.byteLength(JSON.stringify(component))+(components.length?1:0);
       if(bytes+size<=maxBytes||budget===0)break;cut();budget=Math.floor(budget/2);
     }
     if(bytes+size>maxBytes){cut();return false;}components.push(component);bytes+=size;return true;
   };
-  if(!payload||typeof payload!=='object'||Array.isArray(payload))return {state:'incomplete',components,bytes,reasons:['invalid_payload'],opaqueReasoningExcluded};
+  if(!payload||typeof payload!=='object'||Array.isArray(payload))return {state:'incomplete',components,bytes,reasons:['invalid_payload'],opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
   if(typeof payload.instructions==='string')add('instruction',{source:'instructions',value:payload.instructions});
   else if(payload.instructions!==undefined&&payload.instructions!==null)reasons.add('unsupported_instructions');
   if(Array.isArray(payload.tools))for(let index=0;index<payload.tools.length;index++){if(nodes<=0){cut();break;}const tool=payload.tools[index];if(!tool||typeof tool!=='object'||Array.isArray(tool)){nodes--;reasons.add('unsupported_tools');continue;}if(!add('tool_schema',{source:'tools',index,value:tool}))break;}
@@ -125,5 +127,5 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
     const value=payload[key],valid=value===null||key==='parallel_tool_calls'&&typeof value==='boolean'||key!=='parallel_tool_calls'&&typeof value==='string'||['conversation','tool_choice'].includes(key)&&typeof value==='object'&&!Array.isArray(value);
     if(!valid){reasons.add('unsupported_content');continue;}add('context',{source:key,value});
   }
-  return {state:reasons.size?'incomplete':'complete',components,bytes,reasons:[...reasons].sort(),opaqueReasoningExcluded};
+  return {state:reasons.size?'incomplete':'complete',components,bytes,reasons:[...reasons].sort(),opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
 }
