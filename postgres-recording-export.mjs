@@ -3,12 +3,15 @@ import {AppError,usageWindow} from './store.mjs';
 import {recordingQuery,recordingScope} from './postgres-recording-query.mjs';
 import {csvHeader,metadataCsv,exportMetadata,referenceUsdDisplay} from './recording-export-format.mjs';
 import {validPrice,joins} from './postgres-reference-query.mjs';
+import {createPostgresRecordingContextExport} from './postgres-recording-context-export.mjs';
 
 const fail=(status,message,code='recording_export_invalid')=>{throw new AppError(status,message,code);};
 const isId=value=>typeof value==='string'&&/^[a-f0-9-]{36}$/.test(value);
 const stopped=signal=>{if(signal?.aborted)fail(503,'导出已停止','worker_stopping');};
-export function createPostgresRecordingExports(store,{jobs,crypto,recordings,clock=Date.now,storagePolicy=async()=>({exportAllowed:true}),maxRows=100000,maxBytes=1073741824,chunkBytes=65536,ttlMs=3600000,batchRows=25,queryQueue,devices=false,maxPageBytes=65536}={}){
+export function createPostgresRecordingExports(store,{jobs,crypto,recordings,contexts,clock=Date.now,storagePolicy=async()=>({exportAllowed:true}),maxRows=100000,maxBytes=1073741824,chunkBytes=65536,ttlMs=3600000,batchRows=25,queryQueue,devices=false,maxPageBytes=65536}={}){
   if(!jobs||!crypto||!recordings||!Number.isInteger(maxRows)||maxRows<1||maxRows>1000000||!Number.isSafeInteger(maxBytes)||maxBytes<1024||maxBytes>4294967296||!Number.isInteger(chunkBytes)||chunkBytes<1024||chunkBytes>1048576||!Number.isInteger(ttlMs)||ttlMs<60000||ttlMs>86400000||!Number.isInteger(batchRows)||batchRows<1||batchRows>100||!Number.isInteger(maxPageBytes)||maxPageBytes<2048||maxPageBytes>1048576)fail(503,'导出资源配置无效','recording_export_configuration');
+  if(contexts!==undefined&&(!contexts||typeof contexts.describeSnapshot!=='function'||typeof contexts.readObject!=='function'))fail(503,'上下文导出依赖无效','recording_export_configuration');
+  const contextExport=contexts?createPostgresRecordingContextExport(store,{contexts,chunkBytes}):null;
   const read=op=>queryQueue?queryQueue.run(op):op();
   async function enqueue(input){
     if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(key=>!['include_body','format','filters'].includes(key))||typeof input.include_body!=='boolean'||!['csv','jsonl'].includes(input.format)||input.include_body&&input.format!=='jsonl'||!input.filters||typeof input.filters!=='object'||Array.isArray(input.filters)||Object.values(input.filters).some(value=>typeof value!=='string'))fail(400,'导出须明确格式、是否包含正文和筛选');
@@ -17,7 +20,7 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,clo
     const policy=await storagePolicy();if(!policy.exportAllowed)fail(503,'磁盘或存储预算不足，暂不接受导出','recording_storage_low');
     return store.transaction(async()=>{
       const id=randomUUID(),at=clock(),job=await jobs.enqueue('recording.export',{id:'recording.export:'+id,target:id,payload:{export_id:id}}),visibility=(await store.get('SELECT pg_current_snapshot()::text value')).value;
-      await store.run('INSERT INTO harbor.recording_exports(id,created,expires,actor,options,visibility) VALUES($1,$2,$3,$4,$5::jsonb,$6::pg_snapshot)',job.id,at,at+ttlMs,'admin',JSON.stringify({include_body:input.include_body,format:input.format,query,max_rows:maxRows,max_bytes:maxBytes,key_version:crypto.keyVersion}),visibility);
+      await store.run('INSERT INTO harbor.recording_exports(id,created,expires,actor,options,visibility) VALUES($1,$2,$3,$4,$5::jsonb,$6::pg_snapshot)',job.id,at,at+ttlMs,'admin',JSON.stringify({include_body:input.include_body,format:input.format,query,...(contextExport?{include_context:input.include_body,context_format:1}:{}),max_rows:maxRows,max_bytes:maxBytes,key_version:crypto.keyVersion}),visibility);
       await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',randomUUID(),at,'recording.export.requested',JSON.stringify({export:job.id,include_body:input.include_body,format:input.format,actor:'admin'}));
       return {id:job.id,status:'queued',expires:at+ttlMs,max_rows:maxRows,max_bytes:maxBytes};
     });
@@ -38,11 +41,12 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,clo
     const last=items.at(-1),next_cursor=last&&rows.length>items.length?Buffer.from(JSON.stringify({start:window.start,at:last.created,id:last.id})).toString('base64url'):null;return {items,next_cursor};
   });}
 
-  async function cancel(id){return store.transaction(async()=>{const value=await row(id);if(['cancelled','expired'].includes(value.status))return {id,status:value.status};if(value.status==='complete')fail(409,'导出已完成，可等待到期清理');await jobs.cancel(id);await store.run("UPDATE harbor.recording_exports SET status='cancelled',error_code='admin_cancelled' WHERE id=$1",id);await store.run('DELETE FROM harbor.recording_export_chunks WHERE export_id=$1',id);return {id,status:'cancelled'};});}
+  async function cancel(id){return store.transaction(async()=>{const value=await row(id);if(['cancelled','expired'].includes(value.status))return {id,status:value.status};if(value.status==='complete')fail(409,'导出已完成，可等待到期清理');await jobs.cancel(id);await store.run("UPDATE harbor.recording_exports SET status='cancelled',error_code='admin_cancelled' WHERE id=$1",id);await store.run('DELETE FROM harbor.recording_export_chunks WHERE export_id=$1',id);if(contextExport)await contextExport.release(id);return {id,status:'cancelled'};});}
   async function execute(job,{signal}={}){
     if(job.kind!=='recording.export'||job.id!=='recording.export:'+job.payload?.export_id||job.target!==job.payload?.export_id||!isId(job.target)||Object.keys(job.payload).length!==1)fail(400,'导出任务参数无效');
     for(;;){
       stopped(signal);let current=await jobs.owned(job,()=>row(job.id));if(current.status==='complete')return {id:job.id,rows:current.rows,bytes:current.bytes};if(current.status==='cancelled'||current.expires<=clock())fail(410,'导出已取消或过期','recording_export_expired');if(current.options.key_version!==crypto.keyVersion)fail(503,'导出加密材料已变化','recording_export_key_changed');
+      if(current.options.include_context&&(!contextExport||current.options.context_format!==1))fail(503,'上下文导出格式或能力不匹配','recording_export_configuration');
       if(!(await storagePolicy()).exportAllowed)fail(503,'存储不足，导出已暂停','recording_storage_low');
       const scope=recordingScope(current.options.query),args=[...scope.values,current.visibility],visibilityArg=args.length;let seek='';
       if(current.after_id){args.push(current.after_at,current.after_id);seek=` AND (r.started,r.id)>($${args.length-1},$${args.length})`;}
@@ -50,7 +54,7 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,clo
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,CASE WHEN ${validPrice} THEN p.total_atoms::text END total_atoms
         FROM harbor.requests r${joins} WHERE ${scope.where} AND pg_visible_in_snapshot(r.inserted_xid,$${visibilityArg}::pg_snapshot)${seek} ORDER BY r.started,r.id LIMIT $${args.length}`,...args);
       if(!rows.length)return jobs.commitEffect(job,async()=>{const final=await row(job.id);await store.run("UPDATE harbor.recording_exports SET status='complete',completed=$1 WHERE id=$2",clock(),job.id);return {id:job.id,rows:final.rows,bytes:final.bytes};});
-      const chunks=[],sources=new Set();let text=current.rows===0&&current.options.format==='csv'?csvHeader:'',written=0,expires=current.expires;
+      const chunks=[],sources=new Set(),contextBatch=current.options.include_context?contextExport.batch():null;let text=current.rows===0&&current.options.format==='csv'?csvHeader:'',written=0,expires=current.expires;
       const append=line=>{if(Buffer.byteLength(line)>chunkBytes)fail(413,'导出单行超过分块预算','recording_export_capacity');if(text&&Buffer.byteLength(text)+Buffer.byteLength(line)>chunkBytes){chunks.push(text);text='';}text+=line;};
       for(const request of rows){
         stopped(signal);if(current.rows+written>=current.options.max_rows)fail(413,'导出超过请求数量上限，请缩小范围','recording_export_capacity');
@@ -59,7 +63,9 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,clo
           if(page.events.length&&page.expiresAt){expires=Math.min(expires,page.expiresAt);sources.add(request.id);}
           for(const event of page.events){const serialized=JSON.stringify({...event,event_kind:event.kind,kind:'recording_event',request_id:request.id});if(Buffer.byteLength(serialized)<=chunkBytes)append(serialized+'\n');else{const encoded=Buffer.from(serialized).toString('base64');for(let offset=0,part=0;offset<encoded.length;offset+=Math.floor(chunkBytes/2),part++)append(JSON.stringify({kind:'recording_event_fragment',request_id:request.id,sequence:event.sequence,part,encoding:'base64_json',data:encoded.slice(offset,offset+Math.floor(chunkBytes/2)),last:offset+Math.floor(chunkBytes/2)>=encoded.length})+'\n');}}
           if(!page.hasMore)break;if(page.next<=after)fail(503,'正文导出游标没有前进','recording_export_invalid');after=page.next;
-        }}written++;
+        }
+          if(contextBatch){const until=await contextExport.append(contextBatch,request.id,job.id,value=>{stopped(signal);append(JSON.stringify(value)+'\n');});if(until){expires=Math.min(expires,until);sources.add(request.id);}}
+        }written++;
       }
       if(text)chunks.push(text);const bytes=chunks.reduce((total,value)=>total+Buffer.byteLength(value),0);if(current.bytes+bytes>current.options.max_bytes)fail(413,'导出超过字节上限，请缩小范围','recording_export_capacity');
       const encrypted=chunks.map((value,index)=>({ordinal:current.chunks+index+1,bytes:Buffer.byteLength(value),cipher:crypto.seal({text:value},`export:${job.id}:${current.chunks+index+1}`)}));
@@ -67,9 +73,11 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,clo
         // Lock source expiries before export metadata, matching expiry triggers.
         // If a source disappeared after its page was read, no stale body file is published.
         if(sources.size){const currentSources=await store.all('SELECT request_id,expires_at FROM harbor.recordings WHERE request_id=ANY($1::text[]) ORDER BY request_id FOR SHARE',[...sources]);if(currentSources.length!==sources.size)fail(410,'导出正文已经过期','recording_export_expired');for(const source of currentSources)expires=Math.min(expires,source.expires_at);if(expires<=clock())fail(410,'导出正文已经过期','recording_export_expired');}
+        if(contextBatch)await contextExport.verify(contextBatch);
         const locked=await store.get('SELECT status,chunks,expires FROM harbor.recording_exports WHERE id=$1 FOR UPDATE',job.id);if(locked.status==='cancelled'||locked.expires<=clock())fail(410,'导出已取消或过期','recording_export_expired');if(locked.chunks!==current.chunks)fail(409,'导出进度已变化','job_lease_lost');
         for(const chunk of encrypted)await store.run('INSERT INTO harbor.recording_export_chunks VALUES($1,$2,$3,$4)',job.id,chunk.ordinal,chunk.bytes,chunk.cipher);
         for(const requestId of sources)await store.run('INSERT INTO harbor.recording_export_sources VALUES($1,$2) ON CONFLICT DO NOTHING',job.id,requestId);
+        if(contextBatch)await contextExport.persist(contextBatch,job.id);
         const last=rows.at(-1);await store.run("UPDATE harbor.recording_exports SET status='running',after_at=$1,after_id=$2,rows=rows+$3,bytes=bytes+$4,chunks=chunks+$5,expires=LEAST(expires,$7) WHERE id=$6",last.started,last.id,written,bytes,chunks.length,job.id,expires);
       });
     }

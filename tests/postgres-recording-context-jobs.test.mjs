@@ -12,6 +12,7 @@ import {createPostgresJobs} from '../postgres-jobs.mjs';
 import {createPostgresRecordingJobs} from '../postgres-recording-jobs.mjs';
 import {createRecordingIndexCrypto} from '../recording-search-index.mjs';
 import {recordingQuery} from '../postgres-recording-query.mjs';
+import {createPostgresRecordingExports} from '../postgres-recording-export.mjs';
 import {createPostgresRecordingContextQueries} from '../postgres-recording-context-query.mjs';
 
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需要独占合成PG':false};
@@ -22,7 +23,7 @@ async function fixture(t,{indexBatch=32,schemaIndex=true}={}){
  t.after(async()=>{await store.close();await admin.query('DROP DATABASE '+name);await admin.close();});await store.migrate({recordingContext:true,recordingContextIndex:schemaIndex});await store.initializePricing();
  let now=Date.now();const clock=()=>now,key=randomBytes(32),jobs=createPostgresJobs(store,{clock,leaseMs:1000}),contexts=new RecordingContextStore(store,{encryptionKey:key,clock}),recordings=new RecordingStore(store,{encryptionKey:key,clock}),crypto=createRecordingIndexCrypto(key),backend=createPostgresRecordingJobs(store,{recordingKey:key,jobs,clock,contextIndex:schemaIndex,contextStorage:true,indexBatch,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
  const member=randomUUID(),session=randomUUID();await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',member,'合成索引员工',now);await store.run("INSERT INTO harbor.accounts(id,name,home) VALUES('synthetic','合成上游','synthetic')");await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,created,updated) VALUES($1,$2,'synthetic',$3,$3)",session,member,now);
- const request=async(content='可检索的上下文',ttl=10000)=>{const id=randomUUID();await store.run("INSERT INTO harbor.requests(id,member_id,session_id,started,ended,status,business_status,ip,model) VALUES($1,$2,$3,$4,$4,'ok','ok','synthetic','gpt-6.1-sol')",id,member,session,now);await recordings.start(id);await store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',now+ttl,id);await contexts.writeSnapshot(id,[{kind:'history',content}]);return id;};
+ const request=async(content='可检索的上下文',ttl=10000,components)=>{const id=randomUUID();await store.run("INSERT INTO harbor.requests(id,member_id,session_id,started,ended,status,business_status,ip,model) VALUES($1,$2,$3,$4,$4,'ok','ok','synthetic','gpt-6.1-sol')",id,member,session,now);await recordings.start(id);await store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',now+ttl,id);await contexts.writeSnapshot(id,components??[{kind:'history',content}]);return id;};
  const run=async()=>{let job;while(job=await jobs.claim([kind]))await jobs.complete(job,await backend.handlers[kind](job));};
  const document=async()=>{const d=await store.get('SELECT * FROM harbor.recording_context_documents ORDER BY object_id LIMIT 1');if(!d)return null;const parts=await store.all('SELECT * FROM harbor.recording_context_document_parts WHERE object_id=$1 ORDER BY ordinal',d.object_id);return {d,parts,text:parts.map(p=>crypto.open(p.payload_cipher,`context-document:${d.object_id}:${d.source_revision}:1:${p.ordinal}`).text).join('')};};
  return {store,jobs,contexts,recordings,backend,key,clock,advance:ms=>{now+=ms;},request,run,document,crypto,connection:connection(name)};
@@ -101,4 +102,48 @@ test('真实PG：上下文搜索有界候选逐页前进，不泄露其他员工
 test('真实PG：23兼容模式未开索引仍清理过期上下文，不误访问24派生表',integration,async t=>{
  const f=await fixture(t,{schemaIndex:false});await f.request('旧结构过期正文',10);await f.backend.schedule();assert.equal(f.backend.handlers[kind],undefined);assert.equal((await f.store.get("SELECT to_regclass('harbor.recording_context_work') present")).present,null);
  f.advance(20);const purge=await f.jobs.claim(['recording.purge']);await f.jobs.complete(purge,await f.backend.handlers['recording.purge'](purge));assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_objects')).n,0);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.requests')).n,1);
+});
+
+
+const downloadLines=async(exporter,id)=>{const chunks=[];for await(const chunk of exporter.download(id))chunks.push(chunk);return Buffer.concat(chunks).toString().trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));};
+const contextExporter=f=>createPostgresRecordingExports(f.store,{jobs:f.jobs,crypto:f.crypto,recordings:f.recordings,contexts:f.contexts,clock:f.clock,batchRows:1,chunkBytes:1024});
+const exportBody={include_body:true,format:'jsonl',filters:{}};
+
+test('真实PG：导出保留重复引用及顺序，同对象跨批次只写一次，元数据CSV不含正文',integration,async t=>{
+ const f=await fixture(t),components=[{kind:'history',content:'相同问题重复出现'},{kind:'history',content:'相同问题重复出现'}],a=await f.request('',10000,components),b=await f.request('相同问题重复出现');const exporter=contextExporter(f),created=await exporter.enqueue(exportBody),job=await f.jobs.claim(['recording.export']);await f.jobs.complete(job,await exporter.handlers[job.kind](job));
+ const lines=await downloadLines(exporter,created.id),objects=lines.filter(x=>x.kind==='context_object'),refs=lines.filter(x=>x.kind==='context_reference');assert.equal(objects.length,1);assert.equal(refs.length,3);assert.equal(new Set(refs.map(x=>x.object_id)).size,1);assert.deepEqual(refs.filter(x=>x.request_id===a).map(x=>x.ordinal),[1,2]);assert.equal(lines.filter(x=>x.kind==='context_snapshot').length,2);
+ assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects WHERE export_id=$1',created.id)).n,1);const chunks=await f.store.all('SELECT payload_cipher FROM harbor.recording_export_chunks');assert.ok(chunks.every(x=>!x.payload_cipher.includes(Buffer.from('相同问题'))));
+ const csv=await exporter.enqueue({include_body:false,format:'csv',filters:{}}),csvJob=await f.jobs.claim(['recording.export']);await f.jobs.complete(csvJob,await exporter.handlers[csvJob.kind](csvJob));let text='';for await(const value of exporter.download(csv.id))text+=value;assert.ok(!text.includes('相同问题'));assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects WHERE export_id=$1',csv.id)).n,0);
+ assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_export_sources WHERE export_id=$1',created.id)).n,2);await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock()-1,a);assert.equal((await exporter.status(created.id)).status,'expired');await assert.rejects(downloadLines(exporter,created.id),{code:'recording_export_unavailable'});assert.equal((await f.contexts.read(b)).state,'complete');
+});
+
+test('真实PG：导出检查点之后中断，重建exporter恢复时不重复共享正文',integration,async t=>{
+ const f=await fixture(t);await f.request('跨进程继续的共享正文');await f.request('跨进程继续的共享正文');let exporter=contextExporter(f);const created=await exporter.enqueue(exportBody),first=await f.jobs.claim(['recording.export']),owned=f.jobs.owned;let injected=false;
+ f.jobs.owned=async(...args)=>{const result=await owned(...args);if(!injected&&(await f.store.get('SELECT rows FROM harbor.recording_exports WHERE id=$1',created.id)).rows===1){injected=true;throw Error('synthetic committed checkpoint interruption');}return result;};
+ try{await assert.rejects(exporter.handlers[first.kind](first),/synthetic committed checkpoint/);}finally{f.jobs.owned=owned;}
+ assert.equal(injected,true);assert.equal((await f.store.get('SELECT rows FROM harbor.recording_exports WHERE id=$1',created.id)).rows,1);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects')).n,1);
+ await f.jobs.fail(first,{retry:true,retryDelayMs:0});exporter=contextExporter(f);const resumed=await f.jobs.claim(['recording.export']);await f.jobs.complete(resumed,await exporter.handlers[resumed.kind](resumed));const lines=await downloadLines(exporter,created.id);assert.equal(lines.filter(x=>x.kind==='context_object').length,1);assert.equal(lines.filter(x=>x.kind==='context_reference').length,2);assert.equal((await exporter.status(created.id)).rows,2);
+});
+
+test('真实PG：导出依赖写入故障回滚分块和进度，重试后引用正文完整',integration,async t=>{
+ const f=await fixture(t);await f.request('原子写入唯一基线');const exporter=contextExporter(f),created=await exporter.enqueue(exportBody),job=await f.jobs.claim(['recording.export']);
+ await f.store.query("CREATE FUNCTION harbor.reject_context_export_dependency() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic dependency failure'; END $$; CREATE TRIGGER reject_context_export_dependency BEFORE INSERT ON harbor.recording_context_export_objects FOR EACH ROW EXECUTE FUNCTION harbor.reject_context_export_dependency()");
+ await assert.rejects(exporter.handlers[job.kind](job),/synthetic dependency failure/);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_export_chunks')).n,0);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects')).n,0);assert.equal((await f.store.get('SELECT rows FROM harbor.recording_exports WHERE id=$1',created.id)).rows,0);
+ await f.store.query('DROP TRIGGER reject_context_export_dependency ON harbor.recording_context_export_objects; DROP FUNCTION harbor.reject_context_export_dependency()');await f.jobs.complete(job,await exporter.handlers[job.kind](job));const lines=await downloadLines(exporter,created.id);assert.equal(lines.filter(x=>x.kind==='context_object').length,1);assert.equal(lines.filter(x=>x.kind==='context_reference').length,1);
+});
+
+test('真实PG：只有上下文没有普通事件的来源也受导出到期保护，取消立即清理依赖',integration,async t=>{
+ const f=await fixture(t),source=await f.request('到期前读取的基线'),exporter=contextExporter(f),created=await exporter.enqueue(exportBody),job=await f.jobs.claim(['recording.export']),readObject=f.contexts.readObject.bind(f.contexts);let changed=false;
+ f.contexts.readObject=async(...args)=>{const result=await readObject(...args);if(!changed){changed=true;await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock()-1,source);}return result;};
+ try{await assert.rejects(exporter.handlers[job.kind](job),{code:'recording_export_expired'});}finally{f.contexts.readObject=readObject;}
+ assert.equal(changed,true);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_export_chunks')).n,0);assert.equal((await exporter.status(created.id)).download_ready,false);
+ await exporter.cancel(created.id);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects')).n,0);
+});
+
+test('真实PG：大上下文导出分片可重建原JSON，取消已提交批次同时清除分块和依赖',integration,async t=>{
+ const f=await fixture(t),content='较长中文上下文'.repeat(300);await f.request(content);await f.request(content);const exporter=contextExporter(f),created=await exporter.enqueue(exportBody),job=await f.jobs.claim(['recording.export']);await f.jobs.complete(job,await exporter.handlers[job.kind](job));const lines=await downloadLines(exporter,created.id),fragments=lines.filter(x=>x.kind==='context_object_fragment');assert.ok(fragments.length>1);assert.equal(lines.filter(x=>x.kind==='context_object').length,0);assert.equal(JSON.parse(Buffer.from(fragments.map(x=>x.data).join(''),'base64').toString()).content,content);assert.equal(fragments.at(-1).last,true);
+ const cancelled=await exporter.enqueue(exportBody),task=await f.jobs.claim(['recording.export']),owned=f.jobs.owned;let injected=false;
+ f.jobs.owned=async(...args)=>{const result=await owned(...args);if(!injected&&(await f.store.get('SELECT rows FROM harbor.recording_exports WHERE id=$1',cancelled.id)).rows===1){injected=true;await exporter.cancel(cancelled.id);}return result;};
+ try{await assert.rejects(exporter.handlers[task.kind](task),{code:'job_lease_lost'});}finally{f.jobs.owned=owned;}
+ assert.equal(injected,true);assert.equal((await exporter.status(cancelled.id)).status,'cancelled');assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects WHERE export_id=$1',cancelled.id)).n,0);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_export_chunks WHERE export_id=$1',cancelled.id)).n,0);
 });

@@ -128,6 +128,25 @@ export class RecordingContextStore{
    return {...this.#receipt({...snapshot,expires_at:expiresAt}),encoding:'json_utf8',parts,next,hasMore:sizes.length>parts.length};
   },{level:'REPEATABLE READ',readOnly:true});
  }
+ // Internal export manifest, without fetching shared ciphertext repeatedly.
+ // The exporter locks source recording rows first, then scopes in sorted order.
+ async describeSnapshot(requestId,{lockScope=false}={}){
+  if(typeof lockScope!=='boolean')fail(400,'上下文导出锁选项无效');
+  return this.store.transaction(async()=>{
+   const authority=await this.#authority(requestId,{allowMissing:true});
+   if(authority.expires_at===null)return {requestId,state:['disabled','historical','expired','pending'].includes(authority.recording_state)?authority.recording_state:'unavailable',references:[]};
+   if(lockScope)await this.#lock(authority.scope);
+   const snapshot=await this.store.get('SELECT * FROM harbor.recording_context_snapshots WHERE request_id=$1',requestId);
+   if(!snapshot)return {requestId,state:authority.expires_at<=this.clock()||authority.recording_state==='expired'?'expired':'unavailable',references:[]};
+   if(!equal(snapshot.scope_digest,authority.scope)||snapshot.key_version!==this.keyVersion)fail(503,'上下文导出归属或密钥不一致','recording_context_scope');
+   const expiresAt=Math.min(snapshot.expires_at,authority.expires_at);
+   if(expiresAt<=this.clock()||authority.recording_state==='expired')return {requestId,state:'expired',references:[],expiresAt};
+   if(snapshot.components>this.maxComponents||snapshot.bytes>this.maxSnapshotBytes)fail(503,'上下文导出超过快照预算','recording_context_capacity');
+   await this.#validateSnapshot(snapshot);
+   const references=await this.store.all('SELECT ref.ordinal,ref.object_id,ref.truncated,o.kind,o.fingerprint,o.key_version FROM harbor.recording_context_references ref JOIN harbor.recording_context_objects o ON o.id=ref.object_id WHERE ref.request_id=$1 ORDER BY ref.ordinal',requestId);
+   return {...this.#receipt({...snapshot,expires_at:expiresAt}),references,scopeDigest:authority.scope,fingerprint:snapshot.fingerprint,keyVersion:snapshot.key_version};
+  },{level:'REPEATABLE READ',readOnly:!lockScope});
+ }
  // Internal derived-data reader. It is not exposed as an employee endpoint.
  // A live source authorizes the scope; ciphertext is fetched only after its
  // full size is checked. Workers must recheck source liveness when committing.
