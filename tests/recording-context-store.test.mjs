@@ -121,12 +121,28 @@ test('真实PG：脱敏发生在分块前，UTF8有界分页、顺序和加密�
 },{partBytes:256,maxReadBytes:512}));
 
 test('真实PG：注入半写故障整体回滚；残缺对象不能复用或假complete',integration,()=>fixture(async({store,context,request,read})=>{
- const id=await request(),run=store.run.bind(store);let calls=0;store.run=async(sql,...args)=>{if(sql.startsWith('INSERT INTO harbor.recording_context_parts')&&++calls===2)throw Error('synthetic chunk failure');return run(sql,...args);};
- const input=[{kind:'history',content:{text:'分块🙂'.repeat(200)}}];await assert.rejects(context.writeSnapshot(id,input),/synthetic chunk failure/);store.run=run;
+ const id=await request();await store.query(`CREATE FUNCTION harbor.synthetic_context_chunk_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.ordinal=2 THEN RAISE EXCEPTION 'synthetic chunk failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER synthetic_context_chunk_failure BEFORE INSERT ON harbor.recording_context_parts FOR EACH ROW EXECUTE FUNCTION harbor.synthetic_context_chunk_failure()`);
+ const input=[{kind:'history',content:{text:'分块🙂'.repeat(200)}}];await assert.rejects(context.writeSnapshot(id,input),/synthetic chunk failure/);await store.query('DROP TRIGGER synthetic_context_chunk_failure ON harbor.recording_context_parts; DROP FUNCTION harbor.synthetic_context_chunk_failure()');
  assert.equal((await store.get('SELECT COUNT(*) count FROM harbor.recording_context_objects')).count,0);assert.equal((await context.read(id)).state,'unavailable');
  await context.writeSnapshot(id,input);const object=(await read(id)).components[0].objectId;await store.run('DELETE FROM harbor.recording_context_parts WHERE object_id=$1 AND ordinal=2',object);
  await assert.rejects(context.read(id),{code:'recording_context_incomplete'});await assert.rejects(context.writeSnapshot(await request(),input),{code:'recording_context_incomplete'});
 },{partBytes:256}));
+
+test('真实PG：长历史首次和复用均批量往返，混合新旧对象保留顺序与重复引用',integration,()=>fixture(async({store,context,request})=>{
+ const query=store.query.bind(store),measurements=[];let calls=0;store.query=async(...args)=>{calls++;return query(...args);};
+ try{
+  for(const size of [128,1024]){
+   const input=Array.from({length:size},(_,index)=>({kind:'history',content:{text:'规模'+size+' 行'+index}})),measured=[];
+   for(let attempt=0;attempt<2;attempt++){
+    const id=await request();calls=0;const receipt=await context.writeSnapshot(id,input);measured.push(calls);assert.equal(receipt.state,'complete');assert.equal(receipt.components,size);
+    assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_references WHERE request_id=$1',id)).n,size);const last=await context.read(id,{after:{component:size-1,part:1},limit:2});assert.equal(last.parts.length,1);assert.equal(JSON.parse(last.parts[0].text).text,'规模'+size+' 行'+(size-1));
+   }measurements.push(measured);
+  }
+  assert.ok(measurements[0].every(count=>count>0));assert.deepEqual(measurements[1],measurements[0],'在同一容量内，SQL往返不能随组件数逐条增长');
+  const before=(await store.get('SELECT COUNT(*) n FROM harbor.recording_context_objects')).n,old={kind:'history',content:{text:'规模1024 行0'}},fresh={kind:'history',content:{text:'合成新增对象'}},id=await request();await context.writeSnapshot(id,[old,fresh,old]);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_objects')).n,before+1);
+  const page=await context.read(id);assert.equal(page.parts.length,3);assert.equal(page.parts[0].objectId,page.parts[2].objectId);assert.notEqual(page.parts[0].objectId,page.parts[1].objectId);assert.deepEqual(page.parts.map(part=>JSON.parse(part.text).text),['规模1024 行0','合成新增对象','规模1024 行0']);
+ }finally{store.query=query;}
+}));
 
 test('真实PG：旧请求过期不延寿，后续引用仍可读；过期/删除来源后GC回收对象',integration,()=>fixture(async({store,context,clock,request,read,gc})=>{
  const old=await request({expires:at+100}),recent=await request({expires:at+1000});await context.writeSnapshot(old,components);await context.writeSnapshot(recent,components);clock.now=at+200;
