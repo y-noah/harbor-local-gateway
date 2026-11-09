@@ -2,7 +2,7 @@ import test from 'node:test';
 import {tmpdir} from 'node:os';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,rmSync,existsSync,statSync,writeFileSync,readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {join,resolve} from 'node:path';
 import {runCodex} from '../codex.mjs';
@@ -62,6 +62,53 @@ test('quota subprocess cancellation skips pre-aborted spawn and stops a running 
   const pending=readRateLimits('unused',scratch,{signal:controller.signal,spawnProcess:(_,args,options)=>child=spawn(process.execPath,[childFile,'rates','hang'],options)});
   const ended=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('cancelled quota child did not exit')),3000);child.once('close',()=>{clearTimeout(timer);resolve();});});
   controller.abort();await assert.rejects(pending,/已取消/);await ended;
+});
+
+test('quota reads isolate SQLite from account state and settle only after graceful child close and cleanup',async t=>{
+  const home=mkdtempSync(join(scratch,'quota-account-'));t.after(()=>rmSync(home,{recursive:true,force:true}));
+  const state=join(home,'state_5.sqlite');writeFileSync(state,'existing CLI context');
+  let sqliteHome,closed=false,child;
+  const result=await readRateLimits('unused',home,{spawnProcess:(_,args,options)=>{
+    assert.equal(options.env.CODEX_HOME,home);sqliteHome=options.env.CODEX_SQLITE_HOME;
+    assert.ok(sqliteHome&&!resolve(sqliteHome).startsWith(resolve(home)+'/'));assert.equal(statSync(sqliteHome).mode&0o777,0o700);
+    child=spawn(process.execPath,[childFile,'rates','cache'],options);child.once('close',()=>{closed=true;});return child;
+  }});
+  assert.equal(result.rateLimits.primary.usedPercent,25);assert.equal(closed,true);assert.equal(child.exitCode,0);assert.equal(child.signalCode,null);
+  assert.equal(existsSync(sqliteHome),false);assert.equal(readFileSync(state,'utf8'),'existing CLI context');
+});
+
+test('quota spawn errors and cancellation clean their private cache after the real process exits',async()=>{
+  let sqliteHome;
+  await assert.rejects(readRateLimits('unused',scratch,{spawnProcess:(_,args,options)=>{sqliteHome=options.env.CODEX_SQLITE_HOME;throw Error('private spawn diagnostic');}}),/无法启动/);
+  assert.equal(existsSync(sqliteHome),false);
+  const controller=new AbortController();let closed=false;
+  const pending=readRateLimits('unused',scratch,{signal:controller.signal,spawnProcess:(_,args,options)=>{
+    sqliteHome=options.env.CODEX_SQLITE_HOME;const child=spawn(process.execPath,[childFile,'rates','hang'],options);child.once('close',()=>{closed=true;});return child;
+  }});
+  controller.abort();await assert.rejects(pending,/已取消/);assert.equal(closed,true);assert.equal(existsSync(sqliteHome),false);
+});
+
+test('quota cancellation after a result keeps the slot and cache until the real child closes',{timeout:5000},async t=>{
+  const controller=new AbortController();let child,cache,ready,settled=false;
+  const received=new Promise(resolve=>{ready=resolve;});
+  t.after(()=>{if(child?.exitCode===null&&child?.signalCode===null)child.kill('SIGKILL');});
+  const pending=readRateLimits('unused',scratch,{signal:controller.signal,spawnProcess:(_,args,options)=>{
+    cache=options.env.CODEX_SQLITE_HOME;child=spawn(process.execPath,[childFile,'rates','delayed-close'],{...options,stdio:['pipe','pipe','pipe','ipc']});child.stdin.once('finish',ready);return child;
+  }}).finally(()=>{settled=true;});
+  const rejected=assert.rejects(pending,/已取消/);
+  await received;assert.equal(existsSync(cache),true);controller.abort();await Promise.resolve();assert.equal(settled,false);assert.equal(existsSync(cache),true);
+  child.send('release');await rejected;assert.equal(child.exitCode,0);assert.equal(existsSync(cache),false);
+});
+
+test('quota close deadline rejects a received result and preserves uncertain native cache for inspection',{timeout:5000},async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});let child,cache,ready;
+  const received=new Promise(resolve=>{ready=resolve;});
+  t.after(()=>{if(child?.exitCode===null&&child?.signalCode===null)child.kill('SIGKILL');if(child?.signalCode==='SIGKILL')rmSync(cache,{recursive:true,force:true});});
+  const pending=readRateLimits('unused',scratch,{closeTimeoutMs:100,spawnProcess:(_,args,options)=>{
+    cache=options.env.CODEX_SQLITE_HOME;child=spawn(process.execPath,[childFile,'rates','delayed-close'],{...options,stdio:['pipe','pipe','pipe','ipc']});child.stdin.once('finish',ready);return child;
+  }});
+  const rejected=assert.rejects(pending,/未正常退出/);await received;t.mock.timers.tick(100);await rejected;
+  assert.equal(child.signalCode,'SIGKILL');assert.equal(existsSync(cache),true);
 });
 
 for(const provider of ['codex','claude'])test(provider+' optional text observer sees parsed Unicode and cannot turn a successful model call into a failure',async t=>{

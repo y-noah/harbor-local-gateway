@@ -1,10 +1,14 @@
 // Executed only by providers.test.mjs; never contacts an external service.
+import {writeFileSync} from 'node:fs';
+import {join} from 'node:path';
 const [provider,scenario]=process.argv.slice(2);
 process.stdin.resume();
 if(scenario==='hang'){setInterval(()=>{},1000);}
 else if(scenario==='oversize'){process.stdout.write('x'.repeat(2100000));}
 else if(scenario==='invalid-json'){process.stdout.write('private upstream diagnostic should never be echoed');}
 else if(provider==='rates'){
+  if(scenario==='cache')writeFileSync(join(process.env.CODEX_SQLITE_HOME,'state_5.sqlite'),'temporary quota state');
+  if(scenario==='delayed-close'){process.on('SIGTERM',()=>{});process.on('message',()=>process.exit(0));}
   let input='';process.stdin.on('data',b=>{input+=b.toString();let at;while((at=input.indexOf('\n'))!==-1){const message=JSON.parse(input.slice(0,at));input=input.slice(at+1);if(message.id===1)process.stdout.write(JSON.stringify({id:1,result:{}})+'\n');if(message.id===2)process.stdout.write(JSON.stringify(scenario==='error'?{id:2,error:{message:'private'}}:{id:2,result:{rateLimits:{primary:{usedPercent:25,windowDurationMins:300,resetsAt:9999999999}}}})+'\n');}});
 }
 else {

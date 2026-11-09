@@ -1,25 +1,44 @@
 import {spawn} from 'node:child_process';
 import {StringDecoder} from 'node:string_decoder';
+import {mkdtempSync} from 'node:fs';
+import {rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {runnerEnv,codexAuthArgs} from './codex.mjs';
 import {normalizeCodexEntitlements,codexQuotaDenials} from './codex-entitlements.mjs';
-export function readRateLimits(binary,home,{spawnProcess=spawn,timeoutMs=15000,signal}={}){
+export function readRateLimits(binary,home,{spawnProcess=spawn,timeoutMs=15000,closeTimeoutMs=5000,signal}={}){
+  if(signal?.aborted)return Promise.reject(Error('额度查询已取消'));
+  let sqliteHome;try{sqliteHome=mkdtempSync(join(tmpdir(),'harbor-quota-'));}catch{return Promise.reject(Error('无法准备额度查询隔离目录'));}
+  let cleanupAllowed=true;
   return new Promise((resolve,reject)=>{
-    if(signal?.aborted)return reject(Error('额度查询已取消'));
-    const child=spawnProcess(binary,['app-server','--listen','stdio://','--disable','plugins','--disable','apps',...codexAuthArgs()],{env:runnerEnv(home),windowsHide:true});
-    let buffer='',settled=false,size=0;const decoder=new StringDecoder('utf8');
-    const finish=(err,value)=>{if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);child.kill();err?reject(err):resolve(value);};
+    let child;try{child=spawnProcess(binary,['app-server','--listen','stdio://','--disable','plugins','--disable','apps',...codexAuthArgs()],{env:{...runnerEnv(home),CODEX_SQLITE_HOME:sqliteHome},windowsHide:true});}catch{return reject(Error('无法启动额度查询'));}
+    cleanupAllowed=false;
+    let buffer='',outcome,size=0,closeTimer,forced=false;const decoder=new StringDecoder('utf8');
+    const finish=(err,value)=>{
+      if(outcome){if(err&&!outcome.err){outcome.err=err;child.kill();}return;}
+      outcome={err,value};clearTimeout(timer);
+      // EOF lets the official launcher wait for its native child. Do not remove
+      // SQLite files or resolve the query while that process can still write.
+      if(err)child.kill();else child.stdin.end();
+      closeTimer=setTimeout(()=>{forced=true;child.kill('SIGKILL');},closeTimeoutMs);
+    };
     const abort=()=>finish(Error('额度查询已取消'));
     const timer=setTimeout(()=>finish(Error('官方额度读取超时')),timeoutMs);
     const send=value=>child.stdin.write(JSON.stringify(value)+'\n');
-    child.on('error',()=>finish(Error('无法启动额度查询')));child.on('close',()=>{if(!settled)finish(Error('额度查询未完成'));});
+    child.on('error',()=>finish(Error('无法启动额度查询')));
+    child.on('close',(code,exitSignal)=>{
+      clearTimeout(timer);clearTimeout(closeTimer);signal?.removeEventListener('abort',abort);cleanupAllowed=!forced;
+      const error=outcome?.err||(!outcome?Error('额度查询未完成'):forced||code!==0||exitSignal?Error('额度查询进程未正常退出'):null);
+      error?reject(error):resolve(outcome.value);
+    });
     child.stderr.on('data',()=>{});child.stdin.on('error',()=>{});
-    child.stdout.on('data',bytes=>{if(settled)return;size+=bytes.length;if(size>2*1024*1024)return finish(Error('官方额度响应超过限制'));buffer+=decoder.write(bytes);let at;while(!settled&&(at=buffer.indexOf('\n'))!==-1){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);let event;try{event=JSON.parse(line);}catch{continue;}
+    child.stdout.on('data',bytes=>{if(outcome)return;size+=bytes.length;if(size>2*1024*1024)return finish(Error('官方额度响应超过限制'));buffer+=decoder.write(bytes);let at;while(!outcome&&(at=buffer.indexOf('\n'))!==-1){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);let event;try{event=JSON.parse(line);}catch{continue;}
       if(event.id===1){if(event.error)return finish(Error('额度查询初始化失败'));send({method:'initialized',params:{}});send({method:'account/rateLimits/read',id:2});}
       if(event.id===2){if(event.error)return finish(Error('官方暂未提供额度数据'));finish(null,event.result);}
     }});
     signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted){abort();return;}
     send({method:'initialize',id:1,params:{clientInfo:{name:'harbor_local_gateway',title:'Harbor Local Gateway',version:'1.0.0'}}});
-  });
+  }).finally(async()=>{if(cleanupAllowed)try{await rm(sqliteHome,{recursive:true,force:true});}catch{throw Error('额度查询缓存清理失败');}});
 }
 export function normalizeLimits(value,at=Date.now()){
   const by=value?.rateLimitsByLimitId;const selected=by?(by.codex||Object.values(by).find(x=>x?.limitId==='codex')):value?.rateLimits;
