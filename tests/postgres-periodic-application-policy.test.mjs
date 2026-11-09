@@ -1,8 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {periodicApplicationPolicy,periodicApplicationFileExclusions,loadPeriodicApplicationPolicy} from '../postgres-periodic-application-policy.mjs';
+import {periodicApplicationPolicy,periodicApplicationFileExclusions,periodicApplicationDirectoryExclusions,loadPeriodicApplicationPolicy} from '../postgres-periodic-application-policy.mjs';
 
 const configuration=()=>({version:1,enabled:true,database:{name:'harbor_private',oid:'16384'},materialRoots:[{id:'data',directory:'/srv/private/data'},{id:'runtime',directory:'/srv/private/runtime'},{id:'secrets',directory:'/srv/private/secrets'}],publicOrigin:'http://127.0.0.1:18094',deviceOrigin:'https://127.0.0.1:18095',maxBytes:1073741824,maxFiles:100000});
+
+test('rebuildable runtime roles preserve old defaults and only select known account cache locations',()=>{
+  const original=periodicApplicationPolicy(configuration());
+  assert.deepEqual(periodicApplicationPolicy({...configuration(),runtimeRebuildableCaches:[]}),original);
+  assert.equal(Object.hasOwn(original,'runtimeRebuildableCaches'),false);
+  assert.deepEqual(periodicApplicationDirectoryExclusions(original),[]);
+  const roles=['codex-launcher-aliases','codex-log-sqlite','codex-model-catalog'],policy=periodicApplicationPolicy({...configuration(),runtimeRebuildableCaches:roles});
+  roles.pop();assert.equal(policy.runtimeRebuildableCaches.length,3);assert.ok(Object.isFrozen(policy.runtimeRebuildableCaches));
+  assert.deepEqual(periodicApplicationDirectoryExclusions(policy),[{root:'runtime',pattern:'accounts/*/tmp/arg0'}]);
+  assert.deepEqual(periodicApplicationFileExclusions(policy).map(row=>row.pattern),['accounts/*/logs_*.sqlite','accounts/*/logs_*.sqlite-wal','accounts/*/logs_*.sqlite-shm','accounts/*/models_cache.json']);
+  const mixed=periodicApplicationPolicy({...configuration(),runtimeSqliteCaches:['accounts/*/logs_*.sqlite'],excludeModelCatalogCache:true,runtimeRebuildableCaches:policy.runtimeRebuildableCaches});
+  assert.equal(periodicApplicationFileExclusions(mixed).length,4);assert.equal(periodicApplicationDirectoryExclusions(mixed).length,1);
+  for(const runtimeRebuildableCaches of [null,true,'codex-launcher-aliases',['unknown'],['auth-json'],['codex-launcher-aliases','codex-launcher-aliases']])assert.throws(()=>periodicApplicationPolicy({...configuration(),runtimeRebuildableCaches}),{code:'periodic_application_policy_invalid'});
+});
 
 test('model catalog cache selection is opt-in, scoped to account homes and preserves old policy bytes when off',()=>{
   const original=periodicApplicationPolicy(configuration());

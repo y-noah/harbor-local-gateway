@@ -113,6 +113,8 @@ harbor_backup ALL=(root) NOPASSWD: /usr/bin/python3 -I -B /usr/local/lib/harbor/
 
 应用周期默认关闭，仅 root 固定的 `/etc/harbor-storage-application.json` 显式启用后接入原 `schedule`。配置版本1，完整字段为 `enabled`、数据库 `name/oid`、`data/runtime/secrets` 三个材料根（可另设库中路径前缀 `databasePrefix`）、原 HTTP/设备 TLS origin、材料字节及文件数预算；配置不由 HTTP 调用方提交。捕获包含原加密 Key、上游密文对应密钥、正文密钥、账号目录及设备 CA/TLS/report 材料，仍需按实际部署配置完整根目录；配置启用本身不证明备份或恢复完成。
 
+可选 `runtimeRebuildableCaches` 按已核实的材料角色声明可重建缓存，默认缺省或空数组保持完整捕获及旧策略摘要。支持 `codex-log-sqlite`（`runtime/accounts/*/logs_*.sqlite` 及其 WAL/SHM）、`codex-model-catalog`（`runtime/accounts/*/models_cache.json`）、`codex-launcher-aliases`（`runtime/accounts/*/tmp/arg0`）。最后一项只排除真实目录及其子树：Codex 启动会创建临时执行别名链接、退出会删除，恢复后由 CLI 重建；目录根若是链接仍拒绝，同名普通文件仍保留。未知角色、重复角色或其他区域链接均拒绝；auth、state、正文、设备及密钥继续完整覆盖。目录根计遍历预算，排除子树不遍历。角色选择进入策略摘要与加密文件清单，捕获、源复核及历史认证须精确绑定。旧字段继续兼容，重叠文件选择去重；启用前须更新源端及恢复端工具。回退移除角色配置即可恢复全量捕获，保留已有新点与配套工具，不删除源缓存或中断请求。
+
 可选 `runtimeSqliteCaches` 声明已经核实可以重建的运行时 SQLite 缓存，例如 `["**/logs_*.sqlite"]`，默认缺省或空列表时仍完整捕获。每项只接受 runtime 根内的相对文件 glob，必须以 `.sqlite` 结束；对应 `-wal`、`-shm` 一起排除，不改变 data／secrets 根，也不能匹配 JSON 登录文件或密钥。采用 Node glob 语义，隐藏目录须在模式中显式写出；不得把登录或业务状态数据库列为缓存，依赖本机 SQLite 会话状态的旧通道须保持完整覆盖或另用一致性快照。未知 SQLite 默认保留。选择规则进入加密文件清单并与应用策略摘要交叉核验；排除文件仍计遍历预算。仅过滤根的目录分配字节数不参与指纹，目录路径、权限、入选子项和文件内容仍严格核验，新增普通文件或凭据变化照常拒绝。启用前更新源端和恢复端工具并核对覆盖范围；旧策略及旧点保持原语义，旧工具拒绝含新策略字段的点。回退移除该配置恢复全量捕获，保留新点、工具及独立密钥用于恢复，不删除缓存或中断模型请求。
 
 可选严格布尔 `excludeModelCatalogCache` 默认关闭；缺省或 `false` 保持原策略摘要与全量覆盖。只有 root 显式设为 `true` 才排除 runtime 根的 `accounts/*/models_cache.json`，用于持续刷新导致在线捕获失败的可重建模型目录缓存；不排除其他位置的同名文件、登录 JSON、SQLite 会话状态、正文或密钥。该选择进入原加密清单及策略摘要，沿现有捕获、源重验、恢复与接收校验执行，不删除源文件、不扩大遍历预算。恢复后 CLI 需重新获取模型目录；断网时不承诺缓存命中。启用前先更新源端与恢复端工具，旧工具拒绝新字段；关闭或移除选项恢复完整捕获，新点仍须保留可识别该字段的工具恢复。

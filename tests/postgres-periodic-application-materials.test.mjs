@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomBytes,randomUUID} from 'node:crypto';
-import {mkdir,writeFile,readFile,readdir} from 'node:fs/promises';
+import {mkdir,writeFile,readFile,readdir,symlink,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
@@ -61,6 +61,18 @@ test('private PG pre-checkpoint capture authenticates material coverage, rejects
   assert.equal((await authenticatePeriodicApplicationCapture(context,proof,modelCapture.captureId)).captureId,modelCapture.captureId);
   await assert.rejects(verifyPeriodicApplicationCapture(context,proof,policy,modelCapture.captureId),{code:'periodic_application_capture_binding'});
   await writeFile(join(runtime,'auth.json'),'DDDD',{mode:0o600});await assert.rejects(verifyPeriodicApplicationCapture(context,proof,modelPolicy,modelCapture.captureId),{code:'transfer_files_changed'});await writeFile(join(runtime,'auth.json'),'AAAA',{mode:0o600});
+  const rolePolicy={...policy,runtimeRebuildableCaches:['codex-launcher-aliases']},launcher=join(modelHome,'tmp','arg0');
+  await mkdir(launcher,{recursive:true,mode:0o700});await symlink(join(runtime,'auth.json'),join(launcher,'apply_patch'));
+  const roleCapture=await capturePeriodicApplicationMaterials(context,proof,rolePolicy),roleSource=periodicApplicationCaptureSource(roleCapture);
+  assert.deepEqual(roleSource.manifest.applicationPolicy.runtimeRebuildableCaches,['codex-launcher-aliases']);
+  await rm(launcher,{recursive:true});await mkdir(launcher,{mode:0o700});await symlink(join(runtime,'auth.json'),join(launcher,'codex-linux-sandbox'));
+  assert.equal((await verifyPeriodicApplicationCapture(context,proof,rolePolicy,roleCapture.captureId)).captureId,roleCapture.captureId);
+  assert.equal((await authenticatePeriodicApplicationCapture(context,proof,roleCapture.captureId)).captureId,roleCapture.captureId);
+  await assert.rejects(verifyPeriodicApplicationCapture(context,proof,policy,roleCapture.captureId),{code:'periodic_application_capture_binding'});
+  // Historical authentication uses the archived selection, even once the live
+  // launcher tree has gone; it does not confer restore or deployment approval.
+  await rm(launcher,{recursive:true});
+  assert.equal((await authenticatePeriodicApplicationCapture(context,proof,roleCapture.captureId)).captureId,roleCapture.captureId);
   const id=randomUUID(),running=capturePeriodicApplicationMaterials(context,proof,policy,{captureId:id}),record=postgresBackupContext(context);
   assert.equal(record.busy,true);const rejection=assert.rejects(running,{name:'AbortError'});
   await closePostgresBackupContext(context);await rejection;

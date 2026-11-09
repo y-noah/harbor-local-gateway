@@ -6,7 +6,7 @@ import {postgresBackupContext,verifyBackupCluster} from './postgres-backup-conte
 import {postgresBackupRestoreSource,authenticatePostgresBackupFileSet} from './postgres-backup.mjs';
 import {withPostgresBackupOperation} from './postgres-backup-lock.mjs';
 import {PostgresStore} from './postgres-store.mjs';
-import {periodicApplicationPolicy,periodicApplicationFileExclusions,installedPeriodicApplicationPolicy,verifyInstalledPeriodicApplicationPolicy} from './postgres-periodic-application-policy.mjs';
+import {periodicApplicationPolicy,periodicApplicationFileExclusions,periodicApplicationDirectoryExclusions,installedPeriodicApplicationPolicy,verifyInstalledPeriodicApplicationPolicy} from './postgres-periodic-application-policy.mjs';
 import {captureFileSet,verifyFileSetSources,readManifest,writeManifest,privateDirectory,syncDirectory,canonical,transferError} from './migration-artifacts.mjs';
 
 const captures=new WeakMap(),scope='harbor-periodic-application-capture-v3';
@@ -49,8 +49,8 @@ async function verifyCapture(context,proof,configuration,captureId,{signal}={}){
   if(manifest.version!==3||manifest.scope!==scope||manifest.captureId!==captureId||manifest.backupId!==proof.backupId||manifest.configurationDigest!==record.configurationDigest||manifest.systemId!==record.expected.system_id||manifest.keyVersion!==record.keyVersion||manifest.applicationPolicyDigest!==hash(policy)||manifest.version===3&&hash(periodicApplicationPolicy(manifest.applicationPolicy))!==manifest.applicationPolicyDigest||!validFence(manifest.walFence)||manifest.walFence.timeline!==postgresBackupRestoreSource(proof).metadata.timeline||!Number.isSafeInteger(manifest.capturedAt)||manifest.capturedAt<0||manifest.files?.files>policy.maxFiles||manifest.files?.bytes>maxBytes)fail('periodic_application_capture_binding');
   await authenticatePostgresBackupFileSet({directory:path,key:periodicApplicationKey(record),files:manifest.files,signal});
   const files=await readManifest(join(path,'files.enc'),periodicApplicationKey(record),{signal});
-  if(canonical(files.roots.map(({id,source})=>({id,source})))!==canonical(await sourceRoots(policy))||canonical(files.excludeFiles??[])!==canonical(periodicApplicationFileExclusions(policy)))fail('periodic_application_source_binding');
-  await verifyFileSetSources(files,{signal,excludeFiles:periodicApplicationFileExclusions(policy),maxFiles:policy.maxFiles,maxFileBytes:maxBytes,maxTotalBytes:maxBytes});
+  if(canonical(files.roots.map(({id,source})=>({id,source})))!==canonical(await sourceRoots(policy))||canonical(files.excludeFiles??[])!==canonical(periodicApplicationFileExclusions(policy))||canonical(files.excludeDirectories??[])!==canonical(periodicApplicationDirectoryExclusions(policy)))fail('periodic_application_source_binding');
+  await verifyFileSetSources(files,{signal,excludeFiles:periodicApplicationFileExclusions(policy),excludeDirectories:periodicApplicationDirectoryExclusions(policy),maxFiles:policy.maxFiles,maxFileBytes:maxBytes,maxTotalBytes:maxBytes});
   signal?.throwIfAborted();return mint(context,proof,policy,path,manifest);
 }
 
@@ -69,8 +69,8 @@ export async function capturePeriodicApplicationMaterials(context,proof,configur
     await mkdir(path,{mode:0o700});const identity=await lstat(path);let complete=false;
     try{
       await syncDirectory(parent);
-      const excludeFiles=periodicApplicationFileExclusions(policy),files=await captureFileSet({roots,directory:path,key:periodicApplicationKey(record),maxFiles:policy.maxFiles,maxFileBytes:maxBytes,maxTotalBytes:maxBytes,excludeFiles,signal});
-      await verifyFileSetSources(await readManifest(join(path,'files.enc'),periodicApplicationKey(record),{signal}),{signal,excludeFiles,maxFiles:policy.maxFiles,maxFileBytes:maxBytes,maxTotalBytes:maxBytes});
+      const excludeFiles=periodicApplicationFileExclusions(policy),excludeDirectories=periodicApplicationDirectoryExclusions(policy),files=await captureFileSet({roots,directory:path,key:periodicApplicationKey(record),maxFiles:policy.maxFiles,maxFileBytes:maxBytes,maxTotalBytes:maxBytes,excludeFiles,excludeDirectories,signal});
+      await verifyFileSetSources(await readManifest(join(path,'files.enc'),periodicApplicationKey(record),{signal}),{signal,excludeFiles,excludeDirectories,maxFiles:policy.maxFiles,maxFileBytes:maxBytes,maxTotalBytes:maxBytes});
       const store=new PostgresStore({...record.adminOptions,poolSize:1});let walFence;
       try{
         const fence=await store.get("SELECT pg_current_wal_insert_lsn()::text lsn,extract(epoch FROM pg_postmaster_start_time())::text postmaster_start,(SELECT timeline_id::integer FROM pg_control_checkpoint()) timeline");
@@ -103,7 +103,7 @@ export async function authenticatePeriodicApplicationCapture(context,proof,captu
     if(manifest.version!==3||manifest.scope!==scope||manifest.captureId!==captureId||manifest.backupId!==proof.backupId||manifest.configurationDigest!==record.configurationDigest||manifest.systemId!==record.expected.system_id||manifest.keyVersion!==record.keyVersion||!policy.enabled||hash(policy)!==manifest.applicationPolicyDigest||!validFence(manifest.walFence)||manifest.walFence.timeline!==source.metadata.timeline||manifest.files?.files>policy.maxFiles||manifest.files?.bytes>Math.min(policy.maxBytes,record.profile.maxBackupBytes-source.metadata.files.bytes))fail('periodic_application_capture_binding');
     await authenticatePostgresBackupFileSet({directory:path,key:periodicApplicationKey(record),files:manifest.files,signal});
     const files=await readManifest(join(path,'files.enc'),periodicApplicationKey(record),{signal});
-    if(canonical(files.roots.map(({id,source})=>({id,source})))!==canonical(policy.materialRoots.map(root=>({id:root.id,source:root.directory})))||canonical(files.excludeFiles??[])!==canonical(periodicApplicationFileExclusions(policy)))fail('periodic_application_source_binding');
+    if(canonical(files.roots.map(({id,source})=>({id,source})))!==canonical(policy.materialRoots.map(root=>({id:root.id,source:root.directory})))||canonical(files.excludeFiles??[])!==canonical(periodicApplicationFileExclusions(policy))||canonical(files.excludeDirectories??[])!==canonical(periodicApplicationDirectoryExclusions(policy)))fail('periodic_application_source_binding');
     return mint(context,proof,policy,path,manifest,{sourceVerified:false});
   },{signal});
 }

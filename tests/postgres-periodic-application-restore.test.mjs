@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomBytes,randomUUID,createHash,generateKeyPairSync} from 'node:crypto';
-import {mkdir,writeFile,readFile,readdir} from 'node:fs/promises';
+import {mkdir,writeFile,readFile,readdir,symlink} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
@@ -49,7 +49,8 @@ test('private periodic application point restores original encrypted credentials
     const exportId=randomUUID(),text='synthetic encrypted export';await store.run("INSERT INTO harbor.background_jobs(id,kind,status,available_at,created,updated) VALUES($1,'recording.export','completed',$2,$2,$2)",exportId,at);await store.run("INSERT INTO harbor.recording_exports(id,created,expires,actor,options,visibility,status,rows,bytes,chunks) VALUES($1,$2,$3,'synthetic','{}',pg_current_snapshot(),'complete',1,$4,1)",exportId,at,at+86400000,Buffer.byteLength(text));await store.run('INSERT INTO harbor.recording_export_chunks VALUES($1,1,$2,$3)',exportId,Buffer.byteLength(text),crypto.seal({text},'export:'+exportId+':1'));
   }finally{records.key.fill(0);}
   await store.run("INSERT INTO harbor.gateway_settings(name,value) VALUES('recording.key.binding',$1)",JSON.stringify({version:1,digest:createHash('sha256').update(Buffer.concat([Buffer.from('harbor-recording-key-binding-v1\0'),recording])).digest('hex')}));
-  const database=await store.get('SELECT current_database() name,(SELECT oid::text FROM pg_database WHERE datname=current_database()) oid'),policy={version:1,enabled:true,database,materialRoots,publicOrigin:'http://localhost:18094',deviceOrigin:'https://localhost:18095',maxBytes:16777216,maxFiles:100};
+  const launcher=join(runtime,'accounts','synthetic','tmp','arg0');await mkdir(launcher,{recursive:true,mode:0o700});await symlink(join(data,'key-encryption.key'),join(launcher,'apply_patch'));
+  const database=await store.get('SELECT current_database() name,(SELECT oid::text FROM pg_database WHERE datname=current_database()) oid'),policy={version:1,enabled:true,database,materialRoots,publicOrigin:'http://localhost:18094',deviceOrigin:'https://localhost:18095',maxBytes:16777216,maxFiles:100,runtimeRebuildableCaches:['codex-launcher-aliases']};
   context=await createTaskPostgresBackupContext({laboratory:lab,directory:join(lab.directory,'periodic-backups'),archiveKey:backupKey,applicationKey,binDirectory,libraryDirectory});
   const proof=await createPostgresBaseBackup(context);await checkpointPostgresBackup(proof);
   await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',randomUUID(),'必须出现在capture之后checkpoint里的合成行',Date.now());
