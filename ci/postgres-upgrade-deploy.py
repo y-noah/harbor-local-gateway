@@ -273,8 +273,13 @@ def run_upgrade(image,config,api,ticket,entry):
   return probe(entry,ticket,row,port,path,headers)
  verify_installed_tools(ticket)
  try:
-  control=entry.entry_state();need(control.get('slot')=='candidate' and control.get('phase')=='active','current entry is not active PG')
-  control=entry.entry_state('hold',control['epoch']);control=entry.entry_state('drain',control['epoch']);need(control.get('phase')=='drained' and control.get('inflight')==0,'entry drain failed')
+  record['phase']='waiting-idle';entry.save_json(path/'release.json',record)
+  control=entry.wait_entry_idle();need(control.get('slot')=='candidate' and control.get('phase')=='active' and control.get('inflight')==0,'current entry is not idle PG')
+  control=entry.entry_state('hold',control['epoch'])
+  # A request can arrive between the idle observation and hold. Abort without
+  # waiting behind that request; the unchanged-source recovery resumes ingress.
+  need(control.get('inflight')==0,'entry became busy before hold')
+  control=entry.entry_state('drain',control['epoch']);need(control.get('phase')=='drained' and control.get('inflight')==0,'entry drain failed')
   gate_attempted=True;gate=gate_install(entry,ticket,config);record.update(phase='holding',gate=gate);entry.save_json(path/'release.json',record);record['retiredSqlite']=retire_sqlite(api,ticket);entry.save_json(path/'release.json',record)
   pg_api.update(runtime_upgrade=True,retain_previous=True,activation=activation,http_code=http_code)
   result=pg.deploy(image,config,None,pg_api);new_gateway=api['inspect_container'](api['NAME']);new_worker=api['inspect_container'](api['NAME']+'-worker')

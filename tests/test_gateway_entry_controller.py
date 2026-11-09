@@ -16,6 +16,43 @@ controller=load('gateway_entry_controller',ROOT/'ci/gateway-entry-controller.py'
 bridge=load('gateway_legacy_transparent',ROOT/'ci/gateway-legacy-transparent.py')
 
 class EntryBoundaryTests(unittest.TestCase):
+ def test_idle_wait_only_reads_active_entry_and_returns_the_idle_epoch(self):
+  states=[{'phase':'active','slot':'candidate','inflight':n,'epoch':7} for n in [2,1,0]]
+  with patch.object(controller,'private_json',return_value={'drainTimeoutMs':100,'shutdownTimeoutMs':1}),patch.object(controller,'entry_state',side_effect=states) as query,patch.object(controller.time,'monotonic',return_value=0),patch.object(controller.time,'sleep') as sleep:
+   self.assertEqual(controller.wait_entry_idle(),states[-1]);self.assertEqual(query.call_args_list,[unittest.mock.call(timeout=0.1)]*3);self.assertEqual(sleep.call_count,2)
+
+ def test_idle_wait_timeout_and_changed_phase_never_issue_control_mutation(self):
+  active={'phase':'active','slot':'candidate','inflight':1,'epoch':7}
+  with patch.object(controller,'private_json',return_value={'drainTimeoutMs':10}),patch.object(controller,'entry_state',return_value=active) as query,patch.object(controller.time,'monotonic',side_effect=[0,0,0.010]),patch.object(controller.time,'sleep') as sleep:
+   with self.assertRaisesRegex(RuntimeError,'entry_idle_timeout'):controller.wait_entry_idle()
+   query.assert_called_once_with(timeout=0.010);sleep.assert_not_called()
+  with patch.object(controller,'private_json',return_value={'shutdownTimeoutMs':100}),patch.object(controller,'entry_state',side_effect=[active,{**active,'phase':'holding'}]) as query,patch.object(controller.time,'monotonic',return_value=0),patch.object(controller.time,'sleep'):
+   with self.assertRaisesRegex(RuntimeError,'entry_idle_state'):controller.wait_entry_idle()
+   self.assertEqual(query.call_args_list,[unittest.mock.call(timeout=0.1)]*2)
+
+ def test_idle_wait_does_not_accept_late_idle_or_query_again_after_sleep_deadline(self):
+  for states,clock in [([{'phase':'active','slot':'candidate','inflight':0}],[0,0,2]),([{'phase':'active','slot':'candidate','inflight':1}],[0,0,0,0.020])]:
+   with self.subTest(clock=clock),patch.object(controller,'private_json',return_value={'drainTimeoutMs':10}),patch.object(controller,'entry_state',side_effect=states) as query,patch.object(controller.time,'monotonic',side_effect=clock),patch.object(controller.time,'sleep'):
+    with self.assertRaisesRegex(RuntimeError,'entry_idle_timeout'):controller.wait_entry_idle()
+    query.assert_called_once_with(timeout=0.010)
+  with patch.object(controller,'private_json',return_value={'drainTimeoutMs':10}),patch.object(controller,'entry_state',side_effect=TimeoutError),patch.object(controller.time,'monotonic',return_value=0):
+   with self.assertRaisesRegex(RuntimeError,'entry_idle_timeout'):controller.wait_entry_idle()
+
+ def test_control_query_timeout_rejects_invalid_values_before_opening_socket(self):
+  for timeout in [None,True,False,0,-1,'1',float('inf'),float('nan'),126]:
+   with self.subTest(timeout=timeout),patch.object(controller,'UnixHttp') as client:
+    with self.assertRaisesRegex(RuntimeError,'entry_control_timeout'):controller.entry_state(timeout=timeout)
+    client.assert_not_called()
+
+ def test_idle_wait_rejects_invalid_budget_and_unknown_inflight(self):
+  for budget in [None,True,False,0,-1,'100',1.0,2147483648]:
+   with self.subTest(budget=budget),patch.object(controller,'private_json',return_value={'drainTimeoutMs':budget}),patch.object(controller,'entry_state') as query:
+    with self.assertRaisesRegex(RuntimeError,'entry_idle_budget'):controller.wait_entry_idle()
+    query.assert_not_called()
+  for count in [None,True,-1,'0']:
+   with self.subTest(count=count),patch.object(controller,'private_json',return_value={'shutdownTimeoutMs':100}),patch.object(controller,'entry_state',return_value={'phase':'active','slot':'candidate','inflight':count}):
+    with self.assertRaisesRegex(RuntimeError,'entry_idle_count'):controller.wait_entry_idle()
+
  def control_reply(self,status,body):
   response=Mock(status=status);response.read.return_value=body
   client=Mock();client.getresponse.return_value=response

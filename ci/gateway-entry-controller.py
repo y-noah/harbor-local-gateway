@@ -321,9 +321,10 @@ class EntryControlError(RuntimeError):
   super().__init__('entry_controller_entry_control_failed');self.diagnostic=diagnostic
 
 
-def entry_state(command=None,epoch=None,slot=None):
+def entry_state(command=None,epoch=None,slot=None,*,timeout=125):
+ require(type(timeout) in [int,float] and 0<timeout<=125,'entry_control_timeout')
  info=Path(CONTROL).lstat();trusted_parents(Path(CONTROL));require(stat.S_ISSOCK(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600,'control_untrusted')
- client=UnixHttp('localhost',timeout=125)
+ client=UnixHttp('localhost',timeout=timeout)
  try:
   body=None if command is None else json.dumps({'command':command,'expectedEpoch':epoch,**({'slot':slot} if slot is not None else {})})
   client.request('GET' if command is None else 'POST','/state' if command is None else '/control',body=body,headers={} if body is None else {'Content-Type':'application/json'})
@@ -348,6 +349,23 @@ def entry_state(command=None,epoch=None,slot=None):
    require(False,'entry_control_failed')
   return json.loads(data)
  finally:client.close()
+
+
+def wait_entry_idle():
+ config=private_json(ENTRY_CONFIG);budget=config.get('drainTimeoutMs',config.get('shutdownTimeoutMs'))
+ require(type(budget) is int and 1<=budget<=2147483647,'entry_idle_budget')
+ deadline=time.monotonic()+budget/1000
+ while True:
+  remaining=deadline-time.monotonic();require(remaining>0,'entry_idle_timeout')
+  try:current=entry_state(timeout=min(125,remaining))
+  except TimeoutError:require(False,'entry_idle_timeout')
+  remaining=deadline-time.monotonic();require(remaining>0,'entry_idle_timeout')
+  require(current.get('phase')=='active' and current.get('slot')=='candidate','entry_idle_state')
+  count=current.get('inflight');require(type(count) is int and count>=0,'entry_idle_count')
+  if count==0:return current
+  # Wait while admission stays active. Never pause unrelated requests merely
+  # to discover that a long-running source request cannot drain in time.
+  time.sleep(min(0.1,remaining))
 
 
 def old_socket_counts(pid,port):
