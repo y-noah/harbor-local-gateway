@@ -29,6 +29,22 @@ test('specialized Standard text models are discovered without ingesting Fast, tr
  const text=official+'\nStandard\n### Grouped Pricing Table data\n| Category | Model | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| Codex | gpt-5.3-codex | $1.75 | $14.00 | $0.175 |\n\nFast\n### Grouped Pricing Table data\n| Category | Model | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| Codex | gpt-5.3-codex | $3.50 | $28.00 | $0.35 |\n\nStandard\n| Model | Training | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| gpt-5.3-codex | $1 | $99 | $99 | $99 |\n\n| Model | Modality | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| mixed-image | Image | $8 | $30 | $2 |\n';
  const parsed=parseOfficialPrices(text);assert.deepEqual(parsed['gpt-5.3-codex'],{input:'1.75',cached:'0.175',output:'14.00'});assert.ok(!Object.hasOwn(parsed,'mixed-image'));assert.equal(Object.keys(parsed).length,38);
 });
+test('unlabelled sections cannot inherit Standard tier or the previous table columns',()=>{
+ const text=official+'\n### Standard pricing data\n| Model | Input | Output | Cached input |\n| --- | --- | --- | --- |\n| synthetic-standard | $2.00 | $10.00 | $0.10 |\n\n### Grouped Pricing Table data\n| Model configuration | Input | Output | Cached input |\n| --- | --- | --- | --- |\n| synthetic-unqualified | $9 | $90 | $1 |\n\n### Grouped Pricing Table data\n| Model | Input | Output | Cached input |\n| --- | --- | --- | --- |\n| synthetic-stale-tier | $8 | $80 | $1 |\n\nStandard\n### Grouped Pricing Table data\n| Category | Model | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| Text | synthetic-explicit | $3 | $15 | $0.30 |\n';
+ const parsed=parseOfficialPrices(text);assert.equal(parsed['synthetic-standard'].input,'2.00');assert.equal(parsed['synthetic-explicit'].input,'3');
+ assert.ok(!Object.hasOwn(parsed,'synthetic-unqualified'));assert.ok(!Object.hasOwn(parsed,'synthetic-stale-tier'));
+ assert.throws(()=>parseOfficialPrices(text.replace('| synthetic-standard | $2.00 | $10.00 | $0.10 |','| synthetic-standard | $2.00 | $10.00 |')),/不完整/);
+});
+test('legal ATX heading levels and closing markers preserve the complete Standard model set',()=>{
+ const expected=parseOfficialPrices(official);
+ for(const level of [1,2,3,4,5,6])for(const closing of ['', ' ###']){
+  const text=official.replace(/^### ((?:Standard|Batch|Fast|Ultrafast|Flex) pricing data)$/gm,(_,title)=>'#'.repeat(level)+' '+title+closing);
+  assert.deepEqual(parseOfficialPrices(text),expected,level+closing);
+  const extra='\nStandard\n#### Grouped Pricing Table data ####\n| Model | Input | Output | Cached input |\n| --- | --- | --- | --- |\n| synthetic-extra | $2 | $10 | $0.10 |\n';
+  const parsed=parseOfficialPrices(text+extra);assert.equal(Object.keys(parsed).length,Object.keys(expected).length+1);for(const [name,rate] of Object.entries(expected))assert.deepEqual(parsed[name],rate);
+  assert.throws(()=>parseOfficialPrices(text+extra.replace('synthetic-extra','gpt-6-astra')),/冲突/);
+ }
+});
 test('price versions stay fixed across changes while unpriced data can be resolved by explicit dated mappings',t=>{
  const {store,add}=fixture(t);const prior=add('gpt-6.1-sol',1000000),unpriced=add('codex-auto-review',1000000),old=store.pricing.current();
  store.pricing.configure({expectedVersion:0,manualRates:{'gpt-6.1-sol':{input:'4',cached:'0.1',output:'10'}}});

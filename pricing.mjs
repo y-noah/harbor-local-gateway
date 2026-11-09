@@ -16,17 +16,22 @@ function validateRate(value){
   return {input:value.input,cached:value.cached,output:value.output,...(value.source?{source:String(value.source).slice(0,500)}:{})};
 }
 export function parseOfficialPrices(text){
-  const begin=text.indexOf('### Standard pricing data'),end=text.indexOf('### Batch pricing data',begin);
+  const headingName=line=>{const match=line.trim().match(/^#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/);return match?match[1].trim():null;};
+  const lines=text.split('\n'),begin=lines.findIndex(line=>headingName(line)==='Standard pricing data'),end=lines.findIndex((line,index)=>index>begin&&headingName(line)==='Batch pricing data');
   if(!text.startsWith('# Pricing')||begin<0||end<begin)fail('官方定价表格式已变化，保留上次有效费率');
-  const primaryHeaders=text.slice(begin,end).split('\n').filter(line=>/^\|\s*Model\s*\|/.test(line)).map(line=>line.replace(/^\||\|$/g,'').split('|').map(x=>x.trim()));
+  const primaryHeaders=lines.slice(begin,end).map(line=>line.trim()).filter(line=>/^\|\s*Model\s*\|/.test(line)).map(line=>line.replace(/^\||\|$/g,'').split('|').map(x=>x.trim()));
   if(!primaryHeaders.length||primaryHeaders.some(h=>(h.includes('Short context input')?['Short context input','Short context cached input','Short context output']:['Input','Cached input','Output']).some(f=>!h.includes(f))))fail('官方主要费率字段已变化，保留上次有效费率');
-  const result={};let header,mode;
+  const result={};let header,mode,pendingMode;
   const money=s=>s==='-'?null:/^\$\d+(?:\.\d{1,6})?$/.test(s)?s.slice(1):fail('官方价格字段无法识别');
-  for(const original of text.split('\n')){
-    const line=original.trim(),speed=line.match(/^(?:###?\s+)?(Standard|Batch|Fast|Ultrafast|Flex)(?: pricing data)?$/);
-    if(speed){mode=speed[1];header=null;continue;}
+  for(const original of lines){
+    const line=original.trim(),heading=headingName(line),label=heading??line,speed=label.match(/^(Standard|Batch|Fast|Ultrafast|Flex)(?: pricing data)?$/);
+    if(speed){mode=speed[1];pendingMode=/ pricing data$/.test(label)?null:mode;header=null;continue;}
+    // Markdown table sections do not inherit the preceding table's columns or
+    // an unrelated section's tier. Grouped tables need an explicit tier label.
+    if(heading!==null){mode=/^(?:Grouped )?Pricing Table data$/.test(heading)?pendingMode:null;pendingMode=null;header=null;continue;}
+    if(!line){header=null;continue;}
     if(!line.startsWith('|'))continue;const cells=line.replace(/^\||\|$/g,'').split('|').map(x=>x.trim());
-    if(cells.includes('Model')){header=cells;continue;}
+    if(cells.includes('Model')){header=cells;pendingMode=null;continue;}
     if(mode!=='Standard'||!header||cells[0].startsWith('---')||header.includes('Modality')||header.includes('Training'))continue;
     if(!header.includes('Model'))continue;
     const fields=header.includes('Short context input')?['Short context input','Short context cached input','Short context output']:['Input','Cached input','Output'];
