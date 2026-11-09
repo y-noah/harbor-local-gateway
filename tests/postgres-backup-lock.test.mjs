@@ -53,7 +53,7 @@ test('private directory, mode and cancellation are enforced before callbacks run
  // Reuse the real artifact helpers without copying their unrelated dependency tree.
  await writeFile(join(path,'migration-artifacts.mjs'),'export * from '+JSON.stringify(new URL('../migration-artifacts.mjs',import.meta.url).href)+';');
  const module=await import(new URL('file://'+join(path,'postgres-backup-lock.mjs')).href),before=await module.backupCoordinationCodeDigest();
- for(const name of ['recording-request-context.mjs','recording-text-metadata.mjs','recording-attachment.mjs','recording-literal.mjs','conversation-capture.mjs']){
+ for(const name of ['recording-request-context.mjs','recording-text-metadata.mjs','recording-attachment.mjs','recording-literal.mjs','conversation-capture.mjs','postgres-worker-startup.mjs']){
   const target=join(path,name),previous=await readFile(target);await writeFile(target,Buffer.concat([previous,Buffer.from('\n// synthetic identity change\n')]));assert.notEqual(await module.backupCoordinationCodeDigest(),before,name);await writeFile(target,previous);assert.equal(await module.backupCoordinationCodeDigest(),before);
  }
  });
