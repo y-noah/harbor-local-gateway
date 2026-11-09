@@ -2,8 +2,18 @@ import {mkdtemp,mkdir,writeFile,readFile,rm,stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {verifyConnectionEnvironment} from '../ci/local-assurance-migrate.mjs';
 import {validateProfile,run,canCloseWithoutRuntime,sourceForAction,revokeRuntimeTarget,controlSnapshot,normalizePublicDeviceCertificates,resumeRuntimeTarget} from '../ci/local-assurance-migrate.mjs';
 const profile=()=>({enabled:true,version:1,mode:'local-assurance',releaseId:'00000000-0000-0000-0000-000000000001',businessRevision:'a'.repeat(40),businessImage:'registry.test/harbor-local-gateway@sha256:'+'b'.repeat(64),runDirectory:'/opt/product-development/harbor-local-gateway/local-assurance/00000000-0000-0000-0000-000000000001',expectedCluster:'123456',source:{containerId:'c'.repeat(64),imageId:'sha256:'+'d'.repeat(64),startedAt:'2026-11-01T00:00:00Z',dataDirectory:'/opt/product-development/harbor-local-gateway/data',runtimeDirectory:'/opt/product-development/harbor-local-gateway/runtime'},fileRoots:[{id:'data',source:'/opt/product-development/harbor-local-gateway/data'},{id:'runtime',source:'/opt/product-development/harbor-local-gateway/runtime'},{id:'secrets',source:'/opt/product-development/harbor-local-gateway/postgres-infra/app-secrets'}]});
+test('既有连接摘要只允许追加单个上下文0/1开关，不放宽数据库或其他配置绑定',()=>{
+ const base='HARBOR_DATABASE_URL=postgresql://synthetic@database.test/fixture\nHARBOR_RECORDING_STORAGE_MODE=report\n',digest=createHash('sha256').update(base).digest('hex');
+ assert.equal(verifyConnectionEnvironment(base,digest),undefined);
+ for(const flag of ['0','1'])for(const suffix of ['','\n'])assert.equal(verifyConnectionEnvironment(base+'HARBOR_RECORDING_CONTEXT_ENABLED='+flag+suffix,digest),flag);
+ for(const flag of ['true','01','','1 ','1\r\n'])assert.throws(()=>verifyConnectionEnvironment(base+'HARBOR_RECORDING_CONTEXT_ENABLED='+flag+'\n',digest),/local_assurance_connection_context_flag/);
+ for(const text of [base+'HARBOR_RECORDING_CONTEXT_ENABLED=0\nHARBOR_RECORDING_CONTEXT_ENABLED=1\n',base.replace('database.test','other.test')+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n',base.replace('MODE=report','MODE=local'),base+'OTHER=value\n',base+'\n',base.slice(0,-1)+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n'])assert.throws(()=>verifyConnectionEnvironment(text,digest),/local_assurance_connection_/);
+ assert.throws(()=>verifyConnectionEnvironment(base,'invalid'),/local_assurance_connection_material_changed/);
+});
 test('关闭模式不加载安装工具/数据库或修改源',async()=>{assert.equal(validateProfile({enabled:false}),false);const value=await run('prepare',{enabled:false});assert.equal(value.state,'disabled');assert.equal(value.deploymentAllowed,false);});
 test('身份从root profile读取，单次release之外同作用域可用',()=>{assert.equal(validateProfile(profile()),true);});
 test('拒绝不可信模式/跨工程路径/非不可变镜像/重复材料',()=>{for(const change of [c=>c.mode='task-owned',c=>c.runDirectory='/tmp/other',c=>c.businessImage='registry.test/harbor-local-gateway:main',c=>c.source.dataDirectory='/etc',c=>c.source.containerId='other',c=>c.fileRoots[2].source='/root',c=>c.fileRoots[2].id='data']){const c=profile();change(c);assert.throws(()=>validateProfile(c),/local_assurance_/);}});

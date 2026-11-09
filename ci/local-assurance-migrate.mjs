@@ -13,6 +13,15 @@ const STACK='/opt/product-development/harbor-local-gateway';
 const need=(ok,code)=>{if(!ok)throw Error('local_assurance_'+code);};
 const ident=value=>{need(/^[-a-zA-Z0-9_]+$/.test(value),'identifier');return '"'+value+'"';};
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+export function verifyConnectionEnvironment(text,expectedDigest){
+ need(typeof text==='string'&&/^[a-f0-9]{64}$/.test(expectedDigest??''),'connection_material_changed');
+ const lines=text.match(/[^\n]*\n|[^\n]+$/g)||[],key='HARBOR_RECORDING_CONTEXT_ENABLED=',flags=lines.filter(line=>line.startsWith(key));
+ need(flags.length<=1&&flags.every(line=>/^HARBOR_RECORDING_CONTEXT_ENABLED=[01]\n?$/.test(line)),'connection_context_flag');
+ // The original encrypted state binds the database URL and storage mode bytes.
+ // Admit only the new server-owned switch without rewriting that old witness.
+ need(hash(text)===expectedDigest||hash(lines.filter(line=>!line.startsWith(key)).join(''))===expectedDigest,'connection_material_changed');
+ return flags.length?flags[0].slice(key.length).trim():undefined;
+}
 async function privateFile(path){const f=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);try{const s=await f.stat();need(s.isFile()&&s.uid===0&&(s.mode&0o777)===0o600&&s.nlink===1&&s.size<=1048576,'private_file');return await f.readFile();}finally{await f.close();}}
 export function validateProfile(c,{allowDisabled=false}={}){
  if(c?.enabled!==true&&!allowDisabled)return false;need(c?.enabled===undefined||typeof c.enabled==='boolean','enabled');
@@ -70,7 +79,7 @@ export async function run(action,c){
    try{await verifyRuntime(t,options,state);const context=await t.createDockerStorageOperatorContext('/etc/harbor-storage-operator.json'),manifest=await t.readManifest(join(c.runDirectory,'artifacts/target.enc'),key);state.result.publisherBinding=await t.bindInstalledInfrastructureReport({context,target:{database:state.database,databaseOid:state.databaseOid,cluster,schemaDigest:hash(JSON.stringify(manifest.schemaChecksums))},deadline:performance.now()+120000});await sourceGuard(c,{stopped:true});state.phase='verified';await saveState(c,state,key,t);}catch(error){await revokeRuntimeTarget(admin,state);throw error;}
    return {...state.result,resumed:true};
   }
-  if(action==='check'){const s=await t.readManifest(join(c.runDirectory,'state.enc'),key);need(s.phase==='verified'&&s.releaseId===c.releaseId&&s.result.database.cluster===cluster,'state_not_verified');const db=await admin.get('SELECT oid::text oid FROM pg_database WHERE datname=$1',s.database);need(db?.oid===s.databaseOid,'database_identity');await verifyRuntime(t,options,s);const env=(await privateFile(s.result.connectionEnvFile)).toString();need(hash(env)===s.connectionEnvDigest,'connection_material_changed');for(const path of ['pg-data','runtime','secrets']){const st=await lstat(join(c.runDirectory,path));need(st.isDirectory()&&!st.isSymbolicLink(),'materials_identity');}return {...s.result,checkedAt:Date.now()};}
+  if(action==='check'){const s=await t.readManifest(join(c.runDirectory,'state.enc'),key);need(s.phase==='verified'&&s.releaseId===c.releaseId&&s.result.database.cluster===cluster,'state_not_verified');const db=await admin.get('SELECT oid::text oid FROM pg_database WHERE datname=$1',s.database);need(db?.oid===s.databaseOid,'database_identity');await verifyRuntime(t,options,s);const env=(await privateFile(s.result.connectionEnvFile)).toString();verifyConnectionEnvironment(env,s.connectionEnvDigest);for(const path of ['pg-data','runtime','secrets']){const st=await lstat(join(c.runDirectory,path));need(st.isDirectory()&&!st.isSymbolicLink(),'materials_identity');}return {...s.result,checkedAt:Date.now()};}
   // Unknown/partial writes are retained for inspection; this entry never guesses a retry.
   await mkdir(c.runDirectory,{mode:0o700,recursive:true});const runInfo=await lstat(c.runDirectory);need(runInfo.isDirectory()&&!runInfo.isSymbolicLink()&&runInfo.uid===0&&(runInfo.mode&0o777)===0o700,'run_directory');try{await lstat(join(c.runDirectory,'state.enc'));throw Error('local_assurance_existing_state_requires_inspection');}catch(error){if(error.code!=='ENOENT')throw error;}const lock=await open(join(c.runDirectory,'migration-intent.json'),constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);await lock.writeFile(JSON.stringify({releaseId:c.releaseId,started:Date.now()}));await lock.sync();await lock.close();
   const directory=join(c.runDirectory,'artifacts'),materials=join(c.runDirectory,'materials');await mkdir(directory,{mode:0o700});const state={version:1,releaseId:c.releaseId,phase:'fencing',runtimePassword:randomBytes(32).toString('base64url')};await saveState(c,state,key,t);
