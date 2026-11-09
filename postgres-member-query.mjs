@@ -4,9 +4,10 @@ import {createPostgresMemberLimits,postgresMemberLimitConfiguration} from './pos
 
 const fail=(status,message,code='member_query_invalid')=>{throw new AppError(status,message,code);};
 export function memberQuery(params,{keys=false}={}){
-  const allowed=keys?['page','page_size','q','member_id']:['page','page_size','q','type_id','status'];
+  const allowed=keys?['page','page_size','q','member_id']:['page','page_size','q','type_id','status','view'];
   if([...params.keys()].some(key=>!allowed.includes(key)||params.getAll(key).length!==1))fail(400,'员工查询参数无效');
   const value={page:1,pageSize:25,q:params.get('q')??'',typeId:params.get('type_id')??'',status:params.get('status')??'',memberId:params.get('member_id')??''};
+  if(params.has('view')){if(params.get('view')!=='list')fail(400,'员工查询视图无效');value.view='list';}
   for(const [key,field] of [['page','page'],['page_size','pageSize']])if(params.has(key)){if(!/^[1-9]\d*$/.test(params.get(key))||!Number.isSafeInteger(Number(params.get(key))))fail(400,'员工分页参数无效');value[field]=Number(params.get(key));}
   if(value.pageSize>100||value.q.length>100||value.q.includes('\0')||!['','enabled','disabled'].includes(value.status)||value.typeId&&!/^(?:unclassified|[a-zA-Z0-9-]{1,80})$/.test(value.typeId)||value.memberId&&!/^[a-f0-9-]{36}$/.test(value.memberId))fail(400,'员工查询参数无效');
   value.q=value.q.trim();return value;
@@ -43,9 +44,9 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
     const rows=scope==='member'?await store.all('SELECT member_id owner_id,COUNT(*) total FROM harbor.employee_devices WHERE member_id=ANY($1::text[]) GROUP BY member_id',ids):await store.all(`SELECT k.id owner_id,COUNT(d.id) total FROM harbor.keys k LEFT JOIN harbor.employee_devices d ON d.member_id=k.member_id AND (d.allowed_key_ids IS NULL OR d.allowed_key_ids ? k.id) AND (k.device_ids IS NULL OR k.device_ids ? d.id) WHERE k.id=ANY($1::text[]) GROUP BY k.id`,ids);
     return new Map(rows.map(row=>[row.owner_id,row.total]));
   }
-  async function member(row,data,at,deviceCounts){
+  async function member(row,data,at,deviceCounts,{metadata=false}={}){
     const {default_models,usage_limits,usage_limits_version,...view}=row,configuration=postgresMemberLimitConfiguration({usage_limits,usage_limits_version});
-    return {...view,default_models:storedModelAllowlist(default_models),usage_limits:configuration,limit_usage:configuration.enabled?(await limits.status(row.id,at)).usage:[],...used(data,row.id),registered_devices:(deviceCounts??await registered('member',[row.id])).get(row.id)??0};
+    return {...view,default_models:storedModelAllowlist(default_models),usage_limits:configuration,...(metadata?{}:{limit_usage:configuration.enabled?(await limits.status(row.id,at)).usage:[],...used(data,row.id)}),registered_devices:(deviceCounts??await registered('member',[row.id])).get(row.id)??0};
   }
   const budget=value=>{if(Buffer.byteLength(JSON.stringify(value))>pageBytes)fail(503,'完整员工页超过字节预算，请减小页大小','member_query_capacity');return value;};
   async function list(query){return read(async()=>{
@@ -56,8 +57,8 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL) key_count,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL AND k.model_source->>'kind'='custom') key_exceptions
       FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE ${condition.where} ORDER BY m.created DESC,m.id DESC LIMIT $${n+1} OFFSET $${n+2}`,...condition.values,query.pageSize,(page-1)*query.pageSize);
-    const ids=rows.map(row=>row.id),data=await usage('member',ids,at),deviceCounts=await registered('member',ids),items=[];for(const row of rows)items.push(await member(row,data,at,deviceCounts));
-    return budget({rows:items,types,pagination:{page,pageSize:query.pageSize,total,totalPages},filters:query,observedAt:at});
+    const metadata=query.view==='list',ids=rows.map(row=>row.id),data=metadata?null:await usage('member',ids,at),deviceCounts=await registered('member',ids),items=[];for(const row of rows)items.push(await member(row,data,at,deviceCounts,{metadata}));
+    return budget({rows:items,types,pagination:{page,pageSize:query.pageSize,total,totalPages},filters:query,observedAt:at,...(metadata?{usagePending:items.length>0}:{})});
   });}
   async function detail(memberId){return read(async()=>{
     const at=clock(),row=await store.get(`SELECT ${memberColumns},(SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL) key_count FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE m.id=$1 AND m.removed_at IS NULL`,memberId);if(!row)fail(404,'员工不存在或已移除','member_not_found');

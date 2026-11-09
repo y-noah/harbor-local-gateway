@@ -39,7 +39,7 @@ export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,c
     if(method==='GET'){
       params??=new URLSearchParams();
       if(path==='/api/admin/members')return {status:200,value:await queries.list(memberQuery(params))};
-      if(path==='/api/admin/members/selection')return {status:200,value:await queries.selection(memberQuery(params))};
+      if(path==='/api/admin/members/selection'){if(params.has('view'))throw new AppError(400,'筛选选择不接受视图参数');return {status:200,value:await queries.selection(memberQuery(params))};}
       if(path==='/api/admin/keys')return {status:200,value:await queries.keys(memberQuery(params,{keys:true}))};
       const detail=path.match(/^\/api\/admin\/members\/([a-f0-9-]{36})(\/keys)?$/);
       if(detail){if(!detail[2]&&[...params.keys()].length)throw new AppError(400,'员工详情不接受查询参数');return {status:200,value:detail[2]?await queries.keys(memberQuery(params,{keys:true}),{memberId:detail[1],reveal:true}):await queries.detail(detail[1])};}
