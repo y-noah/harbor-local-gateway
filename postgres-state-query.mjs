@@ -4,12 +4,12 @@ import {AppError,usageWindow,participatesNightly,revealStoredKey,storedModelAllo
 import {sanitizeRecord} from './record-redaction.mjs';
 import {referenceMetric} from './pricing.mjs';
 import {postgresMemberLimitConfiguration} from './postgres-member-limits.mjs';
-import {fields,validPrice,joins,decorate,aggregate,aggregateSql} from './postgres-reference-query.mjs';
+import {fields,validPrice,joins,decorate,aggregate,aggregateSql,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 
 export function stateQuery(params){
   const value={sessionPage:1,sessionPageSize:25};
-  if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
+  if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview','accounts'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
   if(params.has('people')){if(params.getAll('people').length!==1||!['all','none'].includes(params.get('people')))throw new AppError(400,'员工加载模式无效');value.people=params.get('people');}
   for(const [name,field] of [['session_page','sessionPage'],['session_page_size','sessionPageSize']]){
     const entries=params.getAll(name);
@@ -35,7 +35,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
   if(!Number.isSafeInteger(maxPeople)||maxPeople<1||maxPeople>10000)throw new AppError(503,'兼容员工状态容量无效','state_configuration');
   async function execute({sessionPage=1,sessionPageSize=25,people='all',view='full',sessionQ='',sessionType='',sessionAccount='',sessionStatus=''}={}){
     validateSessionFilters({sessionQ,sessionType,sessionAccount,sessionStatus});sessionQ=sessionQ.trim();
-    if(!['full','overview'].includes(view))throw new AppError(400,'状态视图无效');
+    if(!['full','overview','accounts'].includes(view))throw new AppError(400,'状态视图无效');
     if(!['all','none'].includes(people))throw new AppError(400,'员工加载模式无效');
     if(!Number.isSafeInteger(sessionPage)||sessionPage<1||!Number.isSafeInteger(sessionPageSize)||sessionPageSize<1||sessionPageSize>100)throw new AppError(400,'会话分页参数无效');
     const at=clock(),window=usageWindow(at),recentUsageWindow={start:at-12*3600000,end:at,hours:12};
@@ -56,11 +56,26 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
           totals:rows.reduce((total,row)=>({requests:total.requests+Number(row.requests),success:total.success+Number(row.success)}),{requests:0,success:0}),
           daily:rows.map(row=>({day:row.day,requests:Number(row.requests)}))};
       }
+      const packages=createPostgresAccountPackages(store,{clock}),packagePolicy=await packages.policy(),accounts=await packages.decorate(await store.all('SELECT id,name,kind,auth_mode,route_epoch,platform_config,platform_models,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id'));
+      const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,standard:usage(row.id)}));
+      if(view==='accounts'){
+        const rows=accounts.length?await store.all(`WITH source AS (
+          SELECT r.account_id,r.status,r.started,r.ended,
+            CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
+            CASE WHEN ${validPrice} THEN p.revision END revision,
+            ${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms END ${f}`).join(',')}
+          FROM harbor.requests r${joins} WHERE r.usage_at>=$1 AND r.usage_at<$2 AND r.account_id=ANY($3::text[])
+        ), partial AS MATERIALIZED (
+          SELECT account_id,revision,${referencePartialAggregateSql()} FROM source GROUP BY account_id,revision
+        ) SELECT account_id,${referenceRollupAggregateSql()} FROM partial GROUP BY account_id`,window.start,window.end,accounts.map(row=>row.id)):[];
+        const usage=new Map(rows.map(row=>[row.account_id,aggregate(row).standard])),empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(f=>[f,'0']))}).standard;
+        return {view:'accounts',usageMetric:referenceMetric,usageWindow:window,observedAt:at,peopleLoaded:false,
+          accounts:accountData(id=>usage.get(id)||empty),...(balancingReader?{balancing:await balancingReader(at)}:{})};
+      }
       const members=people==='none'?[]:await store.all('SELECT m.id,m.name,m.enabled,m.created,m.removed_at,m.usage_limits,m.usage_limits_version,m.usage_type_id,m.usage_type_version,m.defaults_version,m.configuration_source,m.default_models_set,m.default_models,t.code usage_type_code,t.name usage_type_name FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE m.removed_at IS NULL ORDER BY m.created DESC,m.id DESC LIMIT $1',maxPeople+1);
       const keys=people==='none'?[]:await store.all('SELECT id,member_id,digest,prefix,secret_cipher,expires,allowed_models,model_policy_version,model_source,enabled,created FROM harbor.keys WHERE removed_at IS NULL ORDER BY created DESC,id DESC LIMIT $1',maxPeople+1);
       if(members.length>maxPeople||keys.length>maxPeople)throw new AppError(503,'兼容状态超过员工或Key容量，请使用分页接口','state_people_capacity');
       const counts=await store.get('SELECT (SELECT COUNT(*) FROM harbor.members WHERE removed_at IS NULL) member_count,(SELECT COUNT(*) FROM harbor.keys WHERE removed_at IS NULL) key_count');
-      const packages=createPostgresAccountPackages(store,{clock}),packagePolicy=await packages.policy(),accounts=await packages.decorate(await store.all('SELECT id,name,kind,auth_mode,route_epoch,platform_config,platform_models,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id'));
       const sessionArgs=[window.start,window.end],conditions=['s.updated>=$1','s.updated<$2'];
       const filter=(sql,value)=>{sessionArgs.push(value);conditions.push(sql.replaceAll('?',String(sessionArgs.length)));};
       if(sessionQ)filter("(position(lower($?::text) in lower(m.name))>0 OR position(lower($?::text) in lower(m.id))>0 OR position(lower($?::text) in lower(COALESCE(s.client_session_id,'')))>0 OR position(lower($?::text) in lower(s.id))>0)",sessionQ);
@@ -75,7 +90,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       const loadPeople=people==='all',usageArgs=loadPeople?
         [window.start,window.end,recentUsageWindow.start,at,members.map(r=>r.id),keys.map(r=>r.id),accounts.map(r=>r.id),sessions.map(r=>r.id)]:
         [window.start,window.end,accounts.map(r=>r.id),sessions.map(r=>r.id)];
-      const rows=await store.all(`WITH source AS ${loadPeople?'MATERIALIZED ':''}(
+      const usageSql=loadPeople?`WITH source AS ${loadPeople?'MATERIALIZED ':''}(
         SELECT ${loadPeople?`CASE WHEN r.member_id=ANY($5::text[]) THEN r.member_id END member_id,
           CASE WHEN r.key_id=ANY($6::text[]) THEN r.key_id END key_id,`:''}
           CASE WHEN r.account_id=ANY($${loadPeople?7:3}::text[]) THEN r.account_id END account_id,
@@ -91,7 +106,25 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         WHERE NOT period.recent OR (usage_at>=$3 AND usage_at<$4)`:'SELECT source.*,false recent FROM source'}
       ) SELECT recent,${loadPeople?'GROUPING(member_id) g_member,GROUPING(key_id) g_key':'1 g_member,1 g_key'},GROUPING(account_id) g_account,GROUPING(session_id) g_session,GROUPING(day) g_day,
         ${loadPeople?'member_id,key_id':'NULL::text member_id,NULL::text key_id'},account_id,session_id,day,COUNT(DISTINCT ip) ips,MAX(started) last_seen,${aggregateSql}
-        FROM data GROUP BY GROUPING SETS((recent),${loadPeople?'(recent,member_id),(recent,key_id),':''}(recent,account_id),(recent,session_id),(recent,day))`,...usageArgs);
+        FROM data GROUP BY GROUPING SETS((recent),${loadPeople?'(recent,member_id),(recent,key_id),':''}(recent,account_id),(recent,session_id),(recent,day))`:
+        `WITH source AS (
+          SELECT CASE WHEN r.account_id=ANY($3::text[]) THEN r.account_id END account_id,
+            CASE WHEN r.session_id=ANY($4::text[]) THEN r.session_id END session_id,
+            to_char(to_timestamp(r.usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
+            r.status,r.started,r.ended,
+            CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
+            CASE WHEN ${validPrice} THEN p.revision END revision,
+            ${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms END ${f}`).join(',')}
+          FROM harbor.requests r${joins} WHERE r.usage_at>=$1 AND r.usage_at<$2
+        ), partial AS MATERIALIZED (
+          SELECT account_id,session_id,day,revision,${referencePartialAggregateSql()}
+          FROM source GROUP BY account_id,session_id,day,revision
+        ) SELECT false recent,1 g_member,1 g_key,GROUPING(account_id) g_account,GROUPING(session_id) g_session,GROUPING(day) g_day,
+          NULL::text member_id,NULL::text key_id,account_id,session_id,day,${referenceRollupAggregateSql()}
+          FROM partial GROUP BY GROUPING SETS((),(account_id),(session_id),(day))`;
+      // No people fields escape the compact DTO. Fold exact amount/count
+      // partials before grouping; IP cardinality and last-seen are not needed.
+      const rows=await store.all(usageSql,...usageArgs);
       const groups=new Map(),daily=[];let totals;
       for(const row of rows){
         const dimension=['member','key','account','session','day'].find(name=>!row['g_'+name]);
@@ -116,7 +149,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         sessionsPagination:{page,pageSize:sessionPageSize,total,totalPages},memberCount:counts.member_count,keyCount:counts.key_count,peopleLoaded:people==='all',
         members:members.map(({usage_limits,usage_limits_version,default_models,...row})=>({ ...row,default_models:storedModelAllowlist(default_models),usage_limits:postgresMemberLimitConfiguration({usage_limits,usage_limits_version}),ips:usage('member',row.id).ips,last_seen:usage('member',row.id).last_seen,standard:usage('member',row.id).standard,standard_12h:usage('member',row.id,true).standard})),
         keys:keys.map(({digest,secret_cipher,allowed_models,...row})=>({...row,allowed_models:storedModelAllowlist(allowed_models),full_key:revealStoredKey(encryptionKey,{id:row.id,digest,secret_cipher}),ips:usage('key',row.id).ips,last_seen:usage('key',row.id).last_seen,standard:usage('key',row.id).standard,standard_12h:usage('key',row.id,true).standard})),
-        accounts:accounts.map(({api_secret_digest,...row})=>({...row,package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,standard:usage('account',row.id).standard})),
+        accounts:accountData(id=>usage('account',id).standard),
         sessions:sessions.map(row=>({...row,nightly_enabled:Number(participatesNightly(row,at)),upstream_thread:row.protocol==='responses'?(row.upstream_thread||row.id):row.upstream_id,standard:usage('session',row.id).standard,request_count:usage('session',row.id).request_count})),
         requests:requests.map(row=>decorate(row,window.start)),totals:totals||{requests:0,success:0,standard:empty},daily:daily.sort((a,b)=>a.day.localeCompare(b.day)),audit};
     },{level:'REPEATABLE READ',readOnly:true});

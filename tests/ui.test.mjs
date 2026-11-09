@@ -1226,3 +1226,41 @@ test('请求列表展示已返回的输入摘要并转义，缺失和过期不�
  for(const [state,label] of Object.entries({unavailable:'无输入摘要',expired:'摘要已过期',unreadable:'摘要暂不可读'}))assert.ok(page.run('requestPreview('+JSON.stringify({...row,input_preview:null,input_preview_state:state})+')').includes(label));
  assert.equal(page.run('requestPreview({})'),'');assert.equal(reads,0);
 });
+
+test('账号专用视图保留账号与精确费用，切页重新取对应状态而不显示虚假总览',async()=>{
+ const paths=[],pending=[];
+ const base={...pagedSnapshot(),view:'overview',capabilities:{pagedMembers:true,accountStateView:true},accounts:[],daily:[],totals:{requests:17,success:16}};
+ const account={id:'synthetic-account',name:'合成轻视图账号',kind:'codex',auth_mode:'subscription',enabled:1,state:'ready',standard:{state:'priced',total:12.34,total_exact:'12.34',requests:3,known:3,unpriced:0,unmetered:0}};
+ const accounts={view:'accounts',peopleLoaded:false,accounts:[account],capabilities:base.capabilities,usageWindow:{start:1,end:2},balancing:{settings:{},weights:{accounts:[]}}};
+ const page=await ui(path=>{paths.push(path);if(path.startsWith('/api/admin/state'))return new Promise(resolve=>pending.push(()=>resolve(response(path.includes('view=accounts')?accounts:base))));return response({});});
+ page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";setTab("accounts")');
+ assert.ok(paths.includes('/api/admin/state?people=none&view=accounts'));
+ assert.match(page.node('#content').innerHTML,/正在读取页面数据/);
+ pending.shift()();await new Promise(setImmediate);
+ assert.equal(page.run('state.view'),'accounts');assert.match(page.node('#content').innerHTML,/合成轻视图账号/);assert.match(page.node('#content').innerHTML,/\$12\.34/);
+ assert.equal(page.run('Object.hasOwn(state,"totals")'),false);
+ page.run('setTab("overview")');assert.ok(paths.at(-1).includes('view=overview'));assert.doesNotMatch(page.node('#content').innerHTML,/近7天请求总数/);
+ pending.shift()();await new Promise(setImmediate);assert.equal(page.run('state.view'),'overview');assert.match(page.node('#content').innerHTML,/17/);
+});
+
+test('账号视图迟到响应不能覆盖切回后的总览，刷新失败保留已有账号金额',async()=>{
+ const capability={pagedMembers:true,accountStateView:true},base={...pagedSnapshot(),view:'overview',capabilities:capability,accounts:[],daily:[],totals:{requests:17,success:16}};
+ const accountView={view:'accounts',accounts:[{id:'synthetic-account',name:'合成保留账号',kind:'codex',auth_mode:'subscription',enabled:1,state:'ready',standard:{total:12.34}}],capabilities:capability,balancing:{weights:{accounts:[]}}};
+ let release,fail=false;const paths=[];const page=await ui(path=>{paths.push(path);if(!path.startsWith('/api/admin/state'))return response({});if(fail)return response({error:{message:'合成暂时不可用'}},503);return new Promise(resolve=>release=()=>resolve(response(accountView)));});
+ page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";setTab("accounts")');page.run('setTab("overview")');release();await new Promise(setImmediate);assert.equal(page.run('state.view'),'overview');assert.doesNotMatch(page.node('#content').innerHTML,/合成保留账号/);
+ page.run('state='+JSON.stringify(accountView)+';tab="accounts";render()');fail=true;await page.run('refresh()');assert.equal(page.run('state.accounts[0].standard.total'),12.34);assert.match(page.node('#content').innerHTML,/\$12\.34/);assert.match(page.node('#toast').textContent,/合成暂时不可用/);
+});
+
+test('旧后端无账号视图能力时仍请求原完整状态',async()=>{
+ const paths=[],base={...pagedSnapshot(),accounts:[],daily:[]},page=await ui(path=>{paths.push(path);return response(base);});page.run('admin=true;state='+JSON.stringify(base)+';tab="accounts"');await page.run('refresh()');assert.ok(paths.some(path=>path.startsWith('/api/admin/state?people=none')));assert.ok(!paths.some(path=>path.includes('view=accounts')));
+});
+
+test('账号轻视图返回请求第2页保留snapshot和cursor，主动刷新才清分页',async()=>{
+ const paths=[],capabilities={pagedMembers:true,accountStateView:true},light={...pagedSnapshot(),view:'overview',capabilities,accounts:[],daily:[],totals:{requests:0,success:0}};
+ const page=await ui(path=>{if(path.startsWith('/api/admin/state'))return response(light);const q=new URL(path,'http://localhost').searchParams;paths.push(q);return response({rows:[],snapshot:q.get('snapshot')||'fresh',pagination:{page:Number(q.get('page')),pageSize:50,total:150,totalPages:3,nextCursor:'next'},summary:{requests:0,success:0,standard:{},average_ms:0},models:[],members:[],byModel:[],byMember:[]});});
+ page.run('admin=true;state='+JSON.stringify({view:'accounts',accounts:[],capabilities})+';tab="accounts";recordView="requests";requestsFilters={member:"member-one",model:"model-one",status:"success",device:"",page:2,pageSize:50};requestsPageSnapshot="fixed";requestsCursors=new Map([[1,""],[2,"page-two"]]);setTab("requests");');await new Promise(setImmediate);
+ assert.equal(page.run('state.view'),'overview');
+ for(const q of paths)for(const [key,value] of Object.entries({page:'2',page_size:'50',member:'member-one',model:'model-one',status:'success',snapshot:'fixed',cursor:'page-two'}))assert.equal(q.get(key),value);
+ assert.ok(paths.length>0);
+ await page.run('refresh()');assert.equal(paths.at(-1).get('page'),'1');assert.equal(paths.at(-1).has('snapshot'),false);assert.equal(paths.at(-1).has('cursor'),false);
+});

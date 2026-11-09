@@ -47,3 +47,20 @@ test('Chat critical files use a fenced command type while new readers preserve l
  const root=await mkdtemp(join(tmpdir(),'harbor-chat-format-')),key=randomBytes(32),recovery=await MeteringRecovery.create({finish:async()=>{throw Error('synthetic unavailable');}},{encryptionKey:key,directory:root,flushMs:10000});t.after(async()=>{await recovery.close();await rm(root,{recursive:true,force:true});});
  const chat={accountEpoch:0,dispatched:true,upstreamId:'synthetic-thread',cursor:{messageCount:2,historyDigest:'a'.repeat(64),cumulative:{input:1,output:0,cached:0}}};assert.equal(recovery.settle('synthetic-chat',{input:1,usageKnown:true,chat}),true);await recovery.flush();const file=(await readdir(root))[0],bytes=await readFile(join(root,file)),cipher=createDecipheriv('aes-256-gcm',Buffer.from(hkdfSync('sha256',key,Buffer.alloc(0),'Harbor metering recovery v1',32)),bytes.subarray(0,12));cipher.setAAD(Buffer.from('metering:'+file));cipher.setAuthTag(bytes.subarray(-16));const raw=JSON.parse(Buffer.concat([cipher.update(bytes.subarray(12,-16)),cipher.final()]).toString('utf8'));assert.equal(raw.type,'settle-chat','older readers require type=settle and must reject this file');const opened=recovery.buffer.repository.open(bytes,file);assert.equal(opened.type,'settle');assert.equal(opened.result.chat.cursor.messageCount,2);
 });
+
+
+test('optional stream summary survives encrypted outage replay while malformed telemetry cannot break billing',async t=>{
+ const {createRequestStreamTiming}=await import('../request-stream-timing.mjs');
+ const timing=createRequestStreamTiming();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(20);timing.decodedEvent();timing.transportEnd();timing.responseEnd();const summary=timing.finish({outcome:'ok'});
+ const root=await mkdtemp(join(tmpdir(),'harbor-timing-metering-')),key=randomBytes(32),calls=[];let unavailable=true;
+ const store={finish:async(...args)=>{if(unavailable)throw Error('synthetic outage');calls.push(args);}};
+ let recovery=await MeteringRecovery.create(store,{encryptionKey:key,directory:root,flushMs:10000});
+ t.after(async()=>{await recovery.close();await rm(root,{recursive:true,force:true});});
+ assert.equal(recovery.settle('synthetic-stream',{input:7,output:3,cached:1,streamTiming:summary},123),true);await recovery.flush();
+ const file=(await readdir(root))[0],bytes=await readFile(join(root,file));assert.ok(!bytes.includes(Buffer.from('process-monotonic')));
+ assert.deepEqual(recovery.buffer.repository.open(bytes,file).result.streamTiming,summary);
+ await recovery.close();unavailable=false;recovery=await MeteringRecovery.create(store,{encryptionKey:key,directory:root,flushMs:10000});await recovery.flush();
+ assert.equal(calls.length,1);assert.deepEqual(calls[0][1].streamTiming,summary);assert.equal(calls[0][1].input,7);
+ assert.equal(recovery.settle('synthetic-invalid',{input:2,streamTiming:{...summary,prompt:'NEVER-PERSIST'}},124),true);await recovery.flush();
+ assert.equal(calls.length,2);assert.equal(calls[1][1].input,2);assert.equal(calls[1][1].streamTiming,undefined);
+});

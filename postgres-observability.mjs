@@ -1,3 +1,4 @@
+import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
 import {AppError,requestPhases,usageWindow} from './store.mjs';
 import seed from './pricing-data.mjs';
 import {joins,validPrice} from './postgres-reference-query.mjs';
@@ -14,7 +15,7 @@ export async function postgresRequestObservation(store,id,at=Date.now()){
     let phases;try{phases=JSON.parse(row.phase_history);}catch{}
     const timeline=(Array.isArray(phases)?phases:[]).filter(p=>p&&requestPhases.has(p.phase)&&Number.isSafeInteger(p.at)).map(({phase,at})=>({phase,at}));
     const value=decorateReferenceRequest(row,publicUsage(await store.quote(row)),window.start);
-    return {...value,error:row.error?sanitizeRecord(row.error,{maxBytes:2048}):null,phase_history:undefined,observedAt:at,
+    return {...value,error:row.error?sanitizeRecord(row.error,{maxBytes:2048}):null,phase_history:undefined,observedAt:at,streamTiming:canonicalStreamTiming(Array.isArray(phases)?phases.at(-1)?.stream_timing:undefined)??null,
       timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??row.ended??at)-p.at)}))};
   },{level:'REPEATABLE READ',readOnly:true});
 }

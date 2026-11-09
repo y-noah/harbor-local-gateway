@@ -3,25 +3,25 @@ import {readFileSync} from 'node:fs';
 
 // The same classifier is used on an actual gateway frame and an actual decoded
 // client frame. Model-supplied timestamps and heartbeat bytes are never evidence.
-export function classifyStageContent(event,{maxBytes=1048576,maxItems=2048}={}){
-  if(!Number.isSafeInteger(maxBytes)||maxBytes<1||!Number.isSafeInteger(maxItems)||maxItems<1)throw new Error('capacity_stage_classifier_configuration');
+export function classifyStageContent(event,{maxBytes=1048576,maxItems=2048,hashContent=true}={}){
+  if(!Number.isSafeInteger(maxBytes)||maxBytes<1||!Number.isSafeInteger(maxItems)||maxItems<1||typeof hashContent!=='boolean')throw new Error('capacity_stage_classifier_configuration');
   if(!event||typeof event!=='object')return null;
   const type=event.type;
-  if(['response.output_text.delta','response.function_call_arguments.delta'].includes(type)){
+  if(['response.output_text.delta','response.function_call_arguments.delta','response.custom_tool_call_input.delta'].includes(type)){
     if(typeof event.delta!=='string'||!event.delta.length)return null;
     const bytes=Buffer.byteLength(event.delta);if(bytes>maxBytes||typeof event.item_id==='string'&&event.item_id.length>200)return {incomplete:true,reason:'content_budget'};
-    const digest=createHash('sha256');digest.update(type+'\0');digest.update(typeof event.item_id==='string'?event.item_id:'');digest.update('\0'+String(event.output_index??'')+'\0');digest.update(event.delta);
-    return {contentKind:type==='response.output_text.delta'?'text':'arguments',hash:digest.digest('hex'),bytes};
+    const digest=hashContent?createHash('sha256'):null;digest?.update(type+'\0');digest?.update(typeof event.item_id==='string'?event.item_id:'');digest?.update('\0'+String(event.output_index??'')+'\0');digest?.update(event.delta);
+    return {contentKind:type==='response.output_text.delta'?'text':'arguments',...(digest?{hash:digest.digest('hex')}:{}),bytes};
   }
   if(type!=='response.completed'||event.response?.status!=='completed'||!Array.isArray(event.response.output))return null;
   if(event.response.output.length>maxItems)return {incomplete:true,reason:'content_budget'};
-  const digest=createHash('sha256');let bytes=0,items=0;
+  const digest=hashContent?createHash('sha256'):null;let bytes=0,items=0;
   for(const item of event.response.output){
     let parts=[];if(item?.type==='message'&&Array.isArray(item.content)){if(item.content.length>maxItems-items)return {incomplete:true,reason:'content_budget'};items+=item.content.length;for(const part of item.content)if(typeof part?.text==='string'&&part.text.length)parts.push(part.text);}
-    else if(item?.type==='function_call'&&typeof item.name==='string'&&item.name.length){items+=2;parts=[item.name,typeof item.arguments==='string'?item.arguments:''];}
-    for(const text of parts){if(items>maxItems)return {incomplete:true,reason:'content_budget'};bytes+=Buffer.byteLength(text);if(bytes>maxBytes)return {incomplete:true,reason:'content_budget'};digest.update(String(Buffer.byteLength(text))+':');digest.update(text);}
+    else if(['function_call','custom_tool_call'].includes(item?.type)&&typeof item.name==='string'&&item.name.length){items+=2;parts=[item.name,typeof item.arguments==='string'?item.arguments:typeof item.input==='string'?item.input:''];}
+    for(const text of parts){if(items>maxItems)return {incomplete:true,reason:'content_budget'};bytes+=Buffer.byteLength(text);if(bytes>maxBytes)return {incomplete:true,reason:'content_budget'};digest?.update(String(Buffer.byteLength(text))+':');digest?.update(text);}
   }
-  return bytes?{contentKind:'terminal',hash:digest.digest('hex'),bytes}:null;
+  return bytes?{contentKind:'terminal',...(digest?{hash:digest.digest('hex')}:{}),bytes}:null;
 }
 
 const validId=value=>typeof value==='string'&&/^[a-zA-Z0-9._:-]{1,200}$/.test(value);

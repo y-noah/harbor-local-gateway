@@ -48,6 +48,13 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
       try{
         const full=await reader.read({people:'all',sessionPage:page}),compact=await reader.read({people:'none',sessionPage:page});
         assert.deepEqual(compact,{...full,members:[],keys:[],peopleLoaded:false});
+        const accountsView=await reader.read({view:'accounts'});
+        assert.equal(accountsView.view,'accounts');
+        assert.deepEqual(accountsView.accounts,full.accounts);
+        assert.deepEqual(accountsView.balancing,full.balancing);
+        assert.deepEqual(accountsView.usageWindow,full.usageWindow);
+        for(const name of ['members','keys','sessions','sessionsPagination','requests','totals','daily','audit'])assert.equal(Object.hasOwn(accountsView,name),false,name+' is outside the accounts view');
+
         assert.deepEqual(compact.recentUsageWindow,{start:observedAt-12*3600000,end:observedAt,hours:12});
         assert.equal(compact.memberCount,1);assert.equal(compact.keyCount,0);
         const light=await reader.read({view:'overview'});
@@ -73,5 +80,71 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
     const before=(await store.get("SELECT pg_get_indexdef('harbor.request_overview_cover'::regclass) definition")).definition;
     await assert.rejects(store.query(indexStatements[0]),/harbor_overview_index_conflict/);
     assert.equal((await store.get("SELECT pg_get_indexdef('harbor.request_overview_cover'::regclass) definition")).definition,before);
+  }finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+database);await admin.close();}
+});
+
+test('compact partial rollup matches every full DTO field for mixed frozen prices and incomplete usage',{
+  skip:!url&&!socket?'需隔离PG；CI test_postgres执行真实链路':false
+},async()=>{
+  const admin=new PostgresStore(options()),database='harbor_test_'+randomUUID().replaceAll('-','');let store;
+  try{
+    await admin.query('CREATE DATABASE '+database+" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8'");
+    store=new PostgresStore(options(database));await store.migrate();await store.initializePricing();
+    const at=Date.parse('2026-11-08T10:00:00+08:00'),member=randomUUID(),accounts=[randomUUID(),randomUUID()],sessions=[randomUUID(),randomUUID()],first=(await store.get('SELECT id FROM harbor.pricing_versions LIMIT 1')).id,second='synthetic-second-revision';
+    await store.run('INSERT INTO harbor.pricing_versions VALUES($1,$2,$3)',second,at,JSON.stringify({rates:{},aliases:[]}));
+    await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',member,'合成聚合员工',at);
+    for(const [index,id] of accounts.entries()){
+      await store.run("INSERT INTO harbor.accounts(id,name,home) VALUES($1,$2,'synthetic')",id,'合成聚合账号'+index);
+      await store.run('INSERT INTO harbor.sessions(id,member_id,account_id,created,updated) VALUES($1,$2,$3,$4,$4)',sessions[index],member,id,at);
+    }
+    const large='9007199254740993',records=[
+      {amount:large},
+      {amount:'7',revision:second},
+      {amount:'13',revision:second,priceState:'manual'},
+      {amount:null,priceState:'unmetered',status:'interrupted',unknown:true},
+      {amount:null,priceState:'pending',status:'running',running:true},
+      {amount:'100',projectedRevision:second},
+      {amount:'100',revision:'synthetic-missing-book'},
+      {amount:null,priceState:'expired'},
+      {amount:null,priceState:'legacy_manual',status:'reconciled'},
+      {noProjection:true},
+      {amount:'101',unattributed:true},
+      {amount:'19',account:1},
+      {amount:'23',dayBefore:true},
+      {amount:'0',status:'failed'}
+    ];
+    for(const record of records){
+      const request=randomUUID(),ended=at-(record.dayBefore?86400000:100),started=ended-100,revision=record.revision??first,account=record.account??0;
+      await store.run('INSERT INTO harbor.requests(id,member_id,account_id,session_id,started,ended,status,ip,model,price_version,usage_unknown) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+        request,record.unattributed?null:member,record.unattributed?null:accounts[account],record.unattributed?null:sessions[account],started,record.running?null:ended,record.status??'ok','synthetic-ip-'+account,'synthetic-model',revision,record.unknown?1:0);
+      if(record.noProjection)continue;
+      const amount=record.amount??null;
+      await store.run('INSERT INTO harbor.request_prices(request_id,state,revision,total_atoms,input_atoms,output_atoms,cached_atoms,adjustment_atoms,measured_at) VALUES($1,$2,$3,$4,$5,$6,$6,$6,$7)',
+        request,record.priceState??'priced',record.projectedRevision??revision,amount,amount,amount===null?null:'0',at);
+    }
+    const reader=createPostgresStateQueries(store,{clock:()=>at,balancingReader:async observedAt=>({observedAt})});
+    try{
+      for(const selection of [{},{sessionAccount:accounts[1]},{sessionStatus:'disabled'},{sessionQ:'不匹配'}]){
+        const full=await reader.read({people:'all',...selection}),compact=await reader.read({people:'none',...selection});
+        assert.deepEqual(compact,{...full,members:[],keys:[],peopleLoaded:false});
+        const accountsView=await reader.read({view:'accounts'});
+        assert.equal(accountsView.view,'accounts');
+        assert.deepEqual(accountsView.accounts,full.accounts);
+        assert.deepEqual(accountsView.balancing,full.balancing);
+        assert.deepEqual(accountsView.usageWindow,full.usageWindow);
+        for(const name of ['members','keys','sessions','sessionsPagination','requests','totals','daily','audit'])assert.equal(Object.hasOwn(accountsView,name),false,name+' is outside the accounts view');
+
+        assert.equal(compact.totals.standard.requests,records.length);
+        assert.equal(compact.totals.standard.known,7);
+        assert.equal(compact.totals.standard.unpriced,3);
+        assert.equal(compact.totals.standard.unmetered,2);
+        assert.equal(compact.totals.standard.pending,1);
+        assert.equal(compact.totals.standard.expired,1);
+        assert.deepEqual(compact.totals.standard.revisions,[first,second].sort());
+        assert.equal(compact.totals.standard.total_exact,'9007.199254741156');
+        assert.equal(compact.accounts.find(row=>row.id===accounts[1]).standard.total_exact,'0.000000000019');
+        assert.equal(compact.daily.length,2);
+      }
+    }finally{await reader.close();}
   }finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+database);await admin.close();}
 });

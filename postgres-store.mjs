@@ -1,3 +1,4 @@
+import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
 import pg from 'pg';
 import {requestParameters,safeUpstreamRequestId} from './request-parameters.mjs';
 import {AsyncLocalStorage} from 'node:async_hooks';
@@ -199,7 +200,20 @@ export class PostgresStore{
     return this.transaction(async()=>{
       const row=await this.get('SELECT * FROM harbor.requests WHERE id=$1 FOR UPDATE',requestId);
       if(!row)throw new AppError(404,'请求不存在');
-      if(!['queued','running'].includes(row.status)||row.ended!==null)return {settled:false};
+      if(!['queued','running'].includes(row.status)||row.ended!==null){
+        // The HTTP finish callback arrives after billing. Its bounded summary
+        // may be replayed, but must never repeat usage or change business facts.
+        const timing=canonicalStreamTiming(result.streamTiming);let history;
+        try{history=JSON.parse(row.phase_history);}catch{}
+        if(timing&&Array.isArray(history)&&history.length&&row.ended!==null){
+          const terminal=history.at(-1);
+          if(terminal?.phase===row.status&&terminal.at===row.ended&&!terminal.stream_timing){
+            terminal.stream_timing=timing;
+            await this.run('UPDATE harbor.requests SET phase_history=$1 WHERE id=$2',JSON.stringify(history.slice(-32)),requestId);
+          }
+        }
+        return {settled:false};
+      }
       let status=result.status||'ok';if(!['ok','failed','unknown','interrupted','cancelled','rejected'].includes(status))throw new AppError(400,'请求结算状态无效');
       let {input=0,output=0,cached=0,usageKnown=true}=result;
       if(![input,output,cached].every(n=>Number.isSafeInteger(n)&&n>=0)||cached>input){input=0;output=0;cached=0;usageKnown=false;}
@@ -212,7 +226,7 @@ export class PostgresStore{
         const candidate=await this.#operationQuote({...next,price_version:active},books);if(candidate.state==='priced')next.price_version=active;
       }
       let history;try{history=JSON.parse(row.phase_history);}catch{}if(!Array.isArray(history))history=[];
-      history.push({phase:status,at});
+      const streamTiming=canonicalStreamTiming(result.streamTiming);history.push({phase:status,at,...(streamTiming?{stream_timing:streamTiming}:{})});
       const settledRow=await this.get(`UPDATE harbor.requests SET ended=$1,status=$2,business_status=$2,input=$3,output=$4,cached=$5,usage_unknown=$6,billing_model=$7,price_version=$8,
         reserved=CASE WHEN $6=0 THEN 0 ELSE reserved END,phase=$2,phase_at=$1,phase_history=$9,upstream_request_id=COALESCE($11,upstream_request_id) WHERE id=$10 RETURNING *`,at,status,input,output,cached,next.usage_unknown,actualModel,next.price_version,JSON.stringify(history.slice(-32)),requestId,safeUpstreamRequestId(result.upstreamRequestId));
       const total=(BigInt(input)+BigInt(output)).toString();

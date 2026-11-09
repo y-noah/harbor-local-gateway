@@ -1,4 +1,6 @@
+import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
+import {createRequestStreamTiming} from './request-stream-timing.mjs';
 import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
 import {createPostgresTypeStatisticsAdmin} from './postgres-type-statistics-admin.mjs';
 import {createPostgresRecordingJobs} from './postgres-recording-jobs.mjs';
@@ -16,7 +18,7 @@ import {responseBodyBytes} from './request-body.mjs';
 import {validateResponses,validateCodexJson,codexJsonRoutes,isResponsesDispatchSource} from './responses.mjs';
 import {captureCodexJsonInput,captureCodexJsonOutput} from './codex-json-recording.mjs';
 import {ConversationCapture,currentInput} from './conversation-capture.mjs';
-import {postgresRequestObservation,postgresPricingStatus} from './postgres-observability.mjs';
+import {postgresRequestObservation} from './postgres-observability.mjs';
 import {createPostgresRequestQueries} from './postgres-request-query.mjs';
 import {createPostgresStateQueries,stateQuery} from './postgres-state-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
@@ -35,8 +37,8 @@ import {createPostgresSessionHandoffs} from './postgres-session-handoffs.mjs';
 import {replayableResponsesInput,replayableResponsesEvent} from './responses-replay-context.mjs';
 
 const json=(res,status,value)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(value));};
-async function sse(res,event,signal,sessionId,output){
-  if(output)return writeOutput(res,event,{output,signal,prefix:'event: '+event.type+'\ndata: ',suffix:'\n\n',headers:{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no','X-Harbor-Session':sessionId}});
+async function sse(res,event,signal,sessionId,output,timing,contentToken){
+  if(output)return writeOutput(res,event,{output,signal,timing,contentToken,prefix:'event: '+event.type+'\ndata: ',suffix:'\n\n',headers:{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no','X-Harbor-Session':sessionId}});
   if(res.destroyed||signal.aborted)throw new AppError(499,'客户端已断开','request_cancelled');
   if(!res.headersSent)res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no','X-Harbor-Session':sessionId});
   if(res.write('event: '+event.type+'\ndata: '+JSON.stringify(event)+'\n\n'))return;
@@ -50,10 +52,11 @@ async function sse(res,event,signal,sessionId,output){
 // Composable asynchronous endpoint. Routing and shared-limit adapters are
 // mandatory: this must never silently replace an existing policy with LRU or
 // an unlimited default while the PostgreSQL migration is being developed.
-export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,checkLimits,transportForAccount,adminAuthenticated,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
+export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,checkLimits,transportForAccount,adminAuthenticated,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},pricingOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
   if(!store||!recordings||!buffer||!meteringRecovery||['settle','flush','status','close'].some(name=>typeof meteringRecovery[name]!=='function')||[resolveRoute,checkLimits,transportForAccount,adminAuthenticated].some(fn=>typeof fn!=='function')||onRouteFailure!==undefined&&typeof onRouteFailure!=='function'||requestQueries!==undefined&&(!requestQueries||['read','close','status'].some(name=>typeof requestQueries[name]!=='function')||!requestQueries.queue||['run','close','status'].some(name=>typeof requestQueries.queue[name]!=='function'))||adminStateContext!==undefined&&typeof adminStateContext!=='function'||typeof recordingEnabled!=='boolean'||![maxConcurrent,maxPerMember].every(n=>Number.isInteger(n)&&n>=1))throw new AppError(503,'PostgreSQL请求处理依赖尚未配置完整','postgres_configuration');
   if(!meteringRecovery.directory||!buffer.directory||realpathSync(meteringRecovery.directory)===realpathSync(buffer.directory))throw new AppError(503,'计量与正文须使用独立恢复目录','metering_configuration');
   const stages=createStreamingStageObserver(stageObserver);
+  const timingPersistence={queued:0,rejected:0};
   const active=new Set(),members=new Map(),preparing=new Map(),accounts=new Map();let stopping=false;
   const execution=createInferenceBudget({...executionOptions,maxConcurrent,maxPerMember:Math.min(maxPerMember,maxConcurrent)});
   const preparation=createRoutingPreparation({maxWaiting:maxConcurrent,stageObserver});
@@ -66,6 +69,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const sessionAdmin=createPostgresSessionAdmin(store,{clock,preparation,isPreparing:memberId=>preparing.has(memberId),isStopping:()=>stopping});
   const planning=createPostgresPlanningJobs(store,{jobs:createPostgresJobs(store),clock}),planningReader=createPostgresPlanningJobs(queryStore,{jobs:createPostgresJobs(queryStore),clock});
   const history=createPostgresHistoryQueries(queryStore,{clock});
+  const pricingAdmin=createPostgresPricingAdmin(store,{...pricingOptions,clock,adminAuthenticated,readStore:queryStore,queryQueue,readBody:(req,{signal}={})=>requestBodies.read(req,{owner:'admin',maxBytes:65536,signal})});
   const memberAdmin=createPostgresMemberAdmin(store,{clock,readStore:queryStore,encryptionKey:keyEncryptionKey,queryQueue,isBusy:memberId=>members.has(memberId)});
   const deviceAccess=createPostgresDeviceAccess(store,{issuer:deviceIssuer,clock,readStore:queryStore,queryQueue});
   const clientCatalog=createPostgresClientCatalog(store,{deviceAccess,transportForAccount,codexBinary,clock});
@@ -143,10 +147,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       const revision=params.has('revision')?Number(params.get('revision')):undefined,paging={after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)};
       const result=await queryQueue.run(()=>match[2]==='/revisions'?history.revisions(match[1],paging):match[2]?history.page(match[1],{...paging,revision,section:params.get('section')??'moves'}):history.nightly(match[1],{revision}));json(res,200,result);return true;
     }
-    if(path==='/api/admin/pricing'&&req.method==='GET'){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      json(res,200,await queryQueue.run(()=>postgresPricingStatus(queryStore,clock())));return true;
-    }
+    if(await pricingAdmin.handle(req,res,{signal:bodySignal}))return true;
     if(path==='/api/admin/state'&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
       const value=await states.read(stateQuery(url.searchParams));
@@ -177,9 +178,15 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     const record=operation=>{try{return operation();}catch{capture=undefined;recordFailed=true;recordFailureReason??='capture_failed';return undefined;}};
     const writeRecording=(method,...args)=>record(()=>{const result=recordingBufferWrite(buffer,method,...args);if(!result.accepted){recordFailed=true;recordFailureReason??=result.reason;}return result.accepted;});
     const flush=()=>{if(!batch.length)return;const events=batch;batch=[];batchBytes=0;if(recordStarted&&!writeRecording('append',requestId,events))recordFailed=true;};
+    const finishCapture=response=>{
+      const result=record(()=>capture?.finish(response));flush();
+      if(result?.coverage&&recordStarted)writeRecording('append',requestId,[{sourceKey:'gateway:coverage',kind:'boundary',provenance:'gateway',content:{section:'coverage',...result.coverage}}]);
+      return result;
+    };
     const ensureConnected=()=>{if(controller.signal.aborted||res.destroyed)throw controller.signal.reason instanceof AppError?controller.signal.reason:new AppError(499,'客户端已断开','request_cancelled');};
     const settle=async result=>{
       settlementAttempted=true;const at=clock();
+      receipt.settlement={requestId,at,result:Object.fromEntries(['status','input','output','cached','usageKnown','actualModel','upstreamRequestId'].filter(key=>result[key]!==undefined).map(key=>[key,result[key]]))};
       try{await store.finish(requestId,result,at);await extraBoundary?.settle();return true;}
       catch{
         if(!meteringRecovery.settle(requestId,result,at))throw new AppError(503,'用量结算暂存已满，需管理员核对本次请求','metering_unavailable');
@@ -258,25 +265,25 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       const reliable=isResponsesDispatchSource(transport);
       const result=await extraBoundary.run(async({beforeDispatch,onDispatch})=>{
         if(!reliable)dispatched=true;
-        return (jsonPath?transport.runJson:transport.run).call(transport,{path:jsonPath,binary:codexBinary,home:route.account.auth_mode==='openai_api'?route.account.id:route.account.home,payload,sessionId:route.session.upstream_thread||route.session.id,signal:controller.signal,protocolHeaders:req.headers,collectOutput:!original.stream,output,
-          beforeDispatch,onDispatch:()=>{onDispatch();dispatched=true;},
-          onEvent:async event=>{if(!replayableResponsesEvent(event))contextReplayable=false;if(event.type==='response.completed')contextComplete=true;record(()=>capture?.event(event));if(!jsonPath&&original.stream)await sse(res,event,controller.signal,route.session.id,output);}});
+        return (jsonPath?transport.runJson:transport.run).call(transport,{path:jsonPath,binary:codexBinary,home:route.account.auth_mode==='openai_api'?route.account.id:route.account.home,payload,sessionId:route.session.upstream_thread||route.session.id,signal:controller.signal,protocolHeaders:req.headers,collectOutput:!original.stream,output,timing:receipt.timing,
+          beforeDispatch,onDispatch:()=>{receipt.timing?.dispatch();onDispatch();dispatched=true;},
+          onEvent:async event=>{const contentToken=receipt.timing?.upstreamEvent(event);if(!replayableResponsesEvent(event))contextReplayable=false;if(event.type==='response.completed')contextComplete=true;record(()=>capture?.event(event));if(!jsonPath&&original.stream)await sse(res,event,controller.signal,route.session.id,output,receipt.timing,contentToken);else receipt.timing?.retireContent(contentToken);}});
       },{source:transport});
       if(!jsonPath){contextComplete=true;if(!replayableResponsesEvent({type:'response.completed',response:result.response}))contextReplayable=false;}
       if(jsonPath)record(()=>{if(capture)captureCodexJsonOutput(capture,jsonPath,result.response);});
-      const recordingResult=record(()=>capture?.finish(jsonPath?undefined:result.response));flush();
-      if(recordStarted&&!writeRecording('finish',requestId,{state:recordFailed||recordingResult?.failed?'partial':recordingResult?.truncated?'truncated':'complete',...recordingFinishReason(recordFailed||recordingResult?.failed?recordFailureReason??'capture_failed':recordingResult?.truncated?'size_limit':null)}))recordFailed=true;
+      const recordingResult=finishCapture(jsonPath?undefined:result.response);
+      if(recordStarted&&!writeRecording('finish',requestId,{state:recordFailed||recordingResult?.failed||recordingResult?.incomplete?'partial':recordingResult?.truncated?'truncated':'complete',...recordingFinishReason(recordFailed||recordingResult?.failed?recordFailureReason??'capture_failed':recordingResult?.truncated?'size_limit':recordingResult?.incomplete?'capture_failed':null)}))recordFailed=true;
       // A failure after dispatch must not cause a second model call.
       const settled=await settle(result);
       await deviceAccess.markVerified(requestId).catch(()=>{});
       await saveContext();
-      if(!res.destroyed){if(!res.headersSent){res.setHeader('X-Harbor-Request',requestId);if(!settled)res.setHeader('X-Harbor-Usage','pending');}if(!jsonPath&&original.stream){await sse(res,result.terminal,controller.signal,route.session.id,output);res.end();}else{res.setHeader('X-Harbor-Session',route.session.id);await writeOutput(res,result.response,{output,signal:controller.signal,headers:{'Content-Type':'application/json; charset=utf-8'}});res.end();}}
+      if(!res.destroyed){if(!res.headersSent){res.setHeader('X-Harbor-Request',requestId);if(!settled)res.setHeader('X-Harbor-Usage','pending');}if(!jsonPath&&original.stream){await sse(res,result.terminal,controller.signal,route.session.id,output,receipt.timing,result.timingTerminalObserved?result.timingTerminalToken:receipt.timing?.upstreamEvent(result.terminal));res.end();}else{res.setHeader('X-Harbor-Session',route.session.id);await writeOutput(res,result.response,{output,signal:controller.signal,timing:receipt.timing,contentToken:result.timingTerminalObserved?result.timingTerminalToken:undefined,headers:{'Content-Type':'application/json; charset=utf-8'}});res.end();}}
       return true;
     }catch(error){
       dispatched||=extraBoundary?.status().dispatched===true;
       if(requestId){
         if(onRouteFailure&&routedAccount&&error.routeFailure){try{await onRouteFailure(routedAccount,error.routeFailure);}catch{}}
-        record(()=>capture?.finish());flush();
+        finishCapture();
         if(recordStarted&&!writeRecording('finish',requestId,{state:'partial',...recordingFinishReason(recordFailed?recordFailureReason??'capture_failed':controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted')}))recordFailed=true;
         if(!settlementAttempted)await settle({...error,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':controller.signal.aborted?'cancelled':error.status&&error.status<500?'rejected':'failed',usageKnown:!dispatched||!extraBoundary?.status().uncertain&&error.usageKnown===true}).catch(()=>{});
         await saveContext();
@@ -292,6 +299,31 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(releaseExecution){releaseExecution();stage.emit('lease',{lease:'execution',action:'release'});}else stage.emit('lease',{lease:'execution',action:'not-acquired'});output?.close();if(output)stage.emit('lease',{lease:'output',action:'release'});res.off('close',close);controller.signal.removeEventListener('abort',observeCancel);active.delete(controller);const count=members.get(member.id)-1;if(count)members.set(member.id,count);else members.delete(member.id);stage.emit('lease',{lease:'member',action:'release'});ticket?.close();
     }
   }
-  const handle=async(req,res)=>{const path=new URL(req.url,'http://localhost').pathname,modelRequest=req.method==='POST'&&(path==='/v1/responses'||path.startsWith('/v1/')&&codexJsonRoutes.has(path.slice(3))),stage=modelRequest?stages.capture():{emit:()=>false},receipt={callbackCompleted:false,nested:false,published:false,publish(type,details){if(this.published)return false;this.published=true;return stage.emit(type,details);}},body=new AbortController(),bodyEnd=()=>stage.emit('body-end'),closed=()=>{if(!res.writableEnded)body.abort();};if(modelRequest)req.once('end',bodyEnd);res.on('close',closed);try{return await handleRoute(req,res,body.signal,stage,receipt);}finally{req.off('end',bodyEnd);res.off('close',closed);if(modelRequest&&!receipt.published){if(receipt.callbackCompleted)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:false,recordingExpected:false});}requestBodies.release(req);}};
-  return {handle,stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),closeQueries:()=>Promise.all([typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]),drain:()=>{stopping=true;clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
+  const handle=async(req,res)=>{
+    const path=new URL(req.url,'http://localhost').pathname,modelRequest=req.method==='POST'&&(path==='/v1/responses'||path.startsWith('/v1/')&&codexJsonRoutes.has(path.slice(3))),stage=modelRequest?stages.capture():{emit:()=>false};
+    const receipt={callbackCompleted:false,nested:false,published:false,publish(type,details){if(this.published)return false;this.published=true;return stage.emit(type,details);}},body=new AbortController();
+    const bodyEnd=()=>{stage.emit('body-end');receipt.timing?.bodyEnd();},closed=()=>{if(!res.writableEnded)body.abort();};
+    if(modelRequest){
+      receipt.timing=createRequestStreamTiming();let responseEnded=false,routeEnded=false,finalized=false;
+      const finalize=()=>{
+        if(finalized||!responseEnded||!routeEnded)return;finalized=true;
+        res.off('finish',responseEnd);res.off('close',responseEnd);
+        const summary=receipt.timing.finish({outcome:receipt.outcome==='interrupted'?'interrupted':receipt.disconnected?'cancelled':receipt.outcome??'unknown'}),fact=receipt.settlement;
+        // Reuse the bounded encrypted FIFO, after the actual HTTP completion.
+        // No database wait or fsync is added to the downstream write path.
+        if(fact){try{if(meteringRecovery.settle(fact.requestId,{...fact.result,streamTiming:summary},fact.at))timingPersistence.queued++;else timingPersistence.rejected++;}catch{timingPersistence.rejected++;}}
+      };
+      const responseEnd=()=>{if(responseEnded)return;responseEnded=true;receipt.disconnected=!res.writableFinished;receipt.timing.responseEnd();finalize();};
+      receipt.routeEnd=()=>{routeEnded=true;finalize();};res.once('finish',responseEnd);res.once('close',responseEnd);req.once('end',bodyEnd);
+    }
+    res.on('close',closed);
+    try{const result=await handleRoute(req,res,body.signal,stage,receipt);receipt.outcome=result?'ok':'unknown';return result;}
+    catch(error){receipt.outcome=body.signal.aborted?'cancelled':error?.code==='service_shutdown'?'interrupted':'failed';throw error;}
+    finally{
+      receipt.routeEnd?.();req.off('end',bodyEnd);res.off('close',closed);
+      if(modelRequest&&!receipt.published){if(receipt.callbackCompleted)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:false,recordingExpected:false});}
+      requestBodies.release(req);
+    }
+  };
+  return {handle,stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({streamTiming:{...timingPersistence},clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),tickPricing:()=>pricingAdmin.tick(),closeQueries:async()=>{await pricingAdmin.close();return Promise.all([typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]);},drain:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
 }

@@ -46,9 +46,11 @@ export function jsonOutputLength(value){
   if(!Number.isSafeInteger(size))throw new AppError(503,'上游输出过大','upstream_buffer_busy');return size;
 }
 
-export async function writeOutput(res,value,{output,signal,prefix='',suffix='',status=200,headers={}}={}){
+export async function writeOutput(res,value,{output,signal,prefix='',suffix='',status=200,headers={},timing,contentToken}={}){
   if(signal?.aborted||res.destroyed)throw new AppError(499,'客户端已断开','request_cancelled');
   const chars=prefix.length+jsonOutputLength(value)+suffix.length;output?.resize('send:text',chars*2);let text=prefix+JSON.stringify(value)+suffix;output?.resize('send:wire',Buffer.byteLength(text));const wire=Buffer.from(text);text=null;output?.resize('send:text',0);
+  let timingToken,backpressured=false,writeSucceeded=false;
+  try{timingToken=timing?.writeStart({bytes:wire.length,contentToken});if(timingToken&&typeof timingToken.then==='function'){void Promise.resolve(timingToken).catch(()=>{});timingToken=null;}}catch{}
   try{
     if(!res.headersSent)res.writeHead(status,headers);
     await new Promise((resolve,reject)=>{
@@ -59,7 +61,7 @@ export async function writeOutput(res,value,{output,signal,prefix='',suffix='',s
       res.once('close',closed);res.once('error',failed);signal?.addEventListener('abort',abort,{once:true});
       // A write error can precede close. Wait for the real close notification
       // so request cancellation and byte release share the same boundary.
-      res.write(wire,error=>{if(error)failed();else done();});if(signal?.aborted||res.destroyed)abort();
+      backpressured=!res.write(wire,error=>{if(error)failed();else{writeSucceeded=true;done();}});if(signal?.aborted||res.destroyed)abort();
     });
-  }finally{output?.resize('send:wire',0);output?.resize('send:text',0);}
+  }finally{try{const value=timing?.writeEnd(timingToken,{ok:writeSucceeded,backpressured});if(value&&typeof value.then==='function')void Promise.resolve(value).catch(()=>{});}catch{}output?.resize('send:wire',0);output?.resize('send:text',0);}
 }

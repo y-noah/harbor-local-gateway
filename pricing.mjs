@@ -98,6 +98,37 @@ export function referenceAccumulator(){
     }
   };
 }
+export function nextPricingSettings(settings,official,value,clock=Date.now){
+  if(!value||value.expectedVersion!==settings.version)fail('费率配置已变化，请刷新后重试');
+  if(Object.keys(value).some(k=>!['expectedVersion','enabled','refreshHours','manualRates','aliases'].includes(k)))fail('费率配置字段无效');
+  const next={...settings,version:settings.version+1,manualRates:{...settings.manualRates}};
+  if(value.enabled!==undefined){if(typeof value.enabled!=='boolean')fail('自动同步开关无效');next.enabled=value.enabled;}
+  if(value.refreshHours!==undefined){if(!Number.isInteger(value.refreshHours)||value.refreshHours<1||value.refreshHours>168)fail('同步间隔须为1至168小时');next.refreshHours=value.refreshHours;}
+  if(value.manualRates!==undefined){
+    if(!value.manualRates||typeof value.manualRates!=='object'||Array.isArray(value.manualRates))fail('手动费率无效');
+    for(const [name,rate] of Object.entries(value.manualRates)){if(!modelName(name))fail('模型名称无效');if(rate===null)delete next.manualRates[name];else next.manualRates[name]=validateRate(rate);}
+  }
+  if(value.aliases!==undefined){
+    if(!Array.isArray(value.aliases)||value.aliases.length>1000)fail('模型映射无效');
+    next.aliases=value.aliases.map(a=>{
+      const from=a?.from??clock(),to=a?.to??null;
+      if(!a||!modelName(a.name)||!modelName(a.target)||!Number.isSafeInteger(from)||from<0||to!==null&&(!Number.isSafeInteger(to)||to<=from)||typeof a.source!=='string'||!a.source.trim()||a.source.length>500)fail('映射须提供明确模型、有效时间及来源说明');
+      if(!Object.hasOwn({...official,...next.manualRates},a.target))fail('映射目标尚无费率');return {name:a.name,target:a.target,from,to,source:a.source};
+    });
+    for(const a of next.aliases)if(next.aliases.some(b=>b!==a&&a.name===b.name&&a.from<(b.to??Infinity)&&b.from<(a.to??Infinity)))fail('同一模型映射有效时间不能重叠');
+  }
+  return next;
+}
+export function pricingPublication(official,settings){
+  const rates=Object.fromEntries(Object.entries({...official,...settings.manualRates}).sort(([a],[b])=>a.localeCompare(b))),value={rates,aliases:settings.aliases};
+  const json=JSON.stringify(value),id=createHash('sha256').update(json).digest('hex');return {value,json,id};
+}
+export async function fetchOfficialPricing({fetchImpl=fetch,signal=new AbortController().signal}={}){
+  const r=await fetchImpl(seed.source,{headers:{Accept:'text/markdown'},redirect:'error',signal:AbortSignal.any([signal,AbortSignal.timeout(15000)])});
+  if(!r.ok)throw Error('official unavailable');const reader=r.body.getReader();let size=0;const chunks=[];
+  try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>3000000)throw Error('official page too large');chunks.push(value);}}catch(e){await reader.cancel().catch(()=>{});throw e;}finally{reader.releaseLock();}
+  const text=Buffer.concat(chunks).toString('utf8'),prices=parseOfficialPrices(text);return {prices,sourceHash:createHash('sha256').update(text).digest('hex')};
+}
 export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=()=>0}={}){
   store.db.exec('CREATE TABLE IF NOT EXISTS pricing_versions(id TEXT PRIMARY KEY,created INTEGER NOT NULL,book TEXT NOT NULL);');
   const get=name=>parse(store.get('SELECT value FROM gateway_settings WHERE name=?',name)?.value);
@@ -107,8 +138,7 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
   const cache=new Map();const abort=new AbortController();
   const book=id=>{if(!id)return null;if(!cache.has(id)){const r=store.get('SELECT book FROM pricing_versions WHERE id=?',id);if(r)cache.set(id,parse(r.book));}return cache.get(id)||null;};
   function publish(){
-    const rates=Object.fromEntries(Object.entries({...official,...settings.manualRates}).sort(([a],[b])=>a.localeCompare(b))),value={rates,aliases:settings.aliases};
-    const json=JSON.stringify(value),id=createHash('sha256').update(json).digest('hex');
+    const {value,json,id}=pricingPublication(official,settings);
     store.run('INSERT OR IGNORE INTO pricing_versions(id,created,book) VALUES(?,?,?)',id,clock(),json);cache.set(id,value);state={...state,active:id};set('pricing.state',state);return id;
   }
   if(!state.active||!book(state.active))publish();
@@ -175,24 +205,7 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
   }
   function configure(value){
     if(closed)throw Object.assign(new Error('服务正在停止'),{status:503,code:'service_stopping'});
-    if(!value||value.expectedVersion!==settings.version)fail('费率配置已变化，请刷新后重试');
-    if(Object.keys(value).some(k=>!['expectedVersion','enabled','refreshHours','manualRates','aliases'].includes(k)))fail('费率配置字段无效');
-    const next={...settings,version:settings.version+1,manualRates:{...settings.manualRates}};
-    if(value.enabled!==undefined){if(typeof value.enabled!=='boolean')fail('自动同步开关无效');next.enabled=value.enabled;}
-    if(value.refreshHours!==undefined){if(!Number.isInteger(value.refreshHours)||value.refreshHours<1||value.refreshHours>168)fail('同步间隔须为1至168小时');next.refreshHours=value.refreshHours;}
-    if(value.manualRates!==undefined){
-      if(!value.manualRates||typeof value.manualRates!=='object'||Array.isArray(value.manualRates))fail('手动费率无效');
-      for(const [name,rate] of Object.entries(value.manualRates)){if(!modelName(name))fail('模型名称无效');if(rate===null)delete next.manualRates[name];else next.manualRates[name]=validateRate(rate);}
-    }
-    if(value.aliases!==undefined){
-      if(!Array.isArray(value.aliases)||value.aliases.length>1000)fail('模型映射无效');
-      next.aliases=value.aliases.map(a=>{
-        const from=a?.from??clock(),to=a?.to??null;
-        if(!a||!modelName(a.name)||!modelName(a.target)||!Number.isSafeInteger(from)||from<0||to!==null&&(!Number.isSafeInteger(to)||to<=from)||typeof a.source!=='string'||!a.source.trim()||a.source.length>500)fail('映射须提供明确模型、有效时间及来源说明');
-        if(!Object.hasOwn({...official,...next.manualRates},a.target))fail('映射目标尚无费率');return {name:a.name,target:a.target,from,to,source:a.source};
-      });
-      for(const a of next.aliases)if(next.aliases.some(b=>b!==a&&a.name===b.name&&a.from<(b.to??Infinity)&&b.from<(a.to??Infinity)))fail('同一模型映射有效时间不能重叠');
-    }
+    const next=nextPricingSettings(settings,official,value,clock);
     const prior=settings,priorState=state;
     store.db.exec('BEGIN IMMEDIATE');try{settings=next;set('pricing.settings',settings);publish();backfill({transaction:false});store.audit('pricing.configure',JSON.stringify({version:settings.version,revision:state.active}));store.db.exec('COMMIT');}catch(e){store.db.exec('ROLLBACK');settings=prior;state=priorState;throw e;}
     return status();
@@ -202,12 +215,9 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
     if(!force&&(!settings.enabled||state.checkedAt&&state.checkedAt>clock()-settings.refreshHours*3600000))return;
     pending=(async()=>{
       try{
-        const r=await fetchImpl(seed.source,{headers:{Accept:'text/markdown'},redirect:'error',signal:AbortSignal.any([abort.signal,AbortSignal.timeout(15000)])});
-        if(!r.ok)throw Error('official unavailable');const reader=r.body.getReader();let size=0;const chunks=[];
-        try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>3000000)throw Error('official page too large');chunks.push(value);}}catch(e){await reader.cancel().catch(()=>{});throw e;}finally{reader.releaseLock();}
-        const text=Buffer.concat(chunks).toString('utf8'),prices=parseOfficialPrices(text);if(closed)return;
+        const {prices,sourceHash}=await fetchOfficialPricing({fetchImpl,signal:abort.signal});if(closed)return;
         const prior=official,priorState=state;store.db.exec('BEGIN IMMEDIATE');
-        try{official={...official,...prices};set('pricing.official',official);state={...state,checkedAt:clock(),lastSuccess:clock(),error:null,sourceHash:createHash('sha256').update(text).digest('hex')};publish();backfill({transaction:false});store.db.exec('COMMIT');}
+        try{official={...official,...prices};set('pricing.official',official);state={...state,checkedAt:clock(),lastSuccess:clock(),error:null,sourceHash};publish();backfill({transaction:false});store.db.exec('COMMIT');}
         catch(e){store.db.exec('ROLLBACK');official=prior;state=priorState;throw e;}
         return status();
       }catch{if(!closed){state={...state,checkedAt:clock(),error:'官方费率更新暂未完成，继续使用上次有效版本'};set('pricing.state',state);return status();}}

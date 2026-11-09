@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {ConversationCapture,currentInput} from '../conversation-capture.mjs';
 import {redactRecordText,sanitizeRecord} from '../record-redaction.mjs';
+import {JsonRecordRedactor} from '../record-json.mjs';
 
 function capture(options){const events=[],collector=new ConversationCapture({...options,emit:event=>events.push(event)});return {events,collector};}
 function output(events){const fields=new Map();for(const {kind,content:c} of events)if(c.field&&kind!=='user')fields.set(c.field,c.mode==='replace'?c.text:(fields.get(c.field)||'')+c.text);return [...fields.values()].join('');}
@@ -103,4 +104,103 @@ test('recording buffers and field count are bounded and completion is idempotent
 test('ignored final output nodes are bounded and capture stops accepting metadata after truncation',()=>{
   let visited=0;const values=new Proxy(Array(10000).fill({type:'reasoning'}),{get(target,key,receiver){if(/^\d+$/.test(String(key)))visited++;return Reflect.get(target,key,receiver);}}),{events,collector}=capture({maxNodes:16});
   assert.equal(collector.finish({output:values}).truncated,true);assert.ok(visited<=17);assert.equal(events.length,0);collector.event({type:'response.output_item.added',output_index:0,item:{id:'late',type:'function_call',name:'lookup'}});assert.equal(collector.itemMetadata.size,0);
+});
+
+function toolFields(events,kind,property='text'){
+  const fields=new Map();for(const event of events){if(event.kind!==kind||!event.content.field)continue;const c=event.content,value=typeof c[property]==='string'?c[property]:JSON.stringify(c[property]);fields.set(c.field,c.mode==='replace'?value:(fields.get(c.field)||'')+(value||''));}return [...fields.values()];
+}
+test('custom result tails retain their current boundary and never record preceding prompts or tool inputs',()=>{
+  const payload={input:[{role:'user',content:'private previous prompt'},{type:'custom_tool_call',name:'exec',call_id:'custom-1',input:'private previous command'},{type:'custom_tool_call_output',call_id:'custom-1',output:'visible tool result'}]},before=JSON.stringify(payload),current=currentInput(payload);
+  assert.equal(current.events.length,1);assert.equal(current.events[0].kind,'tool_result');assert.equal(current.events[0].content.toolType,'custom_tool_call');assert.ok(!JSON.stringify(current).includes('private previous'));
+  const {events,collector}=capture();collector.input(payload,current);const result=collector.finish();assert.equal(events[0].content.output,'visible tool result');assert.equal(events[0].content.callId,'custom-1');assert.equal(Object.hasOwn(events[0].content,'name'),false);assert.deepEqual(result.coverage.seen,{toolCalls:0,toolResults:1,reasoningSummaries:0});assert.deepEqual(result.coverage.captured,result.coverage.seen);assert.equal(result.incomplete,false);assert.equal(JSON.stringify(payload),before);
+});
+test('custom tool raw text is redacted at every split and delta, done, item and final snapshots never duplicate it',()=>{
+  const raw='*** Begin Patch\n*** Add File: visible.txt\n+const value = "literal";\n*** End Patch\nAuthorization: Bearer opaque-fixture-secret\nprintf "visible tail"\n',expected=redactRecordText(raw);
+  for(let split=0;split<=raw.length;split++){
+    const {events,collector}=capture(),item={id:'custom',type:'custom_tool_call',name:'exec',call_id:'custom-call',input:raw},before=JSON.stringify(item);
+    collector.event({type:'response.output_item.added',output_index:1,item:{...item,input:''}});
+    for(const delta of [raw.slice(0,split),raw.slice(split)])collector.event({type:'response.custom_tool_call_input.delta',output_index:1,delta});
+    collector.event({type:'response.custom_tool_call_input.done',item_id:'custom',output_index:1,input:raw});collector.event({type:'response.output_item.done',output_index:1,item});const result=collector.finish({output:[item]});
+    assert.deepEqual(toolFields(events,'tool_call'),[expected],'split '+split);assert.ok(events.every(event=>event.content.callId==='custom-call'&&event.content.name==='exec'&&event.content.toolType==='custom_tool_call'));assert.ok(!JSON.stringify(events).includes('opaque-fixture-secret'));assert.equal(result.coverage.seen.toolCalls,1);assert.equal(result.coverage.captured.toolCalls,1);assert.equal(result.incomplete,false);assert.equal(JSON.stringify(item),before);
+  }
+});
+test('custom tools preserve raw JSON-looking whitespace and authoritative final corrections',()=>{
+  const raw=' {\n  "script": "printf 1",\n  "note": "visible"\n}\n',item={id:'custom',type:'custom_tool_call',call_id:'call',name:'exec',input:raw},{events,collector}=capture();
+  collector.event({type:'response.output_item.done',output_index:0,item:{...item,input:'old partial text'}});const result=collector.finish({output:[item]});assert.deepEqual(toolFields(events,'tool_call'),[raw]);assert.equal(result.coverage.seen.toolCalls,1);assert.equal(result.incomplete,false);
+  const empty=capture();empty.collector.finish({output:[{...item,input:''}]});assert.equal(empty.events.length,1);assert.equal(empty.events[0].content.text,'');assert.equal(empty.events[0].content.callId,'call');
+});
+test('custom multimodal results retain text and structure while credentials split across Responses text parts stay redacted',()=>{
+  for(let split=0;split<32;split++){
+    const secret='sk-proj-opaque-fixture-secret',parts=[{type:'input_text',text:secret.slice(0,split)},{type:'input_image',image_url:'data:image/png;base64,PRIVATE_IMAGE'},{type:'input_text',text:secret.slice(split)+'\nvisible tail'},{type:'input_file',file_data:'PRIVATE_FILE'},{type:'output_audio',data:'PRIVATE_AUDIO'}],payload={input:[{type:'custom_tool_call_output',call_id:'call',output:{content:parts,password:'opaque-password',status:'visible'}}]},before=JSON.stringify(payload),{events,collector}=capture();
+    collector.input(payload);const result=collector.finish(),safe=events[0].content.output,encoded=JSON.stringify(events);assert.equal(safe.content[0].type,'input_text');assert.equal(safe.content[2].type,'input_text');assert.ok(safe.content[2].text.includes('visible tail'));assert.equal(safe.status,'visible');assert.ok(!encoded.includes('opaque-fixture-secret'),'split '+split);assert.ok(!encoded.includes('opaque-password'));assert.ok(!encoded.includes('PRIVATE_'));assert.equal(result.incomplete,false);assert.equal(JSON.stringify(payload),before);
+  }
+});
+test('atomic custom output items deduplicate final snapshots and share one logical result count with input aliases',()=>{
+  const {events,collector}=capture(),item={id:'result',type:'custom_tool_call_output',call_id:'same-call',output:JSON.stringify({content:[{type:'text',text:'visible result'},{type:'image',data:'PRIVATE_IMAGE'}]})};
+  collector.input({input:[{type:'custom_tool_call_output',call_id:'same-call',output:'earlier visible result'}]});collector.event({type:'response.output_item.done',output_index:0,item});const result=collector.finish({output:[item]});assert.equal(events.filter(event=>event.kind==='tool_result').length,2);assert.equal(result.coverage.seen.toolResults,1);assert.equal(result.coverage.captured.toolResults,1);assert.equal(result.incomplete,false);assert.ok(!JSON.stringify(events).includes('PRIVATE_IMAGE'));assert.ok(events.every(event=>!Object.hasOwn(event.content,'name')));
+});
+test('unique tool coverage does not count repeated added/done/final identities as separate calls',()=>{
+  const {collector}=capture(),first={type:'custom_tool_call',id:'one',call_id:'same-call',name:'exec',input:'visible'},second={...first,id:'two'};
+  collector.event({type:'response.output_item.added',output_index:0,item:{...first,input:''}});collector.event({type:'response.output_item.added',output_index:0,item:{...first,input:''}});collector.event({type:'response.output_item.done',output_index:0,item:first});const result=collector.finish({output:[first,second]});assert.equal(result.coverage.seen.toolCalls,1);assert.equal(result.coverage.captured.toolCalls,1);assert.equal(result.incomplete,false);
+});
+test('unknown visible tools and content produce bounded incomplete facts without retaining their raw payload or type',()=>{
+  const {events,collector}=capture({maxFields:8}),unknown={id:'future',type:'future_tool_opaque-fixture-secret',input:'PRIVATE_BODY'};
+  collector.event({type:'response.created'});collector.event({type:'response.output_item.added',output_index:0,item:unknown});collector.event({type:'response.output_item.done',output_index:0,item:unknown});
+  for(let i=0;i<10;i++)collector.event({type:'response.future_tool.progress',output_index:0,delta:'PRIVATE_PROGRESS'});
+  const result=collector.finish({output:[unknown,{type:'message',id:'message',content:[{type:'future-visible-content',data:'PRIVATE_CONTENT'}]}]});assert.equal(result.incomplete,true);assert.equal(result.coverage.complete,false);assert.deepEqual(result.coverage.unsupported,{items:1,events:1,contentParts:1});assert.deepEqual(result.coverage.reasons,['unsupported_content','unsupported_event','unsupported_item']);assert.ok(!JSON.stringify({events,result}).includes('PRIVATE_'));assert.ok(!JSON.stringify({events,result}).includes('opaque-fixture-secret'));
+  const input=capture();input.collector.input({input:[{type:'future_tool_call_output',output:'PRIVATE_UNKNOWN'}]});assert.equal(input.collector.finish().incomplete,true);assert.equal(input.events.length,0);
+});
+test('public reasoning summaries are deduplicated while opaque reasoning is never read or persisted',()=>{
+  let reads=0;const item={type:'reasoning',id:'reason',summary:[{type:'summary_text',text:'visible summary'}]};Object.defineProperty(item,'encrypted_content',{enumerable:true,get(){reads++;throw Error('opaque content must not be read');}});
+  const {events,collector}=capture();collector.event({type:'response.reasoning_summary_text.delta',item_id:'reason',summary_index:0,delta:'visible '});collector.event({type:'response.reasoning_summary_text.done',item_id:'reason',summary_index:0,text:'visible summary'});collector.event({type:'response.output_item.done',output_index:0,item});const result=collector.finish({output:[item]});assert.equal(reads,0);assert.equal(output(events),'visible summary');assert.equal(result.coverage.opaqueReasoningExcluded,1);assert.equal(result.coverage.seen.reasoningSummaries,1);assert.equal(result.coverage.captured.reasoningSummaries,1);assert.equal(result.incomplete,false);
+});
+test('malformed tools, truncation and failed emit cannot report complete capture',()=>{
+  const malformed=capture(),result=malformed.collector.finish({output:[{type:'custom_tool_call',id:'bad',call_id:'call',name:'exec'}]});assert.equal(result.incomplete,true);assert.ok(result.coverage.reasons.includes('malformed_tool_item'));assert.equal(result.coverage.seen.toolCalls,1);assert.equal(result.coverage.captured.toolCalls,0);
+  const failed=new ConversationCapture({emit:()=>false}),failure=failed.finish({output:[{type:'custom_tool_call',id:'custom',call_id:'call',name:'exec',input:'visible'}]});assert.equal(failure.failed,true);assert.equal(failure.incomplete,true);assert.equal(failure.coverage.captured.toolCalls,0);assert.ok(failure.coverage.reasons.includes('capture_failed'));
+  const clipped=capture({maxBytes:256});clipped.collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:'x'.repeat(10000)}]});const truncated=clipped.collector.finish();assert.equal(truncated.truncated,true);assert.equal(truncated.incomplete,true);assert.ok(truncated.coverage.reasons.includes('size_limit'));assert.ok(clipped.collector.bytes<=256);
+});
+test('custom call aliases learned after a delta retain one assembled field and final tool identity',async()=>{
+  const {assembleRecording}=await import('../recording-search-index.mjs'),{events,collector}=capture(),item={type:'custom_tool_call',id:'custom-late',call_id:'late-call',name:'exec',input:'visible raw command'};
+  collector.event({type:'response.custom_tool_call_input.delta',output_index:2,delta:item.input});collector.event({type:'response.output_item.added',output_index:2,item:{...item,input:''}});collector.event({type:'response.custom_tool_call_input.done',item_id:item.id,output_index:2,input:item.input});const result=collector.finish({output:[item]});
+  const assembled=assembleRecording(events.map((event,index)=>({...event,sequence:index+1})));assert.equal(assembled.length,1);assert.equal(assembled[0].text,item.input);assert.equal(assembled[0].metadata.callId,'late-call');assert.equal(assembled[0].metadata.name,'exec');assert.equal(assembled[0].metadata.toolType,'custom_tool_call');assert.equal(result.coverage.seen.toolCalls,1);assert.equal(result.incomplete,false);
+});
+test('large custom results remain chunked, redact credentials and assemble once without broken Unicode',async()=>{
+  const {assembleRecording}=await import('../recording-search-index.mjs'),raw='步骤📌'.repeat(12000)+'\nAuthorization: Bearer opaque-fixture-secret\nvisible tail',payload={input:[{type:'custom_tool_call_output',call_id:'previous-call',output:raw}]},{events,collector}=capture();collector.input(payload);const result=collector.finish(),assembled=assembleRecording(events.map((event,index)=>({...event,sequence:index+1})));
+  assert.ok(events.length>1);assert.ok(events.every(event=>Buffer.byteLength(JSON.stringify(event.content))<32*1024));assert.equal(assembled.length,1);assert.equal(assembled[0].text,redactRecordText(raw));assert.equal(assembled[0].metadata.callId,'previous-call');assert.equal(result.coverage.seen.toolResults,1);assert.equal(result.coverage.captured.toolResults,1);assert.equal(result.incomplete,false);assert.ok(!JSON.stringify(events).includes('opaque-fixture-secret'));
+});
+test('tool result attachment facts survive and unsupported text metadata is disclosed without copying it',()=>{
+  const {events,collector}=capture();collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:[{type:'input_text',text:'visible',annotations:[{url:'PRIVATE_METADATA'}]},{type:'input_image',size:128,position:2,detail:'low',image_url:'PRIVATE_IMAGE'}]}]});const result=collector.finish();assert.deepEqual(events[0].content.output[1],{type:'input_image',bytes:128,position:2,detail:'low',content:'[附件数据已省略]'});assert.ok(!JSON.stringify(events).includes('PRIVATE_'));assert.equal(result.incomplete,true);assert.equal(result.coverage.unsupported.contentParts,1);assert.ok(result.coverage.reasons.includes('unsupported_content'));
+});
+test('visible content-part and summary-part done snapshots survive without separate text delta events',()=>{
+  const {events,collector}=capture();collector.event({type:'response.content_part.done',output_index:0,item_id:'message',content_index:0,part:{type:'output_text',text:'visible message'}});collector.event({type:'response.reasoning_summary_part.done',output_index:1,item_id:'reason',summary_index:0,part:{type:'summary_text',text:'visible summary'}});const result=collector.finish({output:[{type:'message',id:'message',content:[{type:'output_text',text:'visible message'}]},{type:'reasoning',id:'reason',summary:[{type:'summary_text',text:'visible summary'}]}]});assert.equal(output(events),'visible messagevisible summary');assert.equal(result.coverage.seen.reasoningSummaries,1);assert.equal(result.incomplete,false);
+});
+test('JSON-shaped stdout remains original text formatting and numeric spelling while structured outputs remain objects',()=>{
+  const raw=' {\n  "value" : 90071992547409931234567, "scientific": 1.2300e+5,\n  "message": "visible", "items" : [1, 2]\n}\n',c=capture();c.collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:raw}]});const result=c.collector.finish();assert.equal(c.events[0].content.output,raw);assert.equal(typeof c.events[0].content.output,'string');assert.equal(result.incomplete,false);
+  const structured=capture(),value={message:'visible',items:[1,2]};structured.collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:value}]});structured.collector.finish();assert.deepEqual(structured.events[0].content.output,value);assert.equal(typeof structured.events[0].content.output,'object');
+});
+test('JSON stdout changes only redacted values or attachment spans and still filters cross-part credentials',()=>{
+  const raw=' {\n "code": 90071992547409931234567,\n "content" : [ { "type":"input_text", "text":"sk-pr" }, {"type":"input_text","text":"oj-opaque-fixture-secret\\nvisible tail"}, { "data": "PRIVATE_BINARY", "bytes": 9, "type": "image" } ],\n "after" : "visible"\n}\n',c=capture();c.collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:raw}]});c.collector.finish();const value=c.events[0].content.output;assert.equal(typeof value,'string');assert.ok(value.startsWith(' {\n "code": 90071992547409931234567,\n'));assert.ok(value.endsWith('\n "after" : "visible"\n}\n'));assert.ok(!value.includes('PRIVATE_BINARY'));assert.ok(!value.includes('opaque-fixture-secret'));assert.ok(value.includes('visible tail'));assert.equal(JSON.parse(value).content[2].bytes,9);
+});
+test('unsupported tool content parts are omitted with incomplete facts while ordinary business objects remain intact',()=>{
+  for(const output of [[{type:'future_visible_part',data:'PRIVATE_BINARY'}],{content:[{type:'future_visible_part',data:'PRIVATE_BINARY'}]}]){
+    const {events,collector}=capture();collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output}]});const result=collector.finish();assert.ok(!JSON.stringify(events).includes('PRIVATE_BINARY'));assert.ok(!JSON.stringify(events).includes('future_visible_part'));assert.equal(result.incomplete,true);assert.equal(result.coverage.unsupported.contentParts,1);assert.ok(result.coverage.reasons.includes('unsupported_content'));
+  }
+  const {events,collector}=capture(),value={rows:[{type:'invoice',data:'visible business data'}]};collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:value}]});assert.equal(collector.finish().incomplete,false);assert.deepEqual(events[0].content.output,value);
+});
+test('added-only atomic tool results survive interruptions while unfinished result placeholders stay incomplete',()=>{
+  const item={type:'custom_tool_call_output',id:'result',call_id:'call',output:'visible result'},c=capture();c.collector.event({type:'response.output_item.added',output_index:0,item});const result=c.collector.finish();assert.equal(c.events.length,1);assert.equal(c.events[0].content.output,'visible result');assert.equal(result.coverage.seen.toolResults,1);assert.equal(result.coverage.captured.toolResults,1);assert.equal(result.incomplete,false);
+  const pending=capture();pending.collector.event({type:'response.output_item.added',output_index:0,item:{type:'custom_tool_call_output',id:'pending',call_id:'pending-call'}});const incomplete=pending.collector.finish();assert.equal(incomplete.coverage.seen.toolResults,1);assert.equal(incomplete.coverage.captured.toolResults,0);assert.equal(incomplete.incomplete,true);
+  const completed=capture();completed.collector.event({type:'response.output_item.added',output_index:0,item:{...item,output:undefined}});assert.equal(completed.collector.finish({output:[item]}).incomplete,false);
+});
+test('closed done-only tools require associations but can learn them from an authoritative final item',()=>{
+  const missing=capture();missing.collector.event({type:'response.custom_tool_call_input.done',item_id:'custom',output_index:0,input:'visible command'});const incomplete=missing.collector.finish();assert.equal(incomplete.incomplete,true);assert.ok(incomplete.coverage.reasons.includes('malformed_tool_item'));
+  const completed=capture();completed.collector.event({type:'response.custom_tool_call_input.done',item_id:'custom',output_index:0,input:'visible command'});const result=completed.collector.finish({output:[{type:'custom_tool_call',id:'custom',call_id:'call',name:'exec',input:'visible command'}]});assert.equal(result.incomplete,false);assert.equal(result.coverage.seen.toolCalls,1);assert.equal(result.coverage.captured.toolCalls,1);assert.ok(completed.events.some(event=>event.content.callId==='call'&&event.content.name==='exec'));
+});
+test('unchanged results still publish late protocol metadata without duplicating the assembled body',async()=>{
+  const {assembleRecording}=await import('../recording-search-index.mjs'),c=capture(),item={type:'custom_tool_call_output',id:'result',call_id:'call',output:'visible result'};c.collector.event({type:'response.output_item.done',output_index:0,item});const result=c.collector.finish({output:[{...item,name:'protocol-supplied-name'}]});const assembled=assembleRecording(c.events.map((event,index)=>({...event,sequence:index+1})));assert.equal(assembled.length,1);assert.equal(assembled[0].text,'visible result');assert.equal(assembled[0].metadata.name,'protocol-supplied-name');assert.equal(result.coverage.seen.toolResults,1);assert.equal(result.coverage.captured.toolResults,1);assert.equal(result.incomplete,false);
+});
+test('stdout JSON shape never upgrades ordinary business data into protocol content parts',()=>{
+  for(const raw of ['[ { "type" : "invoice", "data" : "visible business data" } ]','{ "content" : [ {"type":"input_text","text":123,"annotations":[{"note":"visible annotation"}],"data":"visible data"} ] }','{ "content": [{"type":"future_visible_part","data":"visible future business value"}], "password": "opaque-fixture-secret" }']){
+    const {events,collector}=capture(),filter=new JsonRecordRedactor(),expected=filter.push(raw)+filter.finish();collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:raw}]});const result=collector.finish();assert.equal(events[0].content.output,expected);assert.equal(result.incomplete,false);assert.equal(result.coverage.unsupported.contentParts,0);assert.ok(!JSON.stringify(events).includes('opaque-fixture-secret'));
+  }
 });

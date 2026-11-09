@@ -21,20 +21,20 @@ const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.e
 const deferred=()=>{let resolve;const promise=new Promise(yes=>{resolve=yes;});return {promise,resolve};};
 const until=async predicate=>{const end=Date.now()+8000;while(!await predicate()){assert.ok(Date.now()<end,'synthetic condition timed out');await new Promise(resolve=>setTimeout(resolve,5));}};
 const quota=(remaining=0)=>JSON.stringify({plan:'pro',checked:Date.now(),remaining,windows:[{used:100-remaining,minutes:10080,reset:Date.now()+3600000}]});
-async function fixture(t,{second=false,initial=0,api=false}={}){
+async function fixture(t,{second=false,initial=0,api=false,recording=false,admin=false,pricingOptions={}}={}){
  const lab=await createPrivatePostgres({binDirectory,libraryDirectory}),store=new PostgresStore({connection:lab.connection}),root=await mkdtemp(join(tmpdir(),'harbor-extra-http-')),key=randomBytes(32),accountId=randomUUID(),otherId=second?randomUUID():null,apiId=api?randomUUID():null,calls=[],gates=[];let upstream,server,handler,buffer,metering,memberAdmin;const state={credentialGate:null,sourceGate:null,disconnect:false};
  t.after(async()=>{for(const gate of gates)gate.resolve();handler?.abort();await until(()=>!handler||handler.status().active===0).catch(()=>{});server?.closeAllConnections();upstream?.closeAllConnections();if(server)await new Promise(resolve=>server.close(resolve));if(upstream)await new Promise(resolve=>upstream.close(resolve));await handler?.closeQueries();await metering?.close();await buffer?.close();await memberAdmin?.close();await store.close();await lab.close();await rm(root,{recursive:true,force:true});});
  await store.migrate();await store.initializePricing();memberAdmin=createPostgresMemberAdmin(store,{encryptionKey:key});const member=(await memberAdmin.handle('/api/admin/members','POST',{name:'合成HTTP额度员工',quota:null,expires:null,allowed_models:[model]})).value;await store.run("INSERT INTO harbor.accounts(id,name,home,state,quota_json) VALUES($1,'合成耗尽账号',$1,'ready',$2)",accountId,quota(initial));if(otherId)await store.run("INSERT INTO harbor.accounts(id,name,home,state,quota_json) VALUES($1,'合成包内账号',$1,'ready',$2)",otherId,quota(50));if(apiId)await store.run("INSERT INTO harbor.accounts(id,name,home,state,auth_mode,api_weight) VALUES($1,'合成API账号',$1,'ready','openai_api',20)",apiId);
  const service=createPostgresAccountExtraUsage(store,{readEntitlement:async owner=>({capability:{supported:true,platform:owner.kind,auth_mode:owner.auth_mode},entitlement:{state:'verified',source:'official',remaining_atoms:'1000',unit:'credits',models:[model],protocols:['responses','images'],verified_at:Date.now(),valid_until:Date.now()+60000,expires_at:null}})}),extraRuntime=createPostgresExtraRuntime(store,{service}),router=createPostgresRouter(store,{extraRuntime}),limits=createPostgresMemberLimits(store);
- upstream=http.createServer((req,res)=>{void(async()=>{for await(const _chunk of req){}calls.push({account_id:req.headers['chatgpt-account-id']||(req.headers.authorization==='Bearer synthetic-api'?apiId:'unknown'),path:req.url});if(state.sourceGate)await state.sourceGate.promise;if(state.disconnect){res.writeHead(200,{'Content-Type':'text/event-stream'});res.write('data: '+JSON.stringify({type:'response.output_text.delta',item_id:'message',output_index:0,delta:'合成片段'})+'\n\n');setImmediate(()=>res.destroy());return;}if(req.url.includes('images')){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({model,data:[{b64_json:'c3ludGhldGlj'}],usage:{input_tokens:1000,output_tokens:200,input_tokens_details:{cached_tokens:100}}}));return;}const response={id:'synthetic-response',model,output:[{id:'message',type:'message',content:[{type:'output_text',text:'合成完成'}]}],usage:{input_tokens:1000,output_tokens:200,input_tokens_details:{cached_tokens:100}}};res.writeHead(200,{'Content-Type':'text/event-stream'});res.end('data: '+JSON.stringify({type:'response.output_text.delta',item_id:'message',output_index:0,delta:'合成完成'})+'\n\ndata: '+JSON.stringify({type:'response.completed',response})+'\n\n');})().catch(()=>res.destroy());});await new Promise(resolve=>upstream.listen(0,'127.0.0.1',resolve));const upstreamOrigin='http://127.0.0.1:'+upstream.address().port;
+ upstream=http.createServer((req,res)=>{void(async()=>{for await(const _chunk of req){}calls.push({account_id:req.headers['chatgpt-account-id']||(req.headers.authorization==='Bearer synthetic-api'?apiId:'unknown'),path:req.url});if(state.sourceGate)await state.sourceGate.promise;if(state.disconnect){res.writeHead(200,{'Content-Type':'text/event-stream'});res.write('data: '+JSON.stringify({type:'response.output_text.delta',item_id:'message',output_index:0,delta:'合成片段'})+'\n\n');setImmediate(()=>res.destroy());return;}if(req.url.includes('images')){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({model,data:[{b64_json:'c3ludGhldGlj'}],usage:{input_tokens:1000,output_tokens:200,input_tokens_details:{cached_tokens:100}}}));return;}const response={id:'synthetic-response',status:'completed',model,output:[{id:'message',type:'message',content:[{type:'output_text',text:'合成完成'}]}],usage:{input_tokens:1000,output_tokens:200,input_tokens_details:{cached_tokens:100}}};response.output.push(...(state.extraOutput??[]));res.writeHead(200,{'Content-Type':'text/event-stream'});res.end((state.terminalOnly?'':'data: '+JSON.stringify({type:'response.output_text.delta',item_id:'message',output_index:0,delta:'合成完成'})+'\n\n')+'data: '+JSON.stringify({type:'response.completed',response})+'\n\n');})().catch(()=>res.destroy());});await new Promise(resolve=>upstream.listen(0,'127.0.0.1',resolve));const upstreamOrigin='http://127.0.0.1:'+upstream.address().port;
  const transport=apiMode=>createResponsesTransport({apiKeyMode:apiMode,credentials:async(_binary,home)=>{if(state.credentialGate)await state.credentialGate.promise;return {token:apiMode?'synthetic-api':'synthetic-subscription',accountId:home};},version:async()=>'0.160.1',fetchImpl:(url,options)=>fetch(upstreamOrigin+new URL(url).pathname,options)}),subscription=transport(false),apiTransport=transport(true);
- const recordings=new RecordingStore(store,{encryptionKey:key});buffer=await RecordingBuffer.create(recordings,{directory:join(root,'recording'),flushMs:10000});metering=await MeteringRecovery.create(store,{encryptionKey:key,directory:join(root,'metering'),flushMs:10000});handler=createPostgresResponsesHandler({store,recordings,buffer,meteringRecovery:metering,extraRuntime,resolveRoute:router.resolve,onRouteFailure:router.block,checkLimits:(current,payload,options)=>limits.check(current.id,payload.model,options),transportForAccount:async account=>account.auth_mode==='openai_api'?apiTransport:subscription,adminAuthenticated:async()=>false,recordingEnabled:false});
- server=http.createServer((req,res)=>{void handler.handle(req,res).then(handled=>{if(!handled){res.writeHead(404);res.end();}}).catch(error=>{if(res.headersSent){res.end();return;}res.writeHead(error.status||500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{code:error.code||'internal_error'}}));});});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+server.address().port;
+ const recordings=new RecordingStore(store,{encryptionKey:key});buffer=await RecordingBuffer.create(recordings,{directory:join(root,'recording'),flushMs:10000});metering=await MeteringRecovery.create(store,{encryptionKey:key,directory:join(root,'metering'),flushMs:10000});handler=createPostgresResponsesHandler({store,recordings,buffer,meteringRecovery:metering,extraRuntime,resolveRoute:router.resolve,onRouteFailure:router.block,checkLimits:(current,payload,options)=>limits.check(current.id,payload.model,options),transportForAccount:async account=>account.auth_mode==='openai_api'?apiTransport:subscription,adminAuthenticated:async req=>admin&&req.headers.authorization==='Bearer synthetic-admin',pricingOptions,recordingEnabled:recording});
+ server=http.createServer((req,res)=>{const write=res.write.bind(res);res.write=(...args)=>{if(state.failDownstreamWrite){state.failDownstreamWrite=false;res.emit('close');throw Object.assign(new Error('synthetic downstream disconnect'),{status:499,code:'request_cancelled'});}return write(...args);};void handler.handle(req,res).then(handled=>{if(!handled){res.writeHead(404);res.end();}}).catch(error=>{if(res.headersSent){res.end();return;}res.writeHead(error.status||500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:{code:error.code||'internal_error'}}));});});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+server.address().port;
  const send=async({thread=randomUUID(),fixed,signal,path='/v1/responses',secret=member.secret}={})=>{const res=await fetch(origin+path,{method:'POST',signal,headers:{authorization:'Bearer '+secret,'content-type':'application/json','thread-id':thread,...(fixed?{'x-harbor-session':fixed}:{})},body:JSON.stringify(path.includes('images')?{model,prompt:'合成图片请求'}:{model,input:'合成预算测试',stream:false})});const data=await res.json();return {status:res.status,data,thread};};
  const legacyEnable=async({limit='1000000000000',reserve='10000000000'}={})=>{const p=await service.readPolicy();if(!p.enabled)await service.savePolicy({enabled:true,expected_version:p.version},actor);const row=await service.readAccount(accountId);await service.saveAccount(accountId,{mode:'inherit',budget:{basis:'reference_estimate',unit:'reference_usd_atoms',limit_atoms:limit,request_reserve_atoms:reserve},expected_version:row.configuration.version,expected_identity_epoch:row.identity_epoch},actor);await service.refresh(accountId);};
  const manual=async()=>{await router.saveSettings({weighted:true});const current=JSON.parse((await store.get("SELECT value FROM harbor.gateway_settings WHERE name='routing_weights'"))?.value||'{"version":0}');await router.saveWeights({mode:'manual',weights:{[accountId]:100,...(otherId?{[otherId]:0}:{})},expected_version:current.version});};
  const fixed=async(account=accountId)=>{const session=randomUUID();await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,protocol,created,updated,nightly_enabled) VALUES($1,$2,$3,'responses',$4,$4,0)",session,member.memberId,account,Date.now());return session;};
- return {lab,store,service,router,handler,member,accountId,otherId,apiId,calls,state,send,legacyEnable,manual,fixed,gate:()=>{const gate=deferred();gates.push(gate);return gate;}};
+ return {lab,store,metering,buffer,recordings,origin,service,router,handler,member,accountId,otherId,apiId,calls,state,send,legacyEnable,manual,fixed,gate:()=>{const gate=deferred();gates.push(gate);return gate;}};
 }
 
 
@@ -60,3 +60,75 @@ test('旧全局许可写锁不再阻塞手动正权重的真实派发',integrati
 test('手动正权重到期后拒绝新请求与固定耗尽绑定，凭据准备中到期也拒绝',integration,async t=>{const f=await fixture(t);await f.manual();const gate=f.gate();f.state.credentialGate=gate;const pending=f.send();await queued(f);await expire(f);gate.resolve();assert.equal((await pending).status,503);f.state.credentialGate=null;assert.equal((await f.send()).status,503);assert.equal((await f.send({fixed:await f.fixed()})).status,503);assert.equal(f.calls.length,0);await noHolds(f);});
 test('官方硬消费限制仍阻止正权重包内及额外请求，不向上游派发',integration,async t=>{const f=await fixture(t,{initial:50});await f.manual();for(const flag of ['spend_control','workspace']){const snapshot=JSON.parse(quota(50));snapshot.officialDenial={ordinary:false,spend_control:false,workspace:false,[flag]:true};await f.store.run('UPDATE harbor.accounts SET quota_json=$1 WHERE id=$2',JSON.stringify(snapshot),f.accountId);assert.equal((await f.send()).status,503);assert.equal((await f.send({fixed:await f.fixed()})).status,503);}assert.equal(f.calls.length,0);await noHolds(f);});
 test('官方普通额度拒绝且没有窗口时管理员正权重可直接尝试上游',integration,async t=>{const f=await fixture(t);await f.store.run('UPDATE harbor.accounts SET quota_json=$1 WHERE id=$2',JSON.stringify({checked:Date.now(),remaining:null,windows:[],ordinaryUsageAllowed:false,officialDenial:{ordinary:true,spend_control:false,workspace:false}}),f.accountId);assert.equal((await f.send()).status,503);await f.manual();assert.equal((await f.send()).status,200);assert.equal(f.calls.length,1);await noHolds(f);});
+
+
+test('真实Responses在HTTP结束后持久化分段计时，重复遥测不重复计量',integration,async t=>{
+ const f=await fixture(t);await f.manual();assert.equal((await f.send()).status,200);
+ await until(async()=>{await f.metering.flush();const row=await f.store.get('SELECT phase_history FROM harbor.requests');return !!JSON.parse(row.phase_history).at(-1).stream_timing;});
+ const before=await f.store.get('SELECT * FROM harbor.requests'),summary=JSON.parse(before.phase_history).at(-1).stream_timing;
+ assert.equal(summary.version,1);assert.equal(summary.clientReceiptVerified,false);assert.equal(summary.outcome,'ok');
+ assert.ok(summary.offsetsMs.responseEnd>=summary.offsetsMs.transportEnd);assert.ok(summary.counts.rawChunks>0);assert.ok(summary.counts.decodedEvents>0);
+ const memberBefore=await f.store.get('SELECT used FROM harbor.members WHERE id=$1',before.member_id),priceBefore=await f.store.get('SELECT total_atoms::text amount FROM harbor.request_prices WHERE request_id=$1',before.id);
+ assert.equal((await f.store.finish(before.id,{input:999999,output:999999,streamTiming:{...summary,outcome:'failed'}},Date.now())).settled,false);
+ assert.deepEqual(await f.store.get('SELECT used FROM harbor.members WHERE id=$1',before.member_id),memberBefore);
+ assert.deepEqual(await f.store.get('SELECT total_atoms::text amount FROM harbor.request_prices WHERE request_id=$1',before.id),priceBefore);
+ assert.deepEqual(JSON.parse((await f.store.get('SELECT phase_history FROM harbor.requests')).phase_history).at(-1).stream_timing,summary);
+});
+
+
+test('业务成功与工具采集覆盖分开，未知可见项不能假报正文完整',integration,async t=>{
+ const f=await fixture(t,{recording:true});await f.manual();
+ f.state.extraOutput=[{id:'synthetic-tool',type:'custom_tool_call',name:'exec',call_id:'synthetic-call',input:'echo "synthetic"'}, {id:'synthetic-unknown',type:'future_visible_work',text:'synthetic'}];
+ assert.equal((await f.send()).status,200);await f.buffer.flush();
+ const row=await f.store.get('SELECT id,status,recording_state,recording_reason FROM harbor.requests');
+ assert.equal(row.status,'ok');assert.equal(row.recording_state,'partial');
+ const page=await f.recordings.read(row.id,{limit:100}),tools=page.events.filter(event=>event.kind==='tool_call');
+ assert.equal(tools.length,1);assert.equal(tools[0].content.callId,'synthetic-call');assert.equal(tools[0].content.text,'echo "synthetic"');
+ const boundary=page.events.find(event=>event.content.section==='coverage');assert.ok(boundary);assert.equal(boundary.content.complete,false);assert.ok(boundary.content.reasons.includes('unsupported_item'));
+ assert.equal(boundary.content.seen.toolCalls,1);assert.equal(boundary.content.captured.toolCalls,1);
+});
+
+
+test('非流式仅终态正文配对最终JSON写入，不误报内容丢弃',integration,async t=>{
+ const f=await fixture(t);await f.manual();f.state.terminalOnly=true;assert.equal((await f.send()).status,200);
+ await until(async()=>{await f.metering.flush();const row=await f.store.get('SELECT phase_history FROM harbor.requests');return !!JSON.parse(row.phase_history).at(-1).stream_timing;});
+ const summary=JSON.parse((await f.store.get('SELECT phase_history FROM harbor.requests')).phase_history).at(-1).stream_timing;
+ assert.equal(summary.complete,true);assert.deepEqual(summary.missing,[]);assert.equal(summary.counts.contentChunks,1);assert.equal(summary.counts.failedWrites,0);
+ assert.ok(summary.durationsMs.firstContentRelay>=0);assert.ok(summary.durationsMs.firstContentWrite>=0);assert.equal(summary.clientReceiptVerified,false);
+});
+
+
+test('真实管理入口恢复费率配置和刷新，拒绝未登录并经原请求体读取',integration,async t=>{
+ const official='# Pricing\n### Standard pricing data\n| Model | Input | Cached input | Output |\n| --- | --- | --- | --- |\n| synthetic-new-model | $3 | $0.3 | $15 |\n### Batch pricing data\n';let fetched=0;
+ const f=await fixture(t,{admin:true,pricingOptions:{fetchImpl:async()=>{fetched++;return new Response(official);}}});
+ const call=async(path,method='GET',body,authenticated=true)=>{
+  const response=await fetch(f.origin+path,{method,headers:{...(authenticated?{authorization:'Bearer synthetic-admin'}:{}),'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
+  return {status:response.status,value:await response.json()};
+ };
+ assert.equal((await call('/api/admin/pricing','GET',undefined,false)).status,401);
+ const initial=await call('/api/admin/pricing');assert.equal(initial.status,200);
+ const configured=await call('/api/admin/pricing','PATCH',{expectedVersion:initial.value.settings.version,refreshHours:12});
+ assert.equal(configured.status,200);assert.equal(configured.value.settings.refreshHours,12);
+ assert.equal((await call('/api/admin/pricing','PATCH',{expectedVersion:initial.value.settings.version,refreshHours:6})).status,400);
+ const refreshed=await call('/api/admin/pricing/refresh','POST',{});assert.equal(refreshed.status,200);assert.equal(fetched,1);assert.ok(refreshed.value.rates.some(rate=>rate.model==='synthetic-new-model'));
+ assert.ok(!refreshed.value.rates.some(rate=>rate.model==='codex-auto-review'));
+});
+
+test('关闭流程先排空已接受的费率操作，再关闭共享查询队列',integration,async t=>{
+ const f=await fixture(t,{admin:true}),gate=f.gate(),original=f.store.all.bind(f.store);let blocked=false;
+ f.store.all=async(sql,...args)=>{if(sql.includes("GROUP BY COALESCE(r.billing_model,r.model,'未记录')")&&!blocked){blocked=true;await gate.promise;}return original(sql,...args);};
+ const pending=fetch(f.origin+'/api/admin/pricing',{method:'PATCH',headers:{authorization:'Bearer synthetic-admin','content-type':'application/json'},body:JSON.stringify({expectedVersion:0,refreshHours:12})});
+ await until(()=>blocked);const closing=f.handler.closeQueries();
+ assert.equal(f.handler.status().queries.closed,false,'admitted pricing response must retain its query queue');
+ gate.resolve();const response=await pending;assert.equal(response.status,200);assert.equal((await response.json()).settings.refreshHours,12);
+ await closing;assert.equal(f.handler.status().queries.closed,true);
+});
+
+
+test('下游中断仍结算同一已收分片的真实终态用量，不重发模型',integration,async t=>{
+ const f=await fixture(t);await f.manual();f.state.failDownstreamWrite=true;
+ let disconnected=false;try{const response=await fetch(f.origin+'/v1/responses',{method:'POST',headers:{authorization:'Bearer '+f.member.secret,'content-type':'application/json'},body:JSON.stringify({model,input:'合成已收计量验证',stream:true})});await response.text();}catch(error){assert.equal(error.cause?.code,'UND_ERR_SOCKET');disconnected=true;}assert.equal(disconnected,true);
+ await until(async()=>{const row=await f.store.get('SELECT status FROM harbor.requests');return !!row&&row.status!=='queued'&&row.status!=='running';});
+ const row=await f.store.get('SELECT r.status,r.usage_unknown,r.input,r.output,r.cached,p.total_atoms::text amount FROM harbor.requests r JOIN harbor.request_prices p ON p.request_id=r.id');
+ assert.equal(row.status,'cancelled');assert.equal(row.usage_unknown,0);assert.equal(row.input,1000);assert.equal(row.output,200);assert.equal(row.cached,100);assert.ok(BigInt(row.amount)>0n);assert.equal(f.calls.length,1);
+});
