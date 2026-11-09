@@ -290,18 +290,24 @@ def run_upgrade(image,config,api,ticket,entry):
   if not commit_started and not (gate_attempted and gate is None):
    old_gateway=api['inspect_container'](api['NAME']);old_worker=api['inspect_container'](api['NAME']+'-worker')
    verify_source(ticket,entry.private_json(entry.ACTIVE),old_gateway,old_worker)
-   if not gate_attempted:
-    # Before gate installation no composition operation has run. Readiness must
-    # not depend on the public admission path that is currently held.
+   if not gate_attempted or isinstance(error,pg.SourcePreflightRejected):
+    # Before gate installation or a source preflight rejection, no source
+    # member was changed. Do not require the rejected recording-storage fact
+    # again to restore the unchanged, core-ready composition.
+    # Readiness must not depend on the held public admission path.
     # Check the exact unchanged PG pair via its private candidate bridge, then
     # release admission without rebuilding networking or replaying deployment.
     state=entry.private_json(entry.STATE);runtime=state.get('activeRuntimeConfig')
     need(state.get('phase')=='activated' and runtime and state.get('candidate')==active.get('candidate'),'unchanged entry runtime required')
     entry.verify_resources(state,runtime);network_snapshot(ticket,entry,old_gateway,old_worker)
-    need(entry.candidate_slot_ready(runtime['bridge']['address'],8092),'unchanged candidate is not ready')
+    if gate_attempted:
+     need(all(row.get('State',{}).get('Running') is True and not any(row['State'].get(k) for k in ['Paused','Restarting','Dead','OOMKilled']) for row in [old_gateway,old_worker]),'unchanged source is not running')
+     need(probe(entry,ticket,old_gateway,8092,'/ready')==200,'unchanged candidate is not core-ready')
+     gate_remove(entry,gate);gate=None
+    else:need(entry.candidate_slot_ready(runtime['bridge']['address'],8092),'unchanged candidate is not ready')
     control=entry.entry_state();need(control.get('slot')=='candidate' and control.get('phase') in ['active','holding','drained'],'unchanged entry control required')
     if control['phase']!='active':entry.entry_state('resume',control['epoch'])
-    record.update(phase='rolled-back-pg',errorCategory='before_composition');entry.save_json(path/'release.json',record)
+    record.update(phase='rolled-back-pg',errorCategory='source_preflight_rejected' if gate_attempted else 'before_composition');entry.save_json(path/'release.json',record)
     raise
    old_approval=active['approval'];pg.verify_started_composition({**pg_api,'http_code':lambda port,p,headers=None:probe(entry,ticket,old_gateway,port,p,headers)},ticket['from']['image'],config,int(time.time()*1000),old_approval)
    # Restarted PG containers have new veths. Rebind only the exact approved
