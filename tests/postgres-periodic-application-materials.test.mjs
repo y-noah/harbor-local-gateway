@@ -52,6 +52,15 @@ test('private PG pre-checkpoint capture authenticates material coverage, rejects
   await writeFile(join(runtime,'auth.json'),'CCCC',{mode:0o600});
   await assert.rejects(verifyPeriodicApplicationCapture(context,proof,cachePolicy,filtered.captureId),{code:'transfer_files_changed'});
   await writeFile(join(runtime,'auth.json'),'AAAA',{mode:0o600});
+  const modelPolicy={...policy,excludeModelCatalogCache:true},modelHome=join(runtime,'accounts','synthetic');await mkdir(modelHome,{recursive:true,mode:0o700});
+  await writeFile(join(modelHome,'models_cache.json'),'{"models":[],"fetched_at":1}',{mode:0o600});
+  const modelCapture=await capturePeriodicApplicationMaterials(context,proof,modelPolicy);
+  assert.equal(periodicApplicationCaptureSource(modelCapture).manifest.applicationPolicy.excludeModelCatalogCache,true);
+  await writeFile(join(modelHome,'models_cache.json'),'{"models":[],"fetched_at":222}',{mode:0o600});
+  assert.equal((await verifyPeriodicApplicationCapture(context,proof,modelPolicy,modelCapture.captureId)).captureId,modelCapture.captureId);
+  assert.equal((await authenticatePeriodicApplicationCapture(context,proof,modelCapture.captureId)).captureId,modelCapture.captureId);
+  await assert.rejects(verifyPeriodicApplicationCapture(context,proof,policy,modelCapture.captureId),{code:'periodic_application_capture_binding'});
+  await writeFile(join(runtime,'auth.json'),'DDDD',{mode:0o600});await assert.rejects(verifyPeriodicApplicationCapture(context,proof,modelPolicy,modelCapture.captureId),{code:'transfer_files_changed'});await writeFile(join(runtime,'auth.json'),'AAAA',{mode:0o600});
   const id=randomUUID(),running=capturePeriodicApplicationMaterials(context,proof,policy,{captureId:id}),record=postgresBackupContext(context);
   assert.equal(record.busy,true);const rejection=assert.rejects(running,{name:'AbortError'});
   await closePostgresBackupContext(context);await rejection;

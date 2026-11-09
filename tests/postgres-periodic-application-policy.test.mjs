@@ -4,6 +4,18 @@ import {periodicApplicationPolicy,periodicApplicationFileExclusions,loadPeriodic
 
 const configuration=()=>({version:1,enabled:true,database:{name:'harbor_private',oid:'16384'},materialRoots:[{id:'data',directory:'/srv/private/data'},{id:'runtime',directory:'/srv/private/runtime'},{id:'secrets',directory:'/srv/private/secrets'}],publicOrigin:'http://127.0.0.1:18094',deviceOrigin:'https://127.0.0.1:18095',maxBytes:1073741824,maxFiles:100000});
 
+test('model catalog cache selection is opt-in, scoped to account homes and preserves old policy bytes when off',()=>{
+  const original=periodicApplicationPolicy(configuration());
+  assert.deepEqual(periodicApplicationPolicy({...configuration(),excludeModelCatalogCache:false}),original);
+  const policy=periodicApplicationPolicy({...configuration(),excludeModelCatalogCache:true});
+  assert.equal(policy.excludeModelCatalogCache,true);
+  assert.deepEqual(periodicApplicationFileExclusions(policy),[{root:'runtime',pattern:'accounts/*/models_cache.json'}]);
+  assert.deepEqual(periodicApplicationFileExclusions(original),[]);
+  for(const excludeModelCatalogCache of [null,0,1,'true',[],{}])assert.throws(()=>periodicApplicationPolicy({...configuration(),excludeModelCatalogCache}),{code:'periodic_application_policy_invalid'});
+  const caches=Array.from({length:21},(_,i)=>'cache_'+i+'.sqlite');
+  assert.equal(periodicApplicationFileExclusions(periodicApplicationPolicy({...configuration(),runtimeSqliteCaches:caches,excludeModelCatalogCache:true})).length,64);
+});
+
 test('runtime SQLite cache exclusions are explicit, frozen and include both sidecars without excluding JSON or keys',()=>{
   const input={...configuration(),runtimeSqliteCaches:['**/state_*.sqlite','**/logs_*.sqlite']},policy=periodicApplicationPolicy(input);
   input.runtimeSqliteCaches.push('changed.sqlite');assert.equal(policy.runtimeSqliteCaches.length,2);assert.ok(Object.isFrozen(policy.runtimeSqliteCaches));

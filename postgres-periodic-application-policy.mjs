@@ -20,7 +20,7 @@ function origin(value,{tls=false}={}){
 // must load its own fixed profile, never accept roots from an HTTP caller.
 export function periodicApplicationPolicy(value){
   if(installedPolicies.has(value))return value;
-  if(!exact(value,['version','enabled','database','materialRoots','publicOrigin','deviceOrigin','maxBytes','maxFiles','runtimeSqliteCaches'])||value.version!==1||typeof value.enabled!=='boolean')fail();
+  if(!exact(value,['version','enabled','database','materialRoots','publicOrigin','deviceOrigin','maxBytes','maxFiles','runtimeSqliteCaches','excludeModelCatalogCache'])||value.version!==1||typeof value.enabled!=='boolean')fail();
   if(!value.enabled&&Object.keys(value).length===2)return Object.freeze({version:1,enabled:false});
   const database=value.database;
   if(!exact(database,['name','oid'])||typeof database.name!=='string'||!database.name||Buffer.byteLength(database.name)>63||/[\0\r\n]/.test(database.name)||typeof database.oid!=='string'||!/^[1-9]\d{0,9}$/.test(database.oid)||BigInt(database.oid)>4294967295n)fail();
@@ -34,16 +34,21 @@ export function periodicApplicationPolicy(value){
   }
   const caches=value.runtimeSqliteCaches??[];
   if(value.runtimeSqliteCaches===null||!Array.isArray(caches)||caches.some(pattern=>typeof pattern!=='string'||!pattern.endsWith('.sqlite')))fail();
-  try{periodicApplicationFileExclusions({runtimeSqliteCaches:caches});}catch{fail();}
+  if(value.excludeModelCatalogCache!==undefined&&typeof value.excludeModelCatalogCache!=='boolean')fail();
+  const excludeModelCatalogCache=value.excludeModelCatalogCache===true;
+  try{periodicApplicationFileExclusions({runtimeSqliteCaches:caches,excludeModelCatalogCache});}catch{fail();}
   const publicOrigin=origin(value.publicOrigin),deviceOrigin=origin(value.deviceOrigin,{tls:true});
   if(publicOrigin===deviceOrigin)fail();
-  return Object.freeze({version:1,enabled:value.enabled,database:Object.freeze({name:database.name,oid:database.oid}),materialRoots:Object.freeze(roots),publicOrigin,deviceOrigin,maxBytes:value.maxBytes,maxFiles:value.maxFiles,...(caches.length?{runtimeSqliteCaches:Object.freeze([...caches])}:{})});
+  return Object.freeze({version:1,enabled:value.enabled,database:Object.freeze({name:database.name,oid:database.oid}),materialRoots:Object.freeze(roots),publicOrigin,deviceOrigin,maxBytes:value.maxBytes,maxFiles:value.maxFiles,...(caches.length?{runtimeSqliteCaches:Object.freeze([...caches])}:{}),...(excludeModelCatalogCache?{excludeModelCatalogCache:true}:{})});
 }
 
-// Only operator-declared rebuildable SQLite caches in the runtime root. Each
-// cache and its two SQLite sidecars are selected together; JSON and keys stay.
+// Account model catalogs are fetched again by the CLI. Only their known account
+// layout can be omitted; auth, session state and similarly named job files stay.
 export function periodicApplicationFileExclusions(policy){
-  return fileSetExclusions((policy.runtimeSqliteCaches??[]).flatMap(pattern=>['','-wal','-shm'].map(suffix=>({root:'runtime',pattern:pattern+suffix}))));
+  return fileSetExclusions([
+    ...(policy.runtimeSqliteCaches??[]).flatMap(pattern=>['','-wal','-shm'].map(suffix=>({root:'runtime',pattern:pattern+suffix}))),
+    ...(policy.excludeModelCatalogCache===true?[{root:'runtime',pattern:'accounts/*/models_cache.json'}]:[]),
+  ]);
 }
 
 export async function loadPeriodicApplicationPolicy(){
