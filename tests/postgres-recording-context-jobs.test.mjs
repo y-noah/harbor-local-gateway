@@ -13,6 +13,7 @@ import {createPostgresRecordingJobs} from '../postgres-recording-jobs.mjs';
 import {createRecordingIndexCrypto} from '../recording-search-index.mjs';
 import {recordingQuery} from '../postgres-recording-query.mjs';
 import {createPostgresRecordingExports} from '../postgres-recording-export.mjs';
+import {verifyRestoredRecordingCiphertexts,hasStoredRecordingCiphertexts} from '../storage-operator-backup-recordings.mjs';
 import {createPostgresRecordingContextQueries} from '../postgres-recording-context-query.mjs';
 
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需要独占合成PG':false};
@@ -23,7 +24,7 @@ async function fixture(t,{indexBatch=32,schemaIndex=true}={}){
  t.after(async()=>{await store.close();await admin.query('DROP DATABASE '+name);await admin.close();});await store.migrate({recordingContext:true,recordingContextIndex:schemaIndex});await store.initializePricing();
  let now=Date.now();const clock=()=>now,key=randomBytes(32),jobs=createPostgresJobs(store,{clock,leaseMs:1000}),contexts=new RecordingContextStore(store,{encryptionKey:key,clock}),recordings=new RecordingStore(store,{encryptionKey:key,clock}),crypto=createRecordingIndexCrypto(key),backend=createPostgresRecordingJobs(store,{recordingKey:key,jobs,clock,contextIndex:schemaIndex,contextStorage:true,indexBatch,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
  const member=randomUUID(),session=randomUUID();await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',member,'合成索引员工',now);await store.run("INSERT INTO harbor.accounts(id,name,home) VALUES('synthetic','合成上游','synthetic')");await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,created,updated) VALUES($1,$2,'synthetic',$3,$3)",session,member,now);
- const request=async(content='可检索的上下文',ttl=10000,components)=>{const id=randomUUID();await store.run("INSERT INTO harbor.requests(id,member_id,session_id,started,ended,status,business_status,ip,model) VALUES($1,$2,$3,$4,$4,'ok','ok','synthetic','gpt-6.1-sol')",id,member,session,now);await recordings.start(id);await store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',now+ttl,id);await contexts.writeSnapshot(id,components??[{kind:'history',content}]);return id;};
+ const request=async(content='可检索的上下文',ttl=10000,components,coverage=null)=>{const id=randomUUID();await store.run("INSERT INTO harbor.requests(id,member_id,session_id,started,ended,status,business_status,ip,model) VALUES($1,$2,$3,$4,$4,'ok','ok','synthetic','gpt-6.1-sol')",id,member,session,now);await recordings.start(id);await store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',now+ttl,id);await contexts.writeSnapshot(id,components??[{kind:'history',content}],{coverage});return id;};
  const run=async()=>{let job;while(job=await jobs.claim([kind]))await jobs.complete(job,await backend.handlers[kind](job));};
  const document=async()=>{const d=await store.get('SELECT * FROM harbor.recording_context_documents ORDER BY object_id LIMIT 1');if(!d)return null;const parts=await store.all('SELECT * FROM harbor.recording_context_document_parts WHERE object_id=$1 ORDER BY ordinal',d.object_id);return {d,parts,text:parts.map(p=>crypto.open(p.payload_cipher,`context-document:${d.object_id}:${d.source_revision}:1:${p.ordinal}`).text).join('')};};
  return {store,jobs,contexts,recordings,backend,key,clock,advance:ms=>{now+=ms;},request,run,document,crypto,connection:connection(name)};
@@ -146,4 +147,46 @@ test('真实PG：大上下文导出分片可重建原JSON，取消已提交批�
  f.jobs.owned=async(...args)=>{const result=await owned(...args);if(!injected&&(await f.store.get('SELECT rows FROM harbor.recording_exports WHERE id=$1',cancelled.id)).rows===1){injected=true;await exporter.cancel(cancelled.id);}return result;};
  try{await assert.rejects(exporter.handlers[task.kind](task),{code:'job_lease_lost'});}finally{f.jobs.owned=owned;}
  assert.equal(injected,true);assert.equal((await exporter.status(cancelled.id)).status,'cancelled');assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects WHERE export_id=$1',cancelled.id)).n,0);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_export_chunks WHERE export_id=$1',cancelled.id)).n,0);
+});
+
+
+test('真实PG：离线校验覆盖只有上下文的密文、过期旧基线及仍有效的引用，不返回正文',integration,async t=>{
+ const f=await fixture(t),components=[{kind:'history',content:'只能在内部校验的上下文'},{kind:'history',content:'只能在内部校验的上下文'}],old=await f.request('',10,components);await f.request('',10000,components);f.advance(20);await f.contexts.gc();await f.backend.schedule();await f.run();
+ assert.equal(await hasStoredRecordingCiphertexts(f.store),true);
+ await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,randomBytes(32)),{code:'recording_context_unreadable'});
+ const exporter=contextExporter(f),created=await exporter.enqueue(exportBody),job=await f.jobs.claim(['recording.export']);await f.jobs.complete(job,await exporter.handlers[job.kind](job));
+ const result=await verifyRestoredRecordingCiphertexts(f.store,f.key);assert.equal(result.allVerified,true);assert.equal(result.contexts.objects,1);assert.equal(result.contexts.snapshots,1);assert.equal(result.contexts.references,2);assert.equal(result.contexts.documents,1);assert.equal(result.contexts.exportDependencies,1);assert.ok(result.verified>=3);assert.ok(!JSON.stringify(result).includes('只能在内部'));
+ assert.equal((await f.contexts.read(old)).state,'expired');assert.equal(await hasStoredRecordingCiphertexts(f.store),true);
+ await f.store.run('DELETE FROM harbor.recordings');await assert.rejects(f.contexts.readObject((await f.store.get('SELECT id FROM harbor.recording_context_objects')).id),{code:'recording_context_expired'});const orphan=await verifyRestoredRecordingCiphertexts(f.store,f.key);assert.equal(orphan.allVerified,true);assert.equal(orphan.contexts.snapshots,0);
+});
+
+test('真实PG：离线校验拒绝引用重排、覆盖事实篡改及密文损坏',integration,async t=>{
+ const f=await fixture(t),components=[{kind:'instruction',content:'不可伪造的指令'},{kind:'history',content:'不可伪造的历史'}],id=await f.request('',10000,components,{state:'incomplete',reasons:['unsupported_input'],opaqueReasoningExcluded:1});assert.equal((await verifyRestoredRecordingCiphertexts(f.store,f.key)).allVerified,true);
+ await f.store.run('UPDATE harbor.recording_context_references SET ordinal=ordinal+10 WHERE request_id=$1',id);await f.store.run('UPDATE harbor.recording_context_references SET ordinal=13-ordinal WHERE request_id=$1',id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'recording_context_unreadable'});
+ await f.store.run('UPDATE harbor.recording_context_references SET ordinal=ordinal+10 WHERE request_id=$1',id);await f.store.run('UPDATE harbor.recording_context_references SET ordinal=13-ordinal WHERE request_id=$1',id);
+ const saved=await f.store.get('SELECT coverage FROM harbor.recording_context_snapshots WHERE request_id=$1',id);await f.store.run("UPDATE harbor.recording_context_snapshots SET coverage=$1::jsonb WHERE request_id=$2",JSON.stringify({state:'complete',reasons:[],opaqueReasoningExcluded:0}),id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'recording_context_unreadable'});await f.store.run('UPDATE harbor.recording_context_snapshots SET coverage=$1::jsonb WHERE request_id=$2',JSON.stringify(saved.coverage),id);
+ const part=await f.store.get('SELECT object_id,ordinal,content_cipher FROM harbor.recording_context_parts LIMIT 1');await f.store.run('UPDATE harbor.recording_context_parts SET content_cipher=$1 WHERE object_id=$2 AND ordinal=$3',randomBytes(part.content_cipher.length),part.object_id,part.ordinal);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'recording_context_unreadable'});
+});
+
+test('真实PG：离线校验拒绝上下文索引缺块和搜索词损坏，取消可中断校验',integration,async t=>{
+ const f=await fixture(t);const requestId=await f.request('恢复后仍可搜索中文代码');await f.backend.schedule();await f.run();const original=await f.store.get('SELECT object_id,ordinal,search_terms FROM harbor.recording_context_document_parts');await f.store.run('UPDATE harbor.recording_context_document_parts SET search_terms=$1::bytea[] WHERE object_id=$2',[randomBytes(32)],original.object_id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'storage_operator_application_context_search_mismatch'});await f.store.run('UPDATE harbor.recording_context_document_parts SET search_terms=$1::bytea[] WHERE object_id=$2',original.search_terms,original.object_id);
+ assert.equal((await verifyRestoredRecordingCiphertexts(f.store,f.key)).allVerified,true);await f.store.run('DELETE FROM harbor.recording_context_documents WHERE object_id=$1',original.object_id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'storage_operator_application_context_index_incomplete'});await f.backend.rebuild({request_id:requestId});await f.backend.schedule();await f.run();assert.equal((await verifyRestoredRecordingCiphertexts(f.store,f.key)).allVerified,true);await f.store.run('DELETE FROM harbor.recording_context_document_parts WHERE object_id=$1',original.object_id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'storage_operator_application_context_index_incomplete'});
+ const controller=new AbortController();controller.abort(Error('synthetic verification cancelled'));await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key,{signal:controller.signal}),/synthetic verification cancelled/);
+});
+
+
+test('真实PG：恢复校验在取数组前拒绝小密文配超大搜索词，正常待处理工作仍合法',integration,async t=>{
+ const f=await fixture(t);await f.request('AA');assert.equal((await verifyRestoredRecordingCiphertexts(f.store,f.key)).allVerified,true);await f.backend.schedule();await f.run();const original=await f.store.get('SELECT object_id,search_terms FROM harbor.recording_context_document_parts');assert.equal(original.search_terms.length,1);
+ const get=f.store.get.bind(f.store),all=f.store.all.bind(f.store);let receivedTerms=0;
+ f.store.get=async(...args)=>{const row=await get(...args);if(Array.isArray(row?.terms))receivedTerms+=row.terms.length;return row;};
+ f.store.all=async(...args)=>{const rows=await all(...args);assert.ok(rows.every(row=>!Object.hasOwn(row,'search_terms')),'未校验的搜索数组不得由批读取返回');return rows;};
+ try{
+  await f.store.run('UPDATE harbor.recording_context_document_parts SET search_terms=array_fill($1::bytea,ARRAY[$2::integer]) WHERE object_id=$3',randomBytes(32),Math.floor(f.recordings.maxBytes/32)+1,original.object_id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'storage_operator_application_context_index_capacity'});assert.equal(receivedTerms,0);
+  // A healthy GIN rejects oversized elements before they reach storage. Drop
+  // only this private fixture index to inject a damaged restored column.
+  await f.store.query('DROP INDEX harbor.recording_context_document_search');
+  await f.store.run('UPDATE harbor.recording_context_document_parts SET search_terms=ARRAY[$1::bytea] WHERE object_id=$2',Buffer.alloc(f.recordings.maxBytes+1),original.object_id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'storage_operator_application_context_search_mismatch'});assert.equal(receivedTerms,0);
+ }finally{f.store.get=get;f.store.all=all;}
+ await f.store.run('UPDATE harbor.recording_context_document_parts SET search_terms=$1::bytea[] WHERE object_id=$2',original.search_terms,original.object_id);await f.store.query('CREATE INDEX recording_context_document_search ON harbor.recording_context_document_parts USING GIN(search_terms)');assert.equal((await verifyRestoredRecordingCiphertexts(f.store,f.key)).allVerified,true);
+ await f.store.run('DELETE FROM harbor.recording_context_documents WHERE object_id=$1',original.object_id);await f.store.run('DELETE FROM harbor.recording_context_work WHERE object_id=$1',original.object_id);await assert.rejects(verifyRestoredRecordingCiphertexts(f.store,f.key),{code:'storage_operator_application_context_index_incomplete'});
 });

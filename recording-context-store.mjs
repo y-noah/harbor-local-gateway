@@ -7,6 +7,13 @@ const kinds=new Set(['instruction','history','tool_schema','context']);
 const captureReasons=new Set(requestContextReasons);
 const fail=(status,message,code='recording_context_invalid')=>{throw new AppError(status,message,code);};
 const equal=(a,b)=>Buffer.isBuffer(a)&&Buffer.isBuffer(b)&&a.length===b.length&&timingSafeEqual(a,b);
+function normalizedCoverage(coverage){
+   if(coverage!==null){
+    if(!coverage||typeof coverage!=='object'||Array.isArray(coverage)||Object.keys(coverage).some(key=>!['state','reasons','opaqueReasoningExcluded'].includes(key))||!['complete','incomplete'].includes(coverage.state)||!Array.isArray(coverage.reasons)||coverage.reasons.length>captureReasons.size||coverage.reasons.some(reason=>!captureReasons.has(reason))||!Number.isSafeInteger(coverage.opaqueReasoningExcluded)||coverage.opaqueReasoningExcluded<0||coverage.state==='complete'&&coverage.reasons.length||coverage.state==='incomplete'&&!coverage.reasons.length)fail(400,'上下文采集覆盖信息无效');
+    coverage={state:coverage.state,reasons:[...new Set(coverage.reasons)].sort(),opaqueReasoningExcluded:coverage.opaqueReasoningExcluded};
+   }
+ return coverage;
+}
 // Each component is JSON, split only at UTF-8 boundaries. The source passed to
 // this repository is already filtered; this second boundary remains defensive.
 function chunks(bytes,limit){const result=[];for(let start=0;start<bytes.length;){let end=Math.min(start+limit,bytes.length);if(end<bytes.length)while(end>start&&(bytes[end]&0xc0)===0x80)end--;result.push(bytes.subarray(start,end));start=end;}return result;}
@@ -56,10 +63,7 @@ export class RecordingContextStore{
   }
  }
  async writeSnapshot(requestId,components,{coverage=null}={}){
-   if(coverage!==null){
-    if(!coverage||typeof coverage!=='object'||Array.isArray(coverage)||Object.keys(coverage).some(key=>!['state','reasons','opaqueReasoningExcluded'].includes(key))||!['complete','incomplete'].includes(coverage.state)||!Array.isArray(coverage.reasons)||coverage.reasons.length>captureReasons.size||coverage.reasons.some(reason=>!captureReasons.has(reason))||!Number.isSafeInteger(coverage.opaqueReasoningExcluded)||coverage.opaqueReasoningExcluded<0||coverage.state==='complete'&&coverage.reasons.length||coverage.state==='incomplete'&&!coverage.reasons.length)fail(400,'上下文采集覆盖信息无效');
-    coverage={state:coverage.state,reasons:[...new Set(coverage.reasons)].sort(),opaqueReasoningExcluded:coverage.opaqueReasoningExcluded};
-   }
+  coverage=normalizedCoverage(coverage);
   const prepared=this.#prepare(components);
    if(coverage?.state==='incomplete'&&prepared.state==='complete')prepared.state=coverage.reasons.includes('size_limit')?'truncated':'partial';
   return this.store.transaction(async()=>{
@@ -177,34 +181,63 @@ export class RecordingContextStore{
  }
  async readObject(objectId){
   if(typeof objectId!=='string'||!objectId||objectId.length>200)fail(400,'上下文对象标识无效');
-  const {object,scope,rows}=await this.store.transaction(async()=>{
+  const {object,rows}=await this.store.transaction(async()=>{
    const object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1',objectId);
    if(!object)fail(404,'上下文对象不存在','recording_context_missing');
    const source=await this.#liveSource(object);
    if(!source)fail(410,'上下文对象已无有效来源','recording_context_expired');
    const scope=this.#digest('scope',JSON.stringify([source.member_id,source.session_id?['session',source.session_id]:['request',source.id]]));
    if(!equal(scope,object.scope_digest)||object.key_version!==this.keyVersion)fail(503,'上下文对象归属或密钥不一致','recording_context_scope');
+   const rows=await this.#objectRows(object);
+   return {object,rows};
+  },{level:'REPEATABLE READ',readOnly:true});
+   // Release the database connection before decrypting/decoding the bounded
+   // object. Derived writes subsequently recheck its source under locks.
+   return this.#decodeObject(object,rows);
+ }
+ async #objectRows(object){
    if(object.state!=='complete')fail(503,'上下文对象尚不完整','recording_context_incomplete');
-   const shape=await this.store.get('SELECT COUNT(*) parts,COALESCE(SUM(bytes),0) bytes,COALESCE(SUM(octet_length(content_cipher)),0) cipher_bytes,MAX(ordinal) last FROM harbor.recording_context_parts WHERE object_id=$1',objectId);
+   const shape=await this.store.get('SELECT COUNT(*) parts,COALESCE(SUM(bytes),0) bytes,COALESCE(SUM(octet_length(content_cipher)),0) cipher_bytes,MAX(ordinal) last FROM harbor.recording_context_parts WHERE object_id=$1',object.id);
    // The smallest supported part is 256 bytes; UTF-8 alignment can retreat
    // three bytes. Do not assume the reader uses the writer's partBytes.
    if(!Number.isSafeInteger(object.bytes)||object.bytes>this.maxSnapshotBytes||object.parts>Math.ceil(this.maxSnapshotBytes/(256-3))+1||Number(shape.cipher_bytes)>this.maxSnapshotBytes+28*object.parts)fail(503,'上下文对象超过读取预算','recording_context_capacity');
    if(shape.parts!==object.parts||shape.last!==object.parts||Number(shape.bytes)!==object.bytes)fail(503,'上下文对象分块缺失','recording_context_incomplete');
-   const rows=await this.store.all('SELECT ordinal,bytes,content_cipher FROM harbor.recording_context_parts WHERE object_id=$1 ORDER BY ordinal',objectId);
-   return {object,scope,rows};
-  },{level:'REPEATABLE READ',readOnly:true});
-   // Release the database connection before decrypting/decoding the bounded
-   // object. Derived writes subsequently recheck its source under locks.
+   const rows=await this.store.all('SELECT ordinal,bytes,content_cipher FROM harbor.recording_context_parts WHERE object_id=$1 ORDER BY ordinal',object.id);
+   return rows;
+ }
+ #decodeObject(object,rows){
    const parts=[];
    for(const [index,row] of rows.entries()){
     if(row.ordinal!==index+1)fail(503,'上下文对象分块顺序无效','recording_context_incomplete');
-    const plain=this.#open(row.content_cipher,objectId,row.ordinal,scope);
+    const plain=this.#open(row.content_cipher,object.id,row.ordinal,object.scope_digest);
     if(plain.length!==row.bytes)fail(503,'上下文对象分块长度不一致','recording_context_incomplete');parts.push(plain);
    }
    const bytes=Buffer.concat(parts);
-   if(!equal(this.#digest('object:'+scope.toString('hex'),Buffer.concat([Buffer.from(object.kind+'\0'),bytes])),object.fingerprint))fail(503,'上下文对象指纹不一致','recording_context_unreadable');
+   if(!equal(this.#digest('object:'+object.scope_digest.toString('hex'),Buffer.concat([Buffer.from(object.kind+'\0'),bytes])),object.fingerprint))fail(503,'上下文对象指纹不一致','recording_context_unreadable');
    let content;try{content=JSON.parse(bytes.toString('utf8'));}catch{fail(503,'上下文对象格式无效','recording_context_unreadable');}
-   return {objectId,kind:object.kind,content,bytes:object.bytes,keyVersion:object.key_version,fingerprint:object.fingerprint,scopeDigest:scope};
+   return {objectId:object.id,kind:object.kind,content,bytes:object.bytes,keyVersion:object.key_version,fingerprint:object.fingerprint,scopeDigest:object.scope_digest};
+ }
+
+ // Offline recovery verification returns counts only, never expired plaintext.
+ // Callers verify the restored schema and keep this clone quiescent.
+ async verifyStoredObjects({signal}={}){
+  let after='',objects=0,parts=0,snapshots=0,references=0;
+  for(;;){signal?.throwIfAborted();const rows=await this.store.all('SELECT * FROM harbor.recording_context_objects WHERE id>$1 ORDER BY id LIMIT 8',after);
+   for(const object of rows){signal?.throwIfAborted();if(object.key_version!==this.keyVersion||!Buffer.isBuffer(object.scope_digest)||object.scope_digest.length!==32)fail(503,'恢复上下文密钥或作用域无效','recording_context_unreadable');this.#decodeObject(object,await this.#objectRows(object));objects++;parts+=object.parts;after=object.id;}if(rows.length<8)break;
+  }
+  after='';
+  for(;;){signal?.throwIfAborted();const rows=await this.store.all('SELECT * FROM harbor.recording_context_snapshots WHERE request_id>$1 ORDER BY request_id LIMIT 8',after);
+   for(const snapshot of rows){signal?.throwIfAborted();const authority=await this.#authority(snapshot.request_id);
+    if(snapshot.components>this.maxComponents||snapshot.bytes>this.maxSnapshotBytes||snapshot.member_id!==authority.member_id||snapshot.session_id!==authority.session_id||snapshot.key_version!==this.keyVersion||!equal(snapshot.scope_digest,authority.scope))fail(503,'恢复上下文引用归属无效','recording_context_scope');
+    await this.#validateSnapshot(snapshot);
+    const refs=await this.store.all('SELECT ref.ordinal,ref.truncated,o.fingerprint FROM harbor.recording_context_references ref JOIN harbor.recording_context_objects o ON o.id=ref.object_id WHERE ref.request_id=$1 ORDER BY ref.ordinal',snapshot.request_id);
+    let coverage;try{coverage=normalizedCoverage(snapshot.coverage);}catch{fail(503,'恢复上下文覆盖信息无效','recording_context_unreadable');}
+    const fingerprint=this.#digest('snapshot',JSON.stringify({state:snapshot.state,coverage,seen:snapshot.seen,objects:refs.map(ref=>[ref.fingerprint.toString('hex'),ref.truncated])}));
+    if(!equal(fingerprint,snapshot.fingerprint)||snapshot.reason!==(snapshot.state==='truncated'?'size_limit':snapshot.state==='partial'?'capture_incomplete':null))fail(503,'恢复上下文快照指纹无效','recording_context_unreadable');
+    snapshots++;references+=refs.length;after=snapshot.request_id;
+   }if(rows.length<8)break;
+  }
+  return {objects,parts,snapshots,references};
  }
  async gc({limit=100}={}){
   if(!Number.isInteger(limit)||limit<1||limit>1000)fail(400,'上下文清理批次无效');
