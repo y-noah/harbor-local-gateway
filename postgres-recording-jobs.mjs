@@ -2,10 +2,13 @@ import {randomUUID,createHash} from 'node:crypto';
 import {statfs} from 'node:fs/promises';
 import {AppError,usageWindow} from './store.mjs';
 import {RecordingStore} from './recording-store.mjs';
+import {RecordingContextStore} from './recording-context-store.mjs';
 import {createPostgresJobs} from './postgres-jobs.mjs';
 import {createRecordingIndexCrypto,assembleRecording,recordingParts} from './recording-search-index.mjs';
 import {createPostgresRecordingQueries,recordingQuery} from './postgres-recording-query.mjs';
 import {createPostgresRecordingExports} from './postgres-recording-export.mjs';
+import {createPostgresRecordingContextJobs} from './postgres-recording-context-jobs.mjs';
+import {createPostgresRecordingContextQueries} from './postgres-recording-context-query.mjs';
 
 const fail=(status,message,code='recording_jobs_invalid')=>{throw new AppError(status,message,code);};
 const stop=signal=>{if(signal?.aborted)fail(503,'正文后台任务已停止','worker_stopping');};
@@ -21,10 +24,15 @@ export function createRecordingStoragePolicy({paths=[],probe,clock=Date.now,cach
     }catch{return cached={checked,status:'unknown',captureAllowed:false,exportAllowed:false,min_free_bytes:null,min_free_ratio:null};}
   })().finally(()=>{pending=null;});};
 }
-export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store),recordingKey,clock=Date.now,queryQueue,readStore=store,storagePolicy,storagePaths,storageProbe,devices=false,indexBatch=32,maxEvents=8192,maxEventBytes=4194304,maxDocumentBytes=2097152,partChars=2048,purgeBatch=32,exports:exportOptions={},queries:queryOptions={}}={}){
+export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store),recordingKey,clock=Date.now,queryQueue,readStore=store,storagePolicy,storagePaths,storageProbe,devices=false,contextIndex=false,contextStorage=false,indexBatch=32,maxEvents=8192,maxEventBytes=4194304,maxDocumentBytes=2097152,partChars=2048,purgeBatch=32,exports:exportOptions={},queries:queryOptions={}}={}){
+  if(typeof contextIndex!=='boolean'||typeof contextStorage!=='boolean')fail(503,'上下文索引能力配置无效','recording_jobs_configuration');
   if(typeof devices!=='boolean'||!Number.isInteger(indexBatch)||indexBatch<1||indexBatch>256||!Number.isInteger(maxEvents)||maxEvents<1||maxEvents>65536||!Number.isSafeInteger(maxEventBytes)||maxEventBytes<1024||maxEventBytes>16777216||!Number.isSafeInteger(maxDocumentBytes)||maxDocumentBytes<1024||maxDocumentBytes>8388608||!Number.isInteger(partChars)||partChars<256||partChars>8192||!Number.isInteger(purgeBatch)||purgeBatch<1||purgeBatch>256)fail(503,'正文后台资源配置无效','recording_jobs_configuration');
   const crypto=createRecordingIndexCrypto(recordingKey),recordings=new RecordingStore(store,{encryptionKey:recordingKey,clock}),policy=storagePolicy||createRecordingStoragePolicy({paths:storagePaths,probe:storageProbe,clock});
   const queries=createPostgresRecordingQueries(readStore,{...queryOptions,crypto,clock,queryQueue,devices}),exporter=createPostgresRecordingExports(store,{...exportOptions,jobs,crypto,recordings,clock,storagePolicy:policy,queryQueue,devices});
+  const contextQueries=contextIndex?createPostgresRecordingContextQueries(readStore,{...queryOptions,crypto,clock,queryQueue,devices}):null;
+  const contextJobs=contextIndex?createPostgresRecordingContextJobs(store,{jobs,recordingKey,crypto,clock,indexBatch,maxDocumentBytes,partChars}):null;
+  const storedContexts=!contextJobs&&contextStorage?new RecordingContextStore(store,{encryptionKey:recordingKey,clock}):null;
+  const contextGc=contextJobs?.gc??(storedContexts?options=>storedContexts.gc(options):null);
   async function schedule(){
     const at=await jobs.now();
     // Rebuilding a changed key is explicit in status; only derived encrypted
@@ -34,6 +42,7 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
     const rows=await store.all('SELECT request_id,revision FROM harbor.recording_work WHERE revision>indexed_revision AND last_error IS NULL ORDER BY changed,request_id LIMIT $1',indexBatch);
     for(const row of rows){const id='recording.index:'+createHash('sha256').update(row.request_id+':'+row.revision).digest('hex'),result=await jobs.enqueue('recording.index',{id,target:row.request_id,payload:{request_id:row.request_id,revision:row.revision}});if(!result.created){const task=await store.get('SELECT status FROM harbor.background_jobs WHERE id=$1',id);if(['failed','cancelled'].includes(task?.status))await store.run("UPDATE harbor.recording_work SET last_error='index_attempts_exhausted' WHERE request_id=$1 AND revision=$2 AND revision>indexed_revision",row.request_id,row.revision);}}
     await jobs.enqueue('recording.purge',{id:'recording.purge:'+Math.floor(at/60000),payload:{}});
+    if(contextJobs)await contextJobs.schedule();
     return {scheduled:rows.length};
   }
   async function organize(job,{signal}={}){
@@ -76,11 +85,12 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
       await store.run("UPDATE harbor.recording_retention_plans SET status='cancelled' WHERE status='preview' AND expires<=$1",clock());
       await store.run("DELETE FROM harbor.recording_retention_items WHERE (plan_id,request_id) IN (SELECT i.plan_id,i.request_id FROM harbor.recording_retention_items i JOIN harbor.recording_retention_plans p ON p.id=i.plan_id WHERE p.status IN ('complete','cancelled') AND p.expires<=$1 ORDER BY i.plan_id,i.request_id LIMIT $2)",clock(),purgeBatch*8);
     });
+    if(contextGc)for(let batch=0;batch<purgeBatch;batch++){stop(signal);const result=await jobs.owned(job,()=>contextGc({limit:purgeBatch}));if(result.cycleComplete)break;}
     return {expired_recordings:requests,expired_exports:exports};
   }
-  async function status(){const row=await readStore.get('SELECT COUNT(*) pending,COUNT(*) FILTER(WHERE last_error IS NOT NULL) failed,MIN(changed) oldest FROM harbor.recording_work WHERE revision>indexed_revision'),disk=await policy();return {index_pending:row.pending,index_failed:row.failed,oldest_pending_at:row.oldest,storage:disk,key_version:crypto.keyVersion,queryable_days:365,default_query_window:'seven_beijing_calendar_days'};}
+  async function status(){const row=await readStore.get('SELECT COUNT(*) pending,COUNT(*) FILTER(WHERE last_error IS NOT NULL) failed,MIN(changed) oldest FROM harbor.recording_work WHERE revision>indexed_revision'),disk=await policy();return {index_pending:row.pending,index_failed:row.failed,oldest_pending_at:row.oldest,...(contextJobs?await contextJobs.status():{}),storage:disk,key_version:crypto.keyVersion,queryable_days:365,default_query_window:'seven_beijing_calendar_days'};}
   async function indexHandler(job,context){try{return await organize(job,context);}catch(error){if(['recording_index_capacity','recording_unreadable','recording_index_unreadable'].includes(error.code))await jobs.owned(job,()=>store.run('UPDATE harbor.recording_work SET last_error=$1 WHERE request_id=$2 AND revision=$3',error.code,job.target,job.payload.revision));throw error;}}
-  async function rebuild(payload){if(!payload||Object.keys(payload).some(key=>key!=='request_id')||typeof payload.request_id!=='string'||!idPattern.test(payload.request_id))fail(400,'请选择需要重新整理的请求');const result=await store.run('UPDATE harbor.recording_work SET revision=revision+1,last_error=NULL,changed=$1 WHERE request_id=$2',clock(),payload.request_id);if(!result.changes)fail(404,'请求正文不存在');return {request_id:payload.request_id,status:'pending'};}
+  async function rebuild(payload){if(!payload||Object.keys(payload).some(key=>key!=='request_id')||typeof payload.request_id!=='string'||!idPattern.test(payload.request_id))fail(400,'请选择需要重新整理的请求');return store.transaction(async()=>{const result=await store.run('UPDATE harbor.recording_work SET revision=revision+1,last_error=NULL,changed=$1 WHERE request_id=$2',clock(),payload.request_id);if(!result.changes)fail(404,'请求正文不存在');if(contextJobs)await contextJobs.rebuild(payload.request_id);return {request_id:payload.request_id,status:'pending'};});}
   async function retentionPreview(days){
     if(!Number.isInteger(days)||days<1||days>365)fail(400,'正文保留期须为1至365天');
     return store.transaction(async()=>{
@@ -126,6 +136,7 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
     if(typeof planId!=='string'||!/^[a-f0-9-]{36}$/.test(planId))fail(404,'保留期计划不存在');const at=clock(),window=usageWindow(at),plan=await readStore.get('SELECT p.id,p.created,p.expires,p.days,p.requests,p.bytes,p.status,p.job_id,p.completed,p.summary,j.status job_status,j.error_code FROM harbor.recording_retention_plans p LEFT JOIN harbor.background_jobs j ON j.id=p.job_id WHERE p.id=$1 AND p.created>=$2 AND p.created<$3',planId,window.start,window.end);if(!plan)fail(404,'保留期计划不存在或超出近7天范围');const rows=await readStore.all('SELECT status,COUNT(*) count FROM harbor.recording_retention_items WHERE plan_id=$1 GROUP BY status',planId);return {...plan,summary:undefined,counts:plan.status==='complete'?plan.summary:Object.fromEntries(rows.map(row=>[row.status,row.count]))};
   }
   async function handle(path,method,payload,params=new URLSearchParams()){
+    if(path==='/api/admin/recordings/context/search'&&method==='GET'&&contextQueries)return {status:200,value:await contextQueries.search(recordingQuery(params,{clock,search:true,devices}))};
     if(path==='/api/admin/recordings/status'&&method==='GET')return {status:200,value:await status()};
     if(path==='/api/admin/recordings/rebuild'&&method==='POST')return {status:202,value:await rebuild(payload)};
     if(path==='/api/admin/recordings/search'&&method==='GET')return {status:200,value:await queries.search(recordingQuery(params,{clock,search:true,devices}))};
@@ -139,5 +150,5 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
     const retention=path.match(/^\/api\/admin\/recordings\/retention\/([a-f0-9-]{36})$/);if(retention&&method==='GET')return {status:200,value:await retentionStatus(retention[1])};
     return null;
   }
-  return {schedule,handlers:{'recording.index':indexHandler,'recording.purge':purge,'recording.retention':retentionExecute,...exporter.handlers},handle,queries,exports:exporter,download:exporter.download,capturePolicy:policy,status,retentionPreview,retentionApply,retentionStatus,rebuild};
+  return {schedule,handlers:{'recording.index':indexHandler,'recording.purge':purge,'recording.retention':retentionExecute,...exporter.handlers,...contextJobs?.handlers},handle,queries,contextQueries,exports:exporter,download:exporter.download,capturePolicy:policy,status,retentionPreview,retentionApply,retentionStatus,rebuild};
 }

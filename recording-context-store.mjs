@@ -131,19 +131,37 @@ export class RecordingContextStore{
  // Internal derived-data reader. It is not exposed as an employee endpoint.
  // A live source authorizes the scope; ciphertext is fetched only after its
  // full size is checked. Workers must recheck source liveness when committing.
- async readObject(objectId){
-  if(typeof objectId!=='string'||!objectId||objectId.length>200)fail(400,'上下文对象标识无效');
-  return this.store.transaction(async()=>{
-   const object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1',objectId);
-   if(!object)fail(404,'上下文对象不存在','recording_context_missing');
-   const source=await this.store.get(`SELECT r.id,r.member_id,r.session_id FROM harbor.recording_context_references ref
+ async #liveSource(object){
+   return this.store.get(`SELECT r.id,r.member_id,r.session_id FROM harbor.recording_context_references ref
     JOIN harbor.recording_context_snapshots s ON s.request_id=ref.request_id
     JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id
     LEFT JOIN harbor.sessions session ON session.id=r.session_id
     WHERE ref.object_id=$1 AND s.scope_digest=$2 AND s.key_version=$3 AND s.member_id=r.member_id
      AND s.session_id IS NOT DISTINCT FROM r.session_id AND r.recording_state<>'expired'
      AND LEAST(s.expires_at,c.expires_at)>$4 AND (r.session_id IS NULL OR session.member_id=r.member_id)
-    ORDER BY r.id LIMIT 1`,objectId,object.scope_digest,object.key_version,this.clock());
+    ORDER BY r.id LIMIT 1`,object.id,object.scope_digest,object.key_version,this.clock());
+ }
+ async withLiveObject(objectId,expected,operation){
+  if(typeof operation!=='function'||!expected||expected.objectId!==objectId||expected.keyVersion!==this.keyVersion||!Buffer.isBuffer(expected.fingerprint)||!Buffer.isBuffer(expected.scopeDigest))fail(503,'上下文派生提交依赖无效','recording_context_configuration');
+  return this.store.transaction(async()=>{
+   let object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1',objectId);
+   if(!object)return {object_id:objectId,expired:true};
+   const source=await this.#liveSource(object);if(!source)return {object_id:objectId,expired:true};
+   // Match capture's source -> scope -> object/work lock order. In particular,
+   // never wait on a recording row while holding the scope GC lock.
+   let authority;try{authority=await this.#authority(source.id,{lock:true});}catch(error){if(error.code==='recording_context_missing')return {object_id:objectId,expired:true};throw error;}await this.#lock(authority.scope);
+   object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1 FOR SHARE',objectId);
+   if(!object||authority.expires_at<=this.clock()||authority.recording_state==='expired'||!await this.#liveSource(object))return {object_id:objectId,expired:true};
+   if(object.state!=='complete'||object.key_version!==expected.keyVersion||!equal(object.scope_digest,expected.scopeDigest)||!equal(authority.scope,expected.scopeDigest)||!equal(object.fingerprint,expected.fingerprint))fail(503,'上下文派生来源已变化','recording_context_scope');
+   return operation(object);
+  });
+ }
+ async readObject(objectId){
+  if(typeof objectId!=='string'||!objectId||objectId.length>200)fail(400,'上下文对象标识无效');
+  const {object,scope,rows}=await this.store.transaction(async()=>{
+   const object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1',objectId);
+   if(!object)fail(404,'上下文对象不存在','recording_context_missing');
+   const source=await this.#liveSource(object);
    if(!source)fail(410,'上下文对象已无有效来源','recording_context_expired');
    const scope=this.#digest('scope',JSON.stringify([source.member_id,source.session_id?['session',source.session_id]:['request',source.id]]));
    if(!equal(scope,object.scope_digest)||object.key_version!==this.keyVersion)fail(503,'上下文对象归属或密钥不一致','recording_context_scope');
@@ -153,7 +171,12 @@ export class RecordingContextStore{
    // three bytes. Do not assume the reader uses the writer's partBytes.
    if(!Number.isSafeInteger(object.bytes)||object.bytes>this.maxSnapshotBytes||object.parts>Math.ceil(this.maxSnapshotBytes/(256-3))+1||Number(shape.cipher_bytes)>this.maxSnapshotBytes+28*object.parts)fail(503,'上下文对象超过读取预算','recording_context_capacity');
    if(shape.parts!==object.parts||shape.last!==object.parts||Number(shape.bytes)!==object.bytes)fail(503,'上下文对象分块缺失','recording_context_incomplete');
-   const rows=await this.store.all('SELECT ordinal,bytes,content_cipher FROM harbor.recording_context_parts WHERE object_id=$1 ORDER BY ordinal',objectId),parts=[];
+   const rows=await this.store.all('SELECT ordinal,bytes,content_cipher FROM harbor.recording_context_parts WHERE object_id=$1 ORDER BY ordinal',objectId);
+   return {object,scope,rows};
+  },{level:'REPEATABLE READ',readOnly:true});
+   // Release the database connection before decrypting/decoding the bounded
+   // object. Derived writes subsequently recheck its source under locks.
+   const parts=[];
    for(const [index,row] of rows.entries()){
     if(row.ordinal!==index+1)fail(503,'上下文对象分块顺序无效','recording_context_incomplete');
     const plain=this.#open(row.content_cipher,objectId,row.ordinal,scope);
@@ -163,7 +186,6 @@ export class RecordingContextStore{
    if(!equal(this.#digest('object:'+scope.toString('hex'),Buffer.concat([Buffer.from(object.kind+'\0'),bytes])),object.fingerprint))fail(503,'上下文对象指纹不一致','recording_context_unreadable');
    let content;try{content=JSON.parse(bytes.toString('utf8'));}catch{fail(503,'上下文对象格式无效','recording_context_unreadable');}
    return {objectId,kind:object.kind,content,bytes:object.bytes,keyVersion:object.key_version,fingerprint:object.fingerprint,scopeDigest:scope};
-  },{level:'REPEATABLE READ',readOnly:true});
  }
  async gc({limit=100}={}){
   if(!Number.isInteger(limit)||limit<1||limit>1000)fail(400,'上下文清理批次无效');
