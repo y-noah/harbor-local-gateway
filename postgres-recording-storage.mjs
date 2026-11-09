@@ -75,7 +75,7 @@ export async function recordingCaptureDecision(enabled,policy=()=>true){
 // infer the cause from a shared last-rejection property.
 export function recordingPolicyBuffer(buffer,monitor){
  const write=(method,args)=>{const snapshot=monitor.snapshot();if(!snapshot.captureAllowed)return Object.freeze({accepted:false,reason:snapshot.status==='low'?'storage_low':'storage_unknown'});const accepted=!!buffer[method](...args);return Object.freeze({accepted,reason:accepted?null:'queue_limit'});};
- return {directory:buffer.directory,startResult:(...args)=>write('start',args),appendResult:(...args)=>write('append',args),start:(...args)=>write('start',args).accepted,append:(...args)=>write('append',args).accepted,finish:(...args)=>buffer.finish(...args)};
+ return {directory:buffer.directory,startResult:(...args)=>write('start',args),appendResult:(...args)=>write('append',args),contextSnapshotResult:(...args)=>write('contextSnapshot',args),start:(...args)=>write('start',args).accepted,append:(...args)=>write('append',args).accepted,contextSnapshot:(...args)=>write('contextSnapshot',args).accepted,finish:(...args)=>buffer.finish(...args)};
 }
 export function recordingBufferWrite(buffer,method,...args){
  const result=typeof buffer[method+'Result']==='function'?buffer[method+'Result'](...args):{accepted:!!buffer[method](...args),reason:'queue_limit'},accepted=result?.accepted===true;

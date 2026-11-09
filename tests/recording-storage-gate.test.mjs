@@ -8,6 +8,14 @@ import {recordingPolicyBuffer,recordingBufferWrite,recordingFinishReason} from '
 import {RecordingBuffer} from '../recording-buffer.mjs';
 import {RecordingStore} from '../recording-store.mjs';
 
+test('context snapshot uses the same per-call storage decision without preventing finish',()=>{
+ let snapshot={captureAllowed:false,status:'low'},calls=[];
+ const raw={directory:'synthetic',contextSnapshot:(...args)=>{calls.push(['context',...args]);return true;},finish:(...args)=>{calls.push(['finish',...args]);return true;}},buffer=recordingPolicyBuffer(raw,{snapshot:()=>snapshot});
+ assert.deepEqual(buffer.contextSnapshotResult('synthetic',[],{state:'complete',reasons:[],opaqueReasoningExcluded:0}),{accepted:false,reason:'storage_low'});assert.deepEqual(calls,[]);
+ snapshot={captureAllowed:false,status:'unknown'};assert.equal(buffer.contextSnapshotResult('synthetic',[],null).reason,'storage_unknown');
+ snapshot={captureAllowed:true,status:'ok'};assert.equal(buffer.contextSnapshotResult('synthetic',[],null).accepted,true);snapshot={captureAllowed:false,status:'low'};assert.equal(buffer.finish('synthetic',{state:'partial'}),true);assert.deepEqual(calls.map(row=>row[0]),['context','finish']);
+});
+
 test('policy outcomes belong to each call and finish still reaches the buffer while capture is forbidden',()=>{
  let snapshot={captureAllowed:false,status:'low'},calls=[];const raw={directory:'synthetic',start:(...args)=>{calls.push(['start',...args]);return true;},append:(...args)=>{calls.push(['append',...args]);return false;},finish:(...args)=>{calls.push(['finish',...args]);return true;}},buffer=recordingPolicyBuffer(raw,{snapshot:()=>snapshot});
  const low=recordingBufferWrite(buffer,'start','one','known');snapshot={captureAllowed:false,status:'unknown'};const unknown=recordingBufferWrite(buffer,'append','two',[]);snapshot={captureAllowed:true,status:'healthy'};const queue=recordingBufferWrite(buffer,'append','three',[]);assert.deepEqual(low,{accepted:false,reason:'storage_low'});assert.deepEqual(unknown,{accepted:false,reason:'storage_unknown'});assert.deepEqual(queue,{accepted:false,reason:'queue_limit'});assert.equal(calls.length,1);assert.equal(calls[0][1],'three');assert.equal(buffer.start('four','known'),true);snapshot={captureAllowed:false,status:'low'};assert.equal(buffer.append('five',[]),false);assert.equal(recordingBufferWrite(buffer,'finish','one',{state:'partial',...recordingFinishReason(low.reason)}).accepted,true);assert.deepEqual(calls.at(-1),['finish','one',{state:'partial',reason:'capture_failed',storageReason:'storage_low'}]);assert.equal(low.reason,'storage_low');assert.equal(unknown.reason,'storage_unknown');assert.equal(buffer.lastReason,undefined);

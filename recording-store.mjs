@@ -12,10 +12,11 @@ const previewCipherBytes=previewCharacters*6+Buffer.byteLength('{"text":""}')+12
 export function consumeRecordingAtomicCommit(receipt,commands,repository){const saved=receipt&&atomicCommits.get(receipt);if(!saved||saved.commands!==commands||saved.repository!==repository)return false;atomicCommits.delete(receipt);return true;}
 const validateTurnState=value=>{if(!['known','uncertain'].includes(value))throw new AppError(400,'本轮识别状态无效');};
 export class RecordingStore{
-  constructor(store,{encryptionKey,retentionDays=30,maxBytes=2*1024*1024,maxEventBytes=128*1024,maxPageBytes=128*1024,clock=Date.now}={}){
+  constructor(store,{encryptionKey,retentionDays=30,maxBytes=2*1024*1024,maxEventBytes=128*1024,maxPageBytes=128*1024,clock=Date.now,contextRepository}={}){
     if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32)throw new AppError(503,'正文加密材料未配置','recording_configuration');
     if(!Number.isInteger(retentionDays)||retentionDays<1||retentionDays>365||!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxEventBytes)||maxEventBytes<256||maxEventBytes>maxBytes||!Number.isSafeInteger(maxPageBytes)||maxPageBytes<256||maxPageBytes>2*1024*1024)throw new AppError(503,'正文保留与容量配置无效','recording_configuration');
-    this.store=store;this.key=Buffer.from(encryptionKey);this.retentionDays=retentionDays;this.maxBytes=maxBytes;this.maxEventBytes=maxEventBytes;this.maxPageBytes=maxPageBytes;this.clock=clock;
+    if(contextRepository!==undefined&&(!contextRepository||contextRepository.store!==store||typeof contextRepository.writeSnapshot!=='function'))throw new AppError(503,'上下文仓储须共用正文事务','recording_configuration');
+    this.store=store;this.key=Buffer.from(encryptionKey);this.retentionDays=retentionDays;this.maxBytes=maxBytes;this.maxEventBytes=maxEventBytes;this.maxPageBytes=maxPageBytes;this.clock=clock;this.contextRepository=contextRepository;
   }
   seal(value,aad){
     const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.key,iv);cipher.setAAD(Buffer.from(aad));
@@ -51,6 +52,10 @@ export class RecordingStore{
     });
   }
   async append(requestId,events){const safe=this.#prepareEvents(events);return this.store.transaction(()=>this.#appendInTransaction(requestId,safe));}
+  async contextSnapshot(requestId,components,coverage){
+    if(!this.contextRepository)throw new AppError(503,'上下文采集尚未启用','recording_context_disabled');
+    return this.contextRepository.writeSnapshot(requestId,components,{coverage});
+  }
   async #appendInTransaction(requestId,safe){
       const row=await this.store.get(`SELECT c.*,r.recording_state FROM harbor.recordings c JOIN harbor.requests r ON r.id=c.request_id WHERE c.request_id=$1 FOR UPDATE OF c,r`,requestId);
       if(!row)throw new AppError(404,'正文采集尚未初始化');
@@ -88,6 +93,7 @@ export class RecordingStore{
       for(const value of values){
         if(value.type==='start'){const turnState=value.turnState===undefined?'uncertain':value.turnState;validateTurnState(turnState);await this.#startInTransaction(value.requestId,turnState,this.clock());}
         else if(value.type==='append')await this.#appendInTransaction(value.requestId,this.#prepareEvents(value.events));
+        else if(value.type==='context')await this.contextSnapshot(value.requestId,value.components,value.coverage);
         else if(value.type==='finish')await this.finish(value.requestId,value.result);
         else if(value.type==='settle')await this.store.finish(value.requestId,value.result,value.at);
         else throw new AppError(503,'正文缓冲命令无效','recording_buffer_invalid');

@@ -65,6 +65,7 @@ export class RecordingBuffer{
   }
   start(requestId,turnState){return this.enqueue({type:'start',requestId,turnState});}
   append(requestId,events){return this.enqueue({type:'append',requestId,events});}
+  contextSnapshot(requestId,components,coverage){if(!this.repository.contextRepository)return false;return this.enqueue({type:'context',requestId,components,coverage});}
   finish(requestId,result){return this.enqueue({type:'finish',requestId,result});}
   settle(requestId,result,at=Date.now()){
     // Only billing facts enter recovery; never store a model response or replay it.
@@ -75,6 +76,7 @@ export class RecordingBuffer{
   async apply(value){
     if(value.type==='start')await this.repository.start(value.requestId,{turnState:value.turnState});
     else if(value.type==='append')await this.repository.append(value.requestId,value.events);
+    else if(value.type==='context')await this.repository.contextSnapshot(value.requestId,value.components,value.coverage);
     else if(value.type==='finish')await this.repository.finish(value.requestId,value.result);
     else if(value.type==='settle')await this.repository.store.finish(value.requestId,value.result,value.at);
     else throw new AppError(503,'正文缓冲命令无效','recording_buffer_invalid');

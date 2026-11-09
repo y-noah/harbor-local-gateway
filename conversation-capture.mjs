@@ -38,7 +38,7 @@ export function currentInput(payload,{maxEvents=256,maxNodes=1024}={}){
 // Custom results can contain Responses input_text parts as well as MCP text
 // parts. Filter adjacent text before any defensive per-value pass, otherwise a
 // credential split across parts can lose its prefix during that first pass.
-function redactToolJson(raw,{maxBytes,maxNodes,onTruncate}){
+function redactToolJson(raw,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMetadata}){
   // The caller already validated the JSON. Locate only typed attachment objects
   // and adjacent text values: other source spans pass unchanged to the existing
   // JSON text redactor, including whitespace and numeric literals.
@@ -46,7 +46,7 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate}){
   const whitespace=()=>{while(/\s/.test(raw[cursor]??'')&&cursor<raw.length)cursor++;};
   const string=()=>{const start=cursor++;while(cursor<raw.length){const char=raw[cursor++];if(char==='\\')cursor++;else if(char==='"')break;}return {start,end:cursor};};
   const value=depth=>{
-    if(--nodes<0||depth>24)throw limit;whitespace();const start=cursor,char=raw[cursor];
+    if(onNodes?.(1)===false||--nodes<0||depth>24)throw limit;whitespace();const start=cursor,char=raw[cursor];
     if(char==='"'){const span=string();return {...span,string:true};}
     if(char==='['){
       cursor++;whitespace();const parts=[];
@@ -57,6 +57,7 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate}){
     if(char==='{'){
       cursor++;whitespace();let type=null,binary=false;const textParts=[],facts={};
       while(raw[cursor]!=='}'){
+        if(onNodes?.(1)===false)throw limit;
         whitespace();const keySpan=string(),key=JSON.parse(raw.slice(keySpan.start,keySpan.end));whitespace();cursor++;
         const child=value(depth+1);
         if(key==='type'&&child.string){const name=JSON.parse(raw.slice(child.start,child.end));if(mediaTypes.has(name)){type=name;binary=true;}else if(!binary)type=name;}
@@ -64,7 +65,7 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate}){
         if(['size','bytes','position','detail'].includes(key)&&child.end-child.start<128){const fact=JSON.parse(raw.slice(child.start,child.end));if(key==='detail'&&['low','high','auto'].includes(fact))facts.detail=fact;else if(Number.isSafeInteger(fact)&&fact>=0)facts[key==='size'?'bytes':key]=fact;}
         whitespace();if(raw[cursor]===','){cursor++;continue;}break;
       }cursor++;
-      if(binary)edits.push({start,end:cursor,replacement:JSON.stringify({type,...facts,content:'[附件数据已省略]'})});
+      if(binary)edits.push({start,end:cursor,replacement:JSON.stringify(attachmentMetadata?attachmentMetadata(JSON.parse(raw.slice(start,cursor))):{type,...facts,content:'[附件数据已省略]'})});
       return {start,end:cursor,...(!binary&&['text','input_text','output_text'].includes(type)?{textParts}:{})};
     }
     while(cursor<raw.length&&!/[\s,\]}]/.test(raw[cursor]))cursor++;return {start,end:cursor};
@@ -74,27 +75,29 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate}){
   for(const edit of edits.sort((a,b)=>a.start-b.start||b.end-a.end)){if(edit.start<position)continue;parts.push(raw.slice(position,edit.start),edit.replacement);position=edit.end;}parts.push(raw.slice(position));
   const filter=new JsonRecordRedactor({onTruncate});return filter.push(parts.join(''))+filter.finish();
 }
-function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,onTruncate,onUnsupported=()=>{}}){
+export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,onTruncate,onUnsupported=()=>{},onNodes,attachmentMetadata}){
   if(typeof value==='string'){
     const prefix=boundedRecordText(value,maxBytes);
     if(/^[\[{]/.test(prefix.trimStart())){
       if(prefix.length!==value.length){onTruncate();return '[工具结构化内容超限，已省略]';}
       let valid=false;try{JSON.parse(value);valid=true;}catch{}
-      if(valid)return redactToolJson(value,{maxBytes,maxNodes,onTruncate});
+      if(valid)return redactToolJson(value,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMetadata});
     }
+    if(onNodes?.(1)===false){onTruncate();return '[已截断]';}
     return sanitizeRecord(value,{maxBytes,onTruncate});
   }
   let nodes=maxNodes,remaining=maxBytes;
   const cut=()=>{onTruncate();return '[已截断]';},text=raw=>{const prefix=boundedRecordText(raw,remaining);remaining-=Buffer.byteLength(prefix);if(prefix.length!==raw.length)onTruncate();return prefix;};
   const visit=(item,depth=0,fragment=false)=>{
-    if(--nodes<0||depth>24||remaining<=0)return cut();
+    if(onNodes?.(1)===false||--nodes<0||depth>24||remaining<=0)return cut();
     if(typeof item==='string')return text(item);
     if(item instanceof ArrayBuffer||ArrayBuffer.isView(item))return {type:'binary',bytes:item.byteLength,content:'[附件数据已省略]'};
     if(Array.isArray(item)){
       const result=[],parts=[],positions=[];
       for(const child of item){if(nodes<=0||remaining<=0){result.push(cut());break;}
-        if(fragment&&(!child||!['text','input_text','output_text',...mediaTypes].includes(child.type)||['text','input_text','output_text'].includes(child.type)&&typeof child.text!=='string')){onUnsupported();result.push({content:'[未支持的工具内容片段已省略]'});nodes--;continue;}
+        if(fragment&&(!child||!['text','input_text','output_text',...mediaTypes].includes(child.type)||['text','input_text','output_text'].includes(child.type)&&typeof child.text!=='string')){if(onNodes?.(1)===false){result.push(cut());break;}onUnsupported();result.push({content:'[未支持的工具内容片段已省略]'});nodes--;continue;}
         if(['text','input_text','output_text'].includes(child?.type)&&typeof child.text==='string'){
+          if(onNodes?.(3)===false){result.push(cut());break;}
           nodes-=3;positions.push([result.length,child.type]);parts.push(text(child.text));result.push(null);
           for(const key in child)if(Object.hasOwn(child,key)&&!['type','text'].includes(key)){onUnsupported();break;}
         }
@@ -104,10 +107,10 @@ function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,onTrunc
       for(let i=0;i<safe.length;i++)result[positions[i][0]]=filteredRecordField({type:positions[i][1]},'text',safe[i]);return result;
     }
     if(item&&typeof item==='object'){
-      if(mediaTypes.has(item.type))return {type:item.type,
+      if(mediaTypes.has(item.type))return attachmentMetadata?attachmentMetadata(item):{type:item.type,
         ...(Number.isSafeInteger(item.size??item.bytes)&&(item.size??item.bytes)>=0?{bytes:item.size??item.bytes}:{}),
         ...(Number.isSafeInteger(item.position)&&item.position>=0?{position:item.position}:{}),...(['low','high','auto'].includes(item.detail)?{detail:item.detail}:{}),content:'[附件数据已省略]'};
-      const result=Object.create(null);for(const key in item){if(!Object.hasOwn(item,key))continue;if(nodes<=0||remaining<=0){result.recording_truncated=cut();break;}
+      const result=Object.create(null);for(const key in item){if(!Object.hasOwn(item,key))continue;if(onNodes?.(1)===false||nodes<=0||remaining<=0){result.recording_truncated=cut();break;}
         const name=boundedRecordText(key,Math.min(remaining,256));remaining-=Buffer.byteLength(name);if(name.length!==key.length){onTruncate();result[name]='[已脱敏]';}else result[name]=visit(item[key],depth+1,key==='content'&&Array.isArray(item[key]));
       }return result;
     }return item;
