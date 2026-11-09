@@ -1,7 +1,7 @@
 """Root-approved same-database PostgreSQL code upgrade; never migrates SQLite."""
 from pathlib import Path
 from types import SimpleNamespace
-import copy,fcntl,hashlib,http.client,importlib.util,json,os,re,stat,time
+import copy,fcntl,hashlib,http.client,importlib.util,json,os,re,stat,time,traceback
 from contextlib import contextmanager
 CONTRACT='harbor-postgres-runtime-upgrade-v1'
 TICKET=Path('/etc/harbor-postgres-runtime-upgrade.json')
@@ -178,9 +178,75 @@ def controller_lock(entry):
   info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'controller lock identity');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);yield
  finally:os.close(fd)
 
+def supervised_upgrade(entry,ticket,operation):
+ # The child keeps both inherited deployment locks and its own session. An SSH
+ # disconnect may stop the CI observer, but cannot abandon a held public entry.
+ root=RELEASES/'runners';root.mkdir(mode=0o700,parents=True,exist_ok=True)
+ run=root/ticket['deploymentId'];run.mkdir(mode=0o700)
+ out=os.open(run/'runner.log',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ pid=os.fork()
+ if pid==0:
+  try:
+   os.setsid();null=os.open('/dev/null',os.O_RDONLY)
+   os.dup2(null,0);os.close(null);os.dup2(out,1);os.dup2(out,2);os.close(out)
+   entry.save_json(run/'process.json',{'pid':os.getpid(),'startTicks':entry.process_ticks(os.getpid()),'deploymentId':ticket['deploymentId']})
+   try:
+    result=operation();entry.save_json(run/'result.json',{'ok':True,'result':result});os._exit(0)
+   except BaseException as error:
+    traceback.print_exc();entry.save_json(run/'result.json',{'ok':False,'errorCategory':type(error).__name__});os._exit(1)
+  except BaseException:traceback.print_exc();os._exit(2)
+ os.close(out)
+ while True:
+  try:_,status=os.waitpid(pid,0);break
+  except InterruptedError:continue
+ need(os.WIFEXITED(status),'upgrade runner exited without a confirmed result; inspect retained release')
+ result=entry.private_json(run/'result.json')
+ need(os.WEXITSTATUS(status)==0 and result.get('ok') is True,'upgrade failed; inspect private runner log and retained release')
+ return result['result']
+
+METADATA_FILES=(Path('/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db'),Path('/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/metadata.db'))
+METADATA_MAX_BYTES=512*1024*1024
+
+@contextmanager
+def metadata_residency(config):
+ enabled=config.get('postgres_metadata_residency',False)
+ need(type(enabled) is bool,'metadata residency must be a root boolean')
+ if not enabled:
+  yield;return
+ import ctypes,resource
+ lib=ctypes.CDLL(None,use_errno=True)
+ lib.mmap.restype=ctypes.c_void_p;lib.mmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_long]
+ lib.mlock.argtypes=[ctypes.c_void_p,ctypes.c_size_t];lib.munmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t]
+ files=[];sizes=[];mappings=[];previous=resource.getrlimit(resource.RLIMIT_MEMLOCK);changed=False
+ try:
+  total=0
+  for path in METADATA_FILES:
+   for parent in path.parents:
+    info=parent.lstat();need(stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'metadata parent is not root controlled')
+   fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK);files.append(fd);info=os.fstat(fd)
+   need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and info.st_nlink==1 and not info.st_mode&0o022 and info.st_size>0,'metadata file is not root controlled')
+   total+=info.st_size;need(total<=METADATA_MAX_BYTES,'metadata residency exceeds memory budget');sizes.append(info.st_size)
+  resource.setrlimit(resource.RLIMIT_MEMLOCK,(METADATA_MAX_BYTES,METADATA_MAX_BYTES));changed=True
+  for fd,size in zip(files,sizes):
+   need(os.fstat(fd).st_size==size,'metadata size changed before mapping')
+   # This is a read-only performance aid, never a database snapshot or proof.
+   # Kernel releases all mappings on process exit, including abnormal exit.
+   ptr=lib.mmap(None,size,1,1,fd,0)
+   if ptr==ctypes.c_void_p(-1).value:raise OSError(ctypes.get_errno(),'metadata mapping failed')
+   mappings.append((ptr,size))
+   if lib.mlock(ptr,size)!=0:raise OSError(ctypes.get_errno(),'metadata residency failed')
+  yield
+ finally:
+  for ptr,size in reversed(mappings):lib.munmap(ptr,size)
+  for fd in reversed(files):os.close(fd)
+  if changed:resource.setrlimit(resource.RLIMIT_MEMLOCK,previous)
+
+def run_with_metadata_residency(image,config,api,ticket,entry):
+ with metadata_residency(config):return run_upgrade(image,config,api,ticket,entry)
+
 def deploy(image,config,archive,api):
  need(archive is None,'installed CI image required');ticket=validate_ticket(private_json(TICKET),image,config);verify_installed_tools(ticket);entry=load(api['ENTRY_HELPER'],'runtime_upgrade_entry')
- with controller_lock(entry):return run_upgrade(image,config,api,ticket,entry)
+ with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry))
 
 def run_upgrade(image,config,api,ticket,entry):
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
@@ -188,6 +254,8 @@ def run_upgrade(image,config,api,ticket,entry):
  active,original,gateway=entry.active_record();worker=api['inspect_container'](api['NAME']+'-worker');verify_source(ticket,active,gateway,worker);check_storage(ticket)
  pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout};common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);proof=pg.image_proof(pg_api,image,common)
  need(all(proof[k]==ticket[v] for k,v in [('database_digest','databaseDigest'),('schema_digest','schemaDigest'),('device_ca_digest','deviceCaDigest')]),'new image changed database/schema/device identity')
+ pg.container_shutdown(pg_api,gateway,'gateway');pg.container_shutdown(pg_api,worker,'worker')
+ pg_api['source_image_preflight']=pg.prepare_source_image_preflights(pg_api,[(gateway,'gateway'),(worker,'worker')],common)
  network_snapshot(ticket,entry,gateway,worker)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
  context=SimpleNamespace(config=original,state=entry.private_json(entry.STATE));entry.EntryDeployment.enter_probe_worker(context);entry.EntryDeployment.allow_probe_worker(context)
@@ -222,6 +290,19 @@ def run_upgrade(image,config,api,ticket,entry):
   if not commit_started and not (gate_attempted and gate is None):
    old_gateway=api['inspect_container'](api['NAME']);old_worker=api['inspect_container'](api['NAME']+'-worker')
    verify_source(ticket,entry.private_json(entry.ACTIVE),old_gateway,old_worker)
+   if not gate_attempted:
+    # Before gate installation no composition operation has run. Readiness must
+    # not depend on the public admission path that is currently held.
+    # Check the exact unchanged PG pair via its private candidate bridge, then
+    # release admission without rebuilding networking or replaying deployment.
+    state=entry.private_json(entry.STATE);runtime=state.get('activeRuntimeConfig')
+    need(state.get('phase')=='activated' and runtime and state.get('candidate')==active.get('candidate'),'unchanged entry runtime required')
+    entry.verify_resources(state,runtime);network_snapshot(ticket,entry,old_gateway,old_worker)
+    need(entry.candidate_slot_ready(runtime['bridge']['address'],8092),'unchanged candidate is not ready')
+    control=entry.entry_state();need(control.get('slot')=='candidate' and control.get('phase') in ['active','holding','drained'],'unchanged entry control required')
+    if control['phase']!='active':entry.entry_state('resume',control['epoch'])
+    record.update(phase='rolled-back-pg',errorCategory='before_composition');entry.save_json(path/'release.json',record)
+    raise
    old_approval=active['approval'];pg.verify_started_composition({**pg_api,'http_code':lambda port,p,headers=None:probe(entry,ticket,old_gateway,port,p,headers)},ticket['from']['image'],config,int(time.time()*1000),old_approval)
    # Restarted PG containers have new veths. Rebind only the exact approved
    # restored pair and infrastructure before the existing guarded rebuild.

@@ -1,5 +1,6 @@
 """Fixed PostgreSQL deployment composition; invoked only by the root-owned wrapper."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -23,6 +24,10 @@ class ShutdownUnconfirmed(RuntimeError):
     pass
 
 class ShutdownContractUnsupported(ValueError):
+    pass
+
+class SourcePreflightRejected(RuntimeError):
+    # This failure is raised only before deploy mutates the source composition.
     pass
 
 def shutdown_configuration(value=None):
@@ -238,6 +243,9 @@ def image_proof_content(api,image,common):
             try:api['docker'](*(['rm',check_name] if stopped else ['rm','-f',check_name]),check=False,timeout=10)
             except subprocess.TimeoutExpired:
                 if not (completed and stopped):raise
+    return validate_image_proof(value,image,common)
+
+def validate_image_proof(value,image,common):
     if not isinstance(value,dict) or value.get('contract')!=CONTRACT or value.get('extra_usage_dispatch_contract')!=EXTRA_USAGE_DISPATCH_CONTRACT or value.get('storage_verified') is not True or value.get('credentials_verified') is not True or value.get('device_tls_verified') is not True or value.get('revision')!=image.rsplit(':',1)[-1] or any(not isinstance(value.get(key),str) or not re.fullmatch('[a-f0-9]{64}',value[key]) for key in ['schema_digest','database_digest','source_digest','device_ca_digest']):raise ValueError('Candidate PostgreSQL preflight proof is invalid')
     requested={key:int(next(item.split('=',1)[1] for item in common if item.startswith(name+'='))) for key,name in SHUTDOWN_ENV.items()}
     if 'shutdown' not in value:raise ShutdownContractUnsupported('Validated legacy PostgreSQL image has no shutdown contract')
@@ -253,6 +261,70 @@ def image_proof(api,image,common):
     except Exception as error:
         record_shutdown_diagnostic(api['STACK'],[{'image_role':'postgres-candidate','outcome':'unknown','reason':'image_proof_unavailable'}])
         raise ShutdownUnconfirmed('PostgreSQL capability or runtime proof unavailable') from error
+
+def source_preflight_material_identity(stack):
+    root=Path(stack);names=['secrets/postgres.env','secrets/postgres-report.key','secrets/postgres-ca.crt','secrets/device/server.key','secrets/device/server.pem','secrets/device/ca.key','secrets/device/ca.pem','pg-data/key-encryption.key','pg-data/recording-encryption.key','pg-data/settings.json']
+    names += [name for name in ['secrets/postgres-client.crt','secrets/postgres-client.key'] if os.path.lexists(root/name)]
+    result=[]
+    for name in names:
+        fd=os.open(root/name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as file:
+            before=os.fstat(file.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size>65536:raise ShutdownUnconfirmed('Source preflight material is invalid')
+            raw=file.read(65537);after=os.fstat(file.fileno())
+            identity=lambda row:(row.st_dev,row.st_ino,row.st_uid,row.st_mode,row.st_size,row.st_mtime_ns,row.st_ctime_ns)
+            if len(raw)>65536 or identity(before)!=identity(after):raise ShutdownUnconfirmed('Source preflight material changed')
+            result.append((name,identity(after),hashlib.sha256(raw).digest()))
+    return tuple(result)
+
+def running_source_image_proof(api,instance,common):
+    # The existing source runs the same full verifier, including fresh signed
+    # storage reports, credentials and device state. No new probe container.
+    expected={}
+    for index,item in enumerate(common[:-1]):
+        if item=='--env-file':
+            for line in Path(common[index+1]).read_text().splitlines():
+                if line and not line.startswith('#'):
+                    key,_,value=line.partition('=');expected[key]=value
+        elif item=='--env':
+            key,_,value=common[index+1].partition('=');expected[key]=value
+    environment=dict(item.split('=',1) for item in instance.get('Config',{}).get('Env',[]) if '=' in item)
+    if not expected.get('HARBOR_DATABASE_URL') or environment.get('HARBOR_DATABASE_URL')!=expected['HARBOR_DATABASE_URL']:
+        # A changed connection must use the original isolated check with the
+        # requested environment; never send connection credentials as argv.
+        return image_proof(api,instance['Config']['Image'],common)
+    overrides={key:expected.get(key) for key in ['HARBOR_RECORDING_STORAGE_MODE','HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES','HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO','HARBOR_RECORDING_CONTEXT_ENABLED']}
+    overrides.update({key:value for key,value in expected.items() if key!='HARBOR_DATABASE_URL'})
+    timeout=preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30))
+    program="import {postgresPreflight} from '/app/ci/postgres-preflight.mjs';const env={...process.env};for(const [key,value] of Object.entries(JSON.parse(process.argv[1]))){if(value===null)delete env[key];else env[key]=value;}const deadline=setTimeout(()=>{console.error('Source runtime preflight timed out');process.exit(1);},SOURCE_TIMEOUT_MS);try{console.log(JSON.stringify(await postgresPreflight({env})));}catch{console.error('Source runtime preflight failed');process.exitCode=1;}finally{clearTimeout(deadline);}".replace('SOURCE_TIMEOUT_MS',str(timeout*1000))
+    try:
+        result=api['docker']('exec',instance['Id'],'node','--input-type=module','-e',program,json.dumps(overrides),timeout=timeout)
+        return validate_image_proof(json.loads(result.stdout),instance['Config']['Image'],common)
+    except (ShutdownUnconfirmed,ShutdownContractUnsupported):raise
+    except Exception as error:raise ShutdownUnconfirmed('Fresh source runtime proof unavailable') from error
+
+def prepare_source_image_preflights(api,sources,common):
+    # Only the same locked upgrade process receives this closure. Never persist
+    # or accept a caller-supplied proof; changes reject before stopping a member.
+    materials=source_preflight_material_identity(api['STACK']);proofs={};bindings={}
+    for instance,role in sources:
+        values=container_shutdown(api,instance,role)
+        if values is None:raise ShutdownUnconfirmed('Source shutdown contract requires controlled maintenance')
+        requested=[next((label+'='+str(values[key]) for key,label in SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
+        image=instance['Config']['Image'];image_id=instance['Image'];key=(image,image_id,tuple(requested))
+        if (image_inspection(api,image,[]) or {}).get('Id')!=image_id:raise ShutdownUnconfirmed('Source preflight image changed')
+        if key not in proofs:proofs[key]=image_proof(api,image,requested)
+        bindings[instance['Id']]=key
+    if source_preflight_material_identity(api['STACK'])!=materials:raise ShutdownUnconfirmed('Source preflight material changed')
+    def verified(instance,requested):
+        try:
+            key=(instance.get('Config',{}).get('Image'),instance.get('Image'),tuple(requested))
+            if bindings.get(instance.get('Id'))!=key or source_preflight_material_identity(api['STACK'])!=materials or (image_inspection(api,key[0],[]) or {}).get('Id')!=key[1]:raise ShutdownUnconfirmed('Prepared source preflight identity changed')
+            fresh=running_source_image_proof(api,instance,requested)
+            if any(fresh.get(name)!=proofs[key].get(name) for name in ['contract','revision','source_digest','schema_digest','database_digest','device_ca_digest','shutdown']):raise ShutdownUnconfirmed('Source runtime proof changed')
+            return fresh
+        except Exception as error:raise SourcePreflightRejected('Source preflight rejected before composition change') from error
+    return verified
 
 def marker(stack,proof):
     path=Path(stack)/'postgres-storage.json'
@@ -451,7 +523,7 @@ def deploy(image,config,archive,api):
         previous=None
         if instance and not sqlite:
             old_common=[next((label+'='+str(values[key]) for key,label in SHUTDOWN_ENV.items() if values is not None and item.startswith(label+'=')),item) for item in common]
-            try:previous=image_proof(api,instance['Config']['Image'],old_common)
+            try:previous=api['source_image_preflight'](instance,old_common) if 'source_image_preflight' in api else image_proof(api,instance['Config']['Image'],old_common)
             except ShutdownContractUnsupported as error:
                 if instance.get('State',{}).get('Running'):raise ShutdownUnconfirmed('Running legacy shutdown contract requires controlled maintenance') from error
         old_proofs.append(previous)

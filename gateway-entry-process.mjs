@@ -11,7 +11,8 @@ const failure=code=>Object.assign(new Error(code),{code});
 const keys=(value,allowed)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(key=>allowed.includes(key));
 const socketPath=value=>typeof value==='string'&&value===resolve(value)&&!value.includes('\0')&&Buffer.byteLength(value)<108;
 export function validateGatewayEntryProcessConfig(value){
- if(!keys(value,['listenPort','slots','initialSlot','limits','shutdownTimeoutMs'])||!Number.isInteger(value.listenPort)||value.listenPort<1024||value.listenPort>65535||!keys(value.slots,['legacy','candidate'])||!socketPath(value.slots.legacy)||!socketPath(value.slots.candidate)||value.slots.legacy===value.slots.candidate||!['legacy','candidate'].includes(value.initialSlot)||!Number.isSafeInteger(value.shutdownTimeoutMs)||value.shutdownTimeoutMs<1||value.shutdownTimeoutMs>2147483647)throw failure('entry_config_invalid');
+ if(!keys(value,['listenPort','slots','initialSlot','limits','shutdownTimeoutMs','drainTimeoutMs'])||!Number.isInteger(value.listenPort)||value.listenPort<1024||value.listenPort>65535||!keys(value.slots,['legacy','candidate'])||!socketPath(value.slots.legacy)||!socketPath(value.slots.candidate)||value.slots.legacy===value.slots.candidate||!['legacy','candidate'].includes(value.initialSlot)||!Number.isSafeInteger(value.shutdownTimeoutMs)||value.shutdownTimeoutMs<1||value.shutdownTimeoutMs>2147483647)throw failure('entry_config_invalid');
+ if(value.drainTimeoutMs!==undefined&&(!Number.isSafeInteger(value.drainTimeoutMs)||value.drainTimeoutMs<1||value.drainTimeoutMs>120000))throw failure('entry_config_invalid');
  // Delegate all admission-policy validation to the existing factory.
  const probe=createGatewayEntry({route:{socketPath:value.slots[value.initialSlot]},limits:value.limits});
  probe.server.removeAllListeners();
@@ -69,11 +70,11 @@ export async function createGatewayEntryProcess({config,controlPath=gatewayEntry
   const valid=keys(command,['command','expectedEpoch','slot'])&&['hold','drain','activate','resume','close'].includes(command.command)&&Number.isSafeInteger(command.expectedEpoch)&&command.expectedEpoch>=0&&(command.command==='activate'?['legacy','candidate'].includes(command.slot):command.slot===undefined);
   if(!valid){reply(res,400,{error:{code:'entry_command_invalid'}});return;}
   if(closingRequested||stopping||busy||command.expectedEpoch!==epoch){reply(res,409,{error:{code:'entry_epoch_or_operation_conflict'},...state()});return;}
-  busy=true;if(command.command==='drain')req.socket.setTimeout(Math.min(config.shutdownTimeoutMs+1000,2147483647));
+  busy=true;if(command.command==='drain')req.socket.setTimeout(Math.min((config.drainTimeoutMs??config.shutdownTimeoutMs)+1000,2147483647));
   try{
    if(command.command==='close'){closingRequested=true;phase='closing';epoch++;res.once('finish',()=>setImmediate(()=>void shutdown().catch(()=>{process.exitCode=1;})));reply(res,202,{accepted:true,epoch});return;}
    if(command.command==='hold'){if(phase!=='active')throw failure('entry_phase_conflict');entry.hold();phase='holding';}
-   if(command.command==='drain'){if(phase!=='holding')throw failure('entry_phase_conflict');await entry.waitForDrain({timeoutMs:config.shutdownTimeoutMs,signal:operation.signal});if(stopping)throw failure('entry_stopping');phase='drained';}
+   if(command.command==='drain'){if(phase!=='holding')throw failure('entry_phase_conflict');await entry.waitForDrain({timeoutMs:config.drainTimeoutMs??config.shutdownTimeoutMs,signal:operation.signal});if(stopping)throw failure('entry_stopping');phase='drained';}
    if(command.command==='activate'){if(phase!=='drained')throw failure('entry_phase_conflict');entry.activate({socketPath:config.slots[command.slot]});slot=command.slot;phase='active';}
    if(command.command==='resume'){if(!['holding','drained'].includes(phase))throw failure('entry_phase_conflict');entry.resume();phase='active';}
    epoch++;reply(res,200,state());

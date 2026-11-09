@@ -29,6 +29,68 @@ class RuntimeUpgradeTests(unittest.TestCase):
    entry=Mock()
    with self.subTest(value=value),patch.object(upgrade,'load',return_value=pg),self.assertRaises(ValueError):upgrade.run_upgrade(IMAGE,{**CONFIG,'postgres_preflight_timeout_seconds':value},{},ticket(),entry)
    entry.active_record.assert_not_called();entry.entry_state.assert_not_called()
+ def test_source_preflight_failure_happens_before_entry_hold_or_composition(self):
+  t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']};composition.prepare_source_image_preflights.side_effect=pg.ShutdownUnconfirmed('source proof failed')
+  with patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),self.assertRaises(pg.ShutdownUnconfirmed):upgrade.run_upgrade(IMAGE,CONFIG,{'NAME':NAME,'inspect_container':Mock(),'inspect_image':Mock()},t,entry)
+  entry.entry_state.assert_not_called();composition.deploy.assert_not_called()
+ def test_upgrade_runner_retains_private_success_and_failure_evidence(self):
+  for fail in [False,True]:
+   with self.subTest(fail=fail),tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+    def save(path,value):path.write_text(json.dumps(value));path.chmod(0o600)
+    entry=SimpleNamespace(save_json=save,private_json=lambda p:json.loads(p.read_text()),process_ticks=lambda pid:'synthetic')
+    def operation():
+     if fail:raise RuntimeError('synthetic failure')
+     return {'completed':True,'sessionLeader':os.getsid(0)==os.getpid()}
+    if fail:
+     with self.assertRaisesRegex(RuntimeError,'inspect private runner log'):upgrade.supervised_upgrade(entry,ticket(),operation)
+    else:self.assertEqual(upgrade.supervised_upgrade(entry,ticket(),operation),{'completed':True,'sessionLeader':True})
+    run=Path(directory)/'runners'/ticket()['deploymentId'];self.assertEqual(stat.S_IMODE((run/'runner.log').stat().st_mode),0o600)
+    self.assertEqual(json.loads((run/'result.json').read_text())['ok'],not fail)
+    if fail:self.assertIn('synthetic failure',(run/'runner.log').read_text())
+    with self.assertRaises(FileExistsError):upgrade.supervised_upgrade(entry,ticket(),operation)
+
+ def test_observer_death_does_not_release_lock_or_kill_upgrade_child(self):
+  import subprocess,time,fcntl,signal
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory)
+   script="""import os,json,time,fcntl,importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+root=Path(ROOT_VALUE)
+spec=importlib.util.spec_from_file_location('u',MODULE_VALUE);u=importlib.util.module_from_spec(spec);spec.loader.exec_module(u);u.RELEASES=root
+lock=os.open(root/'deploy.lock',os.O_CREAT|os.O_RDWR,0o600);fcntl.flock(lock,fcntl.LOCK_EX)
+def save(path,value):path.write_text(json.dumps(value));path.chmod(0o600)
+e=SimpleNamespace(save_json=save,private_json=lambda p:json.loads(p.read_text()),process_ticks=lambda pid:'synthetic')
+def operation():
+ (root/'started').write_text(str(os.getpid()))
+ end=time.monotonic()+5
+ while not (root/'release').exists() and time.monotonic()<end:time.sleep(.01)
+ return {'complete':True}
+u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
+""".replace('ROOT_VALUE',repr(directory)).replace('MODULE_VALUE',repr(str(ROOT/'ci/postgres-upgrade-deploy.py')))
+   observer=subprocess.Popen(['python3','-c',script],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   def wait_for(path):
+    deadline=time.monotonic()+5
+    while not path.exists() and time.monotonic()<deadline:time.sleep(.01)
+    self.assertTrue(path.exists())
+   try:
+    wait_for(root/'started');observer.terminate();observer.wait(timeout=3)
+    fd=os.open(root/'deploy.lock',os.O_RDWR)
+    try:
+     with self.assertRaises(BlockingIOError):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+     (root/'release').touch();result=root/'runners'/'owned-test'/'result.json';wait_for(result)
+     self.assertTrue(json.loads(result.read_text())['ok'])
+     deadline=time.monotonic()+3
+     while True:
+      try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+      except BlockingIOError:
+       if time.monotonic()>deadline:raise
+       time.sleep(.01)
+    finally:os.close(fd)
+   finally:
+    (root/'release').touch()
+    if observer.poll() is None:observer.terminate();observer.wait(timeout=3)
+
  def test_ticket_binds_same_database_materials_network_source_and_ci_target(self):
   t=ticket();self.assertIs(upgrade.validate_ticket(t,IMAGE,CONFIG),t)
   mutations=[lambda x:x.update(approved=False),lambda x:x['to'].update(image=OLD),lambda x:x['to'].update(configDigest='latest'),lambda x:x.update(materialsDirectory='/tmp/untrusted'),lambda x:x['database'].update(oid='unknown'),lambda x:x['network'].update(name='bridge'),lambda x:x['from'].update(containerId='unknown'),lambda x:x.update(hostToolsRevision='main')]
@@ -80,7 +142,7 @@ class RuntimeUpgradeTests(unittest.TestCase):
    self.assertEqual(wrapper.deploy_entry_postgres(IMAGE,CONFIG),{'sameDatabase':True});self.assertEqual(str(spec.call_args.args[1]),'/usr/local/lib/harbor/postgres-upgrade-deploy.py')
  def test_one_time_release_directory_prevents_second_dispatch_before_hold(self):
   t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());proof={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']};composition=Mock();composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.configuration.return_value=([],{});composition.image_proof.return_value=proof
-  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'private_json',return_value=t),patch.object(upgrade,'load',side_effect=[entry,composition]),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot'),patch.object(upgrade,'controller_lock',return_value=nullcontext()),patch.object(upgrade,'verify_installed_tools'):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'private_json',return_value=t),patch.object(upgrade,'load',side_effect=[entry,composition]),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot'),patch.object(upgrade,'controller_lock',return_value=nullcontext()),patch.object(upgrade,'supervised_upgrade',side_effect=lambda entry,ticket,operation:operation()),patch.object(upgrade,'verify_installed_tools'):
    (Path(directory)/t['deploymentId']).mkdir()
    with self.assertRaises(FileExistsError):upgrade.deploy(IMAGE,CONFIG,None,{'NAME':NAME,'ENTRY_HELPER':'fixed','inspect_container':Mock(),'inspect_image':Mock()})
    entry.entry_state.assert_not_called()
@@ -118,23 +180,29 @@ class RuntimeUpgradeTests(unittest.TestCase):
    self.assertEqual(upgrade.gate_install(entry,ticket(),CONFIG),snapshot);script=entry.execute.call_args.kwargs['body'];self.assertEqual(script.count('ct state new'),2);self.assertNotIn('systemctl',script);upgrade.gate_remove(entry,snapshot)
   with patch.object(upgrade,'gate_snapshot',return_value={'unknown':True}),self.assertRaises(RuntimeError):upgrade.gate_remove(entry,snapshot)
  def test_orchestration_success_pg_rollback_and_unknown_shutdown_keep_sqlite_untouched(self):
-  for outcome in ['success','pg-rollback','unknown-stop','unknown-stop-healthy','commit-unknown']:
+  for outcome in ['success','drain-timeout','drain-timeout-unhealthy','pg-rollback','preflight-rejected','unknown-stop','unknown-stop-healthy','commit-unknown']:
    with self.subTest(outcome=outcome),tempfile.TemporaryDirectory() as directory:
     t=ticket();old=active();old_gateway=target(t);old_gateway.update(Id=t['from']['containerId'],Image=t['from']['imageId']);old_gateway['Config'].update(Image=OLD);old_worker=copy.deepcopy(old_gateway);old_worker['Id']=t['from']['workerId'];old_worker['Config']['Cmd']=['node','/app/postgres-worker.mjs'];rows={NAME:old_gateway,NAME+'-worker':old_worker};docker_calls=[]
-    entry=Mock();entry.ACTIVE=Path(directory)/'active.json';entry.STATE=Path(directory)/'controller.json';entry.CANDIDATE_PROFILE=Path(directory)/'candidate.json';data={str(entry.ACTIVE):old,str(entry.STATE):{'phase':'activated','activeRuntimeConfig':{}},str(entry.CANDIDATE_PROFILE):{'socketPath':'/run/harbor-entry/candidate.sock'}};entry.active_record.return_value=(copy.deepcopy(old),{},old_gateway);entry.private_json.side_effect=lambda p:copy.deepcopy(data[str(p)]);entry.save_json.side_effect=lambda p,v:data.__setitem__(str(p),copy.deepcopy(v));entry.fingerprint=upgrade.digest
+    entry=Mock();entry.ACTIVE=Path(directory)/'active.json';entry.STATE=Path(directory)/'controller.json';entry.CANDIDATE_PROFILE=Path(directory)/'candidate.json';data={str(entry.ACTIVE):old,str(entry.STATE):{'phase':'activated','candidate':old['candidate'],'activeRuntimeConfig':{'bridge':{'address':'192.0.2.1'}}},str(entry.CANDIDATE_PROFILE):{'socketPath':'/run/harbor-entry/candidate.sock'}};entry.active_record.return_value=(copy.deepcopy(old),{},old_gateway);entry.private_json.side_effect=lambda p:copy.deepcopy(data[str(p)]);entry.save_json.side_effect=lambda p,v:data.__setitem__(str(p),copy.deepcopy(v));entry.fingerprint=upgrade.digest
     control={'slot':'candidate','phase':'active','inflight':0,'epoch':0}
     def entry_state(command=None,epoch=None,slot=None):
      if command:
       self.assertEqual(epoch,control['epoch']);control['epoch']+=1
       if command=='hold':self.assertEqual(control['phase'],'active');control['phase']='holding'
-      elif command=='drain':self.assertEqual(control['phase'],'holding');control['phase']='drained'
+      elif command=='drain':
+       self.assertEqual(control['phase'],'holding')
+       if outcome.startswith('drain-timeout'):raise RuntimeError('entry drain timeout')
+       control['phase']='drained'
+      elif command=='resume':self.assertIn(control['phase'],['holding','drained']);control['phase']='active'
       elif command=='activate':self.assertEqual(control['phase'],'drained');control['phase']='active';self.assertEqual(slot,'candidate')
      return dict(control)
     entry.entry_state.side_effect=entry_state
+    entry.candidate_slot_ready.return_value=outcome!='drain-timeout-unhealthy'
     if outcome=='commit-unknown':entry.restore_active.side_effect=RuntimeError('publication outcome unknown')
     composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']}
     def deploy(*args):
      self.assertEqual(args[-1]['postgres_preflight_timeout_seconds'],300)
+     if outcome=='preflight-rejected':raise pg.SourcePreflightRejected('source report expired before stop')
      if outcome=='pg-rollback':raise RuntimeError('candidate failed and old PG pair restored')
      if outcome=='unknown-stop':old_gateway['State']['Running']=False;raise pg.ShutdownUnconfirmed('unknown shutdown')
      if outcome=='unknown-stop-healthy':raise pg.ShutdownUnconfirmed('stop timed out but daemon may stop late')
@@ -149,8 +217,13 @@ class RuntimeUpgradeTests(unittest.TestCase):
       result=upgrade.run_upgrade(IMAGE,config,api,t,entry);self.assertEqual(result['contract'],upgrade.CONTRACT);self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64);self.assertEqual(control['phase'],'active');self.assertEqual(len(docker_calls),2);remove_gate.assert_called_once()
      else:
       with self.assertRaises(RuntimeError):upgrade.run_upgrade(IMAGE,config,api,t,entry)
-      if outcome=='pg-rollback':entry.refresh_active.assert_called_once();remove_gate.assert_called_once();self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
+      if outcome in ['pg-rollback','preflight-rejected']:entry.refresh_active.assert_called_once();remove_gate.assert_called_once();self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
       else:entry.refresh_active.assert_not_called();remove_gate.assert_not_called()
+      if outcome.startswith('drain-timeout'):
+       composition.deploy.assert_not_called();composition.verify_started_composition.assert_not_called();entry.refresh_active.assert_not_called();remove_gate.assert_not_called()
+       self.assertEqual(control['phase'],'holding' if outcome.endswith('unhealthy') else 'active')
+       self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
+       entry.candidate_slot_ready.assert_called_once_with('192.0.2.1',8092)
       if outcome=='unknown-stop-healthy':self.assertTrue(old_gateway['State']['Running']);self.assertTrue(old_worker['State']['Running']);composition.verify_started_composition.assert_not_called();self.assertEqual(data[str(upgrade.release_path(t['deploymentId'])/'release.json')]['phase'],'stop-unknown')
       if outcome=='commit-unknown':self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64)
      self.assertEqual(composition.image_proof.call_args.args[0]['postgres_preflight_timeout_seconds'],300)

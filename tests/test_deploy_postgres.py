@@ -89,6 +89,81 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
     result=pg.deploy(IMAGE,CONFIG,None,api)
     self.assertEqual(timeouts,[30 if budget is None else budget]*3)
     self.assertEqual(result['shutdown_contract'],pg.SHUTDOWN_CONTRACT)
+ def source_materials(self,directory):
+  root=Path(directory)
+  for name in ['secrets/postgres-report.key','secrets/postgres-ca.crt','secrets/device/server.key','secrets/device/server.pem','secrets/device/ca.key','secrets/device/ca.pem','pg-data/key-encryption.key','pg-data/recording-encryption.key']:
+   path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'synthetic-material');path.chmod(0o600)
+ def test_source_checks_are_prepared_once_before_hold_and_consumed_without_probes(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);self.source_materials(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory)
+   verified=pg.prepare_source_image_preflights(api,[(state[NAME],'gateway'),(state[NAME+'-worker'],'worker')],common)
+   self.assertEqual(len([c for c in calls if c[0]=='run' and '/app/ci/postgres-preflight.mjs' in c]),1)
+   first=verified(state[NAME],common);first['shutdown']['gateway_drain_ms']=1
+   self.assertEqual(verified(state[NAME+'-worker'],common)['shutdown']['gateway_drain_ms'],pg.SHUTDOWN_DEFAULTS['gateway_drain_ms'])
+   api['source_image_preflight']=verified;result=pg.deploy(IMAGE,CONFIG,None,api)
+   self.assertEqual(result['shutdown_contract'],pg.SHUTDOWN_CONTRACT)
+   probes=[c for c in calls if c[0]=='run' and '/app/ci/postgres-preflight.mjs' in c]
+   self.assertEqual(len(probes),2,'one old image proof before hold and the ordinary candidate proof')
+ def test_prepared_source_rejects_container_image_arguments_and_material_drift_before_stop(self):
+  for change in ['container','image','arguments','tag','material','mode','symlink','new-client-material']:
+   with self.subTest(change=change),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    self.prepare(directory);self.source_materials(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory)
+    verified=pg.prepare_source_image_preflights(api,[(state[NAME],'gateway'),(state[NAME+'-worker'],'worker')],common)
+    row=json.loads(json.dumps(state[NAME]));requested=list(common)
+    if change=='container':row['Id']='replacement'
+    elif change=='image':row['Image']='sha256:'+'0'*64
+    elif change=='arguments':requested.append('HARBOR_GATEWAY_DRAIN_TIMEOUT_MS=1')
+    elif change=='tag':state[OLD]['Id']='sha256:'+'0'*64
+    elif change=='material':(Path(directory)/'secrets/postgres.env').write_text('changed')
+    elif change=='mode':(Path(directory)/'pg-data/settings.json').chmod(0o644)
+    elif change=='symlink':
+     path=Path(directory)/'pg-data/key-encryption.key';path.rename(path.with_suffix('.old'));path.symlink_to(path.with_suffix('.old'))
+    else:(Path(directory)/'secrets/postgres-client.crt').write_text('new')
+    with self.assertRaises(pg.SourcePreflightRejected):verified(row,requested)
+    self.assertFalse(any(c[0] in ['stop','rename','start'] for c in calls))
+ def test_fifo_source_material_rejects_without_waiting_for_a_writer(self):
+  with tempfile.TemporaryDirectory() as directory:
+   self.prepare(directory);self.source_materials(directory);path=Path(directory)/'pg-data/settings.json';path.unlink();os.mkfifo(path,0o600)
+   script="import importlib.util,sys; s=importlib.util.spec_from_file_location('pg',sys.argv[1]); p=importlib.util.module_from_spec(s); s.loader.exec_module(p)\ntry:p.source_preflight_material_identity(sys.argv[2])\nexcept p.ShutdownUnconfirmed:sys.exit(0)\nraise SystemExit(1)"
+   result=subprocess.run(['python3','-c',script,str(ROOT/'ci/postgres-deploy.py'),directory],capture_output=True,timeout=3)
+   self.assertEqual(result.returncode,0)
+ def test_prepared_source_still_checks_dynamic_facts_before_stopping(self):
+  for failure in ['expired-report','low-space','changed-schema','timeout']:
+   with self.subTest(failure=failure),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    self.prepare(directory);self.source_materials(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory)
+    verified=pg.prepare_source_image_preflights(api,[(state[NAME],'gateway'),(state[NAME+'-worker'],'worker')],common);original=api['docker'];executions=[]
+    def docker(*args,**kwargs):
+     if args[0]=='exec':
+      executions.append(args)
+      if failure=='changed-schema':return Mock(stdout=json.dumps({**api['proofs'][OLD],'schema_digest':'0'*64}),returncode=0)
+      if failure=='timeout':raise subprocess.TimeoutExpired('source-check',kwargs['timeout'])
+      raise subprocess.CalledProcessError(1,['source-check'])
+     return original(*args,**kwargs)
+    api.update(docker=docker,source_image_preflight=verified)
+    with self.assertRaises(pg.SourcePreflightRejected):pg.deploy(IMAGE,CONFIG,None,api)
+    self.assertTrue(executions);self.assertFalse(any(c[0] in ['stop','rename','start'] for c in calls))
+    self.assertTrue(state[NAME]['State']['Running']);self.assertTrue(state[NAME+'-worker']['State']['Running'])
+ def test_runtime_probe_has_its_own_deadline_when_the_host_docker_observer_cannot_cancel_it(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'),patch.object(pg,'preflight_timeout_seconds',return_value=.2):
+   self.prepare(directory);self.source_materials(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory)
+   fixture=Path(directory)/'pending-preflight.mjs';fixture.write_text('export async function postgresPreflight(){await new Promise(()=>{setInterval(()=>{},1000);});}')
+   def docker(*args,**kwargs):
+    self.assertEqual(args[0],'exec');program=args[args.index('-e')+1].replace('/app/ci/postgres-preflight.mjs',fixture.as_uri())
+    return subprocess.run([os.environ.get('HARBOR_TEST_NODE','node'),'--input-type=module','-e',program,args[-1]],capture_output=True,text=True,check=True,timeout=kwargs['timeout']+1)
+   api['docker']=docker
+   with self.assertRaises(pg.ShutdownUnconfirmed) as caught:pg.running_source_image_proof(api,state[NAME],common)
+   self.assertIsInstance(caught.exception.__cause__,subprocess.CalledProcessError);self.assertEqual(caught.exception.__cause__.returncode,1);self.assertIn('Source runtime preflight timed out',caught.exception.__cause__.stderr)
+ def test_runtime_probe_uses_current_policy_without_exposing_connection(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);self.source_materials(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory)
+   state[NAME]['Config']['Env'].append('HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES=1')
+   value=pg.running_source_image_proof(api,state[NAME],common);self.assertEqual(value['storage_verified'],True)
+   executed=next(c for c in calls if c[0]=='exec');overrides=json.loads(executed[-1]);self.assertIsNone(overrides['HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES']);self.assertNotIn('HARBOR_DATABASE_URL',overrides);self.assertNotIn('postgresql://',str(executed))
+ def test_source_preparation_failure_does_not_modify_running_composition(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);self.source_materials(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);state[OLD]['Id']='sha256:'+'0'*64
+   with self.assertRaises(pg.ShutdownUnconfirmed):pg.prepare_source_image_preflights(api,[(state[NAME],'gateway')],common)
+   self.assertFalse(any(c[0] in ['stop','rename','start'] for c in calls))
  def test_configured_preflight_timeout_keeps_unknown_proof_fail_closed(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state=self.api(directory);original=api['docker']
@@ -152,6 +227,8 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
   if old:state.update({NAME:container(OLD),NAME+'-worker':container(OLD,'worker')})
   def docker(*args,**kwargs):
    calls.append(args)
+   if args[0]=='exec' and '--input-type=module' in args:
+    row=next(row for row in state.values() if row.get('Id')==args[1]);return Mock(stdout=json.dumps(proofs[row['Config']['Image']]),returncode=0)
    if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:
     image=args[args.index('node')-1];name=args[args.index('--name')+1]
     if name not in state:state[name]={'Name':'/'+name,'Image':state[image]['Id'],'Config':{'Image':image,'Labels':dict(args[i+1].split('=',1) for i,v in enumerate(args[:-1]) if v=='--label')},'State':{'Running':False,'Status':'exited','ExitCode':0}}

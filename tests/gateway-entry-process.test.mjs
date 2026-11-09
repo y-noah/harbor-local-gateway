@@ -92,3 +92,19 @@ test('TCP reset during an unfinished upload cancels the single upstream and keep
  const request=http.request({host:'127.0.0.1',port:f.config.listenPort,path:'/upload-reset',method:'POST',headers:{'Transfer-Encoding':'chunked'},agent:false});request.on('error',()=>{});request.write('synthetic upload prefix');await started;request.socket.resetAndDestroy();
  await untilState(()=>runtime.state().inflight===0&&upstreamClosed);assert.equal(body,'synthetic upload prefix');assert.equal(calls,1);assert.equal((await f.data()).text,'legacy');assert.equal((await f.state()).value().phase,'active');
 });
+
+test('release drain can outlast shutdown timeout without cutting the live stream',{timeout:5000},async t=>{
+ const f=await fixture(t,{timeout:20});f.config.drainTimeoutMs=1000;await f.start();
+ const req=http.get({host:'127.0.0.1',port:f.config.listenPort,path:'/hang',agent:false});req.on('error',()=>{});
+ await new Promise(resolve=>req.once('response',res=>{res.on('error',()=>{});res.once('data',resolve);}));
+ await f.command('hold',0);const draining=f.command('drain',1);
+ await new Promise(resolve=>setTimeout(resolve,80));
+ assert.equal((await f.state()).value().inflight,1);assert.equal(req.destroyed,false);
+ req.destroy();assert.equal((await draining).value().phase,'drained');
+ assert.equal((await f.command('resume',2)).status,200);assert.equal((await f.data()).text,'legacy');
+});
+test('release drain timeout rejects invalid budgets independently of shutdown',()=>{
+ const config={listenPort:18096,slots:{legacy:'/run/old.sock',candidate:'/run/new.sock'},initialSlot:'legacy',limits,shutdownTimeoutMs:100};
+ for(const value of [0,-1,120001,1.5,'120000',null,true])assert.throws(()=>validateGatewayEntryProcessConfig({...config,drainTimeoutMs:value}));
+ assert.equal(validateGatewayEntryProcessConfig({...config,drainTimeoutMs:120000}).shutdownTimeoutMs,100);
+});

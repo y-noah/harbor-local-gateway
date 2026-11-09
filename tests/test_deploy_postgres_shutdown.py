@@ -63,7 +63,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
      return result
     api['docker']=docker
     with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-    self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('start','rm','rename') for call in calls))
+    self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('start','rm','rename') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')))
     self.assertEqual(json.loads((Path(directory)/'postgres-shutdown-diagnostics.json').read_text())['containers'][0]['outcome'],'unknown')
  def test_failed_candidate_shutdown_unknown_keeps_both_and_never_force_removes(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -74,7 +74,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return result
    api['docker']=docker
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertIn(base.NAME,state);self.assertIn(base.NAME+'-worker',state);self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls))
+   self.assertIn(base.NAME,state);self.assertIn(base.NAME+'-worker',state);self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')))
 
  def test_stopped_legacy_is_not_automatically_restarted_after_candidate_failure(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -110,7 +110,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return original_inspect(name)
    api['docker']=docker;api['inspect_container']=inspect
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertFalse(any(call[0] in ('start','rm') for call in calls));self.assertNotIn(('rename',base.NAME+'-previous',base.NAME),calls)
+   self.assertFalse(any(call[0] in ('start','rm') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertNotIn(('rename',base.NAME+'-previous',base.NAME),calls)
    self.assertEqual(json.loads((Path(directory)/'postgres-shutdown-diagnostics.json').read_text())['containers'][-1]['outcome'],'unknown')
  def test_label_without_actual_old_image_shutdown_proof_never_authorizes_stop(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -126,7 +126,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return original(*args,**kwargs)
    api['docker']=docker
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertFalse(any(call[0] in ('start','rm') for call in calls));self.assertNotIn(('rename',base.NAME+'-previous',base.NAME),calls)
+   self.assertFalse(any(call[0] in ('start','rm') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertNotIn(('rename',base.NAME+'-previous',base.NAME),calls)
    self.assertTrue(state[base.NAME+'-worker']['State']['Running'])
  def test_stopped_label_without_image_proof_is_unclassified_not_normal(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -148,7 +148,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     if any(row.get('exit_code')==137 for row in rows):raise OSError('synthetic disk failure')
     return original_diagnostic(stack,rows)
    with patch.object(pg,'shutdown_diagnostic',side_effect=diagnostic),self.assertRaises(pg.ShutdownUnconfirmed) as failure:pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertTrue(failure.exception.diagnostic_write_failed);self.assertFalse(any(call[0] in ('start','rm') for call in calls));self.assertNotIn(('rename',base.NAME+'-previous',base.NAME),calls)
+   self.assertTrue(failure.exception.diagnostic_write_failed);self.assertFalse(any(call[0] in ('start','rm') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertNotIn(('rename',base.NAME+'-previous',base.NAME),calls)
  def test_candidate_inspection_failure_retains_whole_pair_and_no_old_restart(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state=self.api(directory,auth=False);original=api['inspect_container']
@@ -158,7 +158,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return value
    api['inspect_container']=inspect
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertTrue(state[base.NAME]['State']['Running']);self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls))
+   self.assertTrue(state[base.NAME]['State']['Running']);self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')))
  def test_real_wrapper_lookup_distinguishes_absence_and_failed_daemon(self):
   from unittest.mock import Mock
   wrapper=base.wrapper
@@ -179,7 +179,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return value
    api['inspect_container']=inspect
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertEqual(reads,2);self.assertFalse(any(call[0] in ('rm','start') for call in calls));self.assertIn(base.NAME,state);self.assertIn(base.NAME+'-worker',state)
+   self.assertEqual(reads,2);self.assertFalse(any(call[0] in ('rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertIn(base.NAME,state);self.assertIn(base.NAME+'-worker',state)
  def test_foreign_candidate_ownership_never_skips_into_mixed_rollback(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state=self.api(directory,auth=False);original=api['inspect_container'];http=api['http_code'];failed=False
@@ -193,7 +193,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return value
    api['http_code']=http_code;api['inspect_container']=inspect
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls))
+   self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')))
 
  def test_stopped_old_image_lookup_unknown_is_never_downgraded_to_missing_capability(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -206,7 +206,15 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return original(name)
    api['inspect_container']=inspect
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertFalse((Path(directory)/'postgres-storage.json').exists());self.assertFalse(any(call[0] in ('stop','rename','rm','start') for call in calls));self.assertTrue(state[base.NAME+'-worker']['State']['Running'])
+   self.assertFalse((Path(directory)/'postgres-storage.json').exists());self.assertFalse(any(call[0] in ('stop','rename','rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertTrue(state[base.NAME+'-worker']['State']['Running'])
+ def test_image_metadata_has_bounded_read_budget_and_no_mutation_retry(self):
+  from unittest.mock import Mock,patch
+  with patch.object(base.wrapper,'docker',return_value=Mock(returncode=0,stdout=json.dumps([{'Id':'sha256:synthetic','Config':{}}]))) as docker:
+   self.assertEqual(base.wrapper.inspect_image(base.IMAGE)['Id'],'sha256:synthetic')
+   docker.assert_called_once_with('image','inspect',base.IMAGE,check=False,timeout=60)
+  with patch.object(base.wrapper,'docker',side_effect=subprocess.TimeoutExpired('image inspect',60)) as docker:
+   with self.assertRaises(subprocess.TimeoutExpired):base.wrapper.inspect_image(base.IMAGE)
+   self.assertEqual(docker.call_count,1)
  def test_zero_exit_inspect_with_incomplete_json_is_not_absence(self):
   from unittest.mock import Mock
   for value in [[],[{}],[{'Id':'synthetic','Config':{},'State':{}}]]:
@@ -226,7 +234,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     return value
    api['http_code']=http_code;api['inspect_container']=inspect
    with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,base.CONFIG,None,api)
-   self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls))
+   self.assertTrue(state[base.NAME+'-worker']['State']['Running']);self.assertFalse(any(call[0] in ('rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')))
 
  def sqlite_source_fixture(self,directory):
   api,calls,state=self.api(directory)
@@ -247,10 +255,10 @@ class PostgreSQLShutdownTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state,config=self.sqlite_source_fixture(directory);original=api['docker']
    def docker(*args,**kwargs):
-    if args[0]=='run' and '--rm' in args:self.assertNotEqual(args[args.index('node')-1],base.OLD,'legacy SQLite has no PG preflight file')
+    if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args:self.assertNotEqual(args[args.index('node')-1],base.OLD,'legacy SQLite has no PG preflight file')
     return original(*args,**kwargs)
    api['docker']=docker;result=pg.deploy(base.IMAGE,config,None,api)
-   self.assertEqual(result['shutdown'],[{'container':base.NAME,'role':'gateway','outcome':'pre_stopped_unclassified'}]);self.assertFalse(any(call[0] in ('stop','start') for call in calls));self.assertTrue((Path(directory)/'postgres-storage.json').exists())
+   self.assertEqual(result['shutdown'],[{'container':base.NAME,'role':'gateway','outcome':'pre_stopped_unclassified'}]);self.assertFalse(any(call[0] in ('stop','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertTrue((Path(directory)/'postgres-storage.json').exists())
  def test_legacy_sqlite_requires_root_source_engine_stopped_cmd_and_actual_contract(self):
   for variant in ['no-root-source','running','unknown-cmd','wrong-contract','image-id','daemon']:
    with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -262,7 +270,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     elif variant=='image-id':state[base.NAME]['Image']='sha256:'+'f'*64
     else:api['inspect_image']=lambda name:(_ for _ in ()).throw(RuntimeError('synthetic daemon failure'))
     with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,config,None,api)
-    self.assertFalse(any(call[0] in ('stop','rename','rm','start') for call in calls));self.assertFalse((Path(directory)/'postgres-storage.json').exists())
+    self.assertFalse(any(call[0] in ('stop','rename','rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertFalse((Path(directory)/'postgres-storage.json').exists())
  def test_old_pg_unavailable_proof_never_becomes_sqlite_or_known_unsupported(self):
   for variant in ['timeout','io','malformed-json','missing-schema','null-shutdown','image-daemon']:
    with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
@@ -272,7 +280,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
     if variant=='missing-schema':api['proofs'][base.OLD].pop('schema_digest')
     if variant=='null-shutdown':api['proofs'][base.OLD]['shutdown']=None
     def docker(*args,**kwargs):
-     if args[0]=='run' and '--rm' in args and args[args.index('node')-1]==base.OLD:
+     if args[0]=='run' and '/app/ci/postgres-preflight.mjs' in args and args[args.index('node')-1]==base.OLD:
       if variant=='timeout':raise subprocess.TimeoutExpired('preflight',30)
       if variant=='io':raise OSError('synthetic IO')
       if variant=='malformed-json':
@@ -284,7 +292,7 @@ class PostgreSQLShutdownTests(unittest.TestCase):
      return images(name)
     api['docker']=docker;api['inspect_image']=inspect_image
     with self.assertRaises(pg.ShutdownUnconfirmed):pg.deploy(base.IMAGE,config,None,api)
-    self.assertFalse(any(call[0] in ('stop','rename','rm','start') for call in calls));self.assertFalse((Path(directory)/'postgres-storage.json').exists())
+    self.assertFalse(any(call[0] in ('stop','rename','rm','start') for call in calls if not call[-1].startswith(base.NAME+'-postgres-check-')));self.assertFalse((Path(directory)/'postgres-storage.json').exists())
  def test_explicit_unsupported_shutdown_version_is_only_allowed_for_stopped_old_pg(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    self.prepare(directory);api,calls,state=self.api(directory)

@@ -77,7 +77,7 @@ def inspect_container(name):
 
 def inspect_image(name):
     """PG-only image proof: neither absence nor daemon failure is a capability."""
-    result=docker('image','inspect',name,check=False,timeout=10)
+    result=docker('image','inspect',name,check=False,timeout=60)
     if result.returncode!=0:raise RuntimeError('Image inspection failed')
     value=json.loads(result.stdout)
     if not isinstance(value,list) or len(value)!=1 or not isinstance(value[0],dict) or not isinstance(value[0].get('Id'),str) or not value[0]['Id'] or not isinstance(value[0].get('Config'),dict):raise RuntimeError('Image inspection response is invalid')
