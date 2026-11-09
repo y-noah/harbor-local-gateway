@@ -316,13 +316,37 @@ class UnixHttp(http.client.HTTPConnection):
   self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);self.sock.settimeout(self.timeout);self.sock.connect(CONTROL)
 
 
+class EntryControlError(RuntimeError):
+ def __init__(self,diagnostic):
+  super().__init__('entry_controller_entry_control_failed');self.diagnostic=diagnostic
+
+
 def entry_state(command=None,epoch=None,slot=None):
  info=Path(CONTROL).lstat();trusted_parents(Path(CONTROL));require(stat.S_ISSOCK(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600,'control_untrusted')
  client=UnixHttp('localhost',timeout=125)
  try:
   body=None if command is None else json.dumps({'command':command,'expectedEpoch':epoch,**({'slot':slot} if slot is not None else {})})
   client.request('GET' if command is None else 'POST','/state' if command is None else '/control',body=body,headers={} if body is None else {'Content-Type':'application/json'})
-  response=client.getresponse();data=response.read(65537);require(response.status==200 and len(data)<=65536,'entry_control_failed');return json.loads(data)
+  response=client.getresponse();data=response.read(65537);require(len(data)<=65536,'entry_control_failed')
+  if response.status!=200:
+   # Never include the arbitrary response body in privileged deployment logs.
+   # Preserve only protocol-defined failure reasons and bounded counters.
+   try:diagnostic=json.loads(data)
+   except (ValueError,UnicodeError,RecursionError):diagnostic=None
+   detail={}
+   if isinstance(diagnostic,dict):
+    error=diagnostic.get('error');code=error.get('code') if isinstance(error,dict) else None
+    if isinstance(code,str) and code in {'gateway_entry_drain_timeout','entry_epoch_or_operation_conflict','entry_phase_conflict','entry_stopping','entry_operation_failed'}:detail['reason']=code
+    for key in ['phase','slot']:
+     value=diagnostic.get(key)
+     allowed={'phase':{'active','holding','drained','closing','closed'},'slot':{'legacy','candidate'}}
+     if isinstance(value,str) and value in allowed[key]:detail[key]=value
+    for key in ['epoch','inflight','queued']:
+     value=diagnostic.get(key)
+     if type(value) is int and 0<=value<=9007199254740991:detail[key]=value
+   if detail:raise EntryControlError(detail) from RuntimeError('entry_control_diagnostic:'+json.dumps(detail,separators=(',',':')))
+   require(False,'entry_control_failed')
+  return json.loads(data)
  finally:client.close()
 
 
@@ -907,8 +931,13 @@ def main():
  finally:os.close(fd)
 
 
-if __name__=='__main__':
- try:main()
+def run_cli(operation=main):
+ try:operation()
  except BaseException as error:
   code=str(error) if isinstance(error,RuntimeError) and re.fullmatch('entry_controller_[a-z_]+',str(error)) else 'entry_controller_failed_closed'
-  print(json.dumps({'error':{'code':code},'sourceStopped':False,'automaticSqliteRollback':False}));raise SystemExit(1)
+  failure={'code':code}
+  if isinstance(error,EntryControlError):failure['diagnostic']=error.diagnostic
+  print(json.dumps({'error':failure,'sourceStopped':False,'automaticSqliteRollback':False}));raise SystemExit(1)
+
+
+if __name__=='__main__':run_cli()

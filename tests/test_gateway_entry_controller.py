@@ -3,9 +3,11 @@ import json
 import copy
 import unittest
 import stat
+import io
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock,patch
 
 ROOT=Path(__file__).resolve().parents[1]
 def load(name,path):
@@ -14,6 +16,51 @@ controller=load('gateway_entry_controller',ROOT/'ci/gateway-entry-controller.py'
 bridge=load('gateway_legacy_transparent',ROOT/'ci/gateway-legacy-transparent.py')
 
 class EntryBoundaryTests(unittest.TestCase):
+ def control_reply(self,status,body):
+  response=Mock(status=status);response.read.return_value=body
+  client=Mock();client.getresponse.return_value=response
+  trusted=SimpleNamespace(st_mode=stat.S_IFSOCK|0o600,st_uid=0)
+  with patch.object(Path,'lstat',return_value=trusted),patch.object(controller,'trusted_parents'),patch.object(controller,'UnixHttp',return_value=client):
+   try:return controller.entry_state('drain',3)
+   finally:client.close.assert_called_once();response.read.assert_called_once_with(65537)
+
+ def test_control_failure_preserves_safe_drain_evidence_without_response_contents(self):
+  payload={'error':{'code':'gateway_entry_drain_timeout','message':'private-body'},'phase':'holding','slot':'candidate','epoch':3,'inflight':2,'queued':19,'private':'private-body'}
+  with self.assertRaisesRegex(RuntimeError,'^entry_controller_entry_control_failed$') as caught:
+   self.control_reply(409,json.dumps(payload).encode())
+  self.assertEqual(caught.exception.diagnostic,{'reason':'gateway_entry_drain_timeout','phase':'holding','slot':'candidate','epoch':3,'inflight':2,'queued':19})
+  self.assertNotIn('private-body',str(caught.exception.__cause__))
+  output=io.StringIO()
+  def fail():raise caught.exception
+  with redirect_stdout(output),self.assertRaises(SystemExit) as exit:controller.run_cli(fail)
+  self.assertEqual(exit.exception.code,1);saved=json.loads(output.getvalue())
+  self.assertEqual(saved,{'error':{'code':'entry_controller_entry_control_failed','diagnostic':caught.exception.diagnostic},'sourceStopped':False,'automaticSqliteRollback':False})
+  self.assertNotIn('private-body',output.getvalue())
+
+ def test_cli_other_failures_keep_their_fixed_error_contract_and_no_arbitrary_text(self):
+  for error,expected in [(RuntimeError('entry_controller_control_untrusted'),'entry_controller_control_untrusted'),(RuntimeError('private-body'),'entry_controller_failed_closed'),(ValueError('private-body'),'entry_controller_failed_closed')]:
+   output=io.StringIO()
+   def fail():raise error
+   with self.subTest(expected=expected),redirect_stdout(output),self.assertRaises(SystemExit) as exit:controller.run_cli(fail)
+   self.assertEqual(exit.exception.code,1);self.assertEqual(json.loads(output.getvalue())['error'],{'code':expected});self.assertNotIn('private-body',output.getvalue())
+
+ def test_control_rejects_malformed_or_untrusted_diagnostics_without_leaking_them(self):
+  cases=[b'private-body',b'[]',b'null',b'\xff',json.dumps({'error':{'code':['private-body']},'phase':{},'slot':'private-body','epoch':True,'inflight':-1,'queued':2**54}).encode(),json.dumps({'error':{'code':'private-body'}}).encode(),b'x'*65537]
+  for body in cases:
+   with self.subTest(bodyLength=len(body)),self.assertRaisesRegex(RuntimeError,'^entry_controller_entry_control_failed$'):
+    self.control_reply(409,body)
+
+ def test_control_success_and_success_body_budget_keep_existing_contract(self):
+  self.assertEqual(self.control_reply(200,b'{"phase":"drained","epoch":4}'),{'phase':'drained','epoch':4})
+  with self.assertRaisesRegex(RuntimeError,'^entry_controller_entry_control_failed$'):self.control_reply(200,b'x'*65537)
+
+ def test_deep_failure_json_retains_control_error_at_real_cli_boundary(self):
+  body=b'['*1100+b'"private-body"'+b']'*1100;output=io.StringIO()
+  with redirect_stdout(output),self.assertRaises(SystemExit) as exit:controller.run_cli(lambda:self.control_reply(409,body))
+  self.assertEqual(exit.exception.code,1)
+  self.assertEqual(json.loads(output.getvalue())['error'],{'code':'entry_controller_entry_control_failed'})
+  self.assertNotIn('private-body',output.getvalue())
+
  def test_withdraw_retries_after_ports_flushed_and_control_reply_failed(self):
   config={'source':{'port':8092}};state={'configDigest':controller.fingerprint(config),'phase':'holding'};enabled=[8092];first=True
   def resources(current,policy,**kwargs):
