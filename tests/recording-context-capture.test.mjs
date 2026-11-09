@@ -34,3 +34,12 @@ test('大量短消息的已过滤组件不被缓冲再次裁掉，源预算超�
   await buffer.flush();assert.equal(saved.length,1);assert.equal(buffer.status().files,0);
  }
 });
+
+test('真实加密缓冲透传服务端请求限定的附件指纹，不保存附件字节',async t=>{
+ const {buffer,saved}=await fixture(t,{maxBytes:4096,maxMemoryBytes:8192});
+ const {RecordingContextStore}=await import('../recording-context-store.mjs'),context=new RecordingContextStore({}, {encryptionKey:randomBytes(32)});
+ buffer.repository.contextRepository.attachmentFingerprint=context.attachmentFingerprint.bind(context);
+ const body=Buffer.from('synthetic attachment bytes'),payload={input:[{role:'user',content:[{type:'input_file',file_data:body.toString('base64')}]}]};
+ const result=createRequestContextCapture(buffer)('synthetic-attachment-request',payload);assert.equal(result.accepted,true);assert.equal(result.state,'complete');await buffer.flush();
+ const attachment=saved[0][1][0].content.value.content[0];assert.equal(attachment.fingerprint.value,context.attachmentFingerprint('synthetic-attachment-request',body));assert.equal(attachment.bytes,body.length);assert.ok(!JSON.stringify(saved).includes(body.toString('base64')));
+});

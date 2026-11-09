@@ -26,6 +26,10 @@ export class RecordingContextStore{
   this.keyVersion=createHash('sha256').update(this.key).digest('hex');
  }
  #digest(domain,value){return createHmac('sha256',this.fingerprintKey).update(domain+'\0').update(value).digest();}
+ attachmentFingerprint(requestId,bytes){
+  if(typeof requestId!=='string'||!requestId||requestId.length>200||!Buffer.isBuffer(bytes)||bytes.length>this.maxSnapshotBytes)fail(400,'附件指纹输入无效');
+  return this.#digest('attachment-request:'+requestId,bytes).toString('hex');
+ }
  #seal(bytes,id,ordinal,scope){const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.key,iv);cipher.setAAD(Buffer.from(`context:v1:${this.keyVersion}:${scope.toString('hex')}:${id}:${ordinal}`));return Buffer.concat([iv,cipher.update(bytes),cipher.final(),cipher.getAuthTag()]);}
  #open(bytes,id,ordinal,scope){try{const decipher=createDecipheriv('aes-256-gcm',this.key,bytes.subarray(0,12));decipher.setAAD(Buffer.from(`context:v1:${this.keyVersion}:${scope.toString('hex')}:${id}:${ordinal}`));decipher.setAuthTag(bytes.subarray(-16));return Buffer.concat([decipher.update(bytes.subarray(12,-16)),decipher.final()]);}catch{fail(503,'上下文密文无法验证','recording_context_unreadable');}}
  async #authority(requestId,{lock=false,allowMissing=false}={}){

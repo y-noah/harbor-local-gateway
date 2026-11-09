@@ -240,3 +240,12 @@ test('真实PG：最小分块配置的近上限UTF8对象仍可完整派生读�
  const object=await store.get('SELECT id,bytes,parts FROM harbor.recording_context_objects');assert.ok(object.parts>Math.ceil(object.bytes/256));assert.deepEqual((await context.readObject(object.id)).content,content);
  const restarted=new RecordingContextStore(store,{encryptionKey:key,clock:()=>clock.now});assert.deepEqual((await restarted.readObject(object.id)).content,content);
 },{partBytes:256,maxSnapshotBytes:262144}));
+
+test('真实PG：附件已验证摘要随上下文加密恢复，不能跨请求关联',integration,()=>fixture(async({context,request,read,key,clock,store})=>{
+ const body=Buffer.from('synthetic inline attachment'),first=await request(),second=await request(),payload={input:[{role:'user',content:[{type:'input_file',filename:'fixture.txt',file_data:'data:text/plain;base64,'+body.toString('base64'),size:999}]}]};
+ for(const id of [first,second]){
+  const view=captureRequestContext(payload,{attachmentFingerprint:bytes=>context.attachmentFingerprint(id,bytes)});await context.writeSnapshot(id,view.components);
+ }
+ const restarted=new RecordingContextStore(store,{encryptionKey:key,clock:()=>clock.now}),a=(await read(first,restarted)).components[0].content.value.content[0],b=(await read(second,restarted)).components[0].content.value.content[0];
+ assert.equal(a.fingerprint.state,'verified');assert.equal(a.fingerprint.value,restarted.attachmentFingerprint(first,body));assert.notEqual(a.fingerprint.value,b.fingerprint.value);assert.equal(a.bytes,body.length);assert.equal(a.declaredBytes,999);assert.equal(a.mime_type,'text/plain');assert.ok(!JSON.stringify(a).includes(body.toString('base64')));
+}));

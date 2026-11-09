@@ -13,9 +13,11 @@ export const requestContextReasons=Object.freeze(['invalid_payload','unsupported
 
 // This view describes the received context, not a claim about the current turn
 // or local execution. Authentication and scope come from the recording store.
-export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=16384}={}){
+export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=16384,attachmentFingerprint}={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxComponents)||maxComponents<1||!Number.isSafeInteger(maxNodes)||maxNodes<1)throw TypeError('Invalid request context budget');
   const components=[],reasons=new Set();let bytes=2,nodes=maxNodes,opaqueReasoningExcluded=0;
+  let attachmentBytes=maxBytes;
+  const attachment=value=>recordingAttachment(value,{maxBytes:maxBytes-bytes,onTruncate:cut,maxContentBytes:attachmentBytes,onInspect:count=>{attachmentBytes=Math.max(0,attachmentBytes-count);},fingerprint:attachmentFingerprint});
   const cut=()=>{reasons.add('size_limit');return '[已截断]';};
   const literal=(value,depth)=>depth>24?cut():recordingLiteral(value,{maxBytes:maxBytes-bytes,maxDepth:24-depth,onNodes:count=>{nodes-=count;return nodes>=0;},onTruncate:cut});
   const visible=(value,depth=0,protocol=true,slot=null,sensitiveDefinition=false,schema=false)=>{
@@ -30,7 +32,7 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
     }
     if(!value||typeof value!=='object')return value;
     if(protocol&&media.has(value.type)){
-      return recordingAttachment(value,{maxBytes:maxBytes-bytes,onTruncate:cut});
+      return attachment(value);
     }
     if(protocol&&value.type==='reasoning'){
       for(const key in value){if(--nodes<0){cut();break;}if(Object.hasOwn(value,key)&&!['type','id','summary','encrypted_content','status'].includes(key))reasons.add('unsupported_field');}
@@ -67,7 +69,7 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
       if(protocol&&value.role!==undefined&&key==='refusal'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='content'&&value[key]!==null&&typeof value[key]!=='string'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
       if(protocol&&(key==='output'&&['function_call_output','custom_tool_call_output'].includes(value.type)||key==='content'&&value.role==='tool')){
-        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key]),onTruncate:cut,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:item=>recordingAttachment(item,{maxBytes:maxBytes-bytes,onTruncate:cut})}),enumerable:true});continue;
+        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key]),onTruncate:cut,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
       }
       if(schema==='definition'&&['properties','patternProperties','$defs','definitions','dependentSchemas','dependentRequired','dependencies'].includes(key)&&value[key]&&typeof value[key]==='object'&&!Array.isArray(value[key])){
         const definitions={};

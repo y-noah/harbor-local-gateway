@@ -12,7 +12,7 @@ export function createRequestContextCapture(buffer,{policyBuffer=buffer}={}){
   const envelope=Buffer.byteLength(JSON.stringify({type:'context',requestId,components:[],coverage:{state:'incomplete',reasons:requestContextReasons,opaqueReasoningExcluded:Number.MAX_SAFE_INTEGER}}))-2;
   const maxBytes=Math.min(buffer.repository.maxBytes,buffer.maxMemoryBytes,buffer.repository.contextRepository.maxSnapshotBytes)-envelope;
   if(maxBytes<256)return {accepted:false,state:'incomplete',reason:'size_limit'};
-  const view=captureRequestContext(payload,{maxBytes,maxComponents:buffer.repository.contextRepository.maxComponents}),coverage={state:view.state,reasons:view.reasons,opaqueReasoningExcluded:view.opaqueReasoningExcluded};
+  const view=captureRequestContext(payload,{maxBytes,maxComponents:buffer.repository.contextRepository.maxComponents,attachmentFingerprint:typeof buffer.repository.contextRepository.attachmentFingerprint==='function'?bytes=>buffer.repository.contextRepository.attachmentFingerprint(requestId,bytes):undefined}),coverage={state:view.state,reasons:view.reasons,opaqueReasoningExcluded:view.opaqueReasoningExcluded};
   // Contents already carry filtered provenance. Validate and mark the aggregate
   // too, so the FIFO's generic walker need not rescan thousands of component
   // wrappers under its smaller default node budget. One array node, then one
