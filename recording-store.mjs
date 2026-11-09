@@ -54,7 +54,13 @@ export class RecordingStore{
   async append(requestId,events){const safe=this.#prepareEvents(events);return this.store.transaction(()=>this.#appendInTransaction(requestId,safe));}
   async contextSnapshot(requestId,components,coverage){
     if(!this.contextRepository)throw new AppError(503,'上下文采集尚未启用','recording_context_disabled');
-    return this.contextRepository.writeSnapshot(requestId,components,{coverage});
+    try{return await this.contextRepository.writeSnapshot(requestId,components,{coverage});}
+    catch(error){
+      // Authenticated, already expired source data must not be resurrected or
+      // poison the FIFO. Other missing/corrupt/unknown commands remain blocked.
+      if(error.code==='recording_context_expired')return {state:'expired'};
+      throw error;
+    }
   }
   async #appendInTransaction(requestId,safe){
       const row=await this.store.get(`SELECT c.*,r.recording_state FROM harbor.recordings c JOIN harbor.requests r ON r.id=c.request_id WHERE c.request_id=$1 FOR UPDATE OF c,r`,requestId);

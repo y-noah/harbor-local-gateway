@@ -1,9 +1,10 @@
 import {createCipheriv,createDecipheriv,createHash,createHmac,hkdfSync,randomBytes,randomUUID,timingSafeEqual} from 'node:crypto';
 import {AppError} from './store.mjs';
 import {sanitizeRecord,restoreAuthenticatedRecord} from './record-redaction.mjs';
+import {requestContextReasons} from './recording-request-context.mjs';
 
 const kinds=new Set(['instruction','history','tool_schema','context']);
-const captureReasons=new Set(['invalid_payload','unsupported_tools','unsupported_input','unsupported_instructions','ambiguous_input','unsupported_content','unsupported_field','schema_name_collision','size_limit']);
+const captureReasons=new Set(requestContextReasons);
 const fail=(status,message,code='recording_context_invalid')=>{throw new AppError(status,message,code);};
 const equal=(a,b)=>Buffer.isBuffer(a)&&Buffer.isBuffer(b)&&a.length===b.length&&timingSafeEqual(a,b);
 // Each component is JSON, split only at UTF-8 boundaries. The source passed to
@@ -20,10 +21,11 @@ export class RecordingContextStore{
  #digest(domain,value){return createHmac('sha256',this.fingerprintKey).update(domain+'\0').update(value).digest();}
  #seal(bytes,id,ordinal,scope){const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.key,iv);cipher.setAAD(Buffer.from(`context:v1:${this.keyVersion}:${scope.toString('hex')}:${id}:${ordinal}`));return Buffer.concat([iv,cipher.update(bytes),cipher.final(),cipher.getAuthTag()]);}
  #open(bytes,id,ordinal,scope){try{const decipher=createDecipheriv('aes-256-gcm',this.key,bytes.subarray(0,12));decipher.setAAD(Buffer.from(`context:v1:${this.keyVersion}:${scope.toString('hex')}:${id}:${ordinal}`));decipher.setAuthTag(bytes.subarray(-16));return Buffer.concat([decipher.update(bytes.subarray(12,-16)),decipher.final()]);}catch{fail(503,'上下文密文无法验证','recording_context_unreadable');}}
- async #authority(requestId,{lock=false}={}){
+ async #authority(requestId,{lock=false,allowMissing=false}={}){
   if(typeof requestId!=='string'||!requestId||requestId.length>200)fail(400,'上下文请求标识无效');
-  const row=await this.store.get(`SELECT r.id,r.member_id,r.session_id,r.recording_state,c.expires_at,s.member_id session_member FROM harbor.requests r JOIN harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.sessions s ON s.id=r.session_id WHERE r.id=$1${lock?' FOR SHARE OF r,c':''}`,requestId);
+  const row=await this.store.get(`SELECT r.id,r.member_id,r.session_id,r.recording_state,r.recording_reason,c.expires_at,s.member_id session_member FROM harbor.requests r ${allowMissing?'LEFT JOIN':'JOIN'} harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.sessions s ON s.id=r.session_id WHERE r.id=$1${lock?' FOR SHARE OF r,c':''}`,requestId);
   if(!row)fail(404,'请求正文尚不存在','recording_context_missing');
+  if(allowMissing&&row.expires_at===null)return {...row,scope:null};
   if(!row.member_id||row.session_id&&row.session_member!==row.member_id)fail(503,'请求上下文归属不一致','recording_context_scope');
   const scope=this.#digest('scope',JSON.stringify([row.member_id,row.session_id?['session',row.session_id]:['request',row.id]]));
   return {...row,scope};
@@ -98,7 +100,9 @@ export class RecordingContextStore{
  async read(requestId,{after={component:0,part:0},limit=32}={}){
   if(!after||Object.keys(after).some(key=>!['component','part'].includes(key))||![after.component,after.part].every(value=>Number.isSafeInteger(value)&&value>=0)||!Number.isInteger(limit)||limit<1||limit>100)fail(400,'上下文分页无效');
   return this.store.transaction(async()=>{
-   const authority=await this.#authority(requestId),snapshot=await this.store.get('SELECT * FROM harbor.recording_context_snapshots WHERE request_id=$1',requestId);
+   const authority=await this.#authority(requestId,{allowMissing:true});
+   if(authority.expires_at===null){const known=['disabled','historical','expired','pending'].includes(authority.recording_state);return {state:known?authority.recording_state:'unavailable',reason:known?authority.recording_reason:'recording_missing',parts:[],next:after,hasMore:false};}
+   const snapshot=await this.store.get('SELECT * FROM harbor.recording_context_snapshots WHERE request_id=$1',requestId);
    if(!snapshot)return {state:authority.expires_at<=this.clock()||authority.recording_state==='expired'?'expired':'unavailable',parts:[],next:after,hasMore:false};
    if(!equal(snapshot.scope_digest,authority.scope)||snapshot.key_version!==this.keyVersion)fail(503,'上下文归属或密钥版本不一致','recording_context_scope');
    const expiresAt=Math.min(snapshot.expires_at,authority.expires_at);

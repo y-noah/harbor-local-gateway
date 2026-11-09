@@ -1,5 +1,7 @@
 import {postgresShutdownConfiguration,installPostgresGatewayShutdown} from './postgres-shutdown.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
+import {RecordingContextStore} from './recording-context-store.mjs';
+import {createRequestContextCapture} from './recording-context-capture.mjs';
 import {createPostgresExtraUsageAdmin} from './postgres-extra-usage-admin.mjs';
 import {createPostgresExtraUsageBatches} from './postgres-extra-usage-batches.mjs';
 import {createPostgresAccountExtraUsage} from './postgres-account-extra-usage.mjs';
@@ -132,6 +134,11 @@ export async function createPostgresGateway(options={}){
     store=new PostgresStore({...database,poolSize:resources.corePoolSize});
     queryStore=new PostgresStore({...database,poolSize:resources.queryPoolSize});recordingStore=new PostgresStore({...database,poolSize:resources.recordingPoolSize});
     try{await store.verifySchema();}catch(e){if(e.code==='42P01')throw new AppError(503,'数据库尚未迁移，请先运行db:migrate','database_migration_required');throw e;}
+    if(env.HARBOR_RECORDING_CONTEXT_ENABLED!==undefined&&!['0','1'].includes(env.HARBOR_RECORDING_CONTEXT_ENABLED))throw new AppError(503,'上下文采集开关须为0或1','recording_configuration');
+    if(options.recording?.contextEnabled!==undefined&&typeof options.recording.contextEnabled!=='boolean')throw new AppError(503,'上下文采集开关须为布尔值','recording_configuration');
+    const contextEnabled=options.recording?.contextEnabled??env.HARBOR_RECORDING_CONTEXT_ENABLED==='1',contextAvailable=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version===23;
+    if(typeof contextEnabled!=='boolean')throw new AppError(503,'上下文采集开关须为布尔值','recording_configuration');
+    if(contextEnabled&&!contextAvailable)throw new AppError(503,'上下文结构尚未迁移','database_migration_required');
     await store.initializePricing();
     const configPath=join(data,'settings.json');
     config=options.config;
@@ -145,12 +152,16 @@ export async function createPostgresGateway(options={}){
     const encrypted=(await store.get("SELECT EXISTS(SELECT 1 FROM harbor.keys WHERE secret_cipher IS NOT NULL) OR EXISTS(SELECT 1 FROM harbor.accounts WHERE api_secret_cipher IS NOT NULL) required")).required;
     const key=await material(join(data,'key-encryption.key'),encrypted||!await missing(join(data,'metering-spool')));
     const recordKey=await loadPostgresRecordingKey(store,{dataDir:data,createIfEmpty:true,spoolLimits:options.recordingBuffer});
-    const recordings=new RecordingStore(recordingStore,{...options.recording,encryptionKey:recordKey,clock}),recordingReader=new RecordingStore(queryStore,{...options.recording,encryptionKey:recordKey,clock});
+    // Even with new capture disabled, a schema-23 bridge must replay existing
+    // context commands and allow reading already persisted snapshots.
+    const contexts=contextAvailable?new RecordingContextStore(recordingStore,{encryptionKey:recordKey,clock}):undefined,contextReader=contextAvailable?new RecordingContextStore(queryStore,{encryptionKey:recordKey,clock}):undefined;
+    const recordings=new RecordingStore(recordingStore,{...options.recording,encryptionKey:recordKey,clock,contextRepository:contexts}),recordingReader=new RecordingStore(queryStore,{...options.recording,encryptionKey:recordKey,clock});
     buffer=await RecordingBuffer.create(recordings,{...options.recordingBuffer,directory:join(data,'recording-spool'),atomicCommands:commands=>recordings.writeAtomicCommands(commands),atomicBatch:operation=>recordingStore.transaction(operation)});
     recordingProbeStore=createRecordingProbeStore(database);
     recordingMonitor=createRecordingStorageMonitor(recordingProbeStore,{...recordingStorageConfiguration(options.recording?.storage,env),appPaths:[data,join(data,'recording-spool')],clock});await recordingMonitor.refresh();
     if(env.HARBOR_RECORDING_ENABLED!==undefined&&!['0','1'].includes(env.HARBOR_RECORDING_ENABLED))throw new AppError(503,'正文采集开关须为0或1','recording_configuration');
     const recordingEnabled=options.recording?.enabled??env.HARBOR_RECORDING_ENABLED!=='0',captureBuffer=recordingPolicyBuffer(buffer,recordingMonitor);
+    const captureContext=contextEnabled?createRequestContextCapture(buffer,{policyBuffer:captureBuffer}):undefined;
     meteringRecovery=await MeteringRecovery.create(store,{...options.meteringBuffer,encryptionKey:key,directory:join(data,'metering-spool')});
     // Recovery order matters: persisted successful billing must win before stale
     // running rows are marked interrupted. A corrupt critical spool fails closed.
@@ -182,7 +193,7 @@ export async function createPostgresGateway(options={}){
     const extraReader=createPostgresAccountExtraUsage(queryStore,{clock}),extraBatches=createPostgresExtraUsageBatches(store,{readStore:queryStore,service:extraUsage,clock});extraUsageAdmin=createPostgresExtraUsageAdmin({service:extraUsage,reader:extraReader,policyPreviews:extraBatches.policyPreviews,batches:extraBatches,refreshSubscriptionQuota:(id,options)=>accountAdmin.refreshQuota(id,options),adminAuthenticated:auth.authenticated,adminSession:auth.sessionReference,acceptsAdminRequest:req=>acceptsRequest(req.headers,network),requestBodies,clock,refreshSupported:typeof options.extraUsage?.readEntitlement==='function'});
     const files=new Map(await Promise.all(['index.html','app.js','style.css'].map(async name=>[name,await readFile(join(root,'public',name))])));
     handler=createPostgresResponsesHandler({extraRuntime,runChat:({account,processLease,output,session,messages,model,signal,timeoutMs,onText})=>(account.kind==='claude'?(options.claudeExecutor||runClaude):(options.executor||runCodex))({binary:account.kind==='claude'?(config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe')):config.codexBinary,home:account.home,workspace:join(runtime,'jobs',session.id),messages,model,sessionId:session.upstream_id,previousUsage:{input:session.cum_input,output:session.cum_output,cached:session.cum_cached},signal,timeoutMs,onText,output,spawnProcess:processLease?.spawn||spawnFor(account.home,{kind:'model',signal})}),cliProcesses,outputBudget,requestBodies,stageObserver:options.stageObserver,executionOptions:options.execution,pricingOptions:options.pricing,chatOptions:{reserveTokens:config.reserveTokens??32000,...options.chat},store,queryStore,recordings,recordingReader,buffer:captureBuffer,meteringRecovery,accountAdmin,deviceIssuer:deviceSettings?.issuer,platformTransport,keyEncryptionKey:key,clock,codexBinary:config.codexBinary,
-      maxPendingHandoffs:options.handoffs?.maxPending,recordingEnabled,recordingPolicy:recordingMonitor.snapshot,recordingKey:recordKey,recordingStoragePolicy:recordingMonitor.policy,recordingBackendOptions:options.recording?.backend,recordingAdminOptions:options.recording?.http,maxConcurrent:options.maxConcurrent??120,maxPerMember:options.maxPerMember??8,
+      maxPendingHandoffs:options.handoffs?.maxPending,recordingEnabled,captureContext,contextReader,recordingPolicy:recordingMonitor.snapshot,recordingKey:recordKey,recordingStoragePolicy:recordingMonitor.policy,recordingBackendOptions:options.recording?.backend,recordingAdminOptions:options.recording?.http,maxConcurrent:options.maxConcurrent??120,maxPerMember:options.maxPerMember??8,
       resolveRoute:router.resolve,onRouteFailure:router.block,checkLimits:(m,p,o)=>limits.check(m.id,p.model,{...o,tools:p.tools}),adminAuthenticated:auth.authenticated,
       transportForAccount:async account=>{if(account.kind!=='codex')throw new AppError(503,'此开发入口尚未接通该平台通道','platform_unavailable');return account.auth_mode==='openai_api'?apiResponses:responses;},
       adminStateContext:()=>({endpoint:network.origins[0]||'http://'+(network.listenHost==='::1'?'[::1]':network.listenHost)+':'+(server?.address()?.port||network.port||config.port)+'/v1',mode:'PostgreSQL · 开发验证',capabilities:{accountStateView:true,extraUsage:true,accountPackages:true,asyncPlanning:true,pagedHistory:true,sessionHandoffs:true,memberTypes:true,pagedMembers:true,memberListMetadata:true,sessionFilters:true,deviceAccess:true,memberActions:true,typeStatistics:true,recordingHistory:true}})});

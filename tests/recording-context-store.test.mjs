@@ -85,6 +85,14 @@ test('真实PG：首次基线在提交前故障时保留于加密spool，重启�
  }finally{await buffer?.close();await restored?.close();await rm(directory,{recursive:true,force:true});}
 }));
 
+test('真实PG：恢复时来源已过期只确认丢弃上下文命令，不复活正文或阻塞FIFO',integration,()=>fixture(async({store,key,context,request,clock})=>{
+ const directory=await mkdtemp(join(tmpdir(),'harbor-context-expired-buffer-')),repository=new RecordingStore(store,{encryptionKey:key,contextRepository:context,clock:()=>clock.now});let buffer;
+ try{
+  const id=await request({expires:clock.now+10}),view=captureRequestContext({input:'到期前收到的合成内容'}),coverage={state:view.state,reasons:view.reasons,opaqueReasoningExcluded:view.opaqueReasoningExcluded};
+  buffer=await RecordingBuffer.create(repository,{directory,flushMs:10000,atomicCommands:commands=>repository.writeAtomicCommands(commands)});assert.equal(buffer.contextSnapshot(id,view.components,coverage),true);clock.now+=100;await buffer.flush();assert.equal(buffer.status().queued,0);assert.equal(buffer.status().files,0);assert.equal(buffer.status().failures,0);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_snapshots WHERE request_id=$1',id)).n,0);assert.equal((await context.read(id)).state,'expired');
+ }finally{await buffer?.close();await rm(directory,{recursive:true,force:true});}
+}));
+
 test('真实PG：显式独立DDL保留核心22；首次写入读取、跨请求复用、重复出现和重启',integration,()=>fixture(async({store,key,context,request,read,clock})=>{
  assert.equal((await store.get('SELECT COUNT(*) count FROM harbor.schema_migrations')).count,22);assert.equal(await store.verifySchema(),true);
  const first=await request(),second=await request();assert.equal((await context.writeSnapshot(first,[...components,components[0]])).state,'complete');

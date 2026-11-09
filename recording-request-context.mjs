@@ -9,6 +9,7 @@ const textTypes=new Set(['text','input_text','output_text','summary_text','refus
 const scalarFields=new Set(['role','id','call_id','name','status','channel','tool_call_id','input','arguments']);
 const itemFields={function_call:['type','id','call_id','name','arguments','status'],custom_tool_call:['type','id','call_id','name','input','status'],function_call_output:['type','id','call_id','name','output','status'],custom_tool_call_output:['type','id','call_id','name','output','status'],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
 const schemaBranches=new Set(['allOf','anyOf','oneOf','not','items','prefixItems','contains','additionalProperties','unevaluatedProperties','unevaluatedItems','propertyNames','if','then','else','additionalItems','contentSchema']);
+export const requestContextReasons=Object.freeze(['invalid_payload','unsupported_tools','unsupported_input','unsupported_instructions','ambiguous_input','unsupported_content','unsupported_field','schema_name_collision','size_limit']);
 
 // This view describes the received context, not a claim about the current turn
 // or local execution. Authentication and scope come from the recording store.
