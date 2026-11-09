@@ -43,9 +43,14 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       if(view==='overview'){
         const counts=await store.get('SELECT COUNT(*) member_count FROM harbor.members WHERE removed_at IS NULL');
         const accounts=await store.all('SELECT id,name,kind,auth_mode,enabled,state FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id');
-        const rows=await store.all(`SELECT to_char(to_timestamp(usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
-          COUNT(*) requests,COUNT(*) FILTER(WHERE status='ok') success FROM harbor.requests
-          WHERE usage_at>=$1 AND usage_at<$2 GROUP BY 1 ORDER BY 1`,window.start,window.end);
+        // Evaluate the seven day labels once, then count each bounded range.
+        // Empty days stay absent, matching the complete usage snapshot.
+        const rows=await store.all(`SELECT to_char(to_timestamp(days.start_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
+          counts.requests,counts.success
+          FROM generate_series($1::bigint,$2::bigint-1,86400000::bigint) AS days(start_at)
+          CROSS JOIN LATERAL(SELECT COUNT(*) requests,COUNT(*) FILTER(WHERE status='ok') success FROM harbor.requests
+            WHERE usage_at>=days.start_at AND usage_at<LEAST(days.start_at+86400000,$2::bigint)) counts
+          WHERE counts.requests>0 ORDER BY days.start_at`,window.start,window.end);
         return {view:'overview',usageWindow:window,observedAt:at,peopleLoaded:false,memberCount:counts.member_count,
           accounts,members:[],keys:[],sessions:[],requests:[],audit:[],
           totals:rows.reduce((total,row)=>({requests:total.requests+Number(row.requests),success:total.success+Number(row.success)}),{requests:0,success:0}),

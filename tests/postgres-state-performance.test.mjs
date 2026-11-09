@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
 import {PostgresStore} from '../postgres-store.mjs';
 import {usageWindow} from '../store.mjs';
 import {createPostgresStateQueries} from '../postgres-state-query.mjs';
@@ -36,6 +37,12 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
       await store.run('INSERT INTO harbor.requests(id,member_id,account_id,session_id,started,ended,status,ip,model,price_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',id,record.unattributed?null:member,record.unattributed?null:accounts[0],record.session??null,started,record.ended,record.status??'ok','synthetic','synthetic',revision);
       await store.run("INSERT INTO harbor.request_prices(request_id,state,revision,total_atoms,input_atoms,output_atoms,cached_atoms,adjustment_atoms,measured_at) VALUES($1,'priced',$2,9007199254740993,9007199254740993,0,0,0,$3)",id,record.stale?'synthetic-stale':revision,at);
     }
+    const indexStatements=(await readFile(new URL('../ci/storage-recovery/request-overview-index.sql',import.meta.url),'utf8')).split('-- statement-boundary');
+    assert.equal(indexStatements.length,3);
+    const statisticsStatements=(await readFile(new URL('../ci/storage-recovery/request-statistics-indexes.sql',import.meta.url),'utf8')).split('-- statement-boundary');assert.equal(statisticsStatements.length,4);
+    const initialReader=createPostgresStateQueries(store,{clock:()=>at});let withoutIndex;
+    try{withoutIndex=await initialReader.read({view:'overview'});}finally{await initialReader.close();}
+    for(let attempt=0;attempt<2;attempt++)for(const statement of [...indexStatements,...statisticsStatements])await store.query(statement);
     for(const [observedAt,page] of [[at,1],[at,2],[at,999],[at+15*86400000,1]]){
       const reader=createPostgresStateQueries(store,{clock:()=>observedAt,balancingReader:async time=>({observedAt:time})});
       try{
@@ -43,6 +50,11 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
         assert.deepEqual(compact,{...full,members:[],keys:[],peopleLoaded:false});
         assert.deepEqual(compact.recentUsageWindow,{start:observedAt-12*3600000,end:observedAt,hours:12});
         assert.equal(compact.memberCount,1);assert.equal(compact.keyCount,0);
+        const light=await reader.read({view:'overview'});
+        assert.deepEqual(light.totals,{requests:compact.totals.requests,success:compact.totals.success});
+        assert.deepEqual(light.daily,compact.daily.map(({day,requests})=>({day,requests})));
+        if(observedAt===at)assert.deepEqual(light,withoutIndex);
+
         if(observedAt===at){
           assert.equal(compact.totals.requests,5);assert.equal(compact.totals.standard.unpriced,1);assert.equal(compact.totals.standard.total_exact,'36028.797018963972');
           assert.equal(compact.sessionsPagination.total,27);assert.equal(compact.sessionsPagination.page,page===1?1:2);
@@ -52,5 +64,14 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
         }else{assert.equal(compact.totals.requests,0);assert.deepEqual(compact.daily,[]);assert.equal(compact.sessionsPagination.total,0);assert.deepEqual(compact.requests,[]);}
       }finally{await reader.close();}
     }
+    await store.query('DROP INDEX harbor.request_type_statistics_cover');
+    await store.query('CREATE INDEX request_type_statistics_cover ON harbor.requests(usage_at) INCLUDE(status)');
+    await assert.rejects(store.query(statisticsStatements[0]),/harbor_statistics_index_conflict/);
+    assert.equal((await store.get("SELECT pg_get_indexdef('harbor.request_type_statistics_cover'::regclass) definition")).definition,'CREATE INDEX request_type_statistics_cover ON harbor.requests USING btree (usage_at) INCLUDE (status)');
+    await store.query('DROP INDEX harbor.request_overview_cover');
+    await store.query('CREATE INDEX request_overview_cover ON harbor.requests(usage_at) INCLUDE(status,ip)');
+    const before=(await store.get("SELECT pg_get_indexdef('harbor.request_overview_cover'::regclass) definition")).definition;
+    await assert.rejects(store.query(indexStatements[0]),/harbor_overview_index_conflict/);
+    assert.equal((await store.get("SELECT pg_get_indexdef('harbor.request_overview_cover'::regclass) definition")).definition,before);
   }finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+database);await admin.close();}
 });

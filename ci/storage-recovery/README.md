@@ -322,3 +322,10 @@ bootstrap在新infra ROOT预建`archive/`(PG999/0700)、独立`archive.key`(PG99
 返回明确区分`profileBound`、`metadataReady`、`walArchiveVerified`。新helper不生成`cluster.enc`，完整backup/operator inventory/profile及宿主工具由Root准备后，显式运行原有`storage-backup.mjs prepare-archive`初始化同一config digest／keyVersion／UID的认证绑定。之后须实际产生WAL，原archiver真正成功，且现有`inspectArchivedWal`验证对应加密segment、认证摘要和cluster绑定后，才可能ready；始终`deploymentAllowed:false`，不代替部署或正式恢复验收。占位、metadata未齐和WAL未验均只报下一步缺口，归档失败时保留WAL，需监控空间。
 
 本机UID0测试仅使用新/tmp私有目录核root/PG999权限、同inode、并发锁及中断恢复，不安装真实/etc或/opt；私有PG测试只验证真实WAL与文件完整性组件，不升级为已安装root profile或实际Docker/173组合通过。
+
+
+### 后台总览查询索引
+
+`request-overview-index.sql` 是可选的在线性能索引，不改变 schema migration 版本或业务数据。由管理员针对已核对的目标数据库，以同一连接、自动提交模式依次执行三个 `-- statement-boundary` 分隔的语句；不能塞进业务 migration 事务。先核对同名索引的表、字段及有效性，再并发创建 `(usage_at) INCLUDE(status)`，最后重验定义。连接局部设置有界 `lock_timeout` 和 `statement_timeout`；失败保留现场，不自动删除未知或无效同名索引。该索引让近7天每日计数只读取窄索引，查询本身仍能在未安装索引时正确运行。回滚查询代码无需删索引；确需撤销时，在确认无其他维护占用后单独执行 `DROP INDEX CONCURRENTLY harbor.request_overview_cover`，不删除请求记录。新的安装或逻辑恢复后如需同等性能，应重新执行本脚本；物理备份保留该索引。实际收益须以目标环境的执行时间、Index Only Scan 和 Heap Fetches 核对，不以索引存在冒充性能通过。
+
+`request-statistics-indexes.sql` 同样只通过管理员自动提交逐段执行，提供员工／会话聚合与默认类型聚合的两份窄覆盖索引。它们只覆盖各自需要的身份、时间、状态及价格版本，不包含正文、错误、客户端信息或上游返回的模型字符串，避免无界模型字段触发 B-tree 元组长度限制。类型查询按当前分组只投影必要身份，跨维度筛选仍按原字段执行；带额外筛选时允许优化器选择其他索引或堆扫描。两份索引前后都核对精确字段顺序与有效性，同名冲突拒绝，旧业务代码和数据库版本不变。保留以目标环境真实执行计划与耗时为依据；只在确认不再需要时分别并发删除该脚本声明的索引，不处理其他索引或请求记录。

@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {AppError,usageWindow} from './store.mjs';
-import {fields,validPrice,joins,aggregate,aggregateSql} from './postgres-reference-query.mjs';
+import {fields,validPrice,joins,aggregate,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 
 const states=new Set(['queued','running','ok','failed','unknown','interrupted','cancelled','rejected']);
@@ -42,6 +42,7 @@ export function typeStatisticsConditions(value,{at=Date.now(),alias='r',start=1}
 const counters=`COUNT(*) FILTER(WHERE status='failed') failed,COUNT(*) FILTER(WHERE status='queued') queued,COUNT(*) FILTER(WHERE status='running') running,
   COUNT(*) FILTER(WHERE status='cancelled') cancelled,COUNT(*) FILTER(WHERE status='rejected') rejected,COUNT(*) FILTER(WHERE status='interrupted') interrupted,
   COUNT(*) FILTER(WHERE status NOT IN ('ok','failed','queued','running','cancelled','rejected','interrupted')) unresolved`;
+const rolledCounters=['failed','queued','running','cancelled','rejected','interrupted','unresolved'].map(name=>`COALESCE(SUM(${name}),0)::bigint ${name}`).join(',');
 const typeKey="CASE WHEN r.usage_type_id IS NOT NULL THEN 'type:'||r.usage_type_id WHEN r.usage_type_version IS NULL THEN 'historical_unknown' ELSE 'unclassified' END";
 const groupKeys={type:'type_key',model:"CASE WHEN chosen_model IS NULL THEN '0' ELSE '1'||chosen_model END",member:"CASE WHEN member_id IS NULL THEN '0' ELSE '1'||member_id END"};
 function usage(row){
@@ -61,15 +62,21 @@ export function createPostgresTypeStatistics(store,{clock=Date.now,queryQueue,pa
       if(catalog.length>maxVersions){
         const versions=await store.all(`SELECT DISTINCT p.revision FROM harbor.requests r${joins} WHERE ${scope.where} AND ${validPrice} AND p.total_atoms IS NOT NULL ORDER BY p.revision LIMIT $${args.length+1}`,...args,maxVersions+1);if(versions.length>maxVersions)capacity();
       }
-      const data=`WITH data AS (SELECT ${typeKey} type_key,r.usage_type_id type_id,r.usage_type_code snapshot_code,r.usage_type_name snapshot_name,r.member_id,COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model,r.business_status status,r.started,r.ended,
+      // Filters still address the authoritative request row. Only the chosen
+      // public grouping needs identity columns in the aggregate input.
+      const identity=[query.groupBy==='type'?`${typeKey} type_key,r.usage_type_id type_id,r.usage_type_code snapshot_code,r.usage_type_name snapshot_name`:'NULL::text type_key,NULL::text type_id,NULL::text snapshot_code,NULL::text snapshot_name',
+        query.groupBy==='member'?'r.member_id':'NULL::text member_id',query.groupBy==='model'?"COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model":'NULL::text chosen_model'].join(',');
+      const data=`WITH data AS (SELECT ${identity},r.business_status status,r.started,r.ended,
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,CASE WHEN ${validPrice} THEN p.revision END revision,
         ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
         FROM harbor.requests r${joins} WHERE ${scope.where})`;
       // Aggregate the complete filtered window and its groups together. Only the
       // small grouped relation is materialized/reused for counting and paging.
       const resultRows=await store.all(`${data},keyed AS(SELECT data.*,${key} group_key FROM data),
-        grouped AS MATERIALIZED(SELECT GROUPING(group_key) is_total,group_key,MIN(type_id) type_id,MIN(snapshot_code) snapshot_code,MIN(snapshot_name) snapshot_name,MIN(chosen_model) model,MIN(member_id) member_id,${aggregateSql},${counters}
-          FROM keyed GROUP BY GROUPING SETS((),(group_key))),
+        partial AS MATERIALIZED(SELECT group_key,revision,MIN(type_id) type_id,MIN(snapshot_code) snapshot_code,MIN(snapshot_name) snapshot_name,MIN(chosen_model) model,MIN(member_id) member_id,${referencePartialAggregateSql()},${counters}
+          FROM keyed GROUP BY group_key,revision),
+        grouped AS MATERIALIZED(SELECT GROUPING(group_key) is_total,group_key,MIN(type_id) type_id,MIN(snapshot_code) snapshot_code,MIN(snapshot_name) snapshot_name,MIN(model) model,MIN(member_id) member_id,${referenceRollupAggregateSql()},${rolledCounters}
+          FROM partial GROUP BY GROUPING SETS((),(group_key))),
         counts AS(SELECT COUNT(*) FILTER(WHERE is_total=0) group_count FROM grouped),
         paged AS(SELECT * FROM grouped WHERE is_total=0 ORDER BY group_key COLLATE "C" LIMIT $${args.length+1}
           OFFSET (SELECT (LEAST($${args.length+2}::bigint,GREATEST(1,CEIL(group_count::numeric/$${args.length+1})))::bigint-1)*$${args.length+1} FROM counts))

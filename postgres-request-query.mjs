@@ -1,6 +1,6 @@
 import {createHash,randomUUID} from 'node:crypto';
 import {AppError,usageWindow} from './store.mjs';
-import {fields,validPrice,joins,decorate,aggregate,aggregateSql} from './postgres-reference-query.mjs';
+import {fields,validPrice,joins,decorate,aggregate,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 import {typeStatisticsConditions} from './postgres-type-statistics.mjs';
 
@@ -48,9 +48,11 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
         CASE WHEN ${validPrice} THEN p.revision ELSE NULL END revision,
         ${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms ELSE NULL END ${f}`).join(',')}
       FROM harbor.requests r LEFT JOIN harbor.members m ON m.id=r.member_id${joins}${scope.where}
-    ) SELECT GROUPING(chosen_model) g_model,GROUPING(member_id) g_member,chosen_model,member_id,MAX(member_name) member_name,
-      ${aggregateSql}
-      FROM data GROUP BY GROUPING SETS((),(chosen_model),(member_id))`,...scope.args);
+    ),partial AS MATERIALIZED(SELECT chosen_model,member_id,MIN(member_name) member_name,revision,${referencePartialAggregateSql()}
+      FROM data GROUP BY chosen_model,member_id,revision)
+    SELECT GROUPING(chosen_model) g_model,GROUPING(member_id) g_member,chosen_model,member_id,MAX(member_name) member_name,
+      ${referenceRollupAggregateSql()}
+      FROM partial GROUP BY GROUPING SETS((),(chosen_model),(member_id))`,...scope.args);
     const byModel=[],byMember=[];let summary;
     for(const row of rows){const value=aggregate(row);if(row.g_model&&row.g_member)summary=value;else if(!row.g_model)byModel.push({model:row.chosen_model,...value});else byMember.push({member_id:row.member_id,member_name:row.member_name,...value});}
     const sort=key=>(a,b)=>{const x=a.standard.total_exact===null?null:a.standard.total_exact,y=b.standard.total_exact===null?null:b.standard.total_exact;

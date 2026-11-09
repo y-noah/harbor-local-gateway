@@ -162,3 +162,80 @@ test('R55 slash model names preserve type statistics request, indexed search and
  const model='synthetic-vendor/custom-model',request=await record({model,type:'usage-a'}),key=randomBytes(32),jobs=createPostgresJobs(store,{clock:()=>at}),recordings=new RecordingStore(store,{encryptionKey:key,clock:()=>at}),backend=createPostgresRecordingJobs(store,{recordingKey:key,jobs,clock:()=>at,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});await recordings.start(request,{turnState:'known'});await recordings.append(request,[{sourceKey:'synthetic-slash-input',kind:'user',provenance:'client',content:{text:'斜杠模型合成问题'}}]);await recordings.finish(request,{state:'complete'});await backend.schedule();let job;while(job=await jobs.claim(['recording.index']))await jobs.complete(job,await backend.handlers[job.kind](job));
  const stats=await reader.read({groupBy:'model',model}),filters=Object.fromEntries(Object.entries(stats.rows[0].requestFilters).map(([key,value])=>[key,String(value)])),params=new URLSearchParams(filters),queries=createPostgresRequestQueries(store,{clock:()=>at,businessOutcomes:true});try{const list=await queries.read(requestsQuery(params,{usageTypes:true}));assert.deepEqual(list.rows.map(row=>row.id),[request]);params.set('q','模型合成');const searched=await backend.queries.search(recordingQuery(params,{clock:()=>at,search:true}));assert.ok(searched.items.some(row=>row.id===request));const exported=await backend.exports.enqueue({include_body:true,format:'jsonl',filters}),claimed=await jobs.claim(['recording.export']);await jobs.complete(claimed,await backend.handlers[claimed.kind](claimed));let text='';for await(const chunk of backend.download(exported.id))text+=chunk.toString();const rows=text.trim().split('\n').map(JSON.parse);assert.equal(rows.filter(row=>row.kind==='request').length,1);assert.equal(rows.find(row=>row.kind==='request').model,model);assert.ok(rows.some(row=>row.kind==='recording_event'));}finally{await queries.close();}
 }));
+
+// Keep the prior one-stage SQL as an independent oracle: comparing only counts
+// misses nullable money, revision coverage and weighted duration regressions.
+test('partial reference groups preserve the exact legacy statistics for mixed prices, identities and filters',integration,async()=>fixture(async({store,reader,record,ids})=>{
+  const {aggregateSql}=await import('../postgres-reference-query.mjs');
+  const counters=`COUNT(*) FILTER(WHERE status='failed') failed,COUNT(*) FILTER(WHERE status='queued') queued,COUNT(*) FILTER(WHERE status='running') running,
+    COUNT(*) FILTER(WHERE status='cancelled') cancelled,COUNT(*) FILTER(WHERE status='rejected') rejected,COUNT(*) FILTER(WHERE status='interrupted') interrupted,
+    COUNT(*) FILTER(WHERE status NOT IN ('ok','failed','queued','running','cancelled','rejected','interrupted')) unresolved`;
+  const legacy={get:store.get.bind(store),run:store.run.bind(store),transaction:store.transaction.bind(store),all:async(sql,...args)=>{
+    if(sql.includes('partial AS MATERIALIZED(')){
+      if(sql.includes('keyed AS(')){
+        const start=sql.indexOf('        partial AS MATERIALIZED('),end=sql.indexOf('        counts AS(',start);assert.ok(start>0&&end>start);
+        const source=sql.indexOf('        FROM harbor.requests r'),dataEnd=sql.indexOf('),keyed AS(');assert.ok(source>0&&dataEnd>source&&start>dataEnd);
+        // Freeze the complete old source projection as well as its aggregate;
+        // rebuilding only GROUPING SETS would share a missing identity bug.
+        const fullData=`WITH data AS (SELECT CASE WHEN r.usage_type_id IS NOT NULL THEN 'type:'||r.usage_type_id WHEN r.usage_type_version IS NULL THEN 'historical_unknown' ELSE 'unclassified' END type_key,r.usage_type_id type_id,r.usage_type_code snapshot_code,r.usage_type_name snapshot_name,r.member_id,COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model,r.business_status status,r.started,r.ended,
+          CASE WHEN p.revision=r.price_version AND v.id IS NOT NULL THEN p.state ELSE 'unpriced' END price_state,CASE WHEN p.revision=r.price_version AND v.id IS NOT NULL THEN p.revision END revision,
+          ${['input','output','cached','adjustment','total'].map(field=>`CASE WHEN p.revision=r.price_version AND v.id IS NOT NULL THEN p.${field}_atoms END ${field}`).join(',')}
+`+sql.slice(source,dataEnd);
+        sql=fullData+sql.slice(dataEnd,start)+`        grouped AS MATERIALIZED(SELECT GROUPING(group_key) is_total,group_key,MIN(type_id) type_id,MIN(snapshot_code) snapshot_code,MIN(snapshot_name) snapshot_name,MIN(chosen_model) model,MIN(member_id) member_id,${aggregateSql},${counters}
+          FROM keyed GROUP BY GROUPING SETS((),(group_key))),\n`+sql.slice(end);
+      }else{
+        const start=sql.indexOf('),partial AS MATERIALIZED(');assert.ok(start>0);
+        sql=sql.slice(0,start)+`) SELECT GROUPING(chosen_model) g_model,GROUPING(member_id) g_member,chosen_model,member_id,MAX(member_name) member_name,${aggregateSql}
+          FROM data GROUP BY GROUPING SETS((),(chosen_model),(member_id))`;
+      }
+    }
+    return store.all(sql,...args);
+  }};
+  await store.run("INSERT INTO harbor.pricing_versions(id,created,book) SELECT 'synthetic-second-reference',created,book FROM harbor.pricing_versions ORDER BY id LIMIT 1");
+  const statuses=['ok','failed','queued','running','cancelled','rejected','interrupted','unknown'];
+  for(let index=0;index<37;index++){
+    const request=await record({member:index%3,type:index%4===0?null:index%2?'usage-a':'usage-b',version:index%8===0?null:1,status:statuses[index%statuses.length],model:index%3===0?'synthetic-unpriced-model':'gpt-6.1-sol',started:at-5000-index*31,ended:at-1000+index*7,known:index%5!==0});
+    if(index%3===1)await store.run("UPDATE harbor.requests SET price_version='synthetic-second-reference' WHERE id=$1",request);
+    if(index%3===1)await store.run("UPDATE harbor.request_prices SET revision='synthetic-second-reference' WHERE request_id=$1",request);
+    if(index%7===0)await store.run("UPDATE harbor.request_prices SET revision='synthetic-mismatched-reference' WHERE request_id=$1",request);
+    if(index===4){await store.run("UPDATE harbor.requests SET price_version='synthetic-missing-book' WHERE id=$1",request);await store.run("UPDATE harbor.request_prices SET revision='synthetic-missing-book' WHERE request_id=$1",request);}
+    if(index===5){await store.run('UPDATE harbor.requests SET price_version=NULL WHERE id=$1',request);await store.run('UPDATE harbor.request_prices SET revision=NULL WHERE request_id=$1',request);}
+    if(index%11===0)await store.run('UPDATE harbor.request_prices SET total_atoms=NULL WHERE request_id=$1',request);
+    if(index%13===0)await store.run('DELETE FROM harbor.request_prices WHERE request_id=$1',request);
+    if(index===2)await store.run("UPDATE harbor.request_prices SET state='priced',input_atoms=9007199254740993,output_atoms=27,cached_atoms=NULL,adjustment_atoms=-37,total_atoms=9007199254740983 WHERE request_id=$1",request);
+    if(index===3)await store.run('UPDATE harbor.requests SET member_id=NULL,billing_model=NULL,model=NULL WHERE id=$1',request);
+  }
+  await record({started:window.start-2000,ended:window.start-1});await record({started:window.end+1000,ended:window.end+2000});
+  const previous=createPostgresTypeStatistics(legacy,{clock:()=>at}),currentRequests=createPostgresRequestQueries(store,{clock:()=>at,businessOutcomes:true}),previousRequests=createPostgresRequestQueries(legacy,{clock:()=>at,businessOutcomes:true});
+  try{
+    for(const query of [{},{groupBy:'model'},{groupBy:'member',page:2,pageSize:1},{type:'historical_unknown'},{type:'unclassified'},{member:ids[1].id},{modelMissing:true},{memberMissing:true},{status:'unknown'},{model:'no-synthetic-match'},
+      {groupBy:'type',member:ids[1].id,model:'gpt-6.1-sol'},{groupBy:'model',type:'usage-a',member:ids[2].id,status:'ok'},
+      {groupBy:'member',type:'usage-a',model:'gpt-6.1-sol'},{groupBy:'model',type:'historical_unknown'},{groupBy:'member',type:'unclassified'},
+      {groupBy:'model',memberMissing:true,type:'usage-a'},{groupBy:'member',modelMissing:true,type:'usage-a'}]){
+      const current=await reader.read(query),prior=await previous.read(query);
+      for(const field of ['summary','rows','pagination','filters'])assert.deepEqual(current[field],prior[field],JSON.stringify(query)+' '+field);
+    }
+    // A narrow source relation omits every unused identity column. This proves
+    // each default grouping can execute without reading the other identities.
+    await store.transaction(async()=>{
+      const common='id,price_version,usage_at,business_status,started,ended',identities={type:'usage_type_id,usage_type_version,usage_type_code,usage_type_name',model:'billing_model,model',member:'member_id'};
+      for(const [groupBy,columns] of Object.entries(identities)){
+        await store.run(`CREATE TEMP VIEW synthetic_narrow_${groupBy}_requests AS SELECT ${common},${columns} FROM harbor.requests`);
+        const narrow={get:store.get.bind(store),transaction:store.transaction.bind(store),all:(sql,...args)=>store.all(sql.replace('FROM harbor.requests r',`FROM pg_temp.synthetic_narrow_${groupBy}_requests r`),...args)},projected=createPostgresTypeStatistics(narrow,{clock:()=>at});
+        try{const actual=await projected.read({groupBy}),expected=await previous.read({groupBy});for(const field of ['summary','rows','pagination','filters'])assert.deepEqual(actual[field],expected[field],groupBy+' narrow '+field);}finally{await projected.close();}
+      }
+    });
+    for(const filters of [{},{member:ids[1].id},{model:'gpt-6.1-sol'},{outcome:'unknown'},{type:'unclassified'},{model_missing:'true'},{member_missing:'true'},{model:'no-synthetic-match'}]){
+      const query=requestsQuery(new URLSearchParams({view:'summary',...filters}),{usageTypes:true});
+      const current=await currentRequests.read(query),prior=await previousRequests.read(query);
+      for(const field of ['summary','byModel','byMember','models','members'])assert.deepEqual(current[field],prior[field],JSON.stringify(filters)+' '+field);
+    }
+    // A saved page snapshot must exclude later requests, while selector options
+    // retain their established whole-current-window semantics.
+    const query=requestsQuery(new URLSearchParams({view:'summary'}),{usageTypes:true}),snapshot=await currentRequests.read(query);
+    await record({model:'synthetic-late-selector-model',started:at-600,ended:at-100});
+    const current=await currentRequests.read({...query,snapshot:snapshot.snapshot}),prior=await previousRequests.read({...query,snapshot:snapshot.snapshot});
+    assert.deepEqual(current.summary,snapshot.summary);assert.ok(current.models.includes('synthetic-late-selector-model'));
+    for(const field of ['summary','byModel','byMember','models','members'])assert.deepEqual(current[field],prior[field],field);
+  }finally{await previous.close();await currentRequests.close();await previousRequests.close();}
+}));
