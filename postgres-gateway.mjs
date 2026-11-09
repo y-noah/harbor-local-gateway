@@ -14,7 +14,7 @@ import {readFile,writeFile,mkdir,lstat,realpath,rename} from 'node:fs/promises';
 import {resolve,join,dirname,isAbsolute} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {monitorEventLoopDelay} from 'node:perf_hooks';
-import {PostgresStore} from './postgres-store.mjs';
+import {PostgresStore,postgresContextSchemaVersions} from './postgres-store.mjs';
 import {AppError,revealStoredKey} from './store.mjs';
 import {createAdminAuth,passwordHash,adminCookieName} from './auth.mjs';
 import {networkConfig,acceptsRequest} from './network.mjs';
@@ -136,7 +136,7 @@ export async function createPostgresGateway(options={}){
     try{await store.verifySchema();}catch(e){if(e.code==='42P01')throw new AppError(503,'数据库尚未迁移，请先运行db:migrate','database_migration_required');throw e;}
     if(env.HARBOR_RECORDING_CONTEXT_ENABLED!==undefined&&!['0','1'].includes(env.HARBOR_RECORDING_CONTEXT_ENABLED))throw new AppError(503,'上下文采集开关须为0或1','recording_configuration');
     if(options.recording?.contextEnabled!==undefined&&typeof options.recording.contextEnabled!=='boolean')throw new AppError(503,'上下文采集开关须为布尔值','recording_configuration');
-    const contextEnabled=options.recording?.contextEnabled??env.HARBOR_RECORDING_CONTEXT_ENABLED==='1',contextAvailable=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version===23;
+    const contextEnabled=options.recording?.contextEnabled??env.HARBOR_RECORDING_CONTEXT_ENABLED==='1',contextSchemaVersion=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,contextAvailable=[postgresContextSchemaVersions.storage,postgresContextSchemaVersions.index].includes(contextSchemaVersion);
     if(typeof contextEnabled!=='boolean')throw new AppError(503,'上下文采集开关须为布尔值','recording_configuration');
     if(contextEnabled&&!contextAvailable)throw new AppError(503,'上下文结构尚未迁移','database_migration_required');
     await store.initializePricing();

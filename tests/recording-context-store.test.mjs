@@ -203,3 +203,40 @@ test('真实PG：大组件分页仅提取预算内密文，不预读全部正文
  const all=store.all.bind(store);let fetched=0;store.all=async(sql,...args)=>{const rows=await all(sql,...args);for(const row of rows)if(Buffer.isBuffer(row.content_cipher))fetched+=row.content_cipher.length;return rows;};
  try{const page=await context.read(id,{limit:100});assert.ok(page.hasMore);assert.ok(fetched<=1024);assert.ok(page.parts.length>0);const expected=await read(id);assert.equal(expected.components[0].content.text,'合成大块说明'.repeat(1000));}finally{store.all=all;}
 },{partBytes:256,maxReadBytes:1024}));
+
+test('真实PG：派生读取校验完整对象指纹、密钥、预算和有效来源',integration,()=>fixture(async({store,key,context,request,read,clock})=>{
+ const id=await request();await context.writeSnapshot(id,[{kind:'history',content:{text:'可检索的完整正文'.repeat(2000)}}]);const object=(await read(id)).components[0].objectId;
+ const value=await context.readObject(object);assert.equal(value.content.text,'可检索的完整正文'.repeat(2000));assert.equal(value.bytes,Buffer.byteLength(JSON.stringify(value.content)));
+ const wrong=new RecordingContextStore(store,{encryptionKey:randomBytes(32),clock:()=>clock.now});await assert.rejects(wrong.readObject(object),{code:'recording_context_scope'});
+ const original=await store.get('SELECT fingerprint,bytes FROM harbor.recording_context_objects WHERE id=$1',object);
+ await store.run('UPDATE harbor.recording_context_objects SET fingerprint=$1 WHERE id=$2',randomBytes(32),object);await assert.rejects(context.readObject(object),{code:'recording_context_unreadable'});
+ await store.run('UPDATE harbor.recording_context_objects SET fingerprint=$1,bytes=$2 WHERE id=$3',original.fingerprint,context.maxSnapshotBytes+1,object);await assert.rejects(context.readObject(object),{code:'recording_context_capacity'});
+ await store.run('UPDATE harbor.recording_context_objects SET bytes=$1 WHERE id=$2',original.bytes,object);
+ await store.run('UPDATE harbor.requests SET session_id=NULL WHERE id=$1',id);await assert.rejects(context.readObject(object),{code:'recording_context_expired'});
+}));
+
+test('真实PG：派生读取拒绝换块、缺块和过期，其他有效引用不受旧来源到期影响',integration,()=>fixture(async({store,context,request,read,clock})=>{
+ const old=await request({expires:at+10}),recent=await request();await context.writeSnapshot(old,components);await context.writeSnapshot(recent,components);const values=(await read(recent)).components,object=values[0].objectId;
+ clock.now=at+20;assert.deepEqual((await context.readObject(object)).content,components[0].content);
+ const original=await store.get('SELECT content_cipher FROM harbor.recording_context_parts WHERE object_id=$1',object),other=await store.get('SELECT content_cipher FROM harbor.recording_context_parts WHERE object_id=$1',values[1].objectId);
+ await store.run('UPDATE harbor.recording_context_parts SET content_cipher=$1 WHERE object_id=$2',other.content_cipher,object);await assert.rejects(context.readObject(object),{code:'recording_context_unreadable'});
+ await store.run('UPDATE harbor.recording_context_parts SET content_cipher=$1 WHERE object_id=$2',original.content_cipher,object);
+ await store.run('DELETE FROM harbor.recording_context_parts WHERE object_id=$1',values[1].objectId);await assert.rejects(context.readObject(values[1].objectId),{code:'recording_context_incomplete'});
+ clock.now=at+20000;await assert.rejects(context.readObject(object),{code:'recording_context_expired'});
+}));
+
+test('真实PG：活导出保护共享对象，过期及取消导出依赖有限清理且不饿死其他对象',integration,()=>fixture(async({store,context,request,read,clock,gc})=>{
+ await store.query(await readFile(new URL('../migrations/024-recording-context-derived.sql',import.meta.url),'utf8'));
+ const id=await request({expires:at+10});await context.writeSnapshot(id,components);const objects=(await read(id)).components;
+ const createExport=async(status,expires)=>{const exportId=randomUUID();await store.run("INSERT INTO harbor.background_jobs(id,kind,available_at,created,updated) VALUES($1,'recording.export',$2,$2,$2)",exportId,at);await store.run("INSERT INTO harbor.recording_exports(id,created,expires,actor,options,visibility,status) VALUES($1,$2,$3,'synthetic','{}',pg_current_snapshot(),$4)",exportId,at,expires,status);for(const object of objects)await store.run('INSERT INTO harbor.recording_context_export_objects VALUES($1,$2)',exportId,object.objectId);return exportId;};
+ const live=await createExport('complete',at+1000);await createExport('cancelled',at+1000);await createExport('running',at+5);
+ clock.now=at+20;await gc();assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_objects')).n,3);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects')).n,3);
+ assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_snapshots')).n,0);await assert.rejects(context.readObject(objects[0].objectId),{code:'recording_context_expired'});
+ await store.run("UPDATE harbor.recording_exports SET status='cancelled' WHERE id=$1",live);await gc();assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_objects')).n,0);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_work')).n,0);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_export_objects')).n,0);
+}));
+
+test('真实PG：最小分块配置的近上限UTF8对象仍可完整派生读取',integration,()=>fixture(async({store,key,context,request,clock})=>{
+ const id=await request(),content={text:'中'.repeat(87376)};const receipt=await context.writeSnapshot(id,[{kind:'history',content}]);assert.equal(receipt.state,'complete');
+ const object=await store.get('SELECT id,bytes,parts FROM harbor.recording_context_objects');assert.ok(object.parts>Math.ceil(object.bytes/256));assert.deepEqual((await context.readObject(object.id)).content,content);
+ const restarted=new RecordingContextStore(store,{encryptionKey:key,clock:()=>clock.now});assert.deepEqual((await restarted.readObject(object.id)).content,content);
+},{partBytes:256,maxSnapshotBytes:262144}));

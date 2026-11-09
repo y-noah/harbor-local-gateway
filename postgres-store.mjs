@@ -13,7 +13,8 @@ const integer=value=>{
   const n=Number(value);if(!Number.isSafeInteger(n))throw new AppError(503,'数据库整数字段超出安全范围','database_value_invalid');return n;
 };
 const migrationFiles=['001-postgres.sql','002-request-queries.sql','003-startup-recovery.sql','004-account-bindings.sql','005-quota-refresh.sql','006-background-leases.sql','007-routing-plans.sql','008-nightly-execution.sql','009-job-dependencies.sql','010-session-handoffs.sql','011-member-types.sql','012-member-config-batches.sql','013-member-pages.sql','014-device-access.sql','015-recording-jobs.sql','016-automatic-handoffs.sql','017-member-actions.sql','018-account-packages.sql','019-recording-export-history.sql','020-recording-storage-reports.sql','021-account-extra-usage.sql','022-extra-usage-batches.sql'];
-const contextMigrationFile='023-recording-context.sql';
+const contextMigrationFiles=['023-recording-context.sql','024-recording-context-derived.sql'];
+export const postgresContextSchemaVersions=Object.freeze({storage:23,index:24});
 const isolation=new Set(['READ COMMITTED','REPEATABLE READ','SERIALIZABLE']);
 const copyTls=value=>value&&typeof value==='object'?{...value,...(value.key!==undefined?{key:value.key}:{})}:value;
 function databaseTransport(connectionString,connection,allowPlaintextLocalNetwork){
@@ -89,18 +90,18 @@ export class PostgresStore{
     finally{client.release(scope.connection.error??undefined);}
   }
   async migrate(options={}){
-    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(name=>name!=='recordingContext')||options.recordingContext!==undefined&&typeof options.recordingContext!=='boolean')throw new AppError(503,'数据库迁移选项无效','database_configuration');
+    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(name=>!['recordingContext','recordingContextIndex'].includes(name))||['recordingContext','recordingContextIndex'].some(name=>options[name]!==undefined&&typeof options[name]!=='boolean')||options.recordingContext===false&&options.recordingContextIndex===true)throw new AppError(503,'数据库迁移选项无效','database_configuration');
     return this.transaction(async()=>{
-      // The bridge recognizes one exact additive migration. It never enables
+      // The bridge recognizes only the exact known additive migrations. It never enables
       // context storage by merely starting a gateway or calling migrate().
       const lock=createHash('sha256').update('harbor-postgres-migrations').digest().readInt32BE();
       await this.query('SELECT pg_advisory_xact_lock($1)',[lock]);
       await this.query('CREATE SCHEMA IF NOT EXISTS harbor');
       await this.query('CREATE TABLE IF NOT EXISTS harbor.schema_migrations(version INTEGER PRIMARY KEY,checksum TEXT NOT NULL,applied BIGINT NOT NULL)');
       const existing=await this.all('SELECT version,checksum FROM harbor.schema_migrations ORDER BY version');
-      if(existing.length>migrationFiles.length+1||existing.some((row,index)=>row.version!==index+1))throw new AppError(503,'数据库结构版本不匹配，禁止自动修补未知迁移','database_migration_required');
-      const target=options.recordingContext===true||existing.length===migrationFiles.length+1?migrationFiles.length+1:migrationFiles.length;
-      const files=target===migrationFiles.length?migrationFiles:[...migrationFiles,contextMigrationFile];let changed=false,version=0;
+      if(existing.length>migrationFiles.length+contextMigrationFiles.length||existing.some((row,index)=>row.version!==index+1))throw new AppError(503,'数据库结构版本不匹配，禁止自动修补未知迁移','database_migration_required');
+      const target=Math.max(migrationFiles.length,existing.length,options.recordingContextIndex===true?postgresContextSchemaVersions.index:options.recordingContext===true?postgresContextSchemaVersions.storage:migrationFiles.length);
+      const files=[...migrationFiles,...contextMigrationFiles].slice(0,target);let changed=false,version=0;
       for(const file of files){
         version++;const sql=await readFile(new URL('./migrations/'+file,import.meta.url),'utf8'),checksum=createHash('sha256').update(sql).digest('hex');
         const prior=existing[version-1];
@@ -112,8 +113,8 @@ export class PostgresStore{
   }
   async verifySchema(){
     const rows=await this.all('SELECT version,checksum FROM harbor.schema_migrations ORDER BY version');
-    if(![migrationFiles.length,migrationFiles.length+1].includes(rows.length))throw new AppError(503,'数据库结构版本不匹配，请先执行对应迁移','database_migration_required');
-    const files=rows.length===migrationFiles.length?migrationFiles:[...migrationFiles,contextMigrationFile];
+    if(![migrationFiles.length,postgresContextSchemaVersions.storage,postgresContextSchemaVersions.index].includes(rows.length))throw new AppError(503,'数据库结构版本不匹配，请先执行对应迁移','database_migration_required');
+    const files=[...migrationFiles,...contextMigrationFiles].slice(0,rows.length);
     for(const [index,file] of files.entries()){
       const sql=await readFile(new URL('./migrations/'+file,import.meta.url),'utf8');
       if(rows[index].version!==index+1||rows[index].checksum!==createHash('sha256').update(sql).digest('hex'))throw new AppError(503,'数据库迁移校验值不匹配，禁止启动','database_migration_conflict');

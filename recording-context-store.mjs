@@ -128,6 +128,43 @@ export class RecordingContextStore{
    return {...this.#receipt({...snapshot,expires_at:expiresAt}),encoding:'json_utf8',parts,next,hasMore:sizes.length>parts.length};
   },{level:'REPEATABLE READ',readOnly:true});
  }
+ // Internal derived-data reader. It is not exposed as an employee endpoint.
+ // A live source authorizes the scope; ciphertext is fetched only after its
+ // full size is checked. Workers must recheck source liveness when committing.
+ async readObject(objectId){
+  if(typeof objectId!=='string'||!objectId||objectId.length>200)fail(400,'上下文对象标识无效');
+  return this.store.transaction(async()=>{
+   const object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1',objectId);
+   if(!object)fail(404,'上下文对象不存在','recording_context_missing');
+   const source=await this.store.get(`SELECT r.id,r.member_id,r.session_id FROM harbor.recording_context_references ref
+    JOIN harbor.recording_context_snapshots s ON s.request_id=ref.request_id
+    JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id
+    LEFT JOIN harbor.sessions session ON session.id=r.session_id
+    WHERE ref.object_id=$1 AND s.scope_digest=$2 AND s.key_version=$3 AND s.member_id=r.member_id
+     AND s.session_id IS NOT DISTINCT FROM r.session_id AND r.recording_state<>'expired'
+     AND LEAST(s.expires_at,c.expires_at)>$4 AND (r.session_id IS NULL OR session.member_id=r.member_id)
+    ORDER BY r.id LIMIT 1`,objectId,object.scope_digest,object.key_version,this.clock());
+   if(!source)fail(410,'上下文对象已无有效来源','recording_context_expired');
+   const scope=this.#digest('scope',JSON.stringify([source.member_id,source.session_id?['session',source.session_id]:['request',source.id]]));
+   if(!equal(scope,object.scope_digest)||object.key_version!==this.keyVersion)fail(503,'上下文对象归属或密钥不一致','recording_context_scope');
+   if(object.state!=='complete')fail(503,'上下文对象尚不完整','recording_context_incomplete');
+   const shape=await this.store.get('SELECT COUNT(*) parts,COALESCE(SUM(bytes),0) bytes,COALESCE(SUM(octet_length(content_cipher)),0) cipher_bytes,MAX(ordinal) last FROM harbor.recording_context_parts WHERE object_id=$1',objectId);
+   // The smallest supported part is 256 bytes; UTF-8 alignment can retreat
+   // three bytes. Do not assume the reader uses the writer's partBytes.
+   if(!Number.isSafeInteger(object.bytes)||object.bytes>this.maxSnapshotBytes||object.parts>Math.ceil(this.maxSnapshotBytes/(256-3))+1||Number(shape.cipher_bytes)>this.maxSnapshotBytes+28*object.parts)fail(503,'上下文对象超过读取预算','recording_context_capacity');
+   if(shape.parts!==object.parts||shape.last!==object.parts||Number(shape.bytes)!==object.bytes)fail(503,'上下文对象分块缺失','recording_context_incomplete');
+   const rows=await this.store.all('SELECT ordinal,bytes,content_cipher FROM harbor.recording_context_parts WHERE object_id=$1 ORDER BY ordinal',objectId),parts=[];
+   for(const [index,row] of rows.entries()){
+    if(row.ordinal!==index+1)fail(503,'上下文对象分块顺序无效','recording_context_incomplete');
+    const plain=this.#open(row.content_cipher,objectId,row.ordinal,scope);
+    if(plain.length!==row.bytes)fail(503,'上下文对象分块长度不一致','recording_context_incomplete');parts.push(plain);
+   }
+   const bytes=Buffer.concat(parts);
+   if(!equal(this.#digest('object:'+scope.toString('hex'),Buffer.concat([Buffer.from(object.kind+'\0'),bytes])),object.fingerprint))fail(503,'上下文对象指纹不一致','recording_context_unreadable');
+   let content;try{content=JSON.parse(bytes.toString('utf8'));}catch{fail(503,'上下文对象格式无效','recording_context_unreadable');}
+   return {objectId,kind:object.kind,content,bytes:object.bytes,keyVersion:object.key_version,fingerprint:object.fingerprint,scopeDigest:scope};
+  },{level:'REPEATABLE READ',readOnly:true});
+ }
  async gc({limit=100}={}){
   if(!Number.isInteger(limit)||limit<1||limit>1000)fail(400,'上下文清理批次无效');
   // Visit one scope at a time, retaining a keyset cursor across calls. Live
@@ -137,11 +174,21 @@ export class RecordingContextStore{
   const scope=candidate.scope_digest;
   const result=await this.store.transaction(async()=>{
    await this.#lock(scope);
+   const derived=Boolean((await this.store.get("SELECT to_regclass('harbor.recording_context_export_objects') name")).name);
+   // Export dependencies are committed together with their chunks. Release
+   // only terminal/expired exports, in bounded batches under the source lock.
+   const expiredExports=`(e.expires<=$2 OR e.status IN ('cancelled','failed','expired'))`;
+   if(derived)await this.store.run(`DELETE FROM harbor.recording_context_export_objects d USING (
+    SELECT d.export_id,d.object_id FROM harbor.recording_context_export_objects d
+    JOIN harbor.recording_context_objects o ON o.id=d.object_id JOIN harbor.recording_exports e ON e.id=d.export_id
+    WHERE o.scope_digest=$1 AND ${expiredExports} ORDER BY d.export_id,d.object_id LIMIT $3 FOR UPDATE OF d
+   ) stale WHERE d.export_id=stale.export_id AND d.object_id=stale.object_id`,scope,this.clock(),limit);
+   const unreferenced=`NOT EXISTS(SELECT 1 FROM harbor.recording_context_references r WHERE r.object_id=o.id)${derived?' AND NOT EXISTS(SELECT 1 FROM harbor.recording_context_export_objects d WHERE d.object_id=o.id)':''}`;
    const stale=await this.store.all("SELECT s.request_id FROM harbor.recording_context_snapshots s JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id WHERE s.scope_digest=$1 AND (LEAST(s.expires_at,c.expires_at)<=$2 OR r.recording_state='expired') ORDER BY s.request_id LIMIT $3 FOR UPDATE OF s",scope,this.clock(),limit);
    for(const row of stale)await this.store.run('DELETE FROM harbor.recording_context_snapshots WHERE request_id=$1',row.request_id);
-   const orphan=await this.store.all('SELECT o.id FROM harbor.recording_context_objects o WHERE o.scope_digest=$1 AND NOT EXISTS(SELECT 1 FROM harbor.recording_context_references r WHERE r.object_id=o.id) ORDER BY o.id LIMIT $2 FOR UPDATE OF o',scope,limit);
+   const orphan=await this.store.all(`SELECT o.id FROM harbor.recording_context_objects o WHERE o.scope_digest=$1 AND ${unreferenced} ORDER BY o.id LIMIT $2 FOR UPDATE OF o`,scope,limit);
    for(const row of orphan)await this.store.run('DELETE FROM harbor.recording_context_objects WHERE id=$1',row.id);
-   const remaining=await this.store.get("SELECT EXISTS(SELECT 1 FROM harbor.recording_context_snapshots s JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id WHERE s.scope_digest=$1 AND (LEAST(s.expires_at,c.expires_at)<=$2 OR r.recording_state='expired')) OR EXISTS(SELECT 1 FROM harbor.recording_context_objects o WHERE o.scope_digest=$1 AND NOT EXISTS(SELECT 1 FROM harbor.recording_context_references r WHERE r.object_id=o.id)) pending",scope,this.clock());
+   const remaining=await this.store.get(`SELECT EXISTS(SELECT 1 FROM harbor.recording_context_snapshots s JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id WHERE s.scope_digest=$1 AND (LEAST(s.expires_at,c.expires_at)<=$2 OR r.recording_state='expired')) OR EXISTS(SELECT 1 FROM harbor.recording_context_objects o WHERE o.scope_digest=$1 AND ${unreferenced})${derived?` OR EXISTS(SELECT 1 FROM harbor.recording_context_export_objects d JOIN harbor.recording_context_objects o ON o.id=d.object_id JOIN harbor.recording_exports e ON e.id=d.export_id WHERE o.scope_digest=$1 AND ${expiredExports})`:''} pending`,scope,this.clock());
    return {snapshots:stale.length,objects:orphan.length,pending:remaining.pending};
   });
   if(!result.pending)this.gcScope=scope;
