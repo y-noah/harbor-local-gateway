@@ -161,7 +161,7 @@ export async function createPostgresGateway(options={}){
     recordingMonitor=createRecordingStorageMonitor(recordingProbeStore,{...recordingStorageConfiguration(options.recording?.storage,env),appPaths:[data,join(data,'recording-spool')],clock});await recordingMonitor.refresh();
     if(env.HARBOR_RECORDING_ENABLED!==undefined&&!['0','1'].includes(env.HARBOR_RECORDING_ENABLED))throw new AppError(503,'正文采集开关须为0或1','recording_configuration');
     const recordingEnabled=options.recording?.enabled??env.HARBOR_RECORDING_ENABLED!=='0',captureBuffer=recordingPolicyBuffer(buffer,recordingMonitor);
-    const captureContext=contextEnabled?createRequestContextCapture(buffer,{policyBuffer:captureBuffer}):undefined;
+    const captureContext=contextEnabled?createRequestContextCapture(buffer,{policyBuffer:captureBuffer,cooperative:true}):undefined;
     meteringRecovery=await MeteringRecovery.create(store,{...options.meteringBuffer,encryptionKey:key,directory:join(data,'metering-spool')});
     // Recovery order matters: persisted successful billing must win before stale
     // running rows are marked interrupted. A corrupt critical spool fails closed.

@@ -1,8 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {captureRequestContext} from '../recording-request-context.mjs';
+import {captureRequestContext,captureRequestContextAsync} from '../recording-request-context.mjs';
 import {RecordingStore} from '../recording-store.mjs';
 import {randomBytes} from 'node:crypto';
+
+test('协作与同步采集结构、脱敏及截断事实完全一致，并实际让出事件循环',async()=>{
+ const payload={instructions:'合成说明',tools:[{type:'custom',name:'exec'}],input:[{role:'user',content:[{type:'input_text',text:'Authorization: Bearer '},{type:'input_text',text:'private-secret'}]},...Array.from({length:2000},()=>({role:'assistant',content:'合成历史'}))]};
+ for(const options of [{},{maxNodes:80},{maxComponents:12},{maxBytes:1024}]){
+  let yielded=false;const tick=new Promise(resolve=>setImmediate(()=>{yielded=true;resolve();}));
+  const actual=await captureRequestContextAsync(payload,{...options,sliceMs:Number.MIN_VALUE});assert.equal(yielded,true);await tick;
+  assert.deepEqual(actual,captureRequestContext(payload,options));assert.ok(!JSON.stringify(actual).includes('private-secret'));
+ }
+});
+
+test('协作采集在开始前和分段期间响应取消，非法时间片拒绝',async()=>{
+ for(const sliceMs of [0,-1,NaN,Infinity,'5',null])await assert.rejects(captureRequestContextAsync({}, {sliceMs}),TypeError);
+ const before=new AbortController();before.abort();await assert.rejects(captureRequestContextAsync({}, {signal:before.signal}),{name:'AbortError'});
+ const during=new AbortController(),interrupt=new Promise(resolve=>setImmediate(()=>{during.abort();resolve();}));
+ await assert.rejects(captureRequestContextAsync({input:Array.from({length:2000},()=>({role:'user',content:'合成历史'}))},{sliceMs:Number.MIN_VALUE,signal:during.signal}),{name:'AbortError'});await interrupt;
+});
 
 test('内联工具目录保留来源与命名空间，嵌套schema仍只保留定义而不泄漏敏感默认值',()=>{
  const input=[{type:'additional_tools',id:'catalog',role:'developer',tools:[{type:'namespace',name:'functions',tools:[{type:'function',name:'lookup',parameters:{type:'object',properties:{api_key:{type:'string',default:'private-default'},query:{type:'string'}}}},{type:'custom',name:'exec',format:{type:'grammar',syntax:'lark',definition:'start: "ok"'}}]}]},

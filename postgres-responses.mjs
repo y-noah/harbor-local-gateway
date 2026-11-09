@@ -18,7 +18,7 @@ import {responseBodyBytes} from './request-body.mjs';
 import {validateResponses,validateCodexJson,codexJsonRoutes,isResponsesDispatchSource} from './responses.mjs';
 import {captureCodexJsonInput,captureCodexJsonOutput} from './codex-json-recording.mjs';
 import {ConversationCapture,currentInput} from './conversation-capture.mjs';
-import {observeRequestContext,incompleteRequestContext} from './recording-context-capture.mjs';
+import {observeRequestContextAsync,incompleteRequestContext} from './recording-context-capture.mjs';
 import {postgresRequestObservation} from './postgres-observability.mjs';
 import {createPostgresRequestQueries} from './postgres-request-query.mjs';
 import {createPostgresStateQueries,stateQuery} from './postgres-state-query.mjs';
@@ -267,7 +267,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       const current=captureEnabled?record(()=>jsonPath?{state:'known'}:currentInput(payload)):null;
       if(captureEnabled){recordStarted=current?!!writeRecording('start',requestId,current.state):false;if(!recordStarted)recordFailed=true;}
       if(captureEnabled&&recordStarted){
-        if(!jsonPath)requestContext=observeRequestContext(captureContext,requestId,original);
+        if(!jsonPath)requestContext=await observeRequestContextAsync(captureContext,requestId,original,{signal:controller.signal});
         capture=record(()=>new ConversationCapture({emit:event=>{
           const bytes=Buffer.byteLength(JSON.stringify(event));if(batch.length>=128||batchBytes+bytes>64*1024)flush();
           batch.push(event);batchBytes+=bytes;return !recordFailed;

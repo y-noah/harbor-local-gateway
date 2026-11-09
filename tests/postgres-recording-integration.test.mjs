@@ -44,6 +44,20 @@ test('context HTTP: Responses, legacy Chat and platform save their received view
  assert.equal(f.calls(),3);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_snapshots')).n,3);assert.equal(f.app.buffer.status().files,0);
 });
 
+test('context HTTP: long received history remains complete through cooperative capture and real encrypted pagination',integration,async t=>{
+ const f=await fixture(t,{mode:'healthy',probe:async()=>[{total:1000,free:900}],context:true,schemaContext:true}),payload={model:'gpt-6.1-sol',input:Array.from({length:2000},(_,index)=>({role:index%2?'user':'assistant',content:('合成长历史 '+index+' ').repeat(12)})),stream:false};
+ const expected=captureRequestContext(payload);assert.equal(expected.state,'complete');assert.equal(expected.components.length,2000);
+ const response=await f.send('/v1/responses',payload);assert.equal(response.status,200,await response.text());await f.app.buffer.flush();
+ const row=await f.store.get('SELECT id,status,recording_state,usage_unknown FROM harbor.requests');assert.equal(row.status,'ok');assert.equal(row.recording_state,'complete');assert.equal(row.usage_unknown,0);assert.equal(f.calls(),1);
+ const restored=new Map();let cursor={component:0,part:0},finished=false;
+ for(let pageNumber=0;pageNumber<100;pageNumber++){
+  const result=await f.admin(`requests/${row.id}/context?limit=100&after_component=${cursor.component}&after_part=${cursor.part}`);assert.equal(result.status,200);const page=await result.json();assert.equal(page.state,'complete');assert.equal(page.coverage.state,'complete');
+  for(const part of page.parts){const entry=restored.get(part.component)||{kind:part.kind,text:''};entry.text+=part.text;restored.set(part.component,entry);}
+  if(!page.hasMore){finished=true;break;}assert.notDeepEqual(page.next,cursor);cursor=page.next;
+ }
+ assert.equal(finished,true);assert.deepEqual([...restored.values()].map(entry=>({kind:entry.kind,content:JSON.parse(entry.text)})),expected.components);assert.equal(f.app.buffer.status().dropped,0);
+});
+
 test('context HTTP: a rejected snapshot leaves ordinary input/output and one successful metering result',integration,async t=>{
  const f=await fixture(t,{mode:'healthy',probe:async()=>[{total:1000,free:900}],context:true,schemaContext:true}),snapshot=f.app.buffer.contextSnapshot.bind(f.app.buffer);f.app.buffer.contextSnapshot=()=>false;
  try{const response=await f.send('/v1/responses',{model:'gpt-6.1-sol',input:'上下文拒绝后仍保存本轮',stream:false});assert.equal(response.status,200);await response.json();await f.app.buffer.flush();}finally{f.app.buffer.contextSnapshot=snapshot;}

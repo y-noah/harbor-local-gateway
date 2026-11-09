@@ -7,7 +7,7 @@ import {createPostgresChatState} from './postgres-chat-state.mjs';
 import {chatSettlementFacts,validateLegacyChat} from './chat-facts.mjs';
 import {ConversationCapture,currentInput} from './conversation-capture.mjs';
 import {sanitizeRecord} from './record-redaction.mjs';
-import {observeRequestContext,incompleteRequestContext} from './recording-context-capture.mjs';
+import {observeRequestContextAsync,incompleteRequestContext} from './recording-context-capture.mjs';
 
 const fail=(status,message,code)=>new AppError(status,message,code);
 export function createPostgresChatService({store,buffer,meteringRecovery,checkLimits,runChat,execution,cliProcesses,outputBudget,refreshQuotas=async()=>{},activity,deviceAccess,recordingEnabled=true,captureContext,recordingPolicy=()=>true,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock}),readBody=readJsonBody,reserveTokens=32000,maxRequests=16,maxQueued=5,waitMs=120000,timeoutMs=120000,maxConcurrent=120,maxPerMember=8}={}){
@@ -65,7 +65,7 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
       admission=await state.admit(secret,original,{headers:req.headers,ip:req.socket.remoteAddress||'unknown',agent:String(req.headers['user-agent']||'').slice(0,200),recordingEnabled:captureEnabled,authorizeDevice:person=>deviceAccess?.authorize(person,req,{phase:'admission'})});extraBoundary=extraRuntime?.boundary({requestId:admission.requestId,protocol:'chat',admittedExtra:admission.extraAdmission.extraReserved});releasePreparation();releasePreparation=null;
       if(!captureEnabled)await store.run('UPDATE harbor.requests SET recording_reason=$1 WHERE id=$2 AND recording_state=\'disabled\'',captureDecision.reason,admission.requestId).catch(()=>{});
       if(captureEnabled){const input=record(()=>currentInput({input:admission.delta}));recordStarted=!!input&&!!writeRecording('start',admission.requestId,input.state);if(!recordStarted)recordFailed=true;
-        if(recordStarted)requestContext=observeRequestContext(captureContext,admission.requestId,received);
+        if(recordStarted)requestContext=await observeRequestContextAsync(captureContext,admission.requestId,received,{signal:controller.signal});
         if(recordStarted){capture=record(()=>new ConversationCapture({emit:event=>{const size=Buffer.byteLength(JSON.stringify(event));if(batch.length>=128||bytes+size>65536)flush();batch.push(event);bytes+=size;return !recordFailed;}}));record(()=>capture?.input({input:admission.delta},input));flush();flushTimer=setInterval(flush,250);flushTimer.unref();}}
       received=undefined;
       const ready=await enqueue(secret,admission.requestId,controller.signal,member.id,req);releaseSlot=ready.release;admission={...admission,account:ready.account,session:ready.session};alive();

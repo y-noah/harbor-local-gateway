@@ -7,7 +7,7 @@ import {randomBytes} from 'node:crypto';
 import {RecordingStore} from '../recording-store.mjs';
 import {RecordingBuffer} from '../recording-buffer.mjs';
 import {recordingPolicyBuffer} from '../postgres-recording-storage.mjs';
-import {createRequestContextCapture,observeRequestContext,incompleteRequestContext} from '../recording-context-capture.mjs';
+import {createRequestContextCapture,observeRequestContext,observeRequestContextAsync,incompleteRequestContext} from '../recording-context-capture.mjs';
 
 async function fixture(t,{maxBytes=1024,maxMemoryBytes=4096}={}){
  const directory=await mkdtemp(join(tmpdir(),'harbor-context-capture-')),store={},saved=[],contexts={store,maxSnapshotBytes:Math.max(4096,maxBytes),maxComponents:4096,writeSnapshot:async(...args)=>saved.push(args)},repository=new RecordingStore(store,{encryptionKey:randomBytes(32),maxBytes,maxEventBytes:256,contextRepository:contexts}),buffer=await RecordingBuffer.create(repository,{directory,flushMs:10000,maxMemoryBytes});
@@ -27,12 +27,34 @@ test('旁路异常、异步或非法结果只产生缺失状态，关闭时不�
  await new Promise(resolve=>setImmediate(resolve));assert.throws(()=>createRequestContextCapture({}),{code:'recording_configuration'});
 });
 test('大量短消息的已过滤组件不被缓冲再次裁掉，源预算超限仍可保存前缀',async t=>{
- for(const count of [1363,2000]){
+ for(const count of [1363,2000,4096,5000]){
   const {buffer,saved}=await fixture(t,{maxBytes:2*1024*1024,maxMemoryBytes:4*1024*1024}),payload={input:Array.from({length:count},()=>({role:'user',content:'合成短消息'}))},result=createRequestContextCapture(buffer)('synthetic-request',payload);
   assert.equal(result.accepted,true);assert.equal(buffer.status().diagnostics.dropReasons.sanitize,0);assert.equal(buffer.status().dropped,0);const command=buffer.queue[0].value;
-  if(count===1363){assert.equal(result.state,'complete');assert.equal(command.components.length,count);}else{assert.equal(result.state,'incomplete');assert.ok(command.components.length>0&&command.components.length<count);assert.ok(command.coverage.reasons.includes('size_limit'));}
+  if(count<=4096){assert.equal(result.state,'complete');assert.equal(command.components.length,count);}else{assert.equal(result.state,'incomplete');assert.equal(command.components.length,4096);assert.ok(command.coverage.reasons.includes('size_limit'));}
   await buffer.flush();assert.equal(saved.length,1);assert.equal(buffer.status().files,0);
  }
+});
+
+test('协作采集完整进入真实加密缓冲，等待结果后才报告成功',async t=>{
+ const {buffer,saved}=await fixture(t,{maxBytes:2*1024*1024,maxMemoryBytes:4*1024*1024}),capture=createRequestContextCapture(buffer,{cooperative:true}),input=Array.from({length:2000},(_,index)=>({role:'user',content:'合成历史 '+index}));
+ const result=await observeRequestContextAsync(capture,'synthetic-cooperative',{input});assert.deepEqual(result,{accepted:true,state:'complete',reason:null});
+ await buffer.flush();assert.equal(saved.length,1);assert.equal(saved[0][1].length,input.length);assert.equal(saved[0][2].coverage.state,'complete');
+});
+
+test('协作采集中取消或许可关闭不入队，不误报完整记录',async t=>{
+ for(const cancel of [true,false]){
+  const {buffer}=await fixture(t,{maxBytes:2*1024*1024,maxMemoryBytes:4*1024*1024});let allowed=true;
+  const policy=recordingPolicyBuffer(buffer,{snapshot:()=>({captureAllowed:allowed,status:allowed?'ok':'low'})}),capture=createRequestContextCapture(buffer,{policyBuffer:policy,cooperative:true}),controller=new AbortController();
+  const interrupt=new Promise(resolve=>setImmediate(()=>{if(cancel)controller.abort();else allowed=false;resolve();}));
+  const result=await observeRequestContextAsync(capture,'synthetic-cancel',{input:Array.from({length:4096},()=>({role:'user',content:'合成历史'}))},{signal:controller.signal});await interrupt;
+  assert.equal(result.accepted,false);assert.equal(result.reason,cancel?'capture_failed':'storage_low');assert.equal(buffer.status().queued,0);
+ }
+});
+
+test('异步旁路兼容同步结果，拒绝无效结果并消化异步异常',async()=>{
+ assert.equal(await observeRequestContextAsync(undefined,'synthetic',{}),null);
+ const outcome={accepted:true,state:'complete',reason:null};assert.deepEqual(await observeRequestContextAsync(()=>outcome,'synthetic',{}),outcome);
+ for(const capture of [async()=>{throw Error('private-error');},async()=>({accepted:true,state:'complete',reason:'private-error'})])assert.deepEqual(await observeRequestContextAsync(capture,'synthetic',{}),{accepted:false,state:'incomplete',reason:'capture_failed'});
 });
 
 test('真实加密缓冲透传服务端请求限定的附件指纹，不保存附件字节',async t=>{

@@ -14,7 +14,7 @@ export const requestContextReasons=Object.freeze(['invalid_payload','unsupported
 
 // This view describes the received context, not a claim about the current turn
 // or local execution. Authentication and scope come from the recording store.
-export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=16384,attachmentFingerprint}={}){
+function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=65536,attachmentFingerprint}={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxComponents)||maxComponents<1||!Number.isSafeInteger(maxNodes)||maxNodes<1)throw TypeError('Invalid request context budget');
   const redactions=new Set(),onRedact=category=>redactions.add(category);
   const components=[],reasons=new Set();let bytes=2,nodes=maxNodes,opaqueReasoningExcluded=0;
@@ -119,25 +119,43 @@ export function captureRequestContext(payload,{maxBytes=2*1024*1024,maxComponent
     if(bytes+size>maxBytes){cut();return false;}components.push(component);bytes+=size;return true;
   };
   if(!payload||typeof payload!=='object'||Array.isArray(payload))return {state:'incomplete',components,bytes,reasons:['invalid_payload'],opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
-  if(typeof payload.instructions==='string')add('instruction',{source:'instructions',value:payload.instructions});
+  if(typeof payload.instructions==='string'){add('instruction',{source:'instructions',value:payload.instructions});yield;}
   else if(payload.instructions!==undefined&&payload.instructions!==null)reasons.add('unsupported_instructions');
-  if(Array.isArray(payload.tools))for(let index=0;index<payload.tools.length;index++){if(nodes<=0){cut();break;}const tool=payload.tools[index];if(!tool||typeof tool!=='object'||Array.isArray(tool)){nodes--;reasons.add('unsupported_tools');continue;}if(!add('tool_schema',{source:'tools',index,value:tool}))break;}
+  if(Array.isArray(payload.tools))for(let index=0;index<payload.tools.length;index++){if(nodes<=0){cut();break;}const tool=payload.tools[index];if(!tool||typeof tool!=='object'||Array.isArray(tool)){nodes--;reasons.add('unsupported_tools');yield;continue;}if(!add('tool_schema',{source:'tools',index,value:tool}))break;yield;}
   else if(payload.tools!==undefined)reasons.add('unsupported_tools');
   const input=payload.input??payload.messages,source=payload.input===undefined?'messages':'input';
   if(payload.input!==undefined&&payload.messages!==undefined)reasons.add('ambiguous_input');
-  if(typeof input==='string')add('context',{source,value:input});
+  if(typeof input==='string'){add('context',{source,value:input});yield;}
   else if(Array.isArray(input)){
     for(let index=0;index<input.length;index++){
       if(--nodes<0){cut();break;}
       const item=input[index];
-      if(!item||typeof item!=='object'||Array.isArray(item)||!(itemTypes.has(item.type)||item.type==='reasoning'||['user','assistant','system','developer','tool'].includes(item.role))){reasons.add('unsupported_input');continue;}
+      if(!item||typeof item!=='object'||Array.isArray(item)||!(itemTypes.has(item.type)||item.type==='reasoning'||['user','assistant','system','developer','tool'].includes(item.role))){reasons.add('unsupported_input');yield;continue;}
       if(!add(item.type==='additional_tools'?'tool_schema':['system','developer'].includes(item.role)?'instruction':'context',{source,index,value:item}))break;
+      yield;
     }
   }else if(input!==undefined)reasons.add('unsupported_input');
   // Relationships are protocol evidence only; no inference about ancestry.
   for(const key of ['previous_response_id','conversation','tool_choice','parallel_tool_calls','truncation'])if(payload[key]!==undefined){
     const value=payload[key],valid=value===null||key==='parallel_tool_calls'&&typeof value==='boolean'||key!=='parallel_tool_calls'&&typeof value==='string'||['conversation','tool_choice'].includes(key)&&typeof value==='object'&&!Array.isArray(value);
-    if(!valid){reasons.add('unsupported_content');continue;}add('context',{source:key,value});
+    if(!valid){reasons.add('unsupported_content');continue;}add('context',{source:key,value});yield;
   }
   return {state:reasons.size?'incomplete':'complete',components,bytes,reasons:[...reasons].sort(),opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
+}
+
+// Both entry points consume the same filtering and budget state machine.
+export function captureRequestContext(payload,options){
+  const iterator=requestContext(payload,options);let step;
+  do{step=iterator.next();}while(!step.done);return step.value;
+}
+
+export async function captureRequestContextAsync(payload,{sliceMs=5,signal,...options}={}){
+  if(typeof sliceMs!=='number'||!Number.isFinite(sliceMs)||sliceMs<=0)throw TypeError('Invalid context capture slice');
+  const iterator=requestContext(payload,options);let deadline=performance.now()+sliceMs;
+  try{
+    for(;;){
+      signal?.throwIfAborted();const step=iterator.next();if(step.done)return step.value;
+      if(performance.now()>=deadline){await new Promise(setImmediate);signal?.throwIfAborted();deadline=performance.now()+sliceMs;}
+    }
+  }finally{iterator.return();}
 }
