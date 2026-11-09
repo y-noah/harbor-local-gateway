@@ -23,6 +23,7 @@ STACK='/opt/product-development/harbor-local-gateway'
 STATIC_HELPER='/usr/local/lib/harbor/static-release.py'
 ENTRY_HELPER='/usr/local/lib/harbor/gateway-entry-controller.py'
 LOCAL_ASSURANCE_HELPER='/usr/local/lib/harbor/local-assurance-deploy.py'
+IMAGE_STAGE_HELPER='/usr/local/lib/harbor/release-image.py'
 
 def validate(payload,config):
     if not isinstance(payload,dict) or set(payload)!={'action','image'} or payload['action'] not in ('deploy','deploy-entry-postgres'):
@@ -302,6 +303,26 @@ def main():
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o600:raise ValueError('Deployment configuration must be root-owned 0600')
     config=json.loads(Path(CONFIG).read_text())
     if not isinstance(payload,dict):raise ValueError('Only a deployment request is allowed')
+    if payload.get('action') in ('prepare-image','image-stage-status','image-stage-plan'):
+        # Transport can install verified OCI bytes, never authorize or execute a
+        # release. A status read must remain available while the importer holds
+        # the ordinary deployment lock.
+        if type(config.get('image_staging_enabled',False)) is not bool or config.get('image_staging_enabled') is not True:raise ValueError('Image staging requires the root opt-in')
+        helper=Path(IMAGE_STAGE_HELPER)
+        for target in [*reversed(helper.parents),helper]:
+            info=target.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('Image stage helper is not root controlled')
+        spec=importlib.util.spec_from_file_location('harbor_release_image',helper)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        module.identity(payload,config)
+        if payload['action'] in ('image-stage-status','image-stage-plan'):
+            result=module.handle(payload,sys.stdin.buffer,config)
+        else:
+            with open('/run/harbor-gateway-deploy.lock','a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                result=module.handle(payload,sys.stdin.buffer,config)
+        print(json.dumps({'image_staging':result},sort_keys=True))
+        return
     action=deployment_action(payload,config)
     if action=='deploy-static':
         # The helper and approval are independently installed by root. CI cannot select a path or command.

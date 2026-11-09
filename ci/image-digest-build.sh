@@ -43,7 +43,9 @@ manifest="$root/$role-$CI_JOB_ID.manifest"
 test ! -e "$raw" && test ! -e "$manifest" || fail
 set -- --build-arg "$argument"
 if test "$role" = gateway; then set -- "$@" --build-arg "HARBOR_BUILD_DEBIAN_MIRROR_ORIGIN=${HARBOR_TEST_DEBIAN_MIRROR_ORIGIN-}"; fi
-GODEBUG="${GODEBUG:+$GODEBUG,}http2client=0" /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile "$CI_PROJECT_DIR/$dockerfile" "$@" --destination "$destination:$CI_COMMIT_SHA" --digest-file "$CI_PROJECT_DIR/$raw" --insecure --insecure-pull --skip-tls-verify
+# Each role keeps its cache inside the same project. Revision-only metadata is
+# emitted after dependencies in Dockerfile; source timestamps are not identity.
+GODEBUG="${GODEBUG:+$GODEBUG,}http2client=0" /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile "$CI_PROJECT_DIR/$dockerfile" "$@" --destination "$destination:$CI_COMMIT_SHA" --digest-file "$CI_PROJECT_DIR/$raw" --cache=true --cache-repo "$destination-build-cache" --cache-run-layers=true --cache-copy-layers=true --reproducible --insecure --insecure-pull --skip-tls-verify
 result=$(cat "$raw"); digest "$result"
 printf 'schema=1\nproject=%s\npipeline=%s\ncommit=%s\nrole=%s\nrepository=%s\nproducer=%s\ndigest=%s\nparent=%s\n' "$CI_PROJECT_ID" "$CI_PIPELINE_ID" "$CI_COMMIT_SHA" "$role" "$destination" "$CI_JOB_ID" "$result" "$parent" > "$manifest"
 case "$role" in gateway) prefix=GATEWAY;; postgres-validation) prefix=POSTGRES_VALIDATION;; postgres-infrastructure) prefix=POSTGRES_INFRASTRUCTURE;; esac

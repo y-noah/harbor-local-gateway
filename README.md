@@ -16,6 +16,18 @@ Node、Python 校验镜像及服务的 Node 基础镜像使用 Docker 官方 ECR
 
 Kaniko进程局部向既有`GODEBUG`追加`http2client=0`，用于规避基座镜像层传输中已观察到的HTTP/2流错误；不改变构建源、摘要、原TLS参数或增加重试，也不影响模型服务。真实构建才能验证该传输调整的效果。回退需同时恢复CI配置与配套摘要脚本，无数据库迁移；候选digest链不等同于正式容量环境的只读运行、资源隔离或LAN证明。
 
+构建缓存分别保存在本项目业务、验证、基础设施镜像的 `-build-cache` 仓库，沿用原项目机器人权限；不添加外部缓存源。Kaniko复用RUN／COPY层并移除层时间戳，提交revision只在稳定依赖之后进入镜像清单与label，避免仅源码变化也重装Codex／Qoder。CI参数校验不能代替真实缓存证明；须比较同依赖、不同源码的两次实际镜像层摘要，依赖版本或锁文件变化仍重新构建相应层。回退构建脚本及Dockerfile即可关闭缓存，已发布镜像与数据库不变。
+
+### CI直接准备镜像
+
+启用CI变量 `HARBOR_IMAGE_STAGE=1` 后，`prepare_gateway_image_testing` 在真实业务候选成功后手动执行：Runner从现有仓库按digest读取镜像，经原受限SSH直接发送到173，不经过开发机，也不向173发送仓库密码。启用时隐藏原普通部署作业；真正切换仍使用原 `deploy_gateway_entry_installed_testing`、原同库票据与入口控制器。需更新备份工具时，另启用原 `HARBOR_POSTGRES_INFRA_SMOKE=1`，通过实际smoke后执行 `prepare_postgres_tools_image_testing`；普通业务发布不默认更新工具profile或触发备份。
+
+服务器先由管理员安装受信的 `ci/release-image.py` 至 `/usr/local/lib/harbor/release-image.py`，并更新原forced wrapper。原root配置 `/etc/harbor-gateway-deploy.json` 的严格布尔 `image_staging_enabled` 默认关闭，只有显式 `true` 才允许本项目SHA镜像准备；CI不能覆盖该开关。`prepare-image` 仅校验、导入，不运行镜像，不暂停入口、不改票据或业务容器；`image-stage-status` 在导入任务持原部署锁时仍可只读查询。`image-stage-plan` 只接受有界OCI元数据，从最多三份历史complete收据及其整包SHA／长度均匹配的归档计算缺层；Runner单流发送元数据与缺层，服务器组装完整原OCI并重核闭包。首次无可复用包时传全包，缓存命中后只传缺失层；不把镜像存在或未知目录当可复用来源。
+
+准备包在 `/var/lib/harbor-image-staging/<身份摘要>/`，只由root写入。归档成员、压缩及展开字节、平台、源码revision、原manifest／config／各层摘要均校验；只支持当前gzip／普通tar层，不降级转换OCI身份。传输失败清理本次未完成目录；导入或结果未知保留现场。导入在独立systemd任务中执行，SSH观察断开后先查询同一身份，不重启load；只有实际load退出0且原RepoDigests／Descriptor／config／layers一致才记录complete。CI将准备、传输字节、导入状态和完成结果写入作业日志，完成前不会显示成功；收据始终 `ciVerified:false`、`deploymentAllowed:false`，自报流水线信息仅用于审计，不授发布权限。
+
+原宿主四文件manifest和固定票据会绑定wrapper字节。更新前使用root-only `ci/install-image-stage.py install`，传入已核对的source、revision及旧manifest／票据、新wrapper／helper的SHA；它在原部署与controller锁内核当前已完成release及真实active启动授权，保全旧文件，安装后只同步原manifest与固定票据的hostToolsRevision，重新验证源码和原active授权。历史release记录与active approval不改写，待处理release或未知字节拒绝安装。失败恢复旧文件；`rollback --revision <已安装revision>` 仅在当前active身份未变且文件仍为已记录前／后件时恢复。该管理工具不属于CI forced动作，不修改开关或备份工具profile，也不重启服务。移除CI变量及关闭root开关停止后续准备；已有导入按原预算收尾，原installed-release消费方式保留。
+
 遇到公共Node基座限流且内网未命中时，可显式设置CI变量`HARBOR_CACHE_NODE_BASE=1`，再手动执行独立`cache_node_base`；默认不创建该作业，不成为测试或部署依赖。`HARBOR_NODE_CACHE_SOURCE`默认`dockerhub`，仅允许显式改为`ecr`，无自动回退。它复用原缓存脚本的固定`node`枚举，复制与Dockerfile相同摘要的24.21.0基座到既有同项目registry-map路径，保留全部平台和原始摘要，核复制前后index字节一致后生成`.ci-node-base-cache/流水线-作业.json`；不改变Dockerfile、镜像版本或候选门禁。源为官方匿名TLS，目标沿用现有项目凭据；关闭变量只撤销后续手动入口，已上传缓存保留，不删除镜像或影响服务。实际缓存成功及后续构建仍须分别核验，不能把本地脚本测试当远端构建已修复。
 
 `test_gateway`、`test_postgres` 通过 `ci/install-debian-test-dependencies.mjs` 安装测试依赖。固定 Node slim 镜像没有系统 CA，脚本先将 Node 内置的 Mozilla 根证书写入临时公开 PEM（目录0755、文件0644，供 `_apt` 读取），仅将 `debian.sources` 中官方 `deb.debian.org` 的活动 URI 升级为 HTTPS。首次 APT 更新和安装显式使用该 CA 文件，并安装 `ca-certificates`；发行版、组件和 `Signed-By` 保持原值，TLS 证书／主机名及仓库签名校验继续启用。成功、失败或受控中止后清理临时 CA，不自动重试或延长作业期限。该引导只作用于两个测试作业；回退对应 CI 改动即可撤销。
