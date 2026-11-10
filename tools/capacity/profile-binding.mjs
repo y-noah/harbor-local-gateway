@@ -4,7 +4,7 @@ import {usageWindow} from '../../store.mjs';
 import {isOwnedLaboratory} from './owned-runtime.mjs';
 import {datasetManifest,fixtureDatabase,verifyDataset} from './dataset.mjs';
 import {targets} from './scenarios.mjs';
-import {installCapacityBaselineGuard,sealCapacityBaselineGuard,readCapacityBaselineGuard} from './baseline-guard.mjs';
+import {installCapacityBaselineGuard,sealCapacityBaselineGuard,readCapacityBaselineGuard,suspendCapacityBaselineGuard,resumeCapacityBaselineGuard} from './baseline-guard.mjs';
 
 const bindings=new WeakMap(),profiles=new Set(['selfcheck','formal']);
 const fail=code=>{throw new Error(code);};
@@ -64,6 +64,14 @@ export async function sealCapacityProfileCoverage(binding){
  const record=bindings.get(binding);if(!record||!open(record.isOpen))fail('capacity_profile_binding_not_owned');
  if(!record.coverage)fail('capacity_profile_coverage_not_installed');if(record.store.context.getStore())fail('capacity_profile_binding_nested_transaction');
  return sealCapacityBaselineGuard(record.coverage);
+}
+export async function suspendCapacityProfileCoverage(binding){
+ const record=bindings.get(binding);if(!record||!open(record.isOpen))fail('capacity_profile_binding_not_owned');
+ if(!record.coverage)fail('capacity_profile_coverage_not_installed');return suspendCapacityBaselineGuard(record.coverage);
+}
+export async function resumeCapacityProfileCoverage(binding,{recordingKey,store}={}){
+ const record=bindings.get(binding);if(!record||!open(record.isOpen))fail('capacity_profile_binding_not_owned');
+ if(!record.coverage)fail('capacity_profile_coverage_not_installed');const result=await resumeCapacityBaselineGuard(record.coverage,{recordingKey,store});if(store)record.store=store;return result;
 }
 export async function collectCapacityProfileCoverage(binding){
  const record=bindings.get(binding);if(!record||!open(record.isOpen))fail('capacity_profile_binding_not_owned');

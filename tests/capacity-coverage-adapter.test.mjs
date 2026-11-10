@@ -24,3 +24,16 @@ test('continuous baseline evidence covers snapshot gaps without hiding them or k
  assert.equal(summarize([{...sample,metadata7d:1259999}]).passed,false);assert.equal(summarize([{...sample,pricing_revision:'synthetic-other'}]).passed,false);
  assert.equal(summarize([{...sample,at:4}]).passed,null,'old evidence does not extend its own observation interval');
 });
+
+
+test('recovered intervals remain separate and do not silently cover fault samples',()=>{
+ const before={protected:true,sealed:true,available:true,method:'monotone-seed-loss-lower-bound',from:10,through:20,metadata7d:1260000,metadata30d:5400000,pricingRevision:'synthetic-v1'},after={...before,passed:true,from:30,through:40,segments:[before]};
+ const sample=at=>({at,metadata7d:1260000,metadata30d:5400000,pricing_revision:'synthetic-v1'});
+ const summarize=samples=>summarizeCapacityCoverage(samples,{profile:'formal',continuousCoverage:after});
+ const result=summarize([sample(15),sample(35)]);assert.equal(result.continuous,false);assert.equal(result.passed,null);assert.equal(result.segmentedPassed,true);assert.deepEqual(result.gaps,[{from:20,through:30,reason:'database_restart_or_restore',continuous:false}]);
+ const inGap=summarize([sample(15),{at:25,verified:false},sample(35)]);assert.equal(inGap.segmentedPassed,null);assert.equal(inGap.uncoveredSamples,1);assert.equal(inGap.passed,null);
+ const stale=summarize([sample(9),sample(35)]);assert.equal(stale.segmentedPassed,null);assert.equal(stale.passed,null);
+ assert.equal(summarize([sample(15),{...sample(35),metadata7d:1}]).passed,false);
+ assert.equal(summarize([sample(15),{...sample(35),pricing_revision:'other'}]).passed,false);
+ const overlapping={...after,from:19};assert.equal(summarizeCapacityCoverage([sample(15),sample(35)],{profile:'formal',continuousCoverage:overlapping}).segmentedPassed,null);
+});
