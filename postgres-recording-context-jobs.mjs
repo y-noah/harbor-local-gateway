@@ -52,9 +52,10 @@ export function createPostgresRecordingContextJobs(store,{jobs,recordingKey,cryp
   if(!work||work.revision!==job.payload.revision||work.indexed_revision>=work.revision)return {object_id:job.target,skipped:true};
   let source;try{source=await contexts.readObject(job.target);}catch(error){if(['recording_context_missing','recording_context_expired'].includes(error.code))return {object_id:job.target,expired:true};throw error;}
   const text=visibleText(source.content,maxDocumentBytes),parts=recordingParts([{kind:'context',field:'context:'+job.target,text}],{partChars}),prepared=[];let bytes=0;
+  const indexTerms=crypto.createTermsScope();
   for(const [index,part] of parts.entries()){
    stop(signal);const size=Buffer.byteLength(JSON.stringify(part));bytes+=size;
-   prepared.push({ordinal:index+1,bytes:size,cipher:crypto.seal(part,`context-document:${job.target}:${work.revision}:${formatVersion}:${index+1}`),terms:crypto.terms(part.searchText)});
+   prepared.push({ordinal:index+1,bytes:size,cipher:crypto.seal(part,`context-document:${job.target}:${work.revision}:${formatVersion}:${index+1}`),terms:indexTerms(part.searchText)});
    if(index%16===15)await new Promise(setImmediate);
   }
   return jobs.commitEffect(job,()=>contexts.withLiveObject(job.target,source,async()=>{

@@ -7,10 +7,25 @@ export function createRecordingIndexCrypto(key){
   if(!Buffer.isBuffer(key)||key.length!==32)throw new AppError(503,'正文后台加密材料无效','recording_index_configuration');
   const encryption=Buffer.from(hkdfSync('sha256',key,Buffer.alloc(0),'harbor-recording-derived-encryption-v1',32)),search=Buffer.from(hkdfSync('sha256',key,Buffer.alloc(0),'harbor-recording-search-v1',32));
   const keyVersion=createHash('sha256').update(search).digest('hex');
-  const terms=text=>{const chars=Array.from(normalizeSearch(text)),seen=new Set(),found=new Map();for(let i=1;i<chars.length;i++){const gram=chars[i-1]+chars[i];if(/^\s+$/.test(gram)||seen.has(gram))continue;seen.add(gram);const digest=createHmac('sha256',search).update(gram).digest();found.set(digest.toString('hex'),digest);}return [...found.values()];};
+  function indexTerms(text,cache){
+    const chars=Array.from(normalizeSearch(text)),seen=new Set(),found=new Map(),capacity=Math.max(0,chars.length-1);
+    // Keep at most one part's candidate grams, never a whole document or a
+    // process-wide plaintext vocabulary. Each indexing job owns its scope.
+    if(cache)while(cache.size>capacity)cache.delete(cache.keys().next().value);
+    for(let i=1;i<chars.length;i++){
+      const gram=chars[i-1]+chars[i];if(/^\s+$/.test(gram)||seen.has(gram))continue;seen.add(gram);
+      let digest=cache?.get(gram);
+      if(!digest){digest=createHmac('sha256',search).update(gram).digest();if(cache){if(cache.size>=capacity)cache.delete(cache.keys().next().value);cache.set(gram,digest);}}
+      // Callers may mutate returned buffers without poisoning later parts.
+      found.set(digest.toString('hex'),cache?Buffer.from(digest):digest);
+    }
+    return [...found.values()];
+  }
+  const terms=text=>indexTerms(text);
+  const createTermsScope=()=>{const cache=new Map();return text=>indexTerms(text,cache);};
   function seal(value,aad){const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',encryption,iv);cipher.setAAD(Buffer.from(aad));return Buffer.concat([iv,cipher.update(JSON.stringify(value),'utf8'),cipher.final(),cipher.getAuthTag()]);}
   function open(value,aad){try{const decipher=createDecipheriv('aes-256-gcm',encryption,value.subarray(0,12));decipher.setAAD(Buffer.from(aad));decipher.setAuthTag(value.subarray(-16));return JSON.parse(Buffer.concat([decipher.update(value.subarray(12,-16)),decipher.final()]).toString('utf8'));}catch{throw error();}}
-  return {terms,seal,open,keyVersion};
+  return {terms,createTermsScope,seal,open,keyVersion};
 }
 
 // Assembly preserves source order and field identity. A final replacement replaces

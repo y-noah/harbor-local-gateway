@@ -60,7 +60,8 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
     // Decrypt/assemble/tokenize outside a database transaction. Bounds are the
     // repository's recorded bytes, not the original model request size.
     const events=source.events.map(event=>({...event,content:recordings.open(event.content_cipher,job.target+':'+event.sequence+':'+event.source_key)})),items=assembleRecording(events,{maxBytes:maxDocumentBytes}),parts=recordingParts(items,{partChars}),prepared=[];let bytes=0;
-    for(const [index,part] of parts.entries()){stop(signal);const payload=JSON.stringify(part),size=Buffer.byteLength(payload);bytes+=size;prepared.push({ordinal:index+1,kind:part.kind,field:part.field,bytes:size,cipher:crypto.seal(part,`document:${job.target}:${source.row.revision}:${index+1}`),terms:crypto.terms(part.searchText)});if(index%16===15)await new Promise(setImmediate);}
+    const indexTerms=crypto.createTermsScope();
+    for(const [index,part] of parts.entries()){stop(signal);const payload=JSON.stringify(part),size=Buffer.byteLength(payload);bytes+=size;prepared.push({ordinal:index+1,kind:part.kind,field:part.field,bytes:size,cipher:crypto.seal(part,`document:${job.target}:${source.row.revision}:${index+1}`),terms:indexTerms(part.searchText)});if(index%16===15)await new Promise(setImmediate);}
     return jobs.commitEffect(job,async()=>{
       const recording=await store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1 FOR SHARE',job.target);if(!recording||recording.expires_at<=clock())return {request_id:job.target,expired:true};
       const current=await store.get('SELECT revision,indexed_revision FROM harbor.recording_work WHERE request_id=$1 FOR UPDATE',job.target);if(!current||current.revision!==source.row.revision||current.indexed_revision>=current.revision)return {request_id:job.target,stale:true};stop(signal);

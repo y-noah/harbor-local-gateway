@@ -19,6 +19,20 @@ test('blind indexing hashes each distinct normalized gram once while preserving 
  try{crypto.createHmac=(...args)=>{calls++;return original(...args);};syncBuiltinESMExports();assert.deepEqual(index.terms('甲乙ＡB'.repeat(4096)),expected);assert.equal(calls,4,'重复正文不应重复计算相同规范化二元项的HMAC');}
  finally{crypto.createHmac=original;syncBuiltinESMExports();}
 });
+test('per-document term scopes preserve independent digests across Unicode parts and caller mutation',()=>{
+ const key=randomBytes(32),index=createRecordingIndexCrypto(key),scope=index.createTermsScope(),other=index.createTermsScope();
+ const texts=['甲乙ＡB'.repeat(512),'甲乙ab'.repeat(512),'e\u0301😀中文\t\n全角ＡＢ','短','','\t\n','尾部中文'.repeat(1024)];
+ for(let round=0;round<3;round++)for(const text of texts){const expected=index.terms(text),actual=scope(text);assert.deepEqual(actual,expected);for(const buffer of actual)buffer.fill(0);assert.deepEqual(scope(text),expected);assert.deepEqual(other(text),expected);}
+ assert.notDeepEqual(createRecordingIndexCrypto(randomBytes(32)).createTermsScope()('中文'),scope('中文'));
+});
+test('term reuse stays inside one indexing scope and avoids repeated HMAC work across parts',()=>{
+ const index=createRecordingIndexCrypto(randomBytes(32)),expected=index.terms('甲乙ab甲'),scope=index.createTermsScope(),original=crypto.createHmac;let calls=0;
+ try{
+  crypto.createHmac=(...args)=>{calls++;return original(...args);};syncBuiltinESMExports();
+  for(let i=0;i<20;i++)assert.deepEqual(scope('甲乙ＡB'.repeat(512)),expected);
+  assert.equal(calls,4);assert.deepEqual(index.createTermsScope()('甲乙ＡB'.repeat(512)),expected);assert.equal(calls,8,'新任务必须使用独立作用域');
+ }finally{crypto.createHmac=original;syncBuiltinESMExports();}
+});
 test('B5 normalized search windows retain a maximum-length query across a combining-character boundary',()=>{
   const text='x'.repeat(1920)+'e\u0301'.repeat(128)+'z',parts=recordingParts([{kind:'user',field:'u',text}]),query='é'.repeat(128);assert.ok(parts.some(part=>part.searchText.includes(query)));assert.equal(parts.map(part=>part.text).join(''),text);
 });
