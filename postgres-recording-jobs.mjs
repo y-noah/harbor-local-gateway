@@ -67,7 +67,14 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
       const current=await store.get('SELECT revision,indexed_revision FROM harbor.recording_work WHERE request_id=$1 FOR UPDATE',job.target);if(!current||current.revision!==source.row.revision||current.indexed_revision>=current.revision)return {request_id:job.target,stale:true};stop(signal);
       await store.run('DELETE FROM harbor.recording_documents WHERE request_id=$1',job.target);
       await store.run('INSERT INTO harbor.recording_documents VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',job.target,source.row.revision,source.row.persisted_sequence,clock(),source.row.recording_state,source.row.turn_state,source.row.expires_at,prepared.length,bytes,crypto.keyVersion);
-      for(const part of prepared){stop(signal);await store.run('INSERT INTO harbor.recording_document_parts VALUES($1,$2,$3,$4,$5,$6,$7::bytea[])',job.target,part.ordinal,part.kind,part.field,part.cipher,part.bytes,part.terms);}
+      for(let offset=0;offset<prepared.length;offset+=indexBatch){
+        stop(signal);
+        const batch=prepared.slice(offset,offset+indexBatch);
+        await store.run(`INSERT INTO harbor.recording_document_parts(request_id,ordinal,kind,field_id,payload_cipher,bytes,search_terms)
+          SELECT $1,v.ordinal,v.kind,v.field,v.cipher,v.bytes,ARRAY(SELECT decode(term,'hex') FROM jsonb_array_elements_text(v.terms) AS terms(term))
+          FROM jsonb_to_recordset($2::jsonb) AS v(ordinal integer,kind text,field text,cipher bytea,bytes integer,terms jsonb)`,job.target,JSON.stringify(batch.map(part=>({ordinal:part.ordinal,kind:part.kind,field:part.field,cipher:'\\x'+part.cipher.toString('hex'),bytes:part.bytes,terms:part.terms.map(term=>term.toString('hex'))}))));
+      }
+      stop(signal);
       await store.run('UPDATE harbor.recording_work SET indexed_revision=$1,indexed_at=$2,last_error=NULL WHERE request_id=$3',source.row.revision,clock(),job.target);return {request_id:job.target,parts:prepared.length,source_sequence:source.row.persisted_sequence};
     });
   }

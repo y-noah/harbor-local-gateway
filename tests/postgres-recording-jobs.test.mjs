@@ -20,6 +20,23 @@ async function fixture(t){const root=new PostgresStore(connection()),database='h
   return {store,database,clock,key,recordings,jobs,backend,member,session,request,run,advance:ms=>{at+=ms;}};
 }
 
+test('batched document indexing rolls back every part on SQL failure and preserves exact search after retry',integration,async t=>{
+ const f=await fixture(t),text='跨分块故障检索 normalizedHandler '.repeat(300),id=await f.request({text,reply:'重试后正文完整'}),backend=createPostgresRecordingJobs(f.store,{recordingKey:f.key,jobs:f.jobs,clock:f.clock,indexBatch:2,partChars:256,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
+ await backend.schedule();const job=await f.jobs.claim(['recording.index']);assert.equal(job.target,id);
+ await f.store.query('ALTER TABLE harbor.recording_document_parts ADD CONSTRAINT synthetic_batch_failure CHECK(ordinal<=2)');
+ await assert.rejects(backend.handlers[job.kind](job),error=>error.code==='23514');
+ assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_documents WHERE request_id=$1',id)).n,0);
+ assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_document_parts WHERE request_id=$1',id)).n,0);
+ assert.equal((await f.store.get('SELECT indexed_revision FROM harbor.recording_work WHERE request_id=$1',id)).indexed_revision,0);
+ await f.store.query('ALTER TABLE harbor.recording_document_parts DROP CONSTRAINT synthetic_batch_failure');
+ await f.jobs.complete(job,await backend.handlers[job.kind](job));
+ const rows=await f.store.all('SELECT ordinal,payload_cipher,search_terms FROM harbor.recording_document_parts WHERE request_id=$1 ORDER BY ordinal',id);assert.ok(rows.length>2);assert.deepEqual(rows.map(row=>row.ordinal),Array.from({length:rows.length},(_,index)=>index+1));assert.ok(rows.every(row=>!row.payload_cipher.includes(Buffer.from('故障检索'))&&row.search_terms.every(term=>Buffer.isBuffer(term)&&term.length===32)));
+ const items=[];let after=0;
+ for(;;){const document=await backend.queries.document(id,{after,limit:2});assert.equal(document.index_pending,false);items.push(...document.items);if(!document.has_more)break;assert.ok(document.next>after);after=document.next;}
+ assert.equal(items.filter(item=>item.kind==='user').map(item=>item.text).join(''),text);
+ const found=await backend.queries.search(recordingQuery(new URLSearchParams({q:'故障检索'}),{clock:f.clock,search:true}));assert.ok(found.items.some(item=>item.id===id));
+});
+
 test('PostgreSQL recording Worker organizes encrypted actual capture and indexes Chinese/code without plaintext indexes or duplicate deltas',integration,async t=>{
   const f=await fixture(t),first=await f.request({text:'中文故障分析 createInvoiceHandler',reply:'中文结果：createInvoiceHandler 正常'}),repeat=await f.request({text:'重复提问重复提问',reply:'同样文字可以重发'});await f.backend.schedule();await f.run(['recording.index']);
   const document=await f.backend.queries.document(first);assert.equal(document.state,'complete');assert.equal(document.index_pending,false);assert.equal(document.items.filter(item=>item.kind==='assistant').map(item=>item.text).join(''),'中文结果：createInvoiceHandler 正常');
