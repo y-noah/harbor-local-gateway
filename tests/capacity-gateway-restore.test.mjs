@@ -3,13 +3,16 @@ import assert from 'node:assert/strict';
 import {lstat} from 'node:fs/promises';
 import {createTarget,ownedCapacityTarget} from '../tools/capacity/gateway-adapter.mjs';
 import {runCapacitySuite} from '../tools/capacity/runner.mjs';
+import {createNormalExecution} from '../tools/capacity/normal-execution.mjs';
 import {RecordingContextStore} from '../recording-context-store.mjs';
 const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB;
 for(const windowsHelper of [false,true])test('physical host restore reloads server materials at original listeners and keeps old employee device access'+(windowsHelper?' through the original Windows CNG bridge':''),{skip:!binDirectory?'需私有PG18工具':windowsHelper&&process.env.HARBOR_TEST_WINDOWS_DEVICE!=='1'?'需Windows实机开关':false,timeout:240000},async()=>{
   let target,primary;const diagnostics=[];try{
-    target=await createTarget({profile:'selfcheck',employeeCount:windowsHelper?2:1,binDirectory,libraryDirectory,recovery:true,trackCoverage:true,windowsHelper,onRestoreDiagnostic:row=>diagnostics.push(row)});const initialized=await target.collectEvidence();assert.equal(initialized.adapter.ledgerHealth.incomplete,false,JSON.stringify(initialized.adapter.ledgerHealth));assert.equal(initialized.adapter.sourceIntegrity.passed,true);const before=ownedCapacityTarget(target),controller=before.restoreAssessment,originalData=target.laboratory.dataDirectory,pids=[target.gateway.child.pid,target.worker.child.pid],device=target.employeeActors[0],bridgeOrigin=device.origin;
+    target=await createTarget({profile:'selfcheck',employeeCount:windowsHelper?2:1,binDirectory,libraryDirectory,recovery:true,trackCoverage:true,windowsHelper,onRestoreDiagnostic:row=>diagnostics.push(row)});const initialized=await target.collectEvidence();assert.equal(initialized.adapter.ledgerHealth.incomplete,false,JSON.stringify(initialized.adapter.ledgerHealth));assert.equal(initialized.adapter.sourceIntegrity.passed,true);
     const scene={id:'before-context-restore',durationMs:200,modelQps:10,adminQps:10,employees:windowsHelper?2:1,administrators:1,upstreamMs:[30,40],payloadBytes:1024};
-    const report=await runCapacitySuite({plan:{...target.plan,scenarios:[scene]},target,preflight:target.preflight});assert.equal(report.evidence.dataReconciliation.passed,true,JSON.stringify(report.evidence.dataReconciliation));
+    const normal=await createNormalExecution({target,profile:'selfcheck'});
+    try{const report=await runCapacitySuite({plan:{...target.plan,scenarios:[scene]},target:normal.target,preflight:target.preflight});assert.equal(report.evidence.dataReconciliation.passed,true,JSON.stringify(report.evidence.dataReconciliation));}finally{await normal.close();}
+    const before=ownedCapacityTarget(target),controller=before.restoreAssessment,originalData=target.laboratory.dataDirectory,pids=[target.gateway.child.pid,target.worker.child.pid],device=target.employeeActors[0],bridgeOrigin=device.origin;
     assert.equal((await target.store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,24);
     const snapshot=await target.store.get("SELECT request_id FROM harbor.recording_context_snapshots WHERE state='complete' AND components=5 AND request_id NOT IN (SELECT request_id FROM harbor_capacity.body_receipts) ORDER BY created LIMIT 1");assert.ok(snapshot);
     const originalContext=await new RecordingContextStore(target.store,{encryptionKey:target.recordingKey}).read(snapshot.request_id);assert.equal(originalContext.state,'complete');assert.equal(originalContext.hasMore,false);
