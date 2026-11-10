@@ -10,8 +10,12 @@ function checkedWindow(at){
 // Both timestamp partitions are monotone. These counts use the actual seed
 // generator rather than assuming the initial natural-day window stays fixed.
 export function capacitySeedWindowCounts(manifest,at){
- const window=checkedWindow(at),count=start=>[[0,manifest.metadata7d],[manifest.metadata7d,manifest.metadata30d]].reduce((total,[first,end])=>total+below(manifest,first,end,window.end)-below(manifest,first,end,start),0);
- return {metadata7d:count(window.start),metadata30d:count(window.metadata30dStart)};
+ const count=period=>capacitySeedWindowIndexRanges(manifest,at,period).reduce((total,[first,end])=>total+end-first,0);
+ return {metadata7d:count('7d'),metadata30d:count('30d')};
+}
+export function capacitySeedWindowIndexRanges(manifest,at,period){
+ const window=checkedWindow(at);if(!['7d','30d'].includes(period))throw Error('capacity_dataset_window_invalid');const start=period==='7d'?window.start:window.metadata30dStart;
+ return [[0,manifest.metadata7d],[manifest.metadata7d,manifest.metadata30d]].map(([first,end])=>[below(manifest,first,end,start),below(manifest,first,end,window.end)]).filter(([first,end])=>end>first);
 }
 // Receipts cover the first bodyRequests indices. Expiry is strict: an item
 // whose expires_at equals the observation time is already outside retention.
