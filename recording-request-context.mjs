@@ -38,8 +38,10 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       return attachment(value);
     }
     if(protocol&&value.type==='reasoning'){
-      for(const key in value){if(--nodes<0){cut();break;}if(Object.hasOwn(value,key)&&!['type','id','summary','encrypted_content','status'].includes(key))reasons.add('unsupported_field');}
-      if(value.encrypted_content!==undefined)opaqueReasoningExcluded++;
+      // Raw reasoning content is a known exclusion, just like encrypted content;
+      // do not inspect or persist it when retaining the public summary.
+      for(const key in value){if(--nodes<0){cut();break;}if(Object.hasOwn(value,key)&&!['type','id','summary','content','encrypted_content','status'].includes(key))reasons.add('unsupported_field');}
+      if(value.encrypted_content!==undefined||Object.hasOwn(value,'content'))opaqueReasoningExcluded++;
       if(value.summary!==undefined&&!Array.isArray(value.summary))reasons.add('unsupported_content');
       return {type:'reasoning',...(typeof value.id==='string'?{id:value.id}:{}),...(Array.isArray(value.summary)?{summary:visible(value.summary,depth+1,true,'summary')}:{})};
     }

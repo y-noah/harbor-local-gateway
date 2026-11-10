@@ -59,6 +59,13 @@ test('进入缓冲前脱敏，排除附件地址和不透明内容，原请求�
  for(const value of ['synthetic-secret-value','private.example','opaque-private-data','opaque-compaction'])assert.ok(!text.includes(value));
  assert.match(text,/公开摘要/);assert.equal(result.opaqueReasoningExcluded,2);assert.equal(JSON.stringify(payload),before);assert.equal(result.state,'complete');
 });
+test('已知原始推理字段只计排除而非未支持，公开摘要保留且不读取原始值',()=>{
+ for(const content of [null,[],[{type:'reasoning_text',text:'SYNTHETIC_PRIVATE_REASONING'}]]){
+  const result=captureRequestContext({input:[{type:'reasoning',content,encrypted_content:'synthetic-opaque',summary:[{type:'summary_text',text:'公开摘要'}]}]});assert.equal(result.state,'complete');assert.equal(result.opaqueReasoningExcluded,1);assert.deepEqual(result.reasons,[]);assert.match(JSON.stringify(result),/公开摘要/);assert.ok(!JSON.stringify(result).includes('SYNTHETIC_PRIVATE_REASONING'));assert.ok(!JSON.stringify(result).includes('synthetic-opaque'));
+ }
+ const item={type:'reasoning',summary:[]};Object.defineProperty(item,'content',{enumerable:true,get(){assert.fail('raw reasoning must not be read');}});assert.equal(captureRequestContext({input:[item]}).state,'complete');
+ const unknown=captureRequestContext({input:[{type:'reasoning',content:[],summary:[],future_field:'SYNTHETIC_UNKNOWN'}]});assert.equal(unknown.state,'incomplete');assert.deepEqual(unknown.reasons,['unsupported_field']);assert.ok(!JSON.stringify(unknown).includes('SYNTHETIC_UNKNOWN'));
+});
 test('未知输入和非法结构明确不完整，不静默通过；大小、深度、组件和遍历预算有界',()=>{
  assert.deepEqual(captureRequestContext(null).reasons,['invalid_payload']);
  assert.deepEqual(captureRequestContext({input:[{type:'new_protocol'}],tools:{}}).reasons,['unsupported_input','unsupported_tools']);
