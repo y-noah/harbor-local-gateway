@@ -3,6 +3,8 @@ import {readFileSync} from 'node:fs';
 import {PostgresStore} from '../../postgres-store.mjs';
 import {isOwnedLaboratory} from './owned-runtime.mjs';
 import {RecordingStore} from '../../recording-store.mjs';
+import {RecordingContextStore} from '../../recording-context-store.mjs';
+import {capacityHistoricalContext} from './context-payload.mjs';
 import {usageWindow,hash,token,encryptStoredKey,revealStoredKey} from '../../store.mjs';
 import {quoteReference} from '../../pricing.mjs';
 import {fixtureTimestamp,capacitySeedWindowCounts,capacitySeedActiveBodyRanges} from './dataset-time.mjs';
@@ -123,4 +125,38 @@ export async function verifyDataset(store,manifest,{recordingKey,at=Date.now(),s
   pricingVerified=pricingVerified&&pricingRows===manifest.metadata30d;
   const verified=pricingVerified&&bodyMetadataVerified&&counts.request_rows===manifest.metadata30d&&marker.metadata_cursor===manifest.metadata30d&&marker.body_cursor===manifest.bodyRequests&&counts.metadata30d===expected.metadata30d&&counts.metadata7d===expected.metadata7d&&counts.missing_prices===0&&bodies.body_requests+receipts.expired_missing===manifest.bodyRequests&&bodies.empty_bodies===0&&bodies.active_bodies===expectedActiveBodies&&receipts.receipts===manifest.bodyRequests&&receipts.mismatches===0&&bodyReadable;
   return {manifestHash:manifest.manifestHash,source:'isolated-synthetic-dataset',verificationScope:seedOnly?'original-seed-only':'entire-isolated-database',pricingRevision:marker.pricing_revision,pricingBookHash:marker.pricing_book_hash,observedAt:at,verified,pricingVerified,pricingRows,bodyMetadataVerified,bodyDistributionMappingVerified,totalMetadata:counts.request_rows,expectedActiveBodyRequests:expectedActiveBodies,bodyVerificationScope:'active-seed-records',metadata30d:counts.metadata30d,metadata7d:counts.metadata7d,bodyRequests:bodies.body_requests,seedBodyRequests:receipts.receipts,expiredSeedBodyRequests:receipts.expired_missing,activeBodyRequests:bodies.active_bodies,bodyBytes:Number(bodies.body_bytes),encryptedBytes:Number(events.encrypted_bytes),events:events.events,bodyDistribution:distribution,declaredBodyDistribution:manifest.bodyDistribution,bodyReadable,bodyCoverage:manifest.bodyRequests/manifest.metadata30d,formalBodyFootprintVerified:verified&&manifest.bodyRequests===manifest.metadata30d&&bodies.active_bodies>=counts.metadata30d&&distribution.length===manifest.bodyDistribution.length,bodyDistributionVerified:verified&&distribution.length===manifest.bodyDistribution.length,progress:{metadata:marker.metadata_cursor,body:marker.body_cursor},formalScale:verified&&counts.metadata30d>=5400000&&counts.metadata7d>=1260000};
+}
+
+
+// Explicit construction stage only. It does not extend verifyDataset or mint a
+// formal profile until context coverage, indexes and storage are also checked.
+export async function seedDatasetContexts(store,manifest,{recordingKey,signal,onProgress=async()=>{},first=0,until=manifest.bodyRequests}={}){
+ const marker=await owned(store,manifest);
+ if(!Buffer.isBuffer(recordingKey)||recordingKey.length!==32||marker.recording_key_digest!==digest(recordingKey))throw Error('capacity_dataset_recording_key_invalid');
+ if(marker.body_cursor!==manifest.bodyRequests||!Number.isSafeInteger(first)||!Number.isSafeInteger(until)||first<0||until<first||until>manifest.bodyRequests)throw Error('capacity_context_seed_range_invalid');
+ signal?.throwIfAborted();
+ await store.query('CREATE TABLE IF NOT EXISTS harbor_capacity.context_receipts(request_id text PRIMARY KEY,fixture_index bigint UNIQUE NOT NULL,generator_hash text NOT NULL,source_bytes bigint NOT NULL,content_hash text NOT NULL,cipher_hash text NOT NULL)');
+ const contextGenerator=digest(readFileSync(new URL('./context-payload.mjs',import.meta.url))),contextKeyVersion=new RecordingContextStore(store,{encryptionKey:recordingKey}).keyVersion;
+ const cipherHash=async requestId=>(await store.get(`SELECT CASE WHEN BOOL_AND(COALESCE(o.key_version=$2 AND o.state='complete' AND o.scope_digest=s.scope_digest AND p.object_id IS NOT NULL AND p.ordinal>=1 AND p.ordinal<=o.parts,false)) AND COUNT(DISTINCT ref.ordinal)=MAX(s.components) AND MIN(ref.ordinal)=1 AND MAX(ref.ordinal)=COUNT(DISTINCT ref.ordinal) THEN md5(string_agg(md5(jsonb_build_array(r.member_id,r.session_id,session.member_id,r.recording_state,c.expires_at,s.member_id,s.session_id,encode(s.scope_digest,'hex'),s.key_version,s.state,s.reason,s.coverage,s.seen,s.components,s.bytes,s.expires_at,s.created,encode(s.fingerprint,'hex'),ref.ordinal,ref.truncated,o.id,encode(o.scope_digest,'hex'),encode(o.fingerprint,'hex'),o.key_version,o.state,o.kind,o.bytes,o.parts,p.ordinal,p.bytes,md5(p.content_cipher))::text),'' ORDER BY ref.ordinal,p.ordinal)) ELSE NULL END value
+  FROM harbor.recording_context_snapshots s JOIN harbor.requests r ON r.id=s.request_id LEFT JOIN harbor.sessions session ON session.id=r.session_id JOIN harbor.recordings c ON c.request_id=s.request_id LEFT JOIN harbor.recording_context_references ref ON ref.request_id=s.request_id LEFT JOIN harbor.recording_context_objects o ON o.id=ref.object_id LEFT JOIN harbor.recording_context_parts p ON p.object_id=o.id WHERE s.request_id=$1 AND s.key_version=$2`,requestId,contextKeyVersion)).value;
+ let snapshots=0,reused=0;
+ for(let batch=first;batch<until;batch+=manifest.batchSize){
+  const end=Math.min(until,batch+manifest.batchSize);signal?.throwIfAborted();
+  const result=await store.transaction(async()=>{
+   await owned(store,manifest);await store.get('SELECT singleton FROM harbor_capacity.fixture WHERE singleton=1 FOR UPDATE');let saved=0,existing=0;
+   for(let index=batch;index<end;index++){
+    signal?.throwIfAborted();const requestId=fixtureId(manifest.runId,'request',index),payload=capacityHistoricalContext(index,bodyBytes(manifest,index)),receipt=await store.get('SELECT * FROM harbor_capacity.context_receipts WHERE request_id=$1',requestId);
+    if(receipt&&(receipt.fixture_index!==index||receipt.generator_hash!==contextGenerator||receipt.source_bytes!==payload.bytes||receipt.content_hash!==payload.contentHash))throw Error('capacity_context_seed_receipt_mismatch');
+    const body=await store.get('SELECT fixture_index FROM harbor_capacity.body_receipts WHERE request_id=$1',requestId);if(body?.fixture_index!==index)throw Error('capacity_context_seed_source_missing');
+    if(receipt){const actual=await cipherHash(requestId);if(!actual||receipt.cipher_hash!==actual)throw Error('capacity_context_seed_cipher_mismatch');existing++;continue;}
+    const contexts=new RecordingContextStore(store,{encryptionKey:recordingKey,clock:()=>fixtureTimestamp(manifest,index)}),written=await contexts.writeSnapshot(requestId,payload.components,{coverage:{state:'complete',reasons:[],opaqueReasoningExcluded:0}});
+    if(written.state!=='complete'||written.bytes!==payload.bytes||written.components!==payload.components.length)throw Error('capacity_context_seed_incomplete');
+    const actual=await cipherHash(requestId);if(!actual)throw Error('capacity_context_seed_cipher_mismatch');
+    await store.run('INSERT INTO harbor_capacity.context_receipts VALUES($1,$2,$3,$4,$5,$6)',requestId,index,contextGenerator,payload.bytes,payload.contentHash,actual);saved++;
+   }
+   signal?.throwIfAborted();return {saved,existing};
+  });
+  snapshots+=result.saved;reused+=result.existing;await onProgress({kind:'context',completed:end,total:until});
+ }
+ return {scope:'explicit-historical-context-construction',first,until,snapshots,reused,generatorHash:contextGenerator,formalQualified:false};
 }
