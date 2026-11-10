@@ -8,6 +8,7 @@ import {acquireInstance} from './instance.mjs';
 import {postgresBackupContext} from './postgres-backup-context.mjs';
 import {postgresBackupRestoreSource,checkpointPeriodicPostgresBackup} from './postgres-backup.mjs';
 import {withPostgresBackupOperation} from './postgres-backup-lock.mjs';
+import {assertPostgresRestoreDirectoryUnused} from './postgres-backup-processes.mjs';
 import {periodicApplicationPolicy,installedPeriodicApplicationPolicy,verifyInstalledPeriodicApplicationPolicy} from './postgres-periodic-application-policy.mjs';
 import {capturePeriodicApplicationMaterials,verifyPeriodicApplicationCapture,authenticatePeriodicApplicationCapture,periodicApplicationCaptureSource} from './postgres-periodic-application-materials.mjs';
 import {capturePostgresBackupRecoveryPoint,verifyPostgresBackupRecoveryPoint,postgresBackupRecoveryPointSource} from './postgres-backup-recovery-point.mjs';
@@ -155,8 +156,14 @@ export async function verifyPeriodicApplicationBackup(context,proof,pointId,{sig
   if(!uuid(pointId))fail('periodic_application_capture_id');const {record}=contextFor(context,proof,{archived:true});
   return operate(context,proof,'verifier',async signal=>{
     const backup=await authenticatePeriodicApplicationBackup(context,proof,pointId,{signal}),source=periodicApplicationBackupSource(backup),selected=postgresBackupRecoveryPointSource(source.point);
-    await stateChange(context,state=>{
-      if(state.pendingVerification&&(state.pendingVerification.backupId!==proof.backupId||state.pendingVerification.pointId!==pointId))fail('periodic_application_verification_pending');
+    await stateChange(context,async state=>{
+      // The verifier lease already excludes a live peer. A failed invocation
+      // may leave its pointer, but unknown restore remnants must stay protected.
+      if(state.pendingVerification){
+        await assertPostgresRestoreDirectoryUnused(record.restoreDirectory);
+        if((await readdir(record.restoreDirectory)).length)fail('periodic_application_verification_cleanup_required');
+      }
+      signal?.throwIfAborted();
       state.pendingVerification={backupId:proof.backupId,pointId};
     },{signal});
     if(!await exists(join(source.directory,'application-final.enc'))){

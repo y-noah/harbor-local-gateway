@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomBytes,randomUUID,createHash,generateKeyPairSync} from 'node:crypto';
-import {mkdir,writeFile,readFile,readdir,symlink} from 'node:fs/promises';
+import {mkdir,writeFile,readFile,readdir,symlink,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
@@ -106,6 +106,14 @@ for(const withContext of [false,true])test('private periodic application point r
   assert.deepEqual(await readdir(record.restoreDirectory),[],'producer never restores a base');
   let state=await readPeriodicApplicationBackupState(context);assert.equal(state.version,3);assert.equal(state.latestBackup.pointId,second.pointId);assert.equal(state.lastVerified,null);
   const authenticated=await authenticatePeriodicApplicationBackup(context,proof,first.pointId);assert.throws(()=>periodicApplicationBackupSource({...authenticated}),{code:'periodic_application_backup_required'});
+  const secondDirectory=join(record.artifactDirectory,proof.backupId,'points',second.pointId),secondSealed=await readFile(join(secondDirectory,'backup-complete.enc'));
+  const interrupted={...state,pendingVerification:{backupId:proof.backupId,pointId:second.pointId},updatedAt:Date.now()};
+  await writeManifest(join(record.artifactDirectory,'periodic-application-state.enc'),interrupted,applicationKey,{replace:true});
+  const orphan=join(record.restoreDirectory,'synthetic-orphan');await mkdir(orphan,{mode:0o700});
+  await assert.rejects(verifyPeriodicApplicationBackup(context,proof,first.pointId),{code:'periodic_application_verification_cleanup_required'});
+  assert.deepEqual(await readPeriodicApplicationBackupState(context),interrupted,'blocked takeover preserves authenticated state');
+  await assert.rejects(readFile(join(firstDirectory,'application-final.enc')),{code:'ENOENT'});
+  await rm(orphan,{recursive:true});
   producerContext=await createTaskPostgresBackupContext({laboratory:lab,directory:record.artifactDirectory,archiveKey:backupKey,applicationKey,binDirectory,libraryDirectory});
   const producerProof=await verifyPostgresBackup(producerContext,proof.backupId),sourceText=await readFile(join(data,'settings.json'));
   let reached;const restoring=new Promise(resolve=>{reached=resolve;}),paused=new Promise(resolve=>{releaseRestore=resolve;});
@@ -113,10 +121,13 @@ for(const withContext of [false,true])test('private periodic application point r
   const verification=verifyPeriodicApplicationBackup(context,proof,first.pointId);void verification.catch(()=>{});
   const barrierTimeout=new AbortController();try{await Promise.race([restoring,delay(30000,undefined,{signal:barrierTimeout.signal}).then(()=>assert.fail('actual restore never reached private pgdata publication'))]);}finally{barrierTimeout.abort();}
   const concurrent=await capturePeriodicApplicationBackup(producerContext,producerProof,policy);assert.equal(concurrent.state,'application_backup_completed','new backup is not blocked by independent actual restore');
+  await assert.rejects(verifyPeriodicApplicationBackup(producerContext,producerProof,second.pointId),{code:'periodic_application_cycle_busy'},'live verifier lease excludes another context');
   state=await readPeriodicApplicationBackupState(producerContext);assert.equal(state.latestBackup.pointId,concurrent.pointId);assert.equal(state.pendingVerification.pointId,first.pointId,'producer preserves live verification reference');
   await writeFile(join(data,'settings.json'),'source deliberately changed after backup',{mode:0o600});releaseRestore();
   const verified=await verification;fs.promises.rename=originalRename;syncBuiltinESMExports();assert.equal(verified.state,'application_point_verified');assert.equal(verified.restoreVerified,true);assert.ok(verified.restoreDurationMs>0);
   state=await readPeriodicApplicationBackupState(context);assert.equal(state.latestBackup.pointId,concurrent.pointId,'verifier preserves concurrently produced backup');assert.equal(state.lastVerified.pointId,first.pointId);assert.equal(state.pendingVerification,null);
+  assert.deepEqual(await readFile(join(secondDirectory,'backup-complete.enc')),secondSealed,'takeover preserves old point evidence');
+  await assert.rejects(readFile(join(secondDirectory,'application-final.enc')),{code:'ENOENT'});
   const sealed=await readFile(join(firstDirectory,'application-restore.enc')),final=await readFile(join(firstDirectory,'application-final.enc'));
   assert.equal((await verifyPeriodicApplicationBackup(context,proof,first.pointId)).verifiedAt,verified.verifiedAt,'retry authenticates immutable actual proof');
   assert.deepEqual(await readFile(join(firstDirectory,'application-restore.enc')),sealed);assert.deepEqual(await readFile(join(firstDirectory,'application-final.enc')),final);
@@ -132,7 +143,7 @@ for(const withContext of [false,true])test('private periodic application point r
   const withHandoff=await authenticatePeriodicApplicationRetentionGroup(record,join(record.artifactDirectory,proof.backupId),(await import('../postgres-backup.mjs')).postgresBackupRestoreSource(proof).metadata);assert.equal(withHandoff.backupCompletePoints.length,3);
   const receiverDirectory=join(lab.directory,'periodic-receiver');await mkdir(receiverDirectory,{mode:0o700});
   await closePostgresBackupContext(producerContext);producerContext=null;await closePostgresBackupContext(context);context=null;await store.close();storeClosed=true;await lab.runtime.stop(lab.process);
-  const {rm}=await import('node:fs/promises');await rm(lab.dataDirectory,{recursive:true});await rm(join(lab.directory,'wal'),{recursive:true});for(const root of materialRoots)await rm(root.directory,{recursive:true});
+  await rm(lab.dataDirectory,{recursive:true});await rm(join(lab.directory,'wal'),{recursive:true});for(const root of materialRoots)await rm(root.directory,{recursive:true});
   const {createTaskPostgresBackupReceiver}=await import('../postgres-backup-receiver.mjs'),{restorePostgresReceiver,inspectPostgresReceiverRestore,storageReceiverRestoreAuthority}=await import('../storage-receiver.mjs');
   const receiverOptions={laboratory:lab,bundleDirectory,directory:receiverDirectory,archiveKey:backupKey,applicationKey,handoffDigest:handoff.handoffDigest};
   await assert.rejects(createTaskPostgresBackupReceiver(receiverOptions),{code:'transfer_manifest_authentication_failed'});

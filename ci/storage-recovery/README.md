@@ -140,6 +140,8 @@ harbor_backup ALL=(root) NOPASSWD: /usr/bin/python3 -I -B /usr/local/lib/harbor/
 
 应用 v3 顶层状态分别记录 `latestBackup`、`lastVerified`、`pending`、`pendingVerification`；producer 与 verifier 只在短锁内推进各自字段，保留并发产生的新点及最后真实验证点。取消保留已认证的恢复材料与待续状态；未知半成品不猜删。旧的未发布共享密钥应用周期 v1/v2 保全并明确拒绝，不自动迁移、重加密或回退尝试 WAL key。回退先关闭新调度，保留 v3 密文、状态及独立应用密钥，旧清理器对未知格式须拒绝。原数据库-only及 operator pending-final 的格式和严格行为不改变。
 
+失败或中断的 verifier 完成清理后，后续 `verify-point` 可选择原点或另一已认证完成点继续验证：必须先取得覆盖整个验证生命周期的独占租约，并确认恢复目录无使用进程且完全为空，才更新遗留的 `pendingVerification`。仍有活跃 verifier 时拒绝并发；有遗留目录时返回 `periodic_application_verification_cleanup_required`，保留原状态与证据，不自动删除。接替不修改旧点密文或伪造成功收据，`lastVerified` 仍只在实际验证成功后更新。回退旧工具前应等待当前验证结束；旧工具遇到不同点遗留指针仍会拒绝，不通过手工删除认证状态绕过。
+
 周期 checkpoint 对同一 context 已完整验证的 WAL 保存有限内存缓存，命中仍复核密文及 metadata 的实际文件身份与认证小清单，并保留原 `verifiedAt`，不伪刷新完整认证时间。新段、身份变化、源 postmaster 代次变化或显式 scrub 重新完整验证；context 重启后缓存为空，必须重新认证。周期入口与手工 checkpoint 均要求实际 postmaster 代次与 base 一致；源重启后，即使同 timeline、当前五项恢复参数与 base 相同，也必须先维护新 base，不能用当前值推断跨重启 WAL 的历史参数高水位。同代仍核对五项恢复参数不超过 base 封存值，点内代次变化同样拒绝。已有认证旧点及材料保留，仍可按其原目标恢复，不因停止给旧 base 产新点而删除。正式规模吞吐与冷启动耗时仍需真实容量测量，不能用小库运行时间替代。
 
 `node storage-backup.mjs periodic-handoff <base UUID> <point UUID>` 手工生成明确 `periodic-application` 类型的离源包，保存在选定点的 `handoff` 私有目录。包只含共享 base、所选点自己的 checkpoint/WAL 闭包及其应用捕获，不带其他点、operator pending-final、原 `application-final` 或激活证明；归档密钥与独立应用密钥仍须在接收端分别配置。完整包可认证续用，未知或不完整的既有目录保全并拒绝，不借用当前 base 的最新 checkpoint 覆盖所选历史点。
