@@ -117,7 +117,7 @@ async function inspectTargetPrerequisites({profile='formal',purpose='run',resour
  const ownedFactory=isOwnedCapacityFactoryOwnerAuthority(ownerAuthority);evidence.factoryOwner={scope:'private-native-factory-authority',owned:ownedFactory};if(!ownedFactory)missing.push('owned_formal_factory_owner');
  if(!isOwnedCapacityResourceAllocator(resourceAllocator))missing.push('owned_formal_resource_allocator');
  else try{const observed=await resourceAllocator.observe();evidence.allocation=observed;const pending=new Set(['owned_role_process_missing:database','owned_role_process_missing:gatewayWorker','owned_role_effective_quota_unknown:database','owned_role_effective_quota_unknown:gatewayWorker','owned_combined_effective_quota_unknown']);missing.push(...observed.missing.filter(code=>!pending.has(code)));}catch{missing.push('owned_formal_resource_allocator_unavailable');}
- try{const storage=await observeCapacityStorageBudget({storageRoot,manifest,budget:diskBudget});evidence.storage=storage;if(storage.passed!==true)missing.push(...storage.missing);}catch{missing.push('observed_preseed_disk_budget_unavailable');}
+ try{const storage=await observeCapacityStorageBudget({storageRoot,manifest,budget:diskBudget,recordingContextEnabled:true});evidence.storage=storage;if(storage.passed!==true)missing.push(...storage.missing);}catch{missing.push('observed_preseed_disk_budget_unavailable');}
  // No caller boolean/DTO can assert a preserved proxy or a real LAN baseline.
  // The one-shot owned endpoint challenge is a separate prerequisite.
  const software=await inspectCapacityFormalSoftware();evidence.software=software;
