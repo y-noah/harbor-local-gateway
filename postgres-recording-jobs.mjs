@@ -3,6 +3,7 @@ import {statfs} from 'node:fs/promises';
 import {AppError,usageWindow} from './store.mjs';
 import {RecordingStore} from './recording-store.mjs';
 import {RecordingContextStore} from './recording-context-store.mjs';
+import {isRecordingRetentionDays,recordingRetentionDays,unlimitedRecordingExpiry,requireUnlimitedRecordingRetention} from './recording-retention.mjs';
 import {createPostgresJobs} from './postgres-jobs.mjs';
 import {createRecordingIndexCrypto,assembleRecording,recordingParts} from './recording-search-index.mjs';
 import {createPostgresRecordingQueries,recordingQuery} from './postgres-recording-query.mjs';
@@ -108,15 +109,18 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
   async function indexHandler(job,context){try{return await organize(job,context);}catch(error){if(['recording_index_capacity','recording_unreadable','recording_index_unreadable'].includes(error.code))await jobs.owned(job,()=>store.run('UPDATE harbor.recording_work SET last_error=$1 WHERE request_id=$2 AND revision=$3',error.code,job.target,job.payload.revision));throw error;}}
   async function rebuild(payload){if(!payload||Object.keys(payload).some(key=>key!=='request_id')||typeof payload.request_id!=='string'||!idPattern.test(payload.request_id))fail(400,'请选择需要重新整理的请求');return store.transaction(async()=>{const result=await store.run('UPDATE harbor.recording_work SET revision=revision+1,last_error=NULL,changed=$1 WHERE request_id=$2',clock(),payload.request_id);if(!result.changes)fail(404,'请求正文不存在');if(contextJobs)await contextJobs.rebuild(payload.request_id);return {request_id:payload.request_id,status:'pending'};});}
   async function retentionPreview(days){
-    if(!Number.isInteger(days)||days<1||days>365)fail(400,'正文保留期须为1至365天');
+    if(!isRecordingRetentionDays(days))fail(400,'正文保留期须为1至365天或无限期');
+    if(days===null)await requireUnlimitedRecordingRetention(store);
     return store.transaction(async()=>{
-      const at=clock(),plan=randomUUID();await store.run('INSERT INTO harbor.recording_retention_plans(id,created,expires,days,requests,bytes) VALUES($1,$2,$3,$4,0,0)',plan,at,at+300000,days);
-      await store.run(`INSERT INTO harbor.recording_retention_items(plan_id,request_id,expected_expires,target_expires)
+      const at=clock(),plan=randomUUID();await store.run('INSERT INTO harbor.recording_retention_plans(id,created,expires,days,requests,bytes) VALUES($1,$2,$3,$4,0,0)',plan,at,at+300000,days??0);
+      if(days===null)await store.run(`INSERT INTO harbor.recording_retention_items(plan_id,request_id,expected_expires,target_expires)
+        SELECT $1,c.request_id,c.expires_at,$2 FROM harbor.recordings c JOIN harbor.requests r ON r.id=c.request_id WHERE c.expires_at>$3 AND c.expires_at<$2 AND r.recording_state<>'expired'`,plan,unlimitedRecordingExpiry,at);
+      else await store.run(`INSERT INTO harbor.recording_retention_items(plan_id,request_id,expected_expires,target_expires)
         SELECT $1,c.request_id,c.expires_at,r.started+$2 FROM harbor.recordings c JOIN harbor.requests r ON r.id=c.request_id WHERE c.expires_at>r.started+$2`,plan,days*86400000);
       const totals=await store.get('SELECT COUNT(*) requests,COALESCE(SUM(c.bytes),0)::text bytes FROM harbor.recording_retention_items i JOIN harbor.recordings c ON c.request_id=i.request_id WHERE i.plan_id=$1',plan);
       await store.run('UPDATE harbor.recording_retention_plans SET requests=$1,bytes=$2 WHERE id=$3',totals.requests,totals.bytes,plan);
       const settings=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='recording.retention'");const current=settings?JSON.parse(settings.value):{days:30,version:0};
-      return {id:plan,days,previous_days:current.days,expected_version:current.version??0,at,expires:at+300000,affected_requests:totals.requests,affected_bytes:totals.bytes,requires_confirmation:true};
+      return {id:plan,days,previous_days:current.days===0?null:current.days,expected_version:current.version??0,at,expires:at+300000,affected_requests:totals.requests,affected_bytes:totals.bytes,requires_confirmation:true};
     },{level:'REPEATABLE READ'});
   }
   async function retentionApply(payload){
@@ -125,31 +129,51 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
       await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-recording-retention',0))");
       const plan=await store.get('SELECT * FROM harbor.recording_retention_plans WHERE id=$1 FOR UPDATE',payload.id);if(!plan)fail(404,'保留期预览不存在');if(plan.status!=='preview')return {id:plan.id,status:plan.status,job_id:plan.job_id};if(plan.expires<=clock())fail(410,'保留期预览已失效');
       const settings=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='recording.retention'"),current=settings?JSON.parse(settings.value):{days:30,version:0};if((current.version??0)!==payload.expected_version)fail(409,'保留期配置已变化，请重新预览','recording_retention_conflict');
+      const days=recordingRetentionDays(plan);
+      if(days===null){
+        // Confirmation fences legacy capture transactions too. Include their
+        // newly committed live records so none fall between preview and save.
+        await store.run(`INSERT INTO harbor.recording_retention_items(plan_id,request_id,expected_expires,target_expires)
+          SELECT $1,c.request_id,c.expires_at,$2 FROM harbor.recordings c JOIN harbor.requests r ON r.id=c.request_id
+          WHERE c.expires_at>$3 AND c.expires_at<$2 AND r.recording_state<>'expired' ON CONFLICT DO NOTHING`,plan.id,unlimitedRecordingExpiry,clock());
+        const totals=await store.get('SELECT COUNT(*) requests,COALESCE(SUM(c.bytes),0)::text bytes FROM harbor.recording_retention_items i LEFT JOIN harbor.recordings c ON c.request_id=i.request_id WHERE i.plan_id=$1',plan.id);
+        await store.run('UPDATE harbor.recording_retention_plans SET requests=$1,bytes=$2 WHERE id=$3',totals.requests,totals.bytes,plan.id);
+      }
       const job=await jobs.enqueue('recording.retention',{id:'recording.retention:'+plan.id,target:plan.id,payload:{plan_id:plan.id}});
-      await store.run("INSERT INTO harbor.gateway_settings(name,value) VALUES('recording.retention',$1) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value",JSON.stringify({days:plan.days,version:payload.expected_version+1,updated:clock()}));
+      await store.run("INSERT INTO harbor.gateway_settings(name,value) VALUES('recording.retention',$1) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value",JSON.stringify({days:days??0,...(days===null?{mode:'unlimited'}:{}),plan_id:plan.id,version:payload.expected_version+1,updated:clock()}));
       await store.run("UPDATE harbor.recording_retention_plans SET status='queued',job_id=$1 WHERE id=$2",job.id,plan.id);
-      await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',randomUUID(),clock(),'recording.retention.configure',JSON.stringify({days:plan.days,affected:plan.requests,actor:'admin',plan:plan.id}));
-      return {id:plan.id,status:'queued',job_id:job.id,days:plan.days,version:payload.expected_version+1,physical_cleanup:'worker',new_capture_retention_requires_reload:false};
+      await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',randomUUID(),clock(),'recording.retention.configure',JSON.stringify({days,affected:plan.requests,actor:'admin',plan:plan.id}));
+      return {id:plan.id,status:'queued',job_id:job.id,days,version:payload.expected_version+1,physical_cleanup:'worker',new_capture_retention_requires_reload:false};
     });
   }
   async function retentionExecute(job,{signal}={}){
     if(job.kind!=='recording.retention'||job.target!==job.payload?.plan_id||job.id!=='recording.retention:'+job.target||Object.keys(job.payload).length!==1)fail(400,'保留期任务参数无效');
     for(;;){stop(signal);const count=await jobs.owned(job,async()=>{
+      await store.query("SELECT pg_advisory_xact_lock_shared(hashtextextended('harbor-recording-retention',0))");
+      const setting=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='recording.retention'");
+      if(setting&&JSON.parse(setting.value).plan_id&&JSON.parse(setting.value).plan_id!==job.target){await store.run("UPDATE harbor.recording_retention_items SET status='changed' WHERE plan_id=$1 AND status='pending'",job.target);return 0;}
       const rows=await store.all("SELECT request_id,expected_expires,target_expires FROM harbor.recording_retention_items WHERE plan_id=$1 AND status='pending' ORDER BY request_id LIMIT $2",job.target,purgeBatch);if(!rows.length)return 0;
       const sources=await store.all('SELECT request_id,expires_at FROM harbor.recordings WHERE request_id=ANY($1::text[]) ORDER BY request_id FOR UPDATE',rows.map(row=>row.request_id)),byId=new Map(sources.map(row=>[row.request_id,row]));
       await store.all('SELECT id FROM harbor.recording_exports WHERE id IN (SELECT export_id FROM harbor.recording_export_sources WHERE request_id=ANY($1::text[])) ORDER BY id FOR UPDATE',rows.map(row=>row.request_id));
       for(const item of rows){
         // Follow the capture repository's recording -> request order. Changes
-        // after the preview are reported instead of expanding the frozen scope.
+        // finite changes after preview are skipped; unlimited rechecks liveness.
         const current=byId.get(item.request_id);let state='missing';
-        if(current){state=current.expires_at===item.expected_expires?'applied':'changed';if(state==='applied')await store.run('UPDATE harbor.recordings SET expires_at=$1,updated=$2 WHERE request_id=$3',item.target_expires,clock(),item.request_id);}
+        if(current){state=item.target_expires===unlimitedRecordingExpiry||current.expires_at===item.expected_expires?'applied':'changed';if(state==='applied'){
+          // Unlimited never revives content that expired while its plan waited.
+          if(item.target_expires===unlimitedRecordingExpiry&&current.expires_at<=clock())state='changed';
+          else{
+            await store.run('UPDATE harbor.recordings SET expires_at=$1,updated=$2 WHERE request_id=$3',item.target_expires,clock(),item.request_id);
+            if(contextJobs||contextGc)await store.run('UPDATE harbor.recording_context_snapshots SET expires_at=$1 WHERE request_id=$2 AND expires_at>$3',item.target_expires,item.request_id,clock());
+          }
+        }}
         await store.run('UPDATE harbor.recording_retention_items SET status=$1 WHERE plan_id=$2 AND request_id=$3',state,job.target,item.request_id);
       }return rows.length;
     });if(count<purgeBatch)break;}
     return jobs.commitEffect(job,async()=>{const rows=await store.all('SELECT status,COUNT(*) count FROM harbor.recording_retention_items WHERE plan_id=$1 GROUP BY status',job.target),counts=Object.fromEntries(rows.map(row=>[row.status,row.count]));await store.run("UPDATE harbor.recording_retention_plans SET status='complete',completed=$1,summary=$3::jsonb WHERE id=$2",clock(),job.target,JSON.stringify(counts));return {id:job.target,counts};});
   }
   async function retentionStatus(planId){
-    if(typeof planId!=='string'||!/^[a-f0-9-]{36}$/.test(planId))fail(404,'保留期计划不存在');const at=clock(),window=usageWindow(at),plan=await readStore.get('SELECT p.id,p.created,p.expires,p.days,p.requests,p.bytes,p.status,p.job_id,p.completed,p.summary,j.status job_status,j.error_code FROM harbor.recording_retention_plans p LEFT JOIN harbor.background_jobs j ON j.id=p.job_id WHERE p.id=$1 AND p.created>=$2 AND p.created<$3',planId,window.start,window.end);if(!plan)fail(404,'保留期计划不存在或超出近7天范围');const rows=await readStore.all('SELECT status,COUNT(*) count FROM harbor.recording_retention_items WHERE plan_id=$1 GROUP BY status',planId);return {...plan,summary:undefined,counts:plan.status==='complete'?plan.summary:Object.fromEntries(rows.map(row=>[row.status,row.count]))};
+    if(typeof planId!=='string'||!/^[a-f0-9-]{36}$/.test(planId))fail(404,'保留期计划不存在');const at=clock(),window=usageWindow(at),plan=await readStore.get('SELECT p.id,p.created,p.expires,p.days,p.requests,p.bytes,p.status,p.job_id,p.completed,p.summary,j.status job_status,j.error_code FROM harbor.recording_retention_plans p LEFT JOIN harbor.background_jobs j ON j.id=p.job_id WHERE p.id=$1 AND p.created>=$2 AND p.created<$3',planId,window.start,window.end);if(!plan)fail(404,'保留期计划不存在或超出近7天范围');const rows=await readStore.all('SELECT status,COUNT(*) count FROM harbor.recording_retention_items WHERE plan_id=$1 GROUP BY status',planId);return {...plan,days:recordingRetentionDays(plan),summary:undefined,counts:plan.status==='complete'?plan.summary:Object.fromEntries(rows.map(row=>[row.status,row.count]))};
   }
   async function handle(path,method,payload,params=new URLSearchParams()){
     if(path==='/api/admin/recordings/context/search'&&method==='GET'&&contextQueries){const value=await contextQueries.search(recordingQuery(params,{clock,search:true,devices})),backlog=await contextJobs.status();return {status:200,value:{...value,index_backlog:backlog.context_index_pending,oldest_pending_at:backlog.context_oldest_pending_at,complete:!value.has_more&&backlog.context_index_pending===0}};}
@@ -162,6 +186,10 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
     if(path==='/api/admin/recordings/exports'&&method==='POST')return {status:202,value:await exporter.enqueue(payload)};
     const exportPath=path.match(/^\/api\/admin\/recordings\/exports\/(recording\.export:[a-f0-9-]{36})$/);if(exportPath&&method==='GET')return {status:200,value:await exporter.status(exportPath[1])};if(exportPath&&method==='DELETE')return {status:200,value:await exporter.cancel(exportPath[1])};
     if(path==='/api/admin/recordings/retention/preview'&&method==='POST')return {status:200,value:await retentionPreview(payload?.days)};
+    if(path==='/api/admin/recordings/retention'&&method==='GET'){
+      const saved=await readStore.get("SELECT value FROM harbor.gateway_settings WHERE name='recording.retention'"),value=saved?JSON.parse(saved.value):{days:30,version:0};
+      return {status:200,value:{days:value.days===0?null:value.days,version:value.version??0}};
+    }
     if(path==='/api/admin/recordings/retention'&&method==='PATCH')return {status:202,value:await retentionApply(payload)};
     const retention=path.match(/^\/api\/admin\/recordings\/retention\/([a-f0-9-]{36})$/);if(retention&&method==='GET')return {status:200,value:await retentionStatus(retention[1])};
     return null;

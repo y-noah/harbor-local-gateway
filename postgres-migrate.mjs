@@ -8,8 +8,9 @@ export function postgresMigrationArguments(args){
   if(Array.isArray(args)&&args.length===1){
     if(args[0]==='--recording-context=storage')return {recordingContext:true};
     if(args[0]==='--recording-context=index')return {recordingContextIndex:true};
+    if(args[0]==='--recording-retention=unlimited')return {recordingRetentionUnlimited:true};
   }
-  throw new AppError(400,'迁移参数无效，仅支持 --recording-context=storage 或 --recording-context=index','database_configuration');
+  throw new AppError(400,'迁移参数无效，仅支持 --recording-context=storage、--recording-context=index 或 --recording-retention=unlimited','database_configuration');
 }
 export async function migratePostgres(options={},migrationOptions={}){
   const connectionString=options.connectionString??(options.connection?undefined:process.env.HARBOR_DATABASE_URL);

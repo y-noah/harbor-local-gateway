@@ -7,6 +7,7 @@ import {join} from 'node:path';
 import {createPostgresWorker} from '../postgres-worker.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
 import {RecordingStore} from '../recording-store.mjs';
+import {unlimitedRecordingExpiry} from '../recording-retention.mjs';
 import {RecordingContextStore} from '../recording-context-store.mjs';
 import {createPostgresJobs} from '../postgres-jobs.mjs';
 import {createPostgresRecordingJobs} from '../postgres-recording-jobs.mjs';
@@ -21,7 +22,7 @@ const kind='recording.context.index';
 const connection=name=>{const value=new URL(url);value.pathname='/'+(name||'postgres');return {connectionString:value.href,allowPlaintextLocalNetwork:true};};
 async function fixture(t,{indexBatch=32,schemaIndex=true}={}){
  const admin=new PostgresStore(connection()),name='harbor_context_jobs_'+randomUUID().replaceAll('-','');await admin.query('CREATE DATABASE '+name);const store=new PostgresStore({...connection(name),poolSize:8});
- t.after(async()=>{await store.close();await admin.query('DROP DATABASE '+name);await admin.close();});await store.migrate({recordingContext:true,recordingContextIndex:schemaIndex});await store.initializePricing();
+ t.after(async()=>{await store.close();await admin.query('DROP DATABASE '+name);await admin.close();});await store.migrate({recordingContext:true,recordingContextIndex:schemaIndex,recordingRetentionUnlimited:true});await store.initializePricing();
  let now=Date.now();const clock=()=>now,key=randomBytes(32),jobs=createPostgresJobs(store,{clock,leaseMs:1000}),contexts=new RecordingContextStore(store,{encryptionKey:key,clock}),recordings=new RecordingStore(store,{encryptionKey:key,clock}),crypto=createRecordingIndexCrypto(key),backend=createPostgresRecordingJobs(store,{recordingKey:key,jobs,clock,contextIndex:schemaIndex,contextStorage:true,indexBatch,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
  const member=randomUUID(),session=randomUUID();await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',member,'合成索引员工',now);await store.run("INSERT INTO harbor.accounts(id,name,home) VALUES('synthetic','合成上游','synthetic')");await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,created,updated) VALUES($1,$2,'synthetic',$3,$3)",session,member,now);
  const request=async(content='可检索的上下文',ttl=10000,components,coverage=null)=>{const id=randomUUID();await store.run("INSERT INTO harbor.requests(id,member_id,session_id,started,ended,status,business_status,ip,model) VALUES($1,$2,$3,$4,$4,'ok','ok','synthetic','gpt-6.1-sol')",id,member,session,now);await recordings.start(id);await store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',now+ttl,id);await contexts.writeSnapshot(id,components??[{kind:'history',content}],{coverage});return id;};
@@ -29,6 +30,16 @@ async function fixture(t,{indexBatch=32,schemaIndex=true}={}){
  const document=async()=>{const d=await store.get('SELECT * FROM harbor.recording_context_documents ORDER BY object_id LIMIT 1');if(!d)return null;const parts=await store.all('SELECT * FROM harbor.recording_context_document_parts WHERE object_id=$1 ORDER BY ordinal',d.object_id);return {d,parts,text:parts.map(p=>crypto.open(p.payload_cipher,`context-document:${d.object_id}:${d.source_revision}:1:${p.ordinal}`).text).join('')};};
  return {store,jobs,contexts,recordings,backend,key,clock,advance:ms=>{now+=ms;},request,run,document,crypto,connection:connection(name)};
 }
+
+test('真实PG：无限期保留同步保护上下文来源，改回按天后可正常清理',integration,async t=>{
+ const f=await fixture(t),content={text:'无限期上下文检索'},id=await f.request(content,10000);
+ const preview=await f.backend.retentionPreview(null);await f.backend.retentionApply({id:preview.id,expected_version:0,confirm:true});let job=await f.jobs.claim(['recording.retention']);await f.jobs.complete(job,await f.backend.handlers['recording.retention'](job));
+ assert.equal((await f.store.get('SELECT expires_at FROM harbor.recording_context_snapshots WHERE request_id=$1',id)).expires_at,unlimitedRecordingExpiry);
+ f.advance(20000);await f.backend.schedule();await f.run();job=await f.jobs.claim(['recording.purge']);await f.jobs.complete(job,await f.backend.handlers['recording.purge'](job));
+ assert.equal((await f.contexts.read(id)).state,'complete');const query=recordingQuery(new URLSearchParams({q:'无限期上下文检索'}),{clock:f.clock,search:true});assert.equal((await f.backend.contextQueries.search(query)).items.length,1);
+ const finite=await f.backend.retentionPreview(1);await f.backend.retentionApply({id:finite.id,expected_version:1,confirm:true});job=await f.jobs.claim(['recording.retention']);await f.jobs.complete(job,await f.backend.handlers['recording.retention'](job));f.advance(2*86400000);await f.backend.schedule();job=await f.jobs.claim(['recording.purge']);await f.jobs.complete(job,await f.backend.handlers['recording.purge'](job));
+ assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_objects')).n,0);assert.ok(await f.store.get('SELECT id FROM harbor.requests WHERE id=$1',id));
+});
 
 test('真实PG：索引补充只入队待办，上下文版本维护保持定时执行',integration,async t=>{
  const f=await fixture(t);await f.request();await f.backend.refill();assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind='recording.purge'")).n,0);await f.run();

@@ -17,6 +17,6 @@ test('上下文可用性不自动启用，服务端开关只接受0/1且构造�
  for(const allowed of [null,'true',1,{}])assert.throws(()=>recordingContextConfiguration({schemaVersion:24,allowed}),{code:'recording_configuration'});
 });
 test('显式迁移CLI严格限定两个选项，默认不扩大迁移范围',()=>{
- assert.deepEqual(postgresMigrationArguments([]),{});assert.deepEqual(postgresMigrationArguments(['--recording-context=storage']),{recordingContext:true});assert.deepEqual(postgresMigrationArguments(['--recording-context=index']),{recordingContextIndex:true});
+ assert.deepEqual(postgresMigrationArguments([]),{});assert.deepEqual(postgresMigrationArguments(['--recording-context=storage']),{recordingContext:true});assert.deepEqual(postgresMigrationArguments(['--recording-context=index']),{recordingContextIndex:true});assert.deepEqual(postgresMigrationArguments(['--recording-retention=unlimited']),{recordingRetentionUnlimited:true});
  for(const args of [null,{},['--recording-context'],['--recording-context=0'],['--recording-context=24'],['--recording-context=index','--recording-context=storage'],['--recording-context=index','--recording-context=index'],['postgresql://synthetic'],['--help']])assert.throws(()=>postgresMigrationArguments(args),{code:'database_configuration'});
 });

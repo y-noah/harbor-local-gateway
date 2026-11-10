@@ -1,6 +1,7 @@
 import {createCipheriv,createDecipheriv,randomBytes} from 'node:crypto';
 import {AppError} from './store.mjs';
 import {sanitizeRecord,restoreAuthenticatedRecord} from './record-redaction.mjs';
+import {isRecordingRetentionDays,unlimitedRecordingExpiry} from './recording-retention.mjs';
 
 const kinds=new Set(['user','assistant','tool_call','tool_result','attachment','boundary']);
 const origins=new Set(['client','upstream','gateway']);
@@ -14,7 +15,7 @@ const validateTurnState=value=>{if(!['known','uncertain'].includes(value))throw 
 export class RecordingStore{
   constructor(store,{encryptionKey,retentionDays=30,maxBytes=2*1024*1024,maxEventBytes=128*1024,maxPageBytes=128*1024,clock=Date.now,contextRepository}={}){
     if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32)throw new AppError(503,'正文加密材料未配置','recording_configuration');
-    if(!Number.isInteger(retentionDays)||retentionDays<1||retentionDays>365||!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxEventBytes)||maxEventBytes<256||maxEventBytes>maxBytes||!Number.isSafeInteger(maxPageBytes)||maxPageBytes<256||maxPageBytes>2*1024*1024)throw new AppError(503,'正文保留与容量配置无效','recording_configuration');
+    if(!isRecordingRetentionDays(retentionDays)||!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxEventBytes)||maxEventBytes<256||maxEventBytes>maxBytes||!Number.isSafeInteger(maxPageBytes)||maxPageBytes<256||maxPageBytes>2*1024*1024)throw new AppError(503,'正文保留与容量配置无效','recording_configuration');
     if(contextRepository!==undefined&&(!contextRepository||contextRepository.store!==store||typeof contextRepository.writeSnapshot!=='function'))throw new AppError(503,'上下文仓储须共用正文事务','recording_configuration');
     this.store=store;this.key=Buffer.from(encryptionKey);this.retentionDays=retentionDays;this.maxBytes=maxBytes;this.maxEventBytes=maxEventBytes;this.maxPageBytes=maxPageBytes;this.clock=clock;this.contextRepository=contextRepository;
   }
@@ -39,7 +40,7 @@ export class RecordingStore{
       const request=await this.store.get('SELECT id,recording_state FROM harbor.requests WHERE id=$1 FOR UPDATE',requestId);
       if(!request)throw new AppError(404,'请求不存在');
       const row=await this.store.get(`INSERT INTO harbor.recordings(request_id,turn_state,expires_at,updated)
-        VALUES($1,$2,$3,$4) ON CONFLICT(request_id) DO NOTHING RETURNING request_id`,requestId,turnState,at+this.retentionDays*86400000,at);
+        VALUES($1,$2,$3,$4) ON CONFLICT(request_id) DO NOTHING RETURNING request_id`,requestId,turnState,this.retentionDays===null?unlimitedRecordingExpiry:at+this.retentionDays*86400000,at);
       if(row)await this.store.run("UPDATE harbor.requests SET recording_state='pending',recording_reason=NULL WHERE id=$1 AND recording_state IN ('disabled','historical')",requestId);
       return {started:!!row};
   }

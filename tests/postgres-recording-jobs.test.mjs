@@ -4,6 +4,7 @@ import {readFileSync} from 'node:fs';
 import {randomUUID,randomBytes} from 'node:crypto';
 import {PostgresStore} from '../postgres-store.mjs';
 import {RecordingStore} from '../recording-store.mjs';
+import {unlimitedRecordingExpiry} from '../recording-retention.mjs';
 import {ConversationCapture} from '../conversation-capture.mjs';
 import {createPostgresJobs} from '../postgres-jobs.mjs';
 import {createPostgresWorkerRuntime} from '../postgres-worker-runtime.mjs';
@@ -14,11 +15,58 @@ import {createRecordingIndexCrypto} from '../recording-search-index.mjs';
 
 const socket=process.env.HARBOR_TEST_PG_SOCKET,url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!socket&&!url?'需隔离PostgreSQL':false};
 const connection=database=>url?{connectionString:(()=>{const value=new URL(url);if(database)value.pathname='/'+database;return value.toString();})(),allowPlaintextLocalNetwork:true}:{connection:{host:socket,port:Number(process.env.HARBOR_TEST_PG_PORT||55461),user:process.env.HARBOR_TEST_PG_USER||'harbor_scale',database:database||'postgres'}};
-async function fixture(t){const root=new PostgresStore(connection()),database='harbor_test_'+randomUUID().replaceAll('-','');await root.query('CREATE DATABASE '+database);const store=new PostgresStore({...connection(database),poolSize:8});t.after(async()=>{await store.close();await root.query('DROP DATABASE '+database);await root.close();});await store.migrate();if(!(await store.get("SELECT to_regclass('harbor.recording_work') present")).present)await store.query(readFileSync(new URL('../migrations/015-recording-jobs.sql',import.meta.url),'utf8'));await store.initializePricing();let at=Date.now();const clock=()=>at,key=randomBytes(32),recordings=new RecordingStore(store,{encryptionKey:key,clock}),jobs=createPostgresJobs(store,{clock}),policy=async()=>({captureAllowed:true,exportAllowed:true,status:'healthy'}),backend=createPostgresRecordingJobs(store,{recordingKey:key,jobs,clock,storagePolicy:policy}),member=randomUUID(),session=randomUUID();await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',member,'合成正文员工',at);await store.run("INSERT INTO harbor.accounts(id,name,home) VALUES('synthetic','合成上游','synthetic')");await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,protocol,created,updated) VALUES($1,$2,'synthetic','responses',$3,$3)",session,member,at);
+async function fixture(t,{unlimitedMigration=true}={}){const root=new PostgresStore(connection()),database='harbor_test_'+randomUUID().replaceAll('-','');await root.query('CREATE DATABASE '+database);const store=new PostgresStore({...connection(database),poolSize:8});t.after(async()=>{await store.close();await root.query('DROP DATABASE '+database);await root.close();});await store.migrate(unlimitedMigration?{recordingRetentionUnlimited:true}:{});if(!(await store.get("SELECT to_regclass('harbor.recording_work') present")).present)await store.query(readFileSync(new URL('../migrations/015-recording-jobs.sql',import.meta.url),'utf8'));await store.initializePricing();let at=Date.now();const clock=()=>at,key=randomBytes(32),recordings=new RecordingStore(store,{encryptionKey:key,clock}),jobs=createPostgresJobs(store,{clock}),policy=async()=>({captureAllowed:true,exportAllowed:true,status:'healthy'}),backend=createPostgresRecordingJobs(store,{recordingKey:key,jobs,clock,storagePolicy:policy}),member=randomUUID(),session=randomUUID();await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',member,'合成正文员工',at);await store.run("INSERT INTO harbor.accounts(id,name,home) VALUES('synthetic','合成上游','synthetic')");await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,protocol,created,updated) VALUES($1,$2,'synthetic','responses',$3,$3)",session,member,at);
   const request=async({text='中文故障分析 createInvoiceHandler',reply='回复完成',status='ok',started=at,secret=false}={})=>{const id=randomUUID();await store.run('INSERT INTO harbor.requests(id,member_id,session_id,started,ended,status,business_status,ip,model,recording_state) VALUES($1,$2,$3,$4,$5,$6,$6,\'fixture\',\'gpt-6.1-sol\',\'pending\')',id,member,session,started,at,status);await recordings.start(id,{turnState:'known'});const events=[],capture=new ConversationCapture({emit:event=>events.push(event)});capture.input({input:text});capture.event({type:'response.output_text.delta',item_id:'message',output_index:0,delta:reply.slice(0,3)});capture.event({type:'response.output_text.delta',item_id:'message',output_index:0,delta:reply.slice(3)});capture.finish({output:[{id:'message',type:'message',content:[{type:'output_text',text:reply}]}]});await recordings.append(id,events);await recordings.finish(id,{state:'complete'});return id;};
   const run=async kinds=>{let job;while(job=await jobs.claim(kinds)){await jobs.complete(job,await backend.handlers[job.kind](job));}};
   return {store,database,clock,key,recordings,jobs,backend,member,session,request,run,advance:ms=>{at+=ms;}};
 }
+
+test('unlimited retention preserves live and new bodies through purge, and can return to finite retention',integration,async t=>{
+ const f=await fixture(t),old=await f.request({text:'无限期保留的已有正文'}),expired=await f.request({text:'已经过期的正文'});
+ await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock()-1,expired);
+ const original=(await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',old)).expires_at;
+ const preview=await f.backend.retentionPreview(null);assert.equal(preview.days,null);assert.equal(preview.affected_requests,1);assert.equal((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',old)).expires_at,original);
+ const accepted=await f.backend.retentionApply({id:preview.id,expected_version:0,confirm:true});assert.equal(accepted.days,null);await f.run(['recording.retention']);
+ const progress=await f.backend.retentionStatus(preview.id);assert.equal(progress.days,null);assert.deepEqual(progress.counts,{applied:1});
+ const fresh=await f.request({text:'无限期设置下新增正文'});for(const id of [old,fresh])assert.equal((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',id)).expires_at,unlimitedRecordingExpiry);
+ f.advance(31*86400000);await f.backend.schedule();await f.run(['recording.purge']);
+ for(const id of [old,fresh])assert.ok(await f.store.get('SELECT request_id FROM harbor.recordings WHERE request_id=$1',id));assert.equal(await f.store.get('SELECT request_id FROM harbor.recordings WHERE request_id=$1',expired),undefined);
+ const finite=await f.backend.retentionPreview(7);assert.equal(finite.previous_days,null);assert.equal(finite.affected_requests,2);await f.backend.retentionApply({id:finite.id,expected_version:1,confirm:true});await f.run(['recording.retention']);
+ for(const id of [old,fresh])assert.ok((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',id)).expires_at<f.clock());
+ await assert.rejects(f.backend.retentionPreview(0));await assert.rejects(f.backend.retentionPreview('unlimited'));
+});
+
+test('unlimited retention does not revive a body that expires while its plan waits',integration,async t=>{
+ const f=await fixture(t),id=await f.request();await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock()+1000,id);
+ const plan=await f.backend.retentionPreview(null);f.advance(2000);await f.backend.retentionApply({id:plan.id,expected_version:0,confirm:true});await f.run(['recording.retention']);
+ assert.deepEqual((await f.backend.retentionStatus(plan.id)).counts,{changed:1});assert.ok((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',id)).expires_at<f.clock());
+});
+
+test('unlimited migration is opt-in, checksum tracked, and protects legacy capture and retention writes',integration,async t=>{
+ const f=await fixture(t,{unlimitedMigration:false}),versions=await f.store.all('SELECT version,checksum FROM harbor.schema_migrations ORDER BY version');assert.equal(versions.at(-1).version,22);assert.equal(await f.store.get("SELECT value FROM harbor.gateway_settings WHERE name='schema.recording-retention-unlimited'"),undefined);await assert.rejects(f.backend.retentionPreview(null),{code:'database_migration_required'});assert.equal((await f.store.migrate({recordingRetentionUnlimited:true})).changed,true);assert.equal((await f.store.migrate({recordingRetentionUnlimited:true})).changed,false);assert.deepEqual(await f.store.all('SELECT version,checksum FROM harbor.schema_migrations ORDER BY version'),versions);
+ const id=await f.request(),plan=await f.backend.retentionPreview(null);await f.backend.retentionApply({id:plan.id,expected_version:0,confirm:true});await f.run(['recording.retention']);
+ const legacy=randomUUID();await f.store.run("INSERT INTO harbor.requests(id,member_id,started,status,ip) VALUES($1,$2,$3,'queued','synthetic')",legacy,f.member,f.clock());await f.store.run("INSERT INTO harbor.recordings(request_id,turn_state,expires_at,updated) VALUES($1,'known',$2,$3)",legacy,f.clock()+30*86400000,f.clock());assert.equal((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',legacy)).expires_at,unlimitedRecordingExpiry);
+ await f.store.run('UPDATE harbor.recordings SET expires_at=$1,updated=$2 WHERE request_id=$3',f.clock()-1,f.clock(),id);assert.equal((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',id)).expires_at,unlimitedRecordingExpiry);
+ f.advance(31*86400000);await f.backend.schedule();await f.run(['recording.purge']);for(const request of [id,legacy])assert.ok(await f.store.get('SELECT request_id FROM harbor.recordings WHERE request_id=$1',request));
+ const finite=await f.backend.retentionPreview(7);await f.backend.retentionApply({id:finite.id,expected_version:1,confirm:true});await f.store.run('UPDATE harbor.recordings SET expires_at=$1,updated=$2 WHERE request_id=$3',unlimitedRecordingExpiry,f.clock(),legacy);assert.ok((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',legacy)).expires_at<f.clock());await f.run(['recording.retention']);
+ const saved=await f.store.get("SELECT value FROM harbor.gateway_settings WHERE name='schema.recording-retention-unlimited'");await f.store.run("UPDATE harbor.gateway_settings SET value=$1 WHERE name='schema.recording-retention-unlimited'",JSON.stringify({version:1,checksum:'0'.repeat(64)}));await assert.rejects(f.store.verifySchema(),{code:'database_migration_conflict'});await f.store.run("UPDATE harbor.gateway_settings SET value=$1 WHERE name='schema.recording-retention-unlimited'",saved.value);assert.equal(await f.store.verifySchema(),true);
+});
+
+test('an older claimed retention job cannot shorten bodies after unlimited policy is confirmed',integration,async t=>{
+ const f=await fixture(t),id=await f.request(),first=await f.backend.retentionPreview(7);await f.backend.retentionApply({id:first.id,expected_version:0,confirm:true});const stale=await f.jobs.claim(['recording.retention']);
+ const latest=await f.backend.retentionPreview(null);await f.backend.retentionApply({id:latest.id,expected_version:1,confirm:true});await f.jobs.complete(stale,await f.backend.handlers['recording.retention'](stale));await f.run(['recording.retention']);
+ assert.deepEqual((await f.backend.retentionStatus(first.id)).counts,{changed:1});assert.equal((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',id)).expires_at,unlimitedRecordingExpiry);
+});
+
+test('unlimited confirmation fences uncommitted legacy writes and includes live captures arriving after preview',integration,async t=>{
+ const f=await fixture(t),id=await f.request(),plan=await f.backend.retentionPreview(null),legacy=randomUUID(),entered=deferred(),release=deferred();let writing,confirming,confirmed=false;
+ try{
+  writing=f.store.transaction(async()=>{await f.store.run('UPDATE harbor.recordings SET expires_at=$1,updated=$2 WHERE request_id=$3',f.clock()+7*86400000,f.clock(),id);await f.store.run("INSERT INTO harbor.requests(id,member_id,started,status,ip) VALUES($1,$2,$3,'queued','synthetic')",legacy,f.member,f.clock());await f.store.run("INSERT INTO harbor.recordings(request_id,turn_state,expires_at,updated) VALUES($1,'known',$2,$3)",legacy,f.clock()+30*86400000,f.clock());entered.resolve();await release.promise;});
+  await deadline(entered.promise);confirming=f.backend.retentionApply({id:plan.id,expected_version:0,confirm:true}).then(value=>{confirmed=true;return value;});
+  await condition(async()=>!!await f.store.get("SELECT pid FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock(hashtextextended%' LIMIT 1"));assert.equal(confirmed,false);release.resolve();await writing;await confirming;await f.run(['recording.retention']);
+  for(const request of [id,legacy])assert.equal((await f.store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',request)).expires_at,unlimitedRecordingExpiry);assert.deepEqual((await f.backend.retentionStatus(plan.id)).counts,{applied:2});
+ }finally{release.resolve();await Promise.allSettled([writing,confirming].filter(Boolean));}
+});
 
 test('index refill queues pending bodies without purge or periodic key-version maintenance',integration,async t=>{
  const f=await fixture(t),id=await f.request();await f.backend.refill();assert.deepEqual((await f.store.all('SELECT DISTINCT kind FROM harbor.background_jobs')).map(row=>row.kind),['recording.index']);await f.run(['recording.index']);

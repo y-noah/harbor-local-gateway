@@ -273,6 +273,8 @@ PG正文管理HTTP与独立Worker已接同一`recording-encryption.key`（32字�
 
 `GET /api/admin/recordings/exports?before=<游标>&limit=25`返回近7个北京时间自然日的`items/next_cursor`，默认25、最多100及64KiB预算；刷新后可找回任务，019仅追加历史排序索引。列表不读取正文／私有筛选，状态与后台jobs一致；保留期计划也返回真实job失败状态，避免永远显示排队。导出明确固定结构化条件，默认CSV不含正文，显式JSONL才带正文；关键词搜索命中集当前不支持直接导出，界面须明确确认，不能静默丢弃关键词。附件确认完整后下载；保留期先预览影响再确认固定版本，预览本身不修改期限，并发版本冲突或过期须重新核对，清理不删除计量元数据。
 
+正文保留期可选择1–365天或无限期，默认仍为30天。启用无限期前，由数据库迁移入口执行 `node postgres-migrate.mjs --recording-retention=unlimited`：兼容扩展独立保存版本及SQL校验值，不改写已执行的编号迁移、不推进22／23／24版本，也不自动开启上下文。确认无限期后，新正文及预览中仍未过期的已有正文／上下文停止按天清理；已过期或已清理的内容不会恢复，已有导出附件不延长有效期。可重新预览并改回按天保留。兼容扩展同时约束旧写入代码及旧保留期任务，回退应用时保留该扩展；迁移造成的数据库结构摘要变化须重新核验发布与恢复凭证，不复用迁移前的摘要。
+
 可信存储状态来自实际PG盘及应用spool的采样，模型路径只读缓存，不等待磁盘IO；管理查询也不隐式触发慢探针。当前严格同机入口`HARBOR_RECORDING_PG_DATA_DIR`须通过Unix socket、实际backend目录、PG版本与cluster system_identifier核验，并检查真实relation／tablespace／WAL所在文件系统，不能用应用盘冒充数据库盘。`HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES`默认1GiB、`HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO`默认10%，按每个实际卷检查，允许服务端调整，客户端不可覆盖。独立probe池查询超时固定1秒，不能被URL参数扩大；未知、过期、权限不足、远程无可信证明一律停止新正文采集及大导出，模型和核心计量继续。远程DB可显式启用下述可信报告模式；正式宿主调度和最终部署组合仍须验收，不能仅凭本机探针或签名接口存在宣称远程存储已受监控。
 
 远程数据库使用服务端`HARBOR_RECORDING_STORAGE_MODE=report`及独立`HARBOR_RECORDING_STORAGE_REPORT_KEY_FILE`；默认`local`保留严格同机核验，不能自动降级为只看应用盘。DB主机一次性执行`node postgres-storage-report.mjs`，从`HARBOR_STORAGE_REPORT_DATABASE_URL`读取专用发布身份，核对实际PGDATA／backend／control和全部正文关系／WAL后签发，不常驻、不输出报告身份或密钥。签名材料为两端各自用户所有、0600、非符号链接的独立32字节文件，不能替代正文或员工Key材料；代码不生成真实材料、不自动改权限。020只增加有界单行报告及数据库单调时间保护。
