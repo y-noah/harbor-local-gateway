@@ -80,6 +80,8 @@ HARBOR_TEST_PG_BIN_DIR=/private/tools/postgresql/18/bin node --test tests/postgr
 
 ### 应用周期点、全备维护与真实恢复分离
 
+真实恢复的最终应用存储准入仍要求 gateway 与 worker 的可信存储绑定及采集许可同时成立。失败码以 `periodic_application_runtime_storage_<gateway|worker>_<固定原因>` 区分空间不足、监测缓存或报告过期、探针超时及绑定校验失败；未知原因收敛为固定类别，不输出路径、连接信息或报告原文，不因此刷新、放宽或跳过准入校验。
+
 源端 SSH 策略模块 `postgres-periodic-ssh-policy.mjs` 只读取 root／0600 的固定 `/etc/harbor-storage-periodic-ssh.json`，缺失或 `enabled:false` 时关闭，模板见 `periodic-ssh.example.json`。它核对 root 私钥（0600）、不可被组／其他用户改写的主机公钥文件、root／0700 索引目录及受保护祖先；启用时这些材料须预先准备，模块不会创建密钥、安装授权或发起连接。`host/port/user`、`identityFile/knownHostsFile/indexDirectory` 和两项超时由管理员配置；身份与主机公钥文件使用无空白、无 SSH token／环境变量展开的绝对字面路径。参数固定 `/usr/bin/ssh`、非交互身份认证、严格主机公钥核对、禁用代理／转发及远端命令 `harbor-periodic-receive`，不使用默认身份或修改主机公钥文件。策略每次调用读取；关闭阻止后续任务，已开始任务沿原预算收尾。该模块提供配置和参数；实际发送由独立固定 CLI 办理，配置启用本身不证明传输或异机恢复成功。
 
 固定 CLI 为 `node storage-periodic-transfer.mjs send|receive`，只读固定配置，不接收任意配置路径。`send` 认证已有 `latestBackup` 周期点并生成轻量传输索引，在 SSH 子进程真实关闭后才释放传输租约。索引续跑允许在 `handoff.enc` 尚未发布时，复用完整写入、AEAD 认证且内容与预期 catalog 匹配的页；未知文件、损坏认证或不匹配内容保全并拒绝，不承诺任意 SIGKILL 遗留的半写文件都能自动清理。`receive` 只接收并认证密文传输，不执行数据库／应用恢复，也不签发恢复或异机验证证明。

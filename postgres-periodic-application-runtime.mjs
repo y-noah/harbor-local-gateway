@@ -16,6 +16,7 @@ import {publishRecordingStorageReport} from './postgres-storage-report.mjs';
 import {collectRestoredRuntimeCloses,restoredRuntimeClosesSucceeded} from './storage-restored-runtime-shutdown.mjs';
 import {transferError} from './migration-artifacts.mjs';
 import {handoffReceiverRestoredTree} from './storage-receiver-candidate-files.mjs';
+import {assertPeriodicRuntimeStorage} from './postgres-periodic-runtime-storage.mjs';
 
 const fail=code=>{throw transferError(code);},ident=value=>'"'+value.replaceAll('"','""')+'"';
 async function freePort(){const server=createServer();await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});const port=server.address().port;await new Promise((resolve,reject)=>server.close(error=>error?reject(error):resolve()));return port;}
@@ -97,7 +98,7 @@ export async function verifyPeriodicApplicationRuntime(session,{token,destinatio
       if((await store.get("SELECT EXISTS(SELECT 1 FROM harbor.background_jobs WHERE status='completed' AND updated>=$1 AND kind IN ('recording.purge','routing.expiry','recording.index','recording.export')) progress",started)).progress)break;
       if(Date.now()>deadline)fail('periodic_application_worker_timeout');await delay(20,undefined,{signal});
     }
-    for(const candidate of [gateway,worker]){const status=await candidate.command('status');if(!status.storage||!status.captureAllowed)fail('periodic_application_runtime_storage');}
+    for(const [role,candidate] of [['gateway',gateway],['worker',worker]])assertPeriodicRuntimeStorage(role,await candidate.command('status'));
     if(installed)await runtime.revalidate();
     summary={scope:installed?'installed-restored-periodic-source-runtime':'task-restored-periodic-source-runtime',...(installed?{sourceDigest:runtime.sourceDigest,nodeDigest:runtime.nodeDigest,crossUidExecutionVerified:true,publisherUidVerified:true,restoreUid:record.restoreUid}:{}),gatewayStartedVerified:true,independentWorkerStartedVerified:true,workerProgressVerified:true,originalKeyDatabaseVerified:true,oldKeyHttpVerified,restoredTlsServerVerified:true,freshRestoredDatabaseReportVerified:true,reportSampledAt:first.sampled_at,upstreamCallsDisabled:true,originalDeviceClientChallengeVerified:false,candidateVerified:false,offhostVerified:false,deploymentAllowed:false};return summary;
   }finally{

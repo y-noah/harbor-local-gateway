@@ -3,6 +3,7 @@ import {createPostgresWorker} from './postgres-worker.mjs';
 import {postgresMaterialsPreflight} from './ci/postgres-preflight.mjs';
 import {closeRestoredRuntimeApplication} from './storage-restored-runtime-shutdown.mjs';
 import {transferError} from './migration-artifacts.mjs';
+import {periodicRuntimeStorageStatus} from './postgres-periodic-runtime-storage.mjs';
 
 if(process.argv[2]!=='--periodic-restored-runtime'||!process.send)throw transferError('periodic_application_child_private');
 let app,role,initialization,closing=false,closed;
@@ -30,7 +31,7 @@ process.on('message',message=>{void(async()=>{
     let result;
     if(message.operation==='initialize'){if(initialization||closing)throw transferError('periodic_application_initialize_once');initialization=initialize(message.configuration);result=await initialization;}
     else if(message.operation==='close')result=await close();
-    else if(message.operation==='status'&&app&&!closing)result={storage:app.recordingStorage.status().binding.verified,captureAllowed:app.recordingStorage.captureAllowed()};
+    else if(message.operation==='status'&&app&&!closing)result=periodicRuntimeStorageStatus(app.recordingStorage);
     else throw transferError('periodic_application_child_command');
     if(process.connected)process.send({id:message.id,ok:true,result},()=>{if(message.operation==='close')process.exit(result.drained?0:1);});
   }catch(error){if(process.connected)process.send({id:message.id,ok:false,error:typeof error?.code==='string'&&/^[a-z][a-z0-9_]+$/.test(error.code)?error.code:'periodic_application_child_failed'});}
