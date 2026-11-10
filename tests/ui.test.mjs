@@ -667,21 +667,20 @@ test('automatic refresh is limited to live views and the unfiltered first reques
 test('a late automatic response cannot refresh a static page reached after the request began',async()=>{
  let release;const page=await ui(()=>new Promise(r=>release=()=>r(response({...snapshot(),busy:42}))));page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='overview';");const pending=page.run('automaticRefresh()');page.run("tab='members';render()");const before=page.node('#content').innerHTML;release();await pending;assert.equal(page.node('#content').innerHTML,before);assert.equal(page.run('state.busy'),0);assert.equal(page.run('autoRefreshPending'),false);
 });
-test('automatic latest-request refresh does not flash loading or replace unchanged rows; manual refresh remains available',async()=>{
- let release;const result={observedAt:1,summary:{requests:1,success:1,input:1,output:1,cached:0,unmetered:0,active:0,average_ms:1000},pagination:{page:1,pageSize:25,total:1,totalPages:1},rows:[],models:[],members:[],byModel:[],byMember:[]};
- const calls=[];const page=await ui(path=>{calls.push(path);return new Promise(r=>release=()=>r(response({...result,observedAt:2})));});page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(result)+";render();");const before=page.node('#content').innerHTML,pending=page.run('automaticRefresh()');assert.equal(page.node('#content').innerHTML,before);assert.ok(!page.node('#content').innerHTML.includes('正在读取'));release();await pending;assert.equal(page.node('#content').innerHTML,before);assert.ok(calls[0].startsWith('/api/admin/requests?'));assert.ok(!calls.includes('/api/admin/state'));
- page.run("tab='history';historyData=null;render()");assert.equal(page.run('automaticRefreshScope()'),'');
+test('request detail stays unchanged on timer ticks and reloads only on explicit refresh',async()=>{
+ const result={observedAt:1,summary:{requests:1,success:1,active:0,average_ms:1000},pagination:{page:1,pageSize:25,total:1,totalPages:1},rows:[],models:[],members:[],byModel:[],byMember:[]},calls=[];
+ const page=await ui(path=>{calls.push(path);return response(result);});page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(result)+";render()");const before=page.node('#content').innerHTML;await page.run('automaticRefresh()');assert.equal(calls.length,0);assert.equal(page.node('#content').innerHTML,before);await page.click('requests-reload');assert.ok(calls[0].startsWith('/api/admin/requests?'));assert.ok(!calls.includes('/api/admin/state'));
 });
 
-test('request refresh restores online status after an outage without accepting late responses',async()=>{
+test('manual request refresh recovers after an outage without accepting late responses',async()=>{
  const data={summary:{active:0},pagination:{page:1,pageSize:25,total:0,totalPages:1},rows:[],models:[],members:[],byModel:[],byMember:[]};
  let failing=true,release;
  const page=await ui(()=>release===null?new Promise(r=>release=()=>r(response(data))):failing?response({error:{message:'synthetic outage'}},502):response(data));
  page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(data));
- await page.run('automaticRefresh()');assert.equal(page.node('#connection').textContent,'连接异常');
- failing=false;await page.run('automaticRefresh()');assert.equal(page.node('#connection').textContent,'服务在线');
- failing=true;await page.run('automaticRefresh()');failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'服务在线');
- release=null;const pending=page.run('automaticRefresh()');page.run("tab='members';render()");page.node('#connection').textContent='new-page-status';release();await pending;
+ await page.run('loadRequests()');assert.equal(page.run('requestsData'),null);assert.match(page.node('#toast').textContent,/synthetic outage/);
+ failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'服务在线');
+ failing=true;await page.run('loadRequests()');failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'服务在线');
+ release=null;const pending=page.run('loadRequests()');page.run("tab='members';render()");page.node('#connection').textContent='new-page-status';release();await pending;
  assert.equal(page.node('#connection').textContent,'new-page-status');
 });
 
@@ -781,7 +780,7 @@ test('R2 explicit refresh discards a deep or invalid snapshot and recovers on th
 test('R3 delayed statistics defer success and failure rendering while editing or hidden',async()=>{
  for(const protect of ['edit','hidden'])for(const fail of [false,true]){
   const pending=[],page=await ui(path=>new Promise(resolve=>pending.push({path,release:(body,status=200)=>resolve(response(body,status))})));
-  page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';");const load=page.run("loadRequests('requests:latest')");
+  page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';");const load=page.run("loadRequests()");
   pending[0].release({snapshot:'stable',watermark:1,pagination:{page:1,pageSize:25,total:3,totalPages:1},rows:[]});await load;
   const before=page.node('#content').innerHTML;page.run(protect==='edit'?"document.activeElement={tagName:'SELECT'}":"document.hidden=true");
   pending[1].release(fail?{error:{message:'暂不可用'}}:{watermark:1,observedAt:2,summary:{requests:3,success:3,active:0,average_ms:1,standard:{total:2}},byModel:[],byMember:[],members:[],models:[]},fail?503:200);await new Promise(setImmediate);
@@ -1311,4 +1310,25 @@ test('账号额外额度及小数指标统一保留两位且不改原始值',asy
  assert.equal(page.run('decimal(null)'),'—');assert.equal(page.run('decimal("not-a-number")'),'—');
  assert.equal(page.run('packageNumber(12.345678)'),'12.35');assert.equal(page.run('packageNumber(0.0000001)'),'小于0.01');
  assert.equal(page.run('fmt(12.345678)'),'12.35');assert.equal(page.run('fmt(2)'),'2');assert.equal(page.run('weightPercent(12.3)'),'12.30%');
+});
+
+
+test('设备目录展示硬件指纹缩写并复制原始完整摘要，未知不伪造',async()=>{
+ const fingerprint='1234567890abcdef'.repeat(4),directory=deviceDirectory();directory.rows[0].fingerprint=fingerprint;const page=await ui(()=>response(directory));page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));await page.run('openDevices("member-one")');const html=page.node('#devices-content').innerHTML;assert.match(html,/设备指纹/);assert.ok(html.includes('1234567890ab…90abcdef'));assert.ok(!html.includes(fingerprint));await page.click('device-copy-fingerprint',directory.rows[0].id);assert.equal(page.copied.at(-1),fingerprint);
+ for(const value of [null,undefined,'not-a-hardware-fingerprint','<img src=x>']){page.run('deviceView.data.rows[0].fingerprint='+JSON.stringify(value)+';renderDevices(deviceView)');const unknown=page.node('#devices-content').innerHTML;assert.match(unknown,/设备指纹：未获取/);assert.doesNotMatch(unknown,/data-action="device-copy-fingerprint"|<img/);}
+});
+
+
+test('请求明细各页均不定时刷新，手动刷新仍从真实列表读取',async()=>{
+ const calls=[],page=await ui(path=>{calls.push(path);return response({rows:[],members:[],models:[],summary:{requests:0,success:0,active:0,average_ms:0},pagination:{page:1,pageSize:25,total:0,totalPages:1},byModel:[],byMember:[]});});page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="requests";recordView="requests"');
+ for(const current of [1,2]){page.run('requestsFilters.page='+current);assert.equal(page.run('automaticRefreshScope()'),'');await page.run('automaticRefresh()');}assert.equal(calls.length,0);
+ await page.click('requests-reload');assert.ok(calls.some(path=>path.includes('/api/admin/requests?')&&path.includes('view=list')));
+ for(const tab of ['overview','accounts','sessions']){page.run('tab='+JSON.stringify(tab));assert.equal(page.run('automaticRefreshScope()'),'state:'+tab);}
+});
+
+
+test('设备指纹复制在剪贴板与兼容方式均失败时提示错误并清理临时输入',async()=>{
+ const directory=deviceDirectory();directory.rows[0].fingerprint='a'.repeat(64);const page=await ui(()=>response(directory));page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));await page.run('openDevices("member-one")');
+ page.run('navigator.clipboard.writeText=async()=>{throw Error("clipboard-denied")};document.createElement=()=>({setAttribute(){},focus(){},select(){},setSelectionRange(){},remove(){globalThis.copyInputRemoved=true}});document.querySelector("#modal").append=()=>{};document.execCommand=()=>false');
+ await page.click('device-copy-fingerprint',directory.rows[0].id);assert.match(page.node('#toast').textContent,/复制失败.*设备指纹/);assert.equal(page.run('copyInputRemoved'),true);
 });

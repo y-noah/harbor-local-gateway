@@ -146,7 +146,7 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
       if(keyId){requestValues.push(keyId);requestWhere.push('r.key_id=$'+requestValues.length);}
       if(state){requestValues.push(state);requestWhere.push('EXISTS(SELECT 1 FROM harbor.employee_devices sd WHERE sd.id=r.device_id AND sd.state=$'+requestValues.length+')');}
       const summary=await readStore.get(`SELECT COUNT(DISTINCT r.device_id) used_devices,COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests FROM harbor.requests r JOIN harbor.members rm ON rm.id=r.member_id WHERE ${requestWhere.join(' AND ')}`,...requestValues);
-      return {rows:rows.map(row=>({...dto(row),member_name:row.member_name,request_count:row.request_count})),summary:{registered_devices:total,...summary},...(owner?{member:{id:owner.id,device_mode:owner.device_mode,device_policy_version:owner.device_policy_version}}:{}),pagination:{page:current,pageSize,total,totalPages},observedAt:at};
+      return {rows:rows.map(row=>({...dto(row),fingerprint:hex(row.fingerprint)?row.fingerprint:null,member_name:row.member_name,request_count:row.request_count})),summary:{registered_devices:total,...summary},...(owner?{member:{id:owner.id,device_mode:owner.device_mode,device_policy_version:owner.device_policy_version}}:{}),pagination:{page:current,pageSize,total,totalPages},observedAt:at};
     });
   }
   async function handle(path,method,payload,params=new URLSearchParams()){
