@@ -2,6 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {RecordRedactor,redactRecordText,sanitizeRecord,redacted} from '../record-redaction.mjs';
 
+test('field normalization preserves escaped and control-suffixed credentials while ordinary identifiers remain visible',()=>{
+  for(const key of ['auth','AUTH','auth\n','authori\\u007aation','api-key','ApiKey','\\u0074oken','custom_secret','base64']){
+    const safe=sanitizeRecord({[key]:'SYNTHETIC_PRIVATE_VALUE',ordinary:'public'});assert.equal(safe.ordinary,'public');assert.ok(!JSON.stringify(safe).includes('SYNTHETIC_PRIVATE_VALUE'));
+  }
+  for(const key of ['task_result','synthetic','authenticator','tokenizer','123','keynote'])assert.equal(sanitizeRecord({[key]:'VISIBLE_VALUE'})[key],'VISIBLE_VALUE');
+});
+
 const samples=[
   ['sk-proj-'+('A'.repeat(60)),'A'.repeat(40)],
   ['GITHUB_TOKEN = github_pat_'+('x'.repeat(40)),'x'.repeat(30)],

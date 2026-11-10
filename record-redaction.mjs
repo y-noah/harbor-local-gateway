@@ -16,9 +16,11 @@ export function filteredRecordField(metadata,field,value){
   if(field==='text'&&typeof value!=='string'||value&&typeof value==='object'&&!safeRecords.has(value))throw TypeError('Recording field has no filtered provenance');
   const safe={...sanitizeRecord(metadata),[field]:value};return restoreAuthenticatedRecord(safe);
 }
+const sensitiveRecordNames=new Set(['key','auth','authorization','proxyauthorization','cookie','setcookie','credential','credentials','b64json','base64','encryptedcontent']);
 export function sensitiveRecordField(key){
-  const name=String(key).replace(/\\u([0-9a-f]{4})/gi,(_,hex)=>String.fromCharCode(parseInt(hex,16))).replace(/[^a-z0-9]/gi,'').toLowerCase();
-  return ['key','auth','authorization','proxyauthorization','cookie','setcookie','credential','credentials','b64json','base64','encryptedcontent'].includes(name)||/(?:password|passwd|secret|token|apikey|privatekey|signature|credential|accesskeyid|pat)$/.test(name);
+  // Canonical lowercase words need no escape decoding or punctuation removal.
+  const raw=String(key),name=/[^a-z0-9]/.test(raw)?raw.replace(/\\u([0-9a-f]{4})/gi,(_,hex)=>String.fromCharCode(parseInt(hex,16))).replace(/[^a-z0-9]/gi,'').toLowerCase():raw;
+  return sensitiveRecordNames.has(name)||/(?:password|passwd|secret|token|apikey|privatekey|signature|credential|accesskeyid|pat)$/.test(name);
 }
 // Keep hyphenated credential detection conservative; the underscore form needs
 // a lexical boundary so ordinary identifiers such as task_result stay intact.
