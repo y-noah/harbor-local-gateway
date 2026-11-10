@@ -3,6 +3,7 @@ import {AppError} from './store.mjs';
 import {sanitizeRecord,restoreAuthenticatedRecord,validRecordRedaction} from './record-redaction.mjs';
 import {requestContextReasons} from './recording-request-context.mjs';
 
+const minimumPartBytes=256;
 const kinds=new Set(['instruction','history','tool_schema','context']);
 const captureReasons=new Set(requestContextReasons);
 const fail=(status,message,code='recording_context_invalid')=>{throw new AppError(status,message,code);};
@@ -19,7 +20,7 @@ function normalizedCoverage(coverage){
 function chunks(bytes,limit){const result=[];for(let start=0;start<bytes.length;){let end=Math.min(start+limit,bytes.length);if(end<bytes.length)while(end>start&&(bytes[end]&0xc0)===0x80)end--;result.push(bytes.subarray(start,end));start=end;}return result;}
 export class RecordingContextStore{
  constructor(store,{encryptionKey,clock=Date.now,maxSnapshotBytes=2097152,maxComponents=4096,partBytes=65536,maxReadBytes=131072}={}){
-  if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32||typeof clock!=='function'||!Number.isSafeInteger(maxSnapshotBytes)||maxSnapshotBytes<256||maxSnapshotBytes>8388608||!Number.isInteger(maxComponents)||maxComponents<1||maxComponents>16384||!Number.isInteger(partBytes)||partBytes<256||partBytes>131072||partBytes>maxSnapshotBytes||!Number.isInteger(maxReadBytes)||maxReadBytes<partBytes+28||maxReadBytes>2097152)fail(503,'上下文仓储配置无效','recording_context_configuration');
+  if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32||typeof clock!=='function'||!Number.isSafeInteger(maxSnapshotBytes)||maxSnapshotBytes<256||maxSnapshotBytes>8388608||!Number.isInteger(maxComponents)||maxComponents<1||maxComponents>16384||!Number.isInteger(partBytes)||partBytes<minimumPartBytes||partBytes>131072||partBytes>maxSnapshotBytes||!Number.isInteger(maxReadBytes)||maxReadBytes<partBytes+28||maxReadBytes>2097152)fail(503,'上下文仓储配置无效','recording_context_configuration');
   this.store=store;this.clock=clock;this.maxSnapshotBytes=maxSnapshotBytes;this.maxComponents=maxComponents;this.partBytes=partBytes;this.maxReadBytes=maxReadBytes;this.gcScope=null;
   this.key=Buffer.from(hkdfSync('sha256',encryptionKey,Buffer.alloc(0),'harbor-recording-context-encryption-v1',32));
   this.fingerprintKey=Buffer.from(hkdfSync('sha256',encryptionKey,Buffer.alloc(0),'harbor-recording-context-fingerprint-v1',32));
@@ -66,6 +67,68 @@ export class RecordingContextStore{
    const shape=shapes.get(object.id);if(!shape||shape.parts!==object.parts||Number(shape.bytes)!==object.bytes||shape.last!==object.parts)fail(503,'上下文对象分块缺失','recording_context_incomplete');
   }
  }
+ #snapshotFingerprint(authority,prepared,coverage){
+  for(const value of prepared.values)value.fingerprint=this.#digest('object:'+authority.scope.toString('hex'),Buffer.concat([Buffer.from(value.kind+'\0'),value.content]));
+  return this.#digest('snapshot',JSON.stringify({state:prepared.state,coverage,seen:prepared.seen,objects:prepared.values.map(value=>[value.fingerprint.toString('hex'),value.clipped])}));
+ }
+ // Server-side import path. The existing snapshot-byte and component limits
+ // also bound the whole batch; individual request capture keeps its old path.
+ async writeSnapshotBatch(inputs,{signal}={}){
+  if(!Array.isArray(inputs)||inputs.length>this.maxComponents)fail(400,'上下文批次无效');
+  if(!inputs.length)return [];
+  const ids=new Set(),prepared=[];let bytes=0,components=0;
+  for(const input of inputs){
+   signal?.throwIfAborted();
+   if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(key=>!['requestId','components','coverage'].includes(key))||typeof input.requestId!=='string'||!input.requestId||input.requestId.length>200||ids.has(input.requestId))fail(400,'上下文批次请求标识无效');
+   ids.add(input.requestId);const coverage=normalizedCoverage(input.coverage??null),value=this.#prepare(input.components);
+   if(coverage?.state==='incomplete'&&value.state==='complete')value.state=coverage.reasons.includes('size_limit')?'truncated':'partial';
+   bytes+=value.bytes;components+=Math.max(1,value.values.length);if(bytes>this.maxSnapshotBytes||components>this.maxComponents)fail(413,'上下文批次超过仓储预算','recording_context_batch_capacity');
+   prepared.push({id:input.requestId,coverage,value});
+  }
+  return this.store.transaction(async()=>{
+   signal?.throwIfAborted();const at=this.clock();
+   const sources=await this.store.all(`SELECT r.id,r.member_id,r.session_id,r.recording_state,c.expires_at,s.member_id session_member FROM harbor.requests r JOIN harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.sessions s ON s.id=r.session_id WHERE r.id=ANY($1::text[]) ORDER BY r.id FOR SHARE OF r,c`,[...ids]);
+   if(sources.length!==prepared.length)fail(404,'部分请求正文尚不存在','recording_context_missing');
+   const authorities=new Map();for(const row of sources){if(!row.member_id||row.session_id&&row.session_member!==row.member_id)fail(503,'请求上下文归属不一致','recording_context_scope');if(row.expires_at<=at||row.recording_state==='expired')fail(410,'请求正文已过期','recording_context_expired');row.scope=this.#digest('scope',JSON.stringify([row.member_id,row.session_id?['session',row.session_id]:['request',row.id]]));authorities.set(row.id,row);}
+   const scopes=[...new Set(sources.map(row=>'harbor-recording-context:'+row.scope.toString('hex')))];
+   // MATERIALIZED ordering gives every writer the same advisory-lock order.
+   await this.store.all('WITH ordered AS MATERIALIZED(SELECT value FROM unnest($1::text[]) v(value) ORDER BY value) SELECT pg_advisory_xact_lock(hashtextextended(value,0)) FROM ordered',scopes);
+   const lockedAt=this.clock();if(sources.some(row=>row.expires_at<=lockedAt))fail(410,'请求正文已过期','recording_context_expired');
+   const oldRows=await this.store.all('SELECT * FROM harbor.recording_context_snapshots WHERE request_id=ANY($1::text[]) FOR UPDATE',[...ids]),existing=new Map(oldRows.map(row=>[row.request_id,row])),unique=new Map();
+   for(const entry of prepared){
+    const authority=authorities.get(entry.id);entry.authority=authority;entry.fingerprint=this.#snapshotFingerprint(authority,entry.value,entry.coverage);
+    const old=existing.get(entry.id);if(old){if(!equal(old.scope_digest,authority.scope)||old.key_version!==this.keyVersion)fail(503,'上下文归属或密钥版本不一致','recording_context_scope');if(!equal(old.fingerprint,entry.fingerprint))fail(409,'本次上下文已持久化且不可覆盖','recording_context_conflict');await this.#validateSnapshot(old);}
+    for(const value of entry.value.values){const key=authority.scope.toString('hex')+':'+value.fingerprint.toString('hex');if(!unique.has(key))unique.set(key,{...value,scope:authority.scope});}
+   }
+   const wanted=[...unique.values()],oldObjects=wanted.length?await this.store.all(`SELECT o.* FROM unnest($1::bytea[],$2::bytea[]) v(scope,fingerprint) JOIN harbor.recording_context_objects o ON o.scope_digest=v.scope AND o.fingerprint=v.fingerprint AND o.key_version=$3 FOR UPDATE OF o`,wanted.map(row=>row.scope),wanted.map(row=>row.fingerprint),this.keyVersion):[];
+   await this.#validObjects(oldObjects);
+   for(const object of oldObjects){const expected=unique.get(object.scope_digest.toString('hex')+':'+object.fingerprint.toString('hex'));if(object.kind!==expected.kind||object.bytes!==expected.content.length||object.parts<1||object.parts>Math.ceil(expected.content.length/(minimumPartBytes-3)))fail(503,'上下文对象元数据不一致','recording_context_incomplete');}
+   const keyFor=row=>row.scope_digest.toString('hex')+':'+row.fingerprint.toString('hex'),objects=new Map(oldObjects.map(row=>[keyFor(row),row]));
+   // Reused objects must authenticate and match the requested canonical bytes;
+   // otherwise a damaged shared object could seed more unreadable snapshots.
+   const oldParts=oldObjects.length?await this.store.all('SELECT object_id,ordinal,bytes,CASE WHEN bytes>=0 AND bytes<=$2 AND octet_length(content_cipher)=bytes+28 THEN content_cipher ELSE NULL END content_cipher FROM harbor.recording_context_parts WHERE object_id=ANY($1::text[]) ORDER BY object_id,ordinal',oldObjects.map(row=>row.id),this.maxSnapshotBytes):[],partsByObject=new Map();
+   for(const part of oldParts){const list=partsByObject.get(part.object_id)??[];list.push(part);partsByObject.set(part.object_id,list);}
+   for(const object of oldObjects){signal?.throwIfAborted();const wantedObject=unique.get(keyFor(object));if(object.kind!==wantedObject.kind||object.bytes!==wantedObject.content.length)fail(503,'上下文对象元数据不一致','recording_context_incomplete');const blocks=(partsByObject.get(object.id)??[]).map((part,index)=>{if(part.ordinal!==index+1||!part.content_cipher)fail(503,'上下文分块长度不一致','recording_context_incomplete');const plain=this.#open(part.content_cipher,object.id,part.ordinal,object.scope_digest);if(plain.length!==part.bytes)fail(503,'上下文分块长度不一致','recording_context_incomplete');return plain;});if(!Buffer.concat(blocks).equals(wantedObject.content))fail(503,'上下文对象内容不一致','recording_context_incomplete');}
+   const created=[],parts=[];
+   for(const [key,value] of unique){
+    signal?.throwIfAborted();if(objects.has(key))continue;const id=randomUUID(),blocks=chunks(value.content,this.partBytes),row={id,scope_digest:value.scope,fingerprint:value.fingerprint,kind:value.kind,bytes:value.content.length,parts:blocks.length};created.push(row);objects.set(key,row);
+    for(const [index,part] of blocks.entries())parts.push({id,ordinal:index+1,bytes:part.length,cipher:this.#seal(part,id,index+1,value.scope)});
+   }
+   if(created.length){
+    await this.store.run(`INSERT INTO harbor.recording_context_objects(id,scope_digest,fingerprint,key_version,kind,state,bytes,parts,created) SELECT v.id,v.scope,v.fingerprint,$1,v.kind,'writing',v.bytes,v.parts,$2 FROM unnest($3::text[],$4::bytea[],$5::bytea[],$6::text[],$7::bigint[],$8::integer[]) v(id,scope,fingerprint,kind,bytes,parts)`,this.keyVersion,at,created.map(row=>row.id),created.map(row=>row.scope_digest),created.map(row=>row.fingerprint),created.map(row=>row.kind),created.map(row=>row.bytes),created.map(row=>row.parts));
+    signal?.throwIfAborted();await this.store.run(`INSERT INTO harbor.recording_context_parts(object_id,ordinal,bytes,content_cipher) SELECT * FROM unnest($1::text[],$2::integer[],$3::integer[],$4::bytea[])`,parts.map(row=>row.id),parts.map(row=>row.ordinal),parts.map(row=>row.bytes),parts.map(row=>row.cipher));
+    await this.store.run("UPDATE harbor.recording_context_objects SET state='complete' WHERE id=ANY($1::text[])",created.map(row=>row.id));
+   }
+   const fresh=prepared.filter(entry=>!existing.has(entry.id)),references=[];
+   for(const entry of fresh)for(const [index,value] of entry.value.values.entries())references.push({requestId:entry.id,ordinal:index+1,objectId:objects.get(entry.authority.scope.toString('hex')+':'+value.fingerprint.toString('hex')).id,truncated:value.clipped});
+   if(fresh.length){
+    const rows=await this.store.all(`INSERT INTO harbor.recording_context_snapshots(request_id,member_id,session_id,scope_digest,fingerprint,key_version,state,reason,coverage,seen,components,bytes,expires_at,created)
+     SELECT v.id,v.member,v.session,v.scope,v.fingerprint,$1,v.state,v.reason,v.coverage::jsonb,v.seen,v.components,v.bytes,v.expires,$2 FROM unnest($3::text[],$4::text[],$5::text[],$6::bytea[],$7::bytea[],$8::text[],$9::text[],$10::text[],$11::integer[],$12::integer[],$13::bigint[],$14::bigint[]) v(id,member,session,scope,fingerprint,state,reason,coverage,seen,components,bytes,expires) RETURNING *`,this.keyVersion,at,fresh.map(row=>row.id),fresh.map(row=>row.authority.member_id),fresh.map(row=>row.authority.session_id),fresh.map(row=>row.authority.scope),fresh.map(row=>row.fingerprint),fresh.map(row=>row.value.state),fresh.map(row=>row.value.state==='truncated'?'size_limit':row.value.state==='partial'?'capture_incomplete':null),fresh.map(row=>row.coverage===null?null:JSON.stringify(row.coverage)),fresh.map(row=>row.value.seen),fresh.map(row=>row.value.values.length),fresh.map(row=>row.value.bytes),fresh.map(row=>row.authority.expires_at));for(const row of rows)existing.set(row.request_id,row);
+    if(references.length)await this.store.run('INSERT INTO harbor.recording_context_references(request_id,ordinal,object_id,truncated) SELECT * FROM unnest($1::text[],$2::integer[],$3::text[],$4::boolean[])',references.map(row=>row.requestId),references.map(row=>row.ordinal),references.map(row=>row.objectId),references.map(row=>row.truncated));
+   }
+   signal?.throwIfAborted();return prepared.map(row=>this.#receipt({...existing.get(row.id),expires_at:Math.min(existing.get(row.id).expires_at,row.authority.expires_at)}));
+  });
+ }
  async writeSnapshot(requestId,components,{coverage=null}={}){
   coverage=normalizedCoverage(coverage);
   const prepared=this.#prepare(components);
@@ -73,8 +136,7 @@ export class RecordingContextStore{
   return this.store.transaction(async()=>{
    const authority=await this.#authority(requestId,{lock:true});await this.#lock(authority.scope);
    if(authority.expires_at<=this.clock()||authority.recording_state==='expired')fail(410,'请求正文已过期','recording_context_expired');
-   for(const value of prepared.values)value.fingerprint=this.#digest('object:'+authority.scope.toString('hex'),Buffer.concat([Buffer.from(value.kind+'\0'),value.content]));
-   const fingerprint=this.#digest('snapshot',JSON.stringify({state:prepared.state,coverage,seen:prepared.seen,objects:prepared.values.map(value=>[value.fingerprint.toString('hex'),value.clipped])}));
+   const fingerprint=this.#snapshotFingerprint(authority,prepared,coverage);
    const existing=await this.store.get('SELECT * FROM harbor.recording_context_snapshots WHERE request_id=$1 FOR UPDATE',requestId);
    if(existing){if(!equal(existing.scope_digest,authority.scope)||existing.key_version!==this.keyVersion)fail(503,'上下文归属或密钥版本不一致','recording_context_scope');if(!equal(existing.fingerprint,fingerprint))fail(409,'本次上下文已持久化且不可覆盖','recording_context_conflict');await this.#validateSnapshot(existing);return this.#receipt({...existing,expires_at:Math.min(existing.expires_at,authority.expires_at)});}
    // The snapshot byte/component limits also bound these arrays. Keep database

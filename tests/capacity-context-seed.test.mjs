@@ -25,9 +25,9 @@ test('context seeding uses actual encryption, atomic cancellation, immutable res
  try{
   fixture=await createDatasetDatabase(admin,manifest,{laboratory:lab,recordingKey,encryptionKey:randomBytes(32),connectionFor:database=>({connection:{...lab.connection,database}})});const store=fixture.store;await seedDataset(store,manifest,{recordingKey});
   await assert.rejects(seedDatasetContexts(admin,manifest,{recordingKey}),/database_not_owned/);await assert.rejects(seedDatasetContexts(store,manifest,{recordingKey:randomBytes(32)}),/recording_key_invalid/);
-  const controller=new AbortController(),get=store.get.bind(store);let inserted=false;
-  store.get=async(...args)=>{const row=await get(...args);if(!inserted&&args[0].startsWith('INSERT INTO harbor.recording_context_snapshots')){inserted=true;controller.abort();}return row;};
-  try{await assert.rejects(seedDatasetContexts(store,manifest,{recordingKey,until:7,signal:controller.signal}),{name:'AbortError'});}finally{store.get=get;}
+  const controller=new AbortController(),all=store.all.bind(store);let inserted=false;
+  store.all=async(...args)=>{const row=await all(...args);if(!inserted&&args[0].startsWith('INSERT INTO harbor.recording_context_snapshots')){inserted=true;controller.abort();}return row;};
+  try{await assert.rejects(seedDatasetContexts(store,manifest,{recordingKey,until:7,signal:controller.signal}),{name:'AbortError'});}finally{store.all=all;}
   assert.equal(inserted,true);for(const table of ['recording_context_snapshots','recording_context_objects','recording_context_parts','recording_context_references'])assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.'+table)).n,0);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor_capacity.context_receipts')).n,0);
   const began=performance.now(),result=await seedDatasetContexts(store,manifest,{recordingKey,until:12});assert.equal(result.snapshots,12);assert.equal(result.formalQualified,false);t.diagnostic('measured initial context seed ms='+Math.round(performance.now()-began));
   await seedDatasetContexts(store,manifest,{recordingKey,first:600,until:602});const id=index=>fixtureId(manifest.runId,'request',index),contexts=new RecordingContextStore(store,{encryptionKey:recordingKey});
@@ -51,6 +51,22 @@ test('context seeding uses actual encryption, atomic cancellation, immutable res
   const query=store.query.bind(store);let sqlCalls=0;store.query=async(...args)=>{sqlCalls++;return query(...args);};const started=performance.now();let measured,constructionMs;
   try{measured=await seedDatasetContexts(store,manifest,{recordingKey,first:12,until:100});constructionMs=performance.now()-started;}finally{store.query=query;}
   assert.equal(measured.snapshots,88);assert.deepEqual(await read(id(27)),capacityHistoricalContext(27,1048576).components);t.diagnostic(JSON.stringify({measurement:'context-construction-bounded-sample',snapshots:measured.snapshots,elapsedMs:Math.round(constructionMs),sqlCalls,includesSavepointStatements:false,formalQualified:false}));
+
+  const coverage={state:'complete',reasons:[],opaqueReasoningExcluded:0},content=capacityHistoricalContext(100,8192).components,input=index=>({requestId:id(index),components:content,coverage}),smallParts=new RecordingContextStore(store,{encryptionKey:recordingKey,partBytes:256});
+  await smallParts.writeSnapshot(id(100),content,{coverage});const oldSingle=await store.all('SELECT object_id FROM harbor.recording_context_references WHERE request_id=$1 ORDER BY ordinal',id(100));
+  const mixed=await contexts.writeSnapshotBatch([input(100),input(101)]);assert.equal(mixed.length,2);assert.deepEqual(await store.all('SELECT object_id FROM harbor.recording_context_references WHERE request_id=$1 ORDER BY ordinal',id(100)),oldSingle,'single and batch fingerprints remain compatible across legal part sizes');assert.deepEqual(await read(id(101)),content);
+  await contexts.writeSnapshotBatch([input(102),input(103)]);const owners=await store.all('SELECT object_id FROM harbor.recording_context_references WHERE request_id=ANY($1::text[]) AND ordinal=1',[id(102),id(103)]);assert.equal(owners.length,2);assert.notEqual(owners[0].object_id,owners[1].object_id,'different employees never share a context object');
+  await assert.rejects(contexts.writeSnapshotBatch([input(104),input(104)]),/批次请求标识/);
+  await assert.rejects(contexts.writeSnapshotBatch([104,105,106].map(index=>({requestId:id(index),components:capacityHistoricalContext(index,1048576).components,coverage}))),{code:'recording_context_batch_capacity'});assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_snapshots WHERE request_id=ANY($1::text[])',[id(104),id(105),id(106)])).n,0);
+  await Promise.all([contexts.writeSnapshotBatch([input(111),input(112)]),contexts.writeSnapshotBatch([input(112),input(111)])]);assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recording_context_references WHERE request_id=ANY($1::text[])',[id(111),id(112)])).n,10,'opposite input order serializes without duplicate references');
+  await assert.rejects(store.transaction(async()=>{const target=oldSingle[0].object_id;await store.run('UPDATE harbor.recording_context_parts SET content_cipher=set_byte(content_cipher,0,(get_byte(content_cipher,0)+1)%256) WHERE object_id=$1 AND ordinal=1',target);await assert.rejects(contexts.writeSnapshotBatch([input(100)]),{code:'recording_context_unreadable'});throw Error('rollback-batch-shared-cipher');}),/rollback-batch-shared-cipher/);
+  await assert.rejects(store.transaction(async()=>{await store.run("UPDATE harbor.recording_context_parts SET content_cipher=decode(repeat('ab',3000000),'hex') WHERE object_id=$1 AND ordinal=1",oldSingle[0].object_id);await assert.rejects(contexts.writeSnapshotBatch([input(100)]),{code:'recording_context_incomplete'});throw Error('rollback-batch-oversized-cipher');}),/rollback-batch-oversized-cipher/);
+
+  const expires=(await store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',id(113))).expires_at;let now=expires-1,lockObserved=false;
+  const expiring=new RecordingContextStore(store,{encryptionKey:recordingKey,clock:()=>now}),tables=['recording_context_snapshots','recording_context_objects','recording_context_parts','recording_context_references'],counts=async()=>Promise.all(tables.map(async table=>(await store.get('SELECT COUNT(*) n FROM harbor.'+table)).n)),beforeExpiry=await counts(),originalAll=store.all;
+  store.all=async function(sql,...args){const rows=await originalAll.call(this,sql,...args);if(sql.startsWith('WITH ordered AS MATERIALIZED')){lockObserved=true;now=expires;}return rows;};
+  try{await assert.rejects(expiring.writeSnapshotBatch([input(113),input(114)]),{code:'recording_context_expired'});}finally{store.all=originalAll;}
+  assert.equal(lockObserved,true);assert.deepEqual(await counts(),beforeExpiry,'expiry during lock acquisition rolls back every batch table');
 
  }finally{await fixture?.destroy();await admin.close();await lab.close();}
 });
