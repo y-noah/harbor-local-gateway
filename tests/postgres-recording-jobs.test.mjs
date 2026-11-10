@@ -20,6 +20,13 @@ async function fixture(t){const root=new PostgresStore(connection()),database='h
   return {store,database,clock,key,recordings,jobs,backend,member,session,request,run,advance:ms=>{at+=ms;}};
 }
 
+test('index refill queues pending bodies without purge or periodic key-version maintenance',integration,async t=>{
+ const f=await fixture(t),id=await f.request();await f.backend.refill();assert.deepEqual((await f.store.all('SELECT DISTINCT kind FROM harbor.background_jobs')).map(row=>row.kind),['recording.index']);await f.run(['recording.index']);
+ const before=await f.store.get('SELECT revision,indexed_revision FROM harbor.recording_work WHERE request_id=$1',id);await f.store.run("UPDATE harbor.recording_documents SET key_version='synthetic-old-key' WHERE request_id=$1",id);
+ await f.backend.refill();assert.deepEqual(await f.store.get('SELECT revision,indexed_revision FROM harbor.recording_work WHERE request_id=$1',id),before);assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind='recording.purge'")).n,0);
+ await f.backend.schedule();assert.equal((await f.store.get('SELECT revision FROM harbor.recording_work WHERE request_id=$1',id)).revision,before.revision+1);assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind='recording.purge'")).n,1);
+});
+
 test('batched document indexing rolls back every part on SQL failure and preserves exact search after retry',integration,async t=>{
  const f=await fixture(t),text='跨分块故障检索 normalizedHandler '.repeat(300),id=await f.request({text,reply:'重试后正文完整'}),backend=createPostgresRecordingJobs(f.store,{recordingKey:f.key,jobs:f.jobs,clock:f.clock,indexBatch:2,partChars:256,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
  await backend.schedule();const job=await f.jobs.claim(['recording.index']);assert.equal(job.target,id);

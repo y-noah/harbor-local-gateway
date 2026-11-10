@@ -1,8 +1,8 @@
 import {AppError} from './store.mjs';
 
-export function createPostgresWorkerRuntime({jobs,handlers,concurrency=2,pollMs=1000,schedule}={}){
+export function createPostgresWorkerRuntime({jobs,handlers,concurrency=2,pollMs=1000,schedule,refill}={}){
   const kinds=Object.keys(handlers||{});
-  if(!jobs||['claim','heartbeat','complete','fail'].some(name=>typeof jobs[name]!=='function')||!Number.isInteger(jobs.leaseMs)||jobs.leaseMs<1000||!kinds.length||kinds.length>32||kinds.some(kind=>!/^[a-z][a-z0-9_.-]{0,79}$/.test(kind)||typeof handlers[kind]!=='function')||!Number.isInteger(concurrency)||concurrency<1||concurrency>8||!Number.isInteger(pollMs)||pollMs<100||pollMs>60000||schedule!==undefined&&typeof schedule!=='function')throw new AppError(503,'Worker资源或处理器配置无效','worker_configuration');
+  if(!jobs||['claim','heartbeat','complete','fail'].some(name=>typeof jobs[name]!=='function')||!Number.isInteger(jobs.leaseMs)||jobs.leaseMs<1000||!kinds.length||kinds.length>32||kinds.some(kind=>!/^[a-z][a-z0-9_.-]{0,79}$/.test(kind)||typeof handlers[kind]!=='function')||!Number.isInteger(concurrency)||concurrency<1||concurrency>8||!Number.isInteger(pollMs)||pollMs<100||pollMs>60000||schedule!==undefined&&typeof schedule!=='function'||refill!==undefined&&typeof refill!=='function')throw new AppError(503,'Worker资源或处理器配置无效','worker_configuration');
   const active=new Map(),counts={completed:0,failed:0,lost:0};let stopping=false,started=false,timer,pumping,refillImmediate,refillRequested=false,scheduleRequested=false,backingOff=false,retryTimer,closePromise,lastError=null;
   function launch(job){
     const execution=Symbol(),controller=new AbortController();let renewing=null;
@@ -26,9 +26,9 @@ export function createPostgresWorkerRuntime({jobs,handlers,concurrency=2,pollMs=
     refillRequested=true;
     if(pumping||refillImmediate||backingOff)return;
     // One bounded pump per event-loop turn; fast completions cannot starve I/O.
-    refillImmediate=setImmediate(()=>{refillImmediate=null;if(!stopping&&started)void pump(false);});
+    refillImmediate=setImmediate(()=>{refillImmediate=null;if(!stopping&&started)void pump(false,true);});
   }
-  function pump(withSchedule){
+  function pump(withSchedule,allowRefill=false){
     if(stopping)return Promise.resolve();
     if(withSchedule)scheduleRequested=true;
     if(pumping)return pumping;
@@ -37,9 +37,15 @@ export function createPostgresWorkerRuntime({jobs,handlers,concurrency=2,pollMs=
       refillRequested=false;
       try{
         if(scheduleRequested){scheduleRequested=false;if(schedule)try{await schedule();}catch{lastError='worker_schedule_failed';}}
-        const slots=concurrency-active.size;
+        const slots=concurrency-active.size;let refilled=false;
         for(let index=0;index<slots&&!stopping&&active.size<concurrency;index++){
-          const job=await jobs.claim(kinds);if(!job)break;
+          let job=await jobs.claim(kinds);
+          if(!job&&refill&&allowRefill&&started&&!refilled&&!stopping){
+            // Only the bounded index producer runs here. Periodic maintenance
+            // keeps its cadence, and an empty refill does not request a pump.
+            refilled=true;await refill();if(stopping)break;job=await jobs.claim(kinds);
+          }
+          if(!job)break;
           if(stopping){await jobs.fail(job,{errorCode:'worker_interrupted',retryDelayMs:0}).catch(()=>{});break;}
           launch(job);
         }
@@ -48,7 +54,7 @@ export function createPostgresWorkerRuntime({jobs,handlers,concurrency=2,pollMs=
     return pumping;
   }
   const runOnce=()=>pump(true);
-  const start=()=>{if(stopping)throw new AppError(503,'Worker已关闭','worker_stopping');if(started)return;started=true;timer=setInterval(()=>{void runOnce();},pollMs);void runOnce();};
+  const start=()=>{if(stopping)throw new AppError(503,'Worker已关闭','worker_stopping');if(started)return;started=true;timer=setInterval(()=>{void pump(true,true);},pollMs);void pump(true,true);};
   function close(){return closePromise??=(async()=>{stopping=true;clearInterval(timer);clearTimeout(retryTimer);retryTimer=null;clearImmediate(refillImmediate);refillImmediate=null;refillRequested=false;scheduleRequested=false;for(const {controller} of active.values())controller.abort();await pumping;for(const {controller} of active.values())controller.abort();await Promise.allSettled([...active.values()].map(value=>value.task));})();}
   return {start,runOnce,close,status:()=>({stopping,active:active.size,polling:!!pumping,...counts,lastError})};
 }

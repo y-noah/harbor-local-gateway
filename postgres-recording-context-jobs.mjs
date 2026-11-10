@@ -33,7 +33,10 @@ export function createPostgresRecordingContextJobs(store,{jobs,recordingKey,cryp
    FROM harbor.recording_context_documents d WHERE w.object_id=d.object_id AND w.revision=w.indexed_revision
    AND (d.key_version<>$2 OR d.format_version<>$3) AND w.object_id IN
    (SELECT object_id FROM harbor.recording_context_documents WHERE key_version<>$2 OR format_version<>$3 ORDER BY object_id LIMIT $4)`,at,crypto.keyVersion,formatVersion,indexBatch);
-  const rows=await store.all(`SELECT w.object_id,w.revision FROM harbor.recording_context_work w
+  return refill();
+ }
+ async function refill(){
+  const at=clock(),rows=await store.all(`SELECT w.object_id,w.revision FROM harbor.recording_context_work w
    JOIN harbor.recording_context_objects o ON o.id=w.object_id
    WHERE w.revision>w.indexed_revision AND w.last_error IS NULL AND ${live} ORDER BY w.changed,w.object_id LIMIT $2`,at,indexBatch);
   for(const row of rows){const id=jobId(row.object_id,row.revision),result=await jobs.enqueue(kind,{id,target:row.object_id,payload:{object_id:row.object_id,revision:row.revision}});
@@ -73,5 +76,5 @@ export function createPostgresRecordingContextJobs(store,{jobs,recordingKey,cryp
  async function handler(job,context){try{return await organize(job,context);}catch(error){if(['recording_index_capacity','recording_context_scope','recording_context_capacity','recording_context_incomplete','recording_context_unreadable'].includes(error.code))await jobs.owned(job,()=>store.run('UPDATE harbor.recording_context_work SET last_error=$1 WHERE object_id=$2 AND revision=$3',error.code,job.target,job.payload.revision));throw error;}}
  async function rebuild(requestId){await store.run(`UPDATE harbor.recording_context_work SET revision=revision+1,last_error=NULL,changed=$1 WHERE object_id IN (SELECT object_id FROM harbor.recording_context_references WHERE request_id=$2)`,clock(),requestId);}
  async function status(){const row=await store.get(`SELECT COUNT(*) pending,COUNT(*) FILTER(WHERE w.last_error IS NOT NULL) failed,MIN(w.changed) oldest FROM harbor.recording_context_work w JOIN harbor.recording_context_objects o ON o.id=w.object_id WHERE w.revision>w.indexed_revision AND ${live}`,clock());return {context_index_pending:row.pending,context_index_failed:row.failed,context_oldest_pending_at:row.oldest};}
- return {schedule,rebuild,status,gc:options=>contexts.gc(options),handlers:{[kind]:handler}};
+ return {schedule,refill,rebuild,status,gc:options=>contexts.gc(options),handlers:{[kind]:handler}};
 }

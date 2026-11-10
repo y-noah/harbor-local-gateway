@@ -40,11 +40,18 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
     // documents/indexes change, never source events or metering facts.
     await store.run(`UPDATE harbor.recording_work w SET revision=w.revision+1,changed=$1,last_error=NULL WHERE w.request_id IN (
       SELECT d.request_id FROM harbor.recording_documents d JOIN harbor.recording_work x ON x.request_id=d.request_id WHERE d.key_version<>$2 AND x.revision=x.indexed_revision ORDER BY d.request_id LIMIT $3)`,at,crypto.keyVersion,indexBatch);
-    const rows=await store.all('SELECT request_id,revision FROM harbor.recording_work WHERE revision>indexed_revision AND last_error IS NULL ORDER BY changed,request_id LIMIT $1',indexBatch);
-    for(const row of rows){const id='recording.index:'+createHash('sha256').update(row.request_id+':'+row.revision).digest('hex'),result=await jobs.enqueue('recording.index',{id,target:row.request_id,payload:{request_id:row.request_id,revision:row.revision}});if(!result.created){const task=await store.get('SELECT status FROM harbor.background_jobs WHERE id=$1',id);if(['failed','cancelled'].includes(task?.status))await store.run("UPDATE harbor.recording_work SET last_error='index_attempts_exhausted' WHERE request_id=$1 AND revision=$2 AND revision>indexed_revision",row.request_id,row.revision);}}
+    const scheduled=await refillBody();
     await jobs.enqueue('recording.purge',{id:'recording.purge:'+Math.floor(at/60000),payload:{}});
     if(contextJobs)await contextJobs.schedule();
-    return {scheduled:rows.length};
+    return {scheduled};
+  }
+  async function refillBody(){
+    const rows=await store.all('SELECT request_id,revision FROM harbor.recording_work WHERE revision>indexed_revision AND last_error IS NULL ORDER BY changed,request_id LIMIT $1',indexBatch);
+    for(const row of rows){const id='recording.index:'+createHash('sha256').update(row.request_id+':'+row.revision).digest('hex'),result=await jobs.enqueue('recording.index',{id,target:row.request_id,payload:{request_id:row.request_id,revision:row.revision}});if(!result.created){const task=await store.get('SELECT status FROM harbor.background_jobs WHERE id=$1',id);if(['failed','cancelled'].includes(task?.status))await store.run("UPDATE harbor.recording_work SET last_error='index_attempts_exhausted' WHERE request_id=$1 AND revision=$2 AND revision>indexed_revision",row.request_id,row.revision);}}
+    return rows.length;
+  }
+  async function refill(){
+    const scheduled=await refillBody();if(contextJobs)await contextJobs.refill();return {scheduled};
   }
   async function organize(job,{signal}={}){
     if(job.kind!=='recording.index'||!idPattern.test(job.target??'')||job.target!==job.payload?.request_id||!Number.isSafeInteger(job.payload.revision)||job.payload.revision<1||Object.keys(job.payload).length!==2||job.id!=='recording.index:'+createHash('sha256').update(job.target+':'+job.payload.revision).digest('hex'))fail(400,'正文整理任务参数无效');
@@ -159,5 +166,5 @@ export function createPostgresRecordingJobs(store,{jobs=createPostgresJobs(store
     const retention=path.match(/^\/api\/admin\/recordings\/retention\/([a-f0-9-]{36})$/);if(retention&&method==='GET')return {status:200,value:await retentionStatus(retention[1])};
     return null;
   }
-  return {schedule,handlers:{'recording.index':indexHandler,'recording.purge':purge,'recording.retention':retentionExecute,...exporter.handlers,...contextJobs?.handlers},handle,queries,contextQueries,exports:exporter,download:exporter.download,capturePolicy:policy,status,retentionPreview,retentionApply,retentionStatus,rebuild};
+  return {schedule,refill,handlers:{'recording.index':indexHandler,'recording.purge':purge,'recording.retention':retentionExecute,...exporter.handlers,...contextJobs?.handlers},handle,queries,contextQueries,exports:exporter,download:exporter.download,capturePolicy:policy,status,retentionPreview,retentionApply,retentionStatus,rebuild};
 }

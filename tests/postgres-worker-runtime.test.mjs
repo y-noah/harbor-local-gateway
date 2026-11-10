@@ -2,6 +2,29 @@ import test from 'node:test';import assert from 'node:assert/strict';
 import {createPostgresWorkerRuntime} from '../postgres-worker-runtime.mjs';
 const deferred=()=>{let resolve;const promise=new Promise(value=>{resolve=value;});return {promise,resolve};};
 const turn=()=>new Promise(resolve=>setImmediate(resolve));
+test('empty claims refill bounded index batches without accelerating maintenance or spinning when idle',async t=>{
+ t.mock.timers.enable({apis:['setInterval']});const queue=[];let produced=0,completed=0,refills=0,maintenance=0,inside=0,peak=0;
+ const jobs={leaseMs:30000,claim:async()=>queue.shift()??null,heartbeat:async()=>true,complete:async()=>{completed++;},fail:async()=>assert.fail('successful refill task must not fail')};
+ const worker=createPostgresWorkerRuntime({jobs,concurrency:2,schedule:async()=>{maintenance++;},refill:async()=>{refills++;inside++;peak=Math.max(peak,inside);try{await turn();for(let i=0;i<3&&produced<12;i++)queue.push({id:String(produced++),kind:'fixture.task'});}finally{inside--;}},handlers:{'fixture.task':async()=>({done:true})}});
+ try{worker.start();let stable=0,last=-1;await until(()=>{stable=completed===12&&worker.status().active===0&&refills===last&&!worker.status().polling?stable+1:0;last=refills;return stable>=2;});const settled=refills;for(let i=0;i<20;i++)await turn();assert.equal(refills,settled);assert.equal(maintenance,1);assert.equal(peak,1);assert.equal(worker.status().active,0);}finally{await worker.close();}
+});
+test('refill failure backs off while preserving retry and manual runOnce does not invoke the producer',async t=>{
+ t.mock.timers.enable({apis:['setInterval','setTimeout']});let refills=0,claims=0;
+ const jobs={leaseMs:30000,claim:async()=>{claims++;return null;},heartbeat:async()=>true,complete:async()=>{},fail:async()=>assert.fail('no job was claimed')};
+ const worker=createPostgresWorkerRuntime({jobs,refill:async()=>{refills++;throw Error('synthetic producer unavailable');},handlers:{'fixture.task':async()=>({})}});
+ try{await worker.runOnce();assert.equal(refills,0);worker.start();await until(()=>refills===1&&!worker.status().polling);const count=claims;for(let i=0;i<20;i++)await turn();assert.equal(claims,count);t.mock.timers.tick(999);await turn();assert.equal(refills,1);t.mock.timers.tick(1);await until(()=>refills===2);assert.equal(worker.status().lastError,'worker_poll_failed');}finally{await worker.close();}
+});
+test('close waits for an in-flight refill and never claims its newly available work',async t=>{
+ t.mock.timers.enable({apis:['setInterval']});const gate=deferred();let refills=0,claims=0,closed=false;
+ const jobs={leaseMs:30000,claim:async()=>{claims++;return null;},heartbeat:async()=>true,complete:async()=>{},fail:async()=>assert.fail('no job was claimed')};
+ const worker=createPostgresWorkerRuntime({jobs,refill:async()=>{refills++;await gate.promise;},handlers:{'fixture.task':async()=>assert.fail('closed Worker cannot launch work')}});
+ worker.start();await until(()=>refills===1);const closing=worker.close().then(()=>{closed=true;});await turn();assert.equal(closed,false);gate.resolve();await closing;assert.equal(claims,1);assert.equal(refills,1);assert.equal(worker.status().polling,false);
+});
+test('manual runOnce on an already started idle Worker runs maintenance without index refill',async t=>{
+ t.mock.timers.enable({apis:['setInterval']});let refills=0,scheduled=0;
+ const jobs={leaseMs:30000,claim:async()=>null,heartbeat:async()=>true,complete:async()=>{},fail:async()=>assert.fail('no job was claimed')},worker=createPostgresWorkerRuntime({jobs,schedule:async()=>{scheduled++;},refill:async()=>{refills++;},handlers:{'fixture.task':async()=>({})}});
+ try{worker.start();await until(()=>refills===1&&!worker.status().polling);await worker.runOnce();assert.equal(scheduled,2);assert.equal(refills,1);}finally{await worker.close();}
+});
 async function until(predicate,maxTurns=100){for(let i=0;i<maxTurns;i++){if(await predicate())return;await turn();}assert.fail('Worker condition did not settle within bounded event-loop turns');}
 function controlled(count,{concurrency=2,schedule}={}){const queue=Array.from({length:count},(_,i)=>({id:String(i),kind:'fixture.task'})),gates=Array.from({length:count},deferred),entered=[],completed=[],failed=[];let running=0,peak=0,claims=0;const jobs={leaseMs:30000,claim:async()=>{claims++;return queue.shift()??null;},heartbeat:async()=>true,complete:async job=>completed.push(job.id),fail:async job=>{failed.push(job.id);return 'pending';}};const worker=createPostgresWorkerRuntime({jobs,concurrency,pollMs:1000,schedule,handlers:{'fixture.task':async job=>{running++;peak=Math.max(peak,running);entered.push(job.id);try{await gates[Number(job.id)].promise;return {done:true};}finally{running--;}}}});return {worker,jobs,gates,entered,completed,failed,peak:()=>peak,claims:()=>claims,release:()=>gates.forEach(gate=>gate.resolve())};}
 test('started Worker refills completed slots without waiting for the next one-second poll',async t=>{t.mock.timers.enable({apis:['setInterval']});let scheduled=0;const f=controlled(4,{schedule:async()=>{scheduled++;}});try{f.worker.start();await until(()=>f.entered.length===2);f.gates[0].resolve();f.gates[1].resolve();await until(()=>f.entered.length===4);assert.equal(scheduled,1);assert.equal(f.peak(),2);}finally{f.release();await f.worker.close();}});

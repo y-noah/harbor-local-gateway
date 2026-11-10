@@ -30,6 +30,13 @@ async function fixture(t,{indexBatch=32,schemaIndex=true}={}){
  return {store,jobs,contexts,recordings,backend,key,clock,advance:ms=>{now+=ms;},request,run,document,crypto,connection:connection(name)};
 }
 
+test('真实PG：索引补充只入队待办，上下文版本维护保持定时执行',integration,async t=>{
+ const f=await fixture(t);await f.request();await f.backend.refill();assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind='recording.purge'")).n,0);await f.run();
+ const before=await f.store.get('SELECT object_id,revision,indexed_revision FROM harbor.recording_context_work');assert.ok(before.indexed_revision>0);await f.store.run("UPDATE harbor.recording_context_documents SET key_version='synthetic-old-key' WHERE object_id=$1",before.object_id);
+ await f.backend.refill();assert.deepEqual(await f.store.get('SELECT object_id,revision,indexed_revision FROM harbor.recording_context_work WHERE object_id=$1',before.object_id),before);
+ await f.backend.schedule();assert.equal((await f.store.get('SELECT revision FROM harbor.recording_context_work WHERE object_id=$1',before.object_id)).revision,before.revision+1);
+});
+
 test('真实PG：共享对象只索引一次，代码引号可检索，重建不改采集与计量',integration,async t=>{
  const f=await fixture(t),content={role:'user',text:'排查中文故障 await readFile("业务.json")'},a=await f.request(content),b=await f.request(content);
  await f.backend.schedule();await f.run();const result=await f.document();assert.match(result.text,/readFile\("业务.json"\)/);assert.ok(result.parts.every(p=>p.search_terms.length>0&&!p.payload_cipher.includes(Buffer.from('业务.json'))));
