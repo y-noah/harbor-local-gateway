@@ -1,3 +1,4 @@
+import {preDispatchTimingStages} from './request-stream-timing.mjs';
 const keys=Object.freeze({
   root:['version','clock','upstreamBoundary','rawReadBoundary','writeBoundary','clientReceiptVerified','outcome','complete','offsetsMs','durationsMs','counts','missing'],
   offsets:['started','bodyEnd','dispatch','headers','firstRawChunk','firstDecodedEvent','firstUpstreamEvent','firstUpstreamContent','lastUpstreamContent','firstWriteStart','firstContentWriteStart','firstWriteComplete','lastWriteComplete','firstContentWriteComplete','transportEnd','responseEnd','finished'],
@@ -20,9 +21,14 @@ const count=value=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=
 // malformed. Trace samples are a separate diagnostic capability, never persisted
 // through this function. No coercion, content, IDs or arbitrary reasons survive.
 export function canonicalRequestStreamTiming(value){
-  const root=object(value,keys.root);
+  const root=object(value,[...keys.root,'preDispatchOffsetsMs'],{optional:true});if(keys.root.some(name=>!Object.hasOwn(root,name)))invalid();
   if(root.version!==1||root.clock!=='process-monotonic'||root.upstreamBoundary!=='decoded-response-event'||root.rawReadBoundary!=='fetch-response-body-chunk'||root.writeBoundary!=='node-socket-write-callback'||root.clientReceiptVerified!==false||!outcomes.has(root.outcome)||typeof root.complete!=='boolean')invalid();
   const offsets=object(root.offsetsMs,keys.offsets,{optional:true}),durations=object(root.durationsMs,keys.durations),counts=object(root.counts,keys.counts);
+  let preparation;
+  if(Object.hasOwn(root,'preDispatchOffsetsMs')){
+    preparation=object(root.preDispatchOffsetsMs,preDispatchTimingStages,{optional:true});let previous=offsets.bodyEnd??offsets.started??0;
+    for(const name of preDispatchTimingStages)if(Object.hasOwn(preparation,name)){const at=preparation[name];if(at===null||!duration(at)||at<previous||offsets.dispatch!==undefined&&at>offsets.dispatch||offsets.finished!==undefined&&at>offsets.finished)invalid();previous=at;}
+  }
   if(Object.values(offsets).some(value=>value===null||!duration(value))||Object.values(durations).some(value=>!duration(value))||Object.entries(counts).some(([name,value])=>!count(value)&&!(value===null&&['rawChunks','rawBytes','decodedEvents'].includes(name))))invalid();
   if((counts.rawChunks===null)!==(counts.rawBytes===null)||counts.backpressuredWrites>counts.writes||counts.failedWrites>counts.writes)invalid();
   if(!Array.isArray(root.missing)||Object.getPrototypeOf(root.missing)!==Array.prototype)invalid();
@@ -54,7 +60,7 @@ export function canonicalRequestStreamTiming(value){
   }
   const out={version:1,clock:root.clock,upstreamBoundary:root.upstreamBoundary,rawReadBoundary:root.rawReadBoundary,writeBoundary:root.writeBoundary,clientReceiptVerified:false,outcome:root.outcome,complete:root.complete,
     offsetsMs:Object.freeze(Object.fromEntries(keys.offsets.filter(name=>Object.hasOwn(offsets,name)).map(name=>[name,offsets[name]]))),
-    durationsMs:Object.freeze(Object.fromEntries(keys.durations.map(name=>[name,durations[name]]))),counts:Object.freeze(Object.fromEntries(keys.counts.map(name=>[name,counts[name]]))),missing:Object.freeze(missing.sort())};
+    durationsMs:Object.freeze(Object.fromEntries(keys.durations.map(name=>[name,durations[name]]))),counts:Object.freeze(Object.fromEntries(keys.counts.map(name=>[name,counts[name]]))),missing:Object.freeze(missing.sort()),...(preparation?{preDispatchOffsetsMs:Object.freeze(Object.fromEntries(preDispatchTimingStages.filter(name=>Object.hasOwn(preparation,name)).map(name=>[name,preparation[name]])))}:{})};
   return Object.freeze(out);
 }
 

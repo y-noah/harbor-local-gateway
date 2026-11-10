@@ -153,8 +153,10 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
   const stages=createStreamingStageObserver(stageObserver);
   const catalogs=new Map();
   async function request(binary,home,path,{payload,signal,sessionId,protocolHeaders={},accept='text/event-stream',onPhase=()=>{},beforeDispatch=async()=>{},onDispatch=()=>{},stage,timing}={}){
+    observeTiming(timing,'preDispatch','credentialsStart');
     onPhase('credentials');
     let auth;try{auth=await credentials(binary,home);}catch(error){throw Object.assign(error,{usageKnown:true});}
+    observeTiming(timing,'preDispatch','credentialsReady');
     const headers={'Authorization':'Bearer '+auth.token,'Accept':accept,'Content-Type':'application/json'};
     if(!apiKeyMode)headers['ChatGPT-Account-ID']=auth.accountId;
     else if(typeof protocolHeaders['user-agent']==='string')headers['User-Agent']=protocolHeaders['user-agent'];

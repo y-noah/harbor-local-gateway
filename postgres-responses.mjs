@@ -226,11 +226,13 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       try{original=await requestBodies.read(req,{maxBytes:responseBodyBytes,compressed:true,owner:'member:'+member.id,signal:controller.signal});}
       finally{const count=preparing.get(member.id)-1;if(count)preparing.set(member.id,count);else preparing.delete(member.id);}
       ensureConnected();const payload=jsonPath?validateCodexJson(original,jsonPath):validateResponses(original);
+      receipt.timing?.preDispatch('validated');
       contextReplayable=!jsonPath&&replayableResponsesInput(payload);
       // Never wait with a database transaction or routing lock held. Arrival
       // already covers uploads whose client identity only appears in the body.
       const identified=await findPostgresResponseSession(store,member,payload,req.headers);
       if(identified.session)await ticket.bind(identified.session.id);
+      receipt.timing?.preDispatch('sessionReady');
       // This request already owned admission/upload capacity before drain.
       // Graceful shutdown lets it complete; forced stop/ownership loss aborts
       // its controller and is still enforced by ensureConnected.
@@ -257,6 +259,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:jsonPath?'images':'responses'}),fixed:!!identified.fixed};
         receipt.callbackCompleted=true;return {requestId,account,session,extraAdmission};
       });
+      receipt.timing?.preDispatch('admissionEnd');
       requestId=route.requestId;if(receipt.nested)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:true,recordingExpected:captureEnabled});routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
       extraBoundary=extraRuntime.boundary({requestId,protocol:jsonPath?'images':'responses',admittedExtra:route.extraAdmission.extraReserved,fixed:route.extraAdmission.fixed,packagePreference:adminRouter.dispatchPreference,
         prepare:async request=>{ensureConnected();const current=await store.authenticate(secret,{at:clock(),lock:true});if(current.id!==request.member_id||current.key_id!==request.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});await lockPostgresRouting(store);return ensureConnected;},
@@ -275,6 +278,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         // Start must precede the buffered input; no model or raw payload is replayed.
         record(()=>{if(capture){if(jsonPath)captureCodexJsonInput(capture,jsonPath,payload);else capture.input(payload,current);}});flush();flushTimer=setInterval(flush,250);flushTimer.unref();
       }
+      receipt.timing?.preDispatch('captureReady');
       if(!jsonPath||payload.prompt_cache_key!==undefined)payload.prompt_cache_key=route.session.upstream_thread||route.session.id;
       const transport=await transportForAccount(route.account);
       ensureConnected();if(jsonPath&&typeof transport.runJson!=='function')throw Object.assign(new AppError(503,'上游JSON通道尚未配置','upstream_configuration'),{usageKnown:true});
