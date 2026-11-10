@@ -19,6 +19,7 @@ const fingerprints=headers=>Object.fromEntries(['cookie','authorization'].map(ke
 export function createGatewayProbe({sink=()=>{},maxPendingAdmissions=10000}={}){
   if(!Number.isSafeInteger(maxPendingAdmissions)||maxPendingAdmissions<1)throw new Error('capacity_admission_probe_budget_invalid');
   const context=new AsyncLocalStorage(),transactions=new AsyncLocalStorage(),restores=[];let sampler,dropped=0,pendingAdmissions=0,unconfirmedAdmissions=0,pendingHandlers=0,unobservableHandlers=0,attached=false,closed=false,closePromise;
+  const queuedContexts=new WeakMap(),recoveryOwners=new Map();
   const emit=record=>{try{const returned=sink(record);if(returned&&(isPromise(returned)||typeof returned.then==='function')){dropped++;Promise.resolve(returned).catch(()=>{});}}catch{dropped++;}};
   const rejectionCodes=new Set(['gateway_busy','inference_capacity_busy','gateway_ownership_lost','member_model_limit_exceeded','session_quota_exhausted','no_account_capacity','member_busy','routing_preparation_busy','metering_recovery_required']);
   const publishAdmission=(row,event)=>{row.requestId=event.requestId;emit({...event,at:Date.now()});};
@@ -64,6 +65,31 @@ export function createGatewayProbe({sink=()=>{},maxPendingAdmissions=10000}={}){
     });
     wrap(app.store,'observe',original=>async function(...args){const options=args[4],canStamp=options===undefined||options!==null&&typeof options==='object',startedAt=canStamp?(options?.at===undefined?Date.now():options.at):undefined;if(canStamp)args[4]={...options,at:startedAt};const result=await original.apply(this,args),row=context.getStore();if(row){row.model=typeof args[3]==='string'?args[3]:null;const event={kind:'gateway-admitted',trace:row.trace,requestId:result,memberId:args[0].id,keyId:args[0].key_id,deviceId:args[4]?.device?.deviceId??null,startedAt},frame=transactions.getStore();if(frame?.row===row&&!frame.finished){if(pendingAdmissions>=maxPendingAdmissions)dropped++;else{frame.events.push(event);pendingAdmissions++;}}else publishAdmission(row,event);}return result;});
     wrap(app.store,'finish',original=>async function(...args){const result=await original.apply(this,args),row=context.getStore();if(row)emit({kind:'gateway-settled',trace:row.trace,requestId:args[0],contextMatches:row.requestId===args[0],at:Date.now(),settled:result.settled,usageKnown:args[1]?.usageKnown!==false});return result;});
+    // A shared recovery drain can run in another request's async context.
+    // Bind only accepted queue commands, not arbitrary store.finish calls.
+    const recovery=app.meteringRecovery?.buffer;
+    if(recovery&&['enqueue','apply','released','endPhase'].every(key=>typeof recovery[key]==='function')&&Array.isArray(recovery.queue)){
+      let replayRequest=null;
+      const retire=requestId=>{const owner=recoveryOwners.get(requestId);if(owner&&--owner.commands===0)recoveryOwners.delete(requestId);};
+      wrap(recovery,'enqueue',original=>function(command){
+        const row=context.getStore(),accepted=original.call(this,command);
+        if(accepted&&command?.type==='settle'&&row){
+          const value=this.queue.at(-1)?.value;
+          if(!value||value.type!=='settle'||value.requestId!==command.requestId){dropped++;return accepted;}
+          queuedContexts.set(value,row);const owner=recoveryOwners.get(value.requestId);
+          if(owner){owner.commands++;if(owner.row!==row)dropped++;}
+          else if(recoveryOwners.size<maxPendingAdmissions)recoveryOwners.set(value.requestId,{row,commands:1});else dropped++;
+        }
+        return accepted;
+      });
+      wrap(recovery,'apply',original=>async function(value){
+        const owner=value?.type==='settle'?recoveryOwners.get(value.requestId):null,row=queuedContexts.get(value)??owner?.row;
+        if(this.writerPhase==='replay')replayRequest=owner?value.requestId:null;
+        return row?context.run(row,()=>original.call(this,value)):original.call(this,value);
+      });
+      wrap(recovery,'released',original=>function(entries){const result=original.call(this,entries);if(this.writerPhase==='atomic')for(const entry of entries)if(entry.value.type==='settle')retire(entry.value.requestId);return result;});
+      wrap(recovery,'endPhase',original=>function(phase,started,succeeded){const result=original.call(this,phase,started,succeeded);if(phase==='replay'){if(succeeded&&replayRequest)retire(replayRequest);replayRequest=null;}return result;});
+    }
     // Hash only the already-filtered recording commands. A cancelled client
     // can leave a genuine captured prefix even after the upstream finished.
     // This private request-local witness is never a normal-success oracle.
@@ -84,5 +110,5 @@ export function createGatewayProbe({sink=()=>{},maxPendingAdmissions=10000}={}){
     wrap(app.sessionHandoffs,'arrive',original=>function(...args){const ticket=original.apply(this,args),bind=ticket.bind;ticket.bind=async function(...values){const start=Date.now();try{return await bind.apply(this,values);}finally{emit({kind:'handoff-boundary-call',trace:context.getStore()?.trace??null,durationMs:Date.now()-start,at:Date.now(),deductibleWait:false});}};return ticket;});
     sampler=startRuntimeMetrics({sink:emit,status:app.status});return app;
   }
-  return {context:()=>context.getStore(),attach,status:()=>({dropped,pendingAdmissions,unconfirmedAdmissions,pendingHandlers,unobservableHandlers}),close:()=>closePromise??=(async()=>{closed=true;try{await sampler?.stop();}finally{for(const restore of restores.reverse())restore();}})()};
+  return {context:()=>context.getStore(),attach,status:()=>({dropped,pendingAdmissions,unconfirmedAdmissions,pendingHandlers,unobservableHandlers,pendingRecoveryBindings:recoveryOwners.size}),close:()=>closePromise??=(async()=>{closed=true;try{await sampler?.stop();}finally{recoveryOwners.clear();for(const restore of restores.reverse())restore();}})()};
 }

@@ -3,6 +3,8 @@ import {PostgresStore} from '../../postgres-store.mjs';
 import {postgresRequestObservation} from '../../postgres-observability.mjs';
 import {createPostgresRecordingQueries} from '../../postgres-recording-query.mjs';
 import {createRecordingIndexCrypto} from '../../recording-search-index.mjs';
+import {RecordingStore} from '../../recording-store.mjs';
+import {validRecordRedaction} from '../../record-redaction.mjs';
 import {publicUsage} from '../../pricing.mjs';
 import {isOwnedLaboratory} from './owned-runtime.mjs';
 import {datasetManifest,fixtureDatabase} from './dataset.mjs';
@@ -10,6 +12,14 @@ import {capacityDataReadinessSql} from './data-readiness.mjs';
 const sha=value=>createHash('sha256').update(value).digest('hex'),emptyHash=sha(''),id=value=>typeof value==='string'&&/^[a-zA-Z0-9._:-]{1,200}$/.test(value),hash=value=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value),count=value=>Number.isSafeInteger(value)&&value>=0;
 const result=(state,reason)=>Object.freeze({state,readVerified:state==='ready',...(reason?{reason}:{})});
 const digestEvidence=value=>value&&hash(value.hash)&&count(value.bytes);
+const coverageReasons=new Set(['capture_failed','malformed_tool_item','size_limit','unsupported_item','unsupported_event','unsupported_content']);
+function knownCoverage(value){
+ const shape=(object,keys)=>object&&typeof object==='object'&&!Array.isArray(object)&&Object.keys(object).length===keys.length&&keys.every(key=>Object.hasOwn(object,key));
+ const categories=['toolCalls','toolResults','reasoningSummaries'],unsupported=['items','events','contentParts'];
+ return shape(value,['section','version','redaction','complete','seen','captured','unsupported','opaqueReasoningExcluded','reasons'])&&value.section==='coverage'&&value.version===1&&validRecordRedaction(value.redaction)&&typeof value.complete==='boolean'&&count(value.opaqueReasoningExcluded)
+  &&shape(value.seen,categories)&&shape(value.captured,categories)&&categories.every(key=>count(value.seen[key])&&count(value.captured[key])&&value.captured[key]<=value.seen[key])
+  &&shape(value.unsupported,unsupported)&&unsupported.every(key=>count(value.unsupported[key]))&&Array.isArray(value.reasons)&&value.reasons.length<=coverageReasons.size&&new Set(value.reasons).size===value.reasons.length&&value.reasons.every(reason=>coverageReasons.has(reason))&&value.complete===(value.reasons.length===0)&&(!value.complete||unsupported.every(key=>value.unsupported[key]===0));
+}
 const referenceFields=['metric','currency','state','model','model_source','revision','input','input_exact','output','output_exact','cached','cached_exact','adjustment','adjustment_exact','total','total_exact'];
 const terminalStates=new Set(['ok','rejected','failed','cancelled','unknown']);
 const metadataKeys=['request_id','status','ended','recording_state','persisted_sequence','recording_updated','expires_at','turn_state','revision','indexed_revision','indexed_at','last_error','source_revision','source_sequence','document_state','document_turn_state','document_expires_at','parts','key_version'];
@@ -28,7 +38,7 @@ export async function createStreamingStageReader({laboratory,manifest,store,reco
  const expectedDatabase=fixtureDatabase(canonical),recordingDigest=sha(recordingKey);let cluster;
  const owner=new PostgresStore({connection:laboratory.connection,poolSize:1});try{cluster=(await owner.get('SELECT system_identifier::text id FROM pg_control_system()')).id;}catch{throw new Error('capacity_stage_reader_laboratory_unavailable');}finally{await owner.close();}
  const verify=async()=>{const actual=await store.get('SELECT current_database() name,(SELECT system_identifier::text FROM pg_control_system()) cluster');if(actual?.name!==expectedDatabase||actual.cluster!==cluster)throw new Error('capacity_stage_reader_identity');const marker=await store.get('SELECT run_id,owner_nonce,manifest_hash,recording_key_digest FROM harbor_capacity.fixture WHERE singleton=1');if(marker?.run_id!==canonical.runId||marker.owner_nonce!==canonical.ownerNonce||marker.manifest_hash!==canonical.manifestHash||marker.recording_key_digest!==recordingDigest)throw new Error('capacity_stage_reader_fixture');};
- try{await verify();}catch{throw new Error('capacity_stage_reader_fixture_identity');}const crypto=createRecordingIndexCrypto(recordingKey),queries=createPostgresRecordingQueries(store,{crypto,clock,maxPageBytes}),cancelled=signal=>signal?.aborted===true;
+ try{await verify();}catch{throw new Error('capacity_stage_reader_fixture_identity');}const recordings=new RecordingStore(store,{encryptionKey:recordingKey}),crypto=createRecordingIndexCrypto(recordingKey),queries=createPostgresRecordingQueries(store,{crypto,clock,maxPageBytes}),cancelled=signal=>signal?.aborted===true;
  const snapshot=async requestId=>({meta:(await store.all(capacityDataReadinessSql.replace('d.source_revision,','d.parts,d.key_version,d.source_revision,'),[requestId]))[0]??null,row:await store.get(sourceSql,requestId)??null});
  const expectation=(requestId,expected)=>{
   if(expected?.passed===false)return result('mismatch','expected_evidence_conflict');if(expected?.available===false)return result('unknown','expected_evidence_unavailable');
@@ -62,13 +72,26 @@ export async function createStreamingStageReader({laboratory,manifest,store,reco
    },{level:'REPEATABLE READ',readOnly:true});if(observed.stop)return observed.stop;const {current,page,sizes}=observed;original??=current;
    if(page.index_pending||page.state!==current.meta.recording_state||page.turn_state!==current.meta.turn_state||page.source_sequence!==current.meta.persisted_sequence||page.expires_at!==current.meta.expires_at)return result('pending','source_changed');if(!Array.isArray(page.items)||!page.items.length&&(current.row.parts!==0||after!==0||page.has_more||page.next!==0))return result('mismatch','document_part_gap');let pageBytes=0;
    for(const item of page.items){if(++partCount>maxParts)return result('unknown','part_budget');const size=sizes.find(row=>row.ordinal===item.ordinal);if(!size||item.ordinal!==after+1)return result('mismatch','document_part_gap');pageBytes+=size.cipher_bytes;readBytes+=size.cipher_bytes;if(pageBytes>maxPageBytes+28*pageSize||readBytes>maxReadBytes)return result('unknown','read_bytes_budget');after=item.ordinal;
-    if(!['user','assistant'].includes(item.kind))return result('unknown','body_format_unproven');if(typeof item.text!=='string'||!id(item.field)||!count(item.offset)||item.continuation!==(item.offset>0)||!count(item.first_sequence)||item.first_sequence<1||!count(item.last_sequence)||item.last_sequence<item.first_sequence||item.last_sequence>current.meta.persisted_sequence)return result('mismatch','document_part_shape');if(item.provenance!==(item.kind==='user'?'client':'upstream'))return result('mismatch','document_provenance');
+    if(!['user','assistant','boundary'].includes(item.kind))return result('unknown','body_format_unproven');if(typeof item.text!=='string'||!id(item.field)||!count(item.offset)||item.continuation!==(item.offset>0)||!count(item.first_sequence)||item.first_sequence<1||!count(item.last_sequence)||item.last_sequence<item.first_sequence||item.last_sequence>current.meta.persisted_sequence)return result('mismatch','document_part_shape');if(item.provenance!==(item.kind==='user'?'client':item.kind==='boundary'?'gateway':'upstream'))return result('mismatch','document_provenance');
     let field=fields.get(item.field);if(!field){if(fields.size>=maxFields)return result('unknown','field_budget');field={kind:item.kind,offset:0,first:item.first_sequence,last:item.last_sequence,hash:createHash('sha256'),bytes:0};fields.set(item.field,field);}// NFKC search expansion can add empty parts beyond the original text end.
     if(field.kind!==item.kind||(field.offset!==item.offset&&!(item.text===''&&item.offset>=field.offset))||field.first!==item.first_sequence||field.last!==item.last_sequence)return result('mismatch','document_field_sequence');field.hash.update(item.text);field.bytes+=Buffer.byteLength(item.text);field.offset=item.offset+Array.from(item.text).length;
    }
    if(page.next!==after||!count(page.next)||page.next<0)return result('mismatch','document_cursor');if(!page.has_more){if(after!==current.row.parts)return result('mismatch','document_part_count');break;}
   }
-  const final=await store.transaction(async()=>{await verify();return snapshot(requestId);},{level:'REPEATABLE READ',readOnly:true});if(cancelled(signal))return result('unknown','cancelled');if(changed(original.meta,final.meta)||original.row.parts!==final.row?.parts||original.row.key_version!==final.row?.key_version)return result('pending','source_changed');if(!identity(final.row,expected))return result('mismatch','actor_mismatch');
+  const final=await store.transaction(async()=>{
+   await verify();const current=await snapshot(requestId);let boundaryCheck=null;
+   for(const field of fields.values())if(field.kind==='boundary'){
+    if(field.first!==field.last){boundaryCheck=result('unknown','body_format_unproven');break;}
+    const size=await store.get('SELECT octet_length(content_cipher) bytes FROM harbor.conversation_events WHERE request_id=$1 AND sequence=$2',requestId,field.first);
+    if(!count(size?.bytes)||size.bytes>maxPageBytes||readBytes+size.bytes>maxReadBytes){boundaryCheck=result('unknown','read_bytes_budget');break;}readBytes+=size.bytes;
+    const source=await store.get('SELECT kind,provenance,source_key,content_cipher FROM harbor.conversation_events WHERE request_id=$1 AND sequence=$2',requestId,field.first);
+    if(source?.kind!=='boundary'||source.provenance!=='gateway'){boundaryCheck=result('mismatch','document_provenance');break;}
+    const content=recordings.open(source.content_cipher,requestId+':'+field.first+':'+source.source_key);
+    if(source.source_key!=='gateway:coverage'||!knownCoverage(content)){boundaryCheck=result('unknown','body_format_unproven');break;}
+    const text=JSON.stringify(content);if(field.bytes!==Buffer.byteLength(text)||field.hash.copy().digest('hex')!==sha(text)){boundaryCheck=result('mismatch','body_digest_mismatch');break;}
+   }
+   return {...current,boundaryCheck};
+  },{level:'REPEATABLE READ',readOnly:true});if(cancelled(signal))return result('unknown','cancelled');if(changed(original.meta,final.meta)||original.row.parts!==final.row?.parts||original.row.key_version!==final.row?.key_version)return result('pending','source_changed');if(!identity(final.row,expected))return result('mismatch','actor_mismatch');if(final.boundaryCheck)return final.boundaryCheck;
   for(const [kind,evidence]of [['user',expected.plannedInput],['assistant',output]]){const matches=[...fields.values()].filter(field=>field.kind===kind);if(!matches.length&&evidence.bytes===0&&evidence.hash===emptyHash)continue;if(matches.length>1)return result('unknown','body_field_evidence_unavailable');if(matches.length!==1||matches[0].bytes!==evidence.bytes||matches[0].hash.digest('hex')!==evidence.hash)return Object.freeze({...result('mismatch','body_digest_mismatch'),mismatchPart:kind==='user'?'input':'output',mismatchState:['complete','partial','truncated'].includes(final.meta.recording_state)?final.meta.recording_state:'unclassified'});}return result('ready');
  }
  return Object.freeze({read:async({projection,requestId,expected,signal}={})=>{if(!['body','usage'].includes(projection)||!id(requestId))return result('unknown','read_input_invalid');if(cancelled(signal))return result('unknown','cancelled');const invalid=expectation(requestId,expected);if(invalid)return invalid;try{const observed=await(projection==='usage'?usage(requestId,expected,signal):body(requestId,expected,signal));return cancelled(signal)?result('unknown','cancelled'):observed;}catch(error){if(cancelled(signal))return result('unknown','cancelled');return result('unknown',error?.code==='recording_index_unreadable'?'document_unreadable':error?.code==='recording_index_rebuild'?'index_key_unavailable':'read_unavailable');}}});

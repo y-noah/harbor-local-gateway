@@ -9,6 +9,7 @@ import {createPostgresRecordingJobs} from '../postgres-recording-jobs.mjs';
 import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
 import {datasetManifest,createDatasetDatabase,fixtureId} from '../tools/capacity/dataset.mjs';
 import {createStreamingStageReader} from '../tools/capacity/streaming-stage-reader.mjs';
+import {createRecordingIndexCrypto} from '../recording-search-index.mjs';
 const digest=text=>({hash:createHash('sha256').update(text).digest('hex'),bytes:Buffer.byteLength(text)});
 const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB,integration={skip:!binDirectory?'需要本任务独占私有PG，绝不使用外部数据库':false};
 test('single-pass reader validates real owned PostgreSQL usage and bounded decrypted pages',integration,async t=>{
@@ -18,9 +19,9 @@ test('single-pass reader validates real owned PostgreSQL usage and bounded decry
   await store.run("INSERT INTO harbor.employee_devices(id,member_id,name,system,hardware_state,fingerprint_source,public_key_sha256,csr,created,enrollment_digest,enrollment_expires) VALUES($1,$2,'合成设备','linux','credentials_only','synthetic','synthetic','synthetic',$3,$1,$3)",deviceId,memberId,at);
   const recordings=new RecordingStore(store,{encryptionKey:recordingKey}),jobs=createPostgresJobs(store),backend=createPostgresRecordingJobs(store,{recordingKey,jobs,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true,status:'healthy'})}),options={laboratory,manifest,store,recordingKey,pageSize:1},reader=await createStreamingStageReader(options);
   const organize=async()=>{await backend.schedule();let job;while(job=await jobs.claim(['recording.index']))await jobs.complete(job,await backend.handlers[job.kind](job));};
-  const request=async({text='合成用户正文',input,reply='合成回复',model='gpt-6.1-sol',usageKnown=true,status='ok',state='complete',index=true}={})=>{
+  const request=async({text='合成用户正文',input,reply='合成回复',model='gpt-6.1-sol',usageKnown=true,status='ok',state='complete',index=true,coverage=false}={})=>{
    const requestId=await store.observe({id:memberId,key_id:keyId},'127.0.0.1','synthetic',model,{device:{deviceId}}),started=(await store.get('SELECT started FROM harbor.requests WHERE id=$1',requestId)).started;
-   await store.finish(requestId,{status,input:31,output:7,cached:3,actualModel:model,usageKnown});await recordings.start(requestId,{turnState:'known'});const events=[],capture=new ConversationCapture({emit:event=>events.push(event)});capture.input({input:input??text});if(reply)capture.event({type:'response.output_text.delta',item_id:'message',output_index:0,delta:reply});capture.finish({output:reply?[{id:'message',type:'message',content:[{type:'output_text',text:reply}]}]:[]});if(events.length)await recordings.append(requestId,events);await recordings.finish(requestId,{state});if(index)await organize();
+   await store.finish(requestId,{status,input:31,output:7,cached:3,actualModel:model,usageKnown});await recordings.start(requestId,{turnState:'known'});const events=[],capture=new ConversationCapture({emit:event=>events.push(event)});capture.input({input:input??text});if(reply)capture.event({type:'response.output_text.delta',item_id:'message',output_index:0,delta:reply});const finished=capture.finish({output:reply?[{id:'message',type:'message',content:[{type:'output_text',text:reply}]}]:[]});if(coverage)events.push({sourceKey:'gateway:coverage',kind:'boundary',provenance:'gateway',content:typeof coverage==='object'?coverage:{section:coverage==='unknown'?'unknown':'coverage',...finished.coverage}});if(events.length)await recordings.append(requestId,events);await recordings.finish(requestId,{state});if(index)await organize();
    const expected={source:'model',admissions:[{request_id:requestId,member_id:memberId,key_id:keyId,device_id:deviceId,started_at:started,confirmed:1}],candidateCount:1,expectedMemberId:memberId,expectedKeyId:keyId,expectedDeviceId:deviceId,plannedInput:digest(text),terminalCount:1,terminal:{outcome:status,usageKnown,model,inputTokens:31,outputTokens:7,cachedTokens:3,outputHash:digest(reply).hash,outputBytes:digest(reply).bytes,outputComplete:state==='complete',outputEvidenceComplete:true,userInputExpected:true}};
    return {requestId,expected,read:(projection,extra={})=>reader.read({projection,requestId,expected,...extra})};
   };
@@ -32,6 +33,16 @@ test('single-pass reader validates real owned PostgreSQL usage and bounded decry
   });
   await t.test('NFKC expansion produces legitimate empty search-padding parts',async()=>{
    const f=await request({text:'ﬃ'.repeat(2000),reply:'ﬄ'.repeat(2500)});assert.deepEqual(await f.read('body'),{state:'ready',readVerified:true});
+  });
+  await t.test('gateway coverage is verified against its authenticated source, never silently skipped',async()=>{
+   const f=await request({coverage:true});assert.deepEqual(await f.read('body'),{state:'ready',readVerified:true});
+   const d=await store.get('SELECT source_revision FROM harbor.recording_documents WHERE request_id=$1',f.requestId),part=await store.get("SELECT ordinal,payload_cipher FROM harbor.recording_document_parts WHERE request_id=$1 AND kind='boundary' ORDER BY ordinal LIMIT 1",f.requestId),crypto=createRecordingIndexCrypto(recordingKey),aad=`document:${f.requestId}:${d.source_revision}:${part.ordinal}`,value=crypto.open(part.payload_cipher,aad);value.text+=' ';
+   await store.run('UPDATE harbor.recording_document_parts SET payload_cipher=$1,bytes=$2 WHERE request_id=$3 AND ordinal=$4',crypto.seal(value,aad),Buffer.byteLength(JSON.stringify(value)),f.requestId,part.ordinal);
+   assert.equal((await f.read('body')).state,'mismatch');
+   const valid={section:'coverage',...new ConversationCapture({emit:()=>{}}).finish().coverage};
+   for(const coverage of ['unknown',{section:'coverage'},{...valid,version:999},{...valid,unsupported:{...valid.unsupported,items:-1}},{...valid,redaction:undefined}]){
+    const unsupported=await request({coverage});assert.deepEqual(await unsupported.read('body'),{state:'unknown',readVerified:false,reason:'body_format_unproven'});
+   }
   });
   await t.test('multiple same-kind fields need independent field evidence instead of concatenation',async()=>{
    const first='第一段'.repeat(900),second='第二段'.repeat(900),f=await request({text:first+second,input:[{role:'user',content:[{type:'input_text',text:first},{type:'input_text',text:second}]}]});assert.deepEqual(await f.read('body'),{state:'unknown',readVerified:false,reason:'body_field_evidence_unavailable'});
