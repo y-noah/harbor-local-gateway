@@ -11,10 +11,26 @@ import {credentialFingerprints} from '../tools/capacity/http-client.mjs';
 import {EventEmitter} from 'node:events';
 import {createGatewayProbe} from '../tools/capacity/gateway-probe.mjs';
 import {runCapacitySuite} from '../tools/capacity/runner.mjs';
+import {summarizeCapacityCoverage} from '../tools/capacity/coverage-adapter.mjs';
 
 test('formal blueprint retains all required scale, long scenarios, API thresholds and frozen acceptance targets',()=>{
   const plan=capacityPlan();assert.equal(plan.targets.metadata7d,1260000);assert.equal(plan.targets.metadata30d,5400000);assert.equal(plan.scenarios.find(row=>row.id==='steady-8h').durationMs,28800000);assert.ok(plan.scenarios.find(row=>row.id==='long-120').durationMs>=1800000);assert.equal(plan.scenarios.find(row=>row.id==='long-60').durationMs,7200000);assert.equal(plan.scenarios.find(row=>row.id==='burst').burst.qps,30);assertFormalPlan(plan);
   assert.throws(()=>{plan.scenarios[0].durationMs=1;},TypeError);const changed=structuredClone(plan);changed.scenarios[0].durationMs=1;assert.throws(()=>assertFormalPlan(changed),/targets_changed/);assert.throws(()=>assertFormalPlan({...plan,operations:[]}),/inventory_incomplete/);
+});
+
+test('formal final verdict cannot omit unknown or failed live dataset coverage',()=>{
+  // Isolate this evidence gate; this minimal plan is not a runnable formal plan.
+  const plan={profile:'formal',operations:[],scenarios:[]},metrics=createCapacityMetrics().view();
+  const sample={at:1,metadata7d:1260000,metadata30d:5400000,pricing_revision:'synthetic-v1'};
+  const verdict=coverage=>evaluateCapacity({plan,metrics,preflight:{eligible:true},evidence:new Proxy({liveDatasetCoverage:coverage,realTransferSlots:[{actual:true,applied:1},{actual:true,applied:1}]},{get:(value,key)=>Object.hasOwn(value,key)?value[key]:{passed:true}})});
+  for(const coverage of [undefined,null,summarizeCapacityCoverage([sample],{profile:'formal'}),summarizeCapacityCoverage([{...sample,verified:false}],{profile:'formal'})]){
+    const result=verdict(coverage);assert.equal(result.status,'incomplete');assert.ok(result.incomplete.includes('缺少验收证据:liveDatasetCoverage'));
+  }
+  const insufficient=verdict(summarizeCapacityCoverage([{...sample,metadata7d:1259999}],{profile:'formal'}));
+  assert.equal(insufficient.status,'failed');assert.ok(insufficient.failures.includes('验收失败:liveDatasetCoverage'));
+  const changedPrice=verdict(summarizeCapacityCoverage([sample,{...sample,at:2,pricing_revision:'synthetic-v2'}],{profile:'formal'}));
+  assert.equal(changedPrice.status,'failed');assert.ok(changedPrice.failures.includes('验收失败:liveDatasetCoverage'));
+  assert.equal(verdict({passed:true}).status,'passed','the isolated gate preserves explicitly verified coverage');
 });
 
 test('histogram reports conservative quantiles and bounded memory rather than keeping every sample',()=>{

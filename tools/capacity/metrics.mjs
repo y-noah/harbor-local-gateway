@@ -54,6 +54,7 @@ export function evaluateCapacity({plan,preflight,metrics,evidence={}}){
   for(const window of metrics.windows)for(const row of window.series.filter(row=>row.group==='normal'))for(const operation of expected.filter(operation=>matches(row,operation))){const limits=operationLimits(operation);if(row.p95>limits.p95||row.p99>limits.p99)failures.push('五分钟窗口超标:'+operation.id+':'+window.start);}
   for(const scene of plan.scenarios)if(!evidence.scenarios?.[scene.id]?.completed||evidence.scenarios[scene.id].durationMs<scene.durationMs)incomplete.push('场景未完整执行:'+scene.id);
   const required=['resources','metricIntegrity','actorCoverage','serverArrivals','sources','networkBaseline','defaultAndMaxPages','deepPagination','coldQueries','tlsNewAndReuse','deviceHelper','recordingComparison','requestStages','streamRelay','cancelRelease','bodyVisibility','batchCompletion','exportAmounts','burstRecovery','databaseRecovery','workerRecovery','gracefulDrain','crashRecovery','hostRestoreRpo','dataReconciliation','idleRecovery','browserLists','browserStatistics','slowReceiver','longContextCompressionLimits','deviceRevocation'];
+  if(plan.profile==='formal')required.push('liveDatasetCoverage');
   for(const key of required){if(evidence[key]?.passed===false)failures.push('验收失败:'+key);else if(evidence[key]?.passed!==true)incomplete.push('缺少验收证据:'+key);}
   if((evidence.realTransferSlots?.filter(row=>row.actual&&row.applied>0).length??0)<2)incomplete.push('未覆盖两次实际时点转移');
   observations.push('未知、故障、突发及主动取消分组均保留，不静默移出报告。');
