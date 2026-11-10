@@ -50,8 +50,8 @@ export async function createCapacityProfileBinding({laboratory,manifest,store,re
  if(!open(isOpen))fail('capacity_profile_binding_closed');
  if(usageWindow(Date.now()).start!==usageWindow(at).start)fail('capacity_profile_verification_stale');
  if(verified?.verified!==true||verified.manifestHash!==canonical.manifestHash||verified.source!=='isolated-synthetic-dataset')fail('capacity_profile_dataset_unverified');
- if(!matchesBodyDistribution(canonical,verified.bodyDistribution))fail('capacity_profile_body_distribution_mismatch');
- const formalDatasetVerified=canonical.profile==='formal'&&verified.formalScale===true&&verified.formalBodyFootprintVerified===true&&verified.bodyDistributionVerified===true&&canonical.metadata7d>=targets.metadata7d&&canonical.metadata30d>=targets.metadata30d&&canonical.bodyRequests===canonical.metadata30d&&verified.metadata7d>=targets.metadata7d&&verified.metadata30d>=targets.metadata30d&&verified.bodyRequests===canonical.bodyRequests&&verified.activeBodyRequests===canonical.bodyRequests;
+ if(!matchesBodyDistribution(canonical,verified.bodyDistribution)||verified.bodyDistributionMappingVerified!==true)fail('capacity_profile_body_distribution_mismatch');
+ const formalDatasetVerified=canonical.profile==='formal'&&verified.formalScale===true&&verified.formalBodyFootprintVerified===true&&verified.bodyDistributionVerified===true&&canonical.metadata7d>=targets.metadata7d&&canonical.metadata30d>=targets.metadata30d&&canonical.bodyRequests===canonical.metadata30d&&verified.metadata7d>=targets.metadata7d&&verified.metadata30d>=targets.metadata30d&&verified.seedBodyRequests===canonical.bodyRequests&&verified.activeBodyRequests>=targets.metadata30d;
  if(canonical.profile==='formal'&&!formalDatasetVerified)fail('capacity_profile_formal_dataset_incomplete');
  const binding=Object.freeze(Object.create(null));bindings.set(binding,{profile:canonical.profile,isOpen,formalDatasetVerified});return binding;
 }

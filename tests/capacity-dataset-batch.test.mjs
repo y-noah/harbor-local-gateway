@@ -4,7 +4,7 @@ import {randomBytes} from 'node:crypto';
 import {PostgresStore} from '../postgres-store.mjs';
 import {RecordingStore} from '../recording-store.mjs';
 import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
-import {datasetManifest,createDatasetDatabase,seedDataset,fixtureId} from '../tools/capacity/dataset.mjs';
+import {datasetManifest,createDatasetDatabase,seedDataset,fixtureId,fixtureTimestamp} from '../tools/capacity/dataset.mjs';
 
 const binDirectory=process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory=process.env.HARBOR_CAPACITY_PG_LIB;
 test('cancelled body generation rolls back the whole batch and resumes over an existing recording without duplication',{
@@ -28,10 +28,17 @@ test('cancelled body generation rolls back the whole batch and resumes over an e
     assert.equal((await store.get('SELECT COUNT(*) n FROM harbor_capacity.body_receipts')).n,0);
     const requestId=fixtureId(manifest.runId,'request',0),recordings=new RecordingStore(store,{encryptionKey:recordingKey,clock:()=>manifest.anchor});
     await recordings.start(requestId,{turnState:'known'});
+    assert.equal((await store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',requestId)).expires_at,manifest.anchor+30*86400000);
     const result=await seedDataset(store,manifest,{recordingKey});assert.equal(result.verified,true);assert.equal(result.bodyReadable,true);assert.equal(result.bodyRequests,32);
+    assert.equal((await store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',requestId)).expires_at,fixtureTimestamp(manifest,0)+30*86400000);
     const before=await store.all('SELECT request_id,sequence,source_key,content_cipher FROM harbor.conversation_events ORDER BY request_id,sequence');
     await seedDataset(store,manifest,{recordingKey});
     assert.deepEqual(await store.all('SELECT request_id,sequence,source_key,content_cipher FROM harbor.conversation_events ORDER BY request_id,sequence'),before);
     assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recordings')).n,32);
+    await store.run('UPDATE harbor_capacity.fixture SET body_cursor=0 WHERE singleton=1');
+    const modifiedExpiry=fixtureTimestamp(manifest,0)+30*86400000+1;
+    await store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',modifiedExpiry,requestId);
+    assert.equal((await seedDataset(store,manifest,{recordingKey})).verified,false,'a completed receipt must not be silently repaired');
+    assert.equal((await store.get('SELECT expires_at FROM harbor.recordings WHERE request_id=$1',requestId)).expires_at,modifiedExpiry);
   }finally{await fixture?.destroy();await admin.close();await lab.close();recordingKey.fill(0);}
 });

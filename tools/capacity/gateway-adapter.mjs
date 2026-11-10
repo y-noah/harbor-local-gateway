@@ -12,7 +12,7 @@ import {PostgresStore} from '../../postgres-store.mjs';
 import {usageWindow} from '../../store.mjs';
 import {passwordHash} from '../../auth.mjs';
 import {createPrivatePostgres,isOwnedLaboratory,ownedProcessProof,terminateOwnedCapacityChild} from './owned-runtime.mjs';
-import {datasetManifest,createDatasetDatabase,bootstrapActors,seedDataset,fixtureDatabase} from './dataset.mjs';
+import {createDatasetDatabase,bootstrapActors,seedDataset,fixtureDatabase} from './dataset.mjs';
 import {createCapacityClientEntry,capacityClientEntryBinding} from './client-entry.mjs';
 import {createCapacityRequestDriver,capacityRequestDriverAgent} from './request-driver.mjs';
 import {capacityStorageDirectory} from './storage-location.mjs';
@@ -30,6 +30,7 @@ import {collectHostEvidence,resourcePreflight,normalizeCapacityResourceLimits} f
 import {createControlledUpstream,isOwnedUpstream} from './controlled-upstream.mjs';
 import {enrollCapacityDevice,enrollCapacityWindowsDevice} from './device-adapter.mjs';
 import {summarizeCapacityCoverage,capacityLiveWindow} from './coverage-adapter.mjs';
+import {capacityTargetDatasetManifest} from './dataset-coverage-plan.mjs';
 import {createCapacityLedgerController} from './ledger-adapter.mjs';
 import {prepareCapacityAccountMaterials,verifyCapacityAccountMaterials} from './recovery-material-adapter.mjs';
 import {createCapacityRestoreAssessment} from './restore-assessment.mjs';
@@ -104,7 +105,7 @@ export function preflightCapacityTarget({profile='selfcheck',purpose='run'}={}){
 
 // A read-only preparation check. Allocator readiness before its children exist
 // is distinct from their required, later, observed role membership.
-export async function inspectCapacityTargetPrerequisites(options={}){return inspectTargetPrerequisites(options,datasetManifest({profile:options.profile??'formal'}));}
+export async function inspectCapacityTargetPrerequisites(options={}){return inspectTargetPrerequisites(options,capacityTargetDatasetManifest(options));}
 function targetResourceLimits(resourceAllocator,declared){
  const owned=isOwnedCapacityResourceAllocator(resourceAllocator),limits=normalizeCapacityResourceLimits(declared===undefined&&owned?resourceAllocator.limits:declared);
  if(owned&&JSON.stringify(limits)!==JSON.stringify(resourceAllocator.limits))throw Error('capacity_resource_limits_mismatch');return limits;
@@ -138,8 +139,9 @@ export async function createTarget({profile='selfcheck',coverageVariants=profile
   resourceLimits=targetResourceLimits(resourceAllocator,resourceLimits);
   if(typeof onAllocation!=='function'||ownerAuthority!==undefined&&!isOwnedCapacityFactoryOwnerAuthority(ownerAuthority))throw Error('capacity_factory_owner_not_owned');
   const runLifetime=createCapacityCertificateLifetime({runLifetimeMs,signal});signal=runLifetime.signal;
-  const manifest=Object.freeze(datasetManifest({profile}));let root;
+  let manifest,root;
   try{
+    manifest=Object.freeze(capacityTargetDatasetManifest({profile,purpose,runLifetimeMs}));
     const preparation=await inspectTargetPrerequisites({profile,purpose,resourceAllocator,storageRoot,diskBudget,ownerAuthority,resourceLimits},manifest);if(!preparation.eligible){const error=new Error('capacity_formal_adapter_incomplete');error.preflight=preparation;throw error;}
     capacityRunLifetime(runLifetimeMs,{required:profile==='formal'&&purpose==='run'});signal.throwIfAborted();await onAllocation();signal.throwIfAborted();
     root=await mkdtemp(join(await capacityStorageDirectory(storageRoot),'harbor-capacity-gateway-'));
