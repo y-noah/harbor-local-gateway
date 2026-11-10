@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {PostgresStore} from '../../postgres-store.mjs';
 import {usageWindow} from '../../store.mjs';
 import {isOwnedLaboratory} from './owned-runtime.mjs';
-import {datasetManifest,fixtureDatabase,verifyDataset} from './dataset.mjs';
+import {datasetManifest,fixtureDatabase,verifyDataset,verifyDatasetContexts} from './dataset.mjs';
 import {targets} from './scenarios.mjs';
 import {installCapacityBaselineGuard,sealCapacityBaselineGuard,readCapacityBaselineGuard,suspendCapacityBaselineGuard,resumeCapacityBaselineGuard} from './baseline-guard.mjs';
 
@@ -10,7 +10,7 @@ const bindings=new WeakMap(),profiles=new Set(['selfcheck','formal']);
 const fail=code=>{throw new Error(code);};
 const open=isOpen=>{try{return isOpen()===true;}catch{return false;}};
 const digest=key=>createHash('sha256').update(key).digest('hex');
-const formalSource=(canonical,verified)=>canonical.profile==='formal'&&verified.formalScale===true&&verified.formalBodyFootprintVerified===true&&verified.bodyDistributionVerified===true&&canonical.metadata7d>=targets.metadata7d&&canonical.metadata30d>=targets.metadata30d&&canonical.bodyRequests===canonical.metadata30d&&verified.metadata7d>=targets.metadata7d&&verified.metadata30d>=targets.metadata30d&&verified.seedBodyRequests===canonical.bodyRequests&&verified.activeBodyRequests>=targets.metadata30d;
+const formalBodySource=(canonical,verified)=>canonical.profile==='formal'&&verified.formalScale===true&&verified.formalBodyFootprintVerified===true&&verified.bodyDistributionVerified===true&&canonical.metadata7d>=targets.metadata7d&&canonical.metadata30d>=targets.metadata30d&&canonical.bodyRequests===canonical.metadata30d&&verified.metadata7d>=targets.metadata7d&&verified.metadata30d>=targets.metadata30d&&verified.seedBodyRequests===canonical.bodyRequests&&verified.activeBodyRequests>=targets.metadata30d;
 
 function matchesBodyDistribution(manifest,observed){
  const expected=new Map(manifest.bodyDistribution.map(bin=>[bin.bytes,0])),cycles=Math.floor(manifest.bodyRequests/100),tail=manifest.bodyRequests%100;
@@ -28,8 +28,8 @@ function matchesBodyDistribution(manifest,observed){
 // A public plan/profile or copied verification DTO cannot issue this capability.
 // This deliberately reruns the source verifier instead of trusting its caller's
 // ordinary `verified` object. It is not a per-request or per-epoch full scan.
-export async function createCapacityProfileBinding({laboratory,manifest,store,recordingKey,isOpen,trackCoverage=false}={}){
- if(!isOwnedLaboratory(laboratory)||!(store instanceof PostgresStore)||!Buffer.isBuffer(recordingKey)||recordingKey.length!==32||typeof isOpen!=='function'||typeof trackCoverage!=='boolean')fail('capacity_profile_binding_configuration');
+export async function createCapacityProfileBinding({laboratory,manifest,store,recordingKey,isOpen,trackCoverage=false,recordingContext=false}={}){
+ if(!isOwnedLaboratory(laboratory)||!(store instanceof PostgresStore)||!Buffer.isBuffer(recordingKey)||recordingKey.length!==32||typeof isOpen!=='function'||typeof trackCoverage!=='boolean'||typeof recordingContext!=='boolean')fail('capacity_profile_binding_configuration');
  if(store.context.getStore())fail('capacity_profile_binding_nested_transaction');
  if(!open(isOpen))fail('capacity_profile_binding_closed');
  let canonical;try{canonical=datasetManifest(manifest);if(JSON.stringify(canonical)!==JSON.stringify(manifest))throw Error();}catch{fail('capacity_profile_manifest_invalid');}
@@ -47,7 +47,12 @@ export async function createCapacityProfileBinding({laboratory,manifest,store,re
    // verifyDataset only reads. The existing store's statement/idle timeouts
    // remain in force; timeout or a failed COMMIT never yields a binding.
    const result=await verifyDataset(store,canonical,{recordingKey,at});
-   if(trackCoverage&&result.verified===true&&result.bodyDistributionMappingVerified===true&&matchesBodyDistribution(canonical,result.bodyDistribution)&&(canonical.profile!=='formal'||formalSource(canonical,result)))coverage=await installCapacityBaselineGuard(store,canonical,result.pricingRevision);
+   if(trackCoverage&&result.verified===true&&result.bodyDistributionMappingVerified===true&&matchesBodyDistribution(canonical,result.bodyDistribution)&&(canonical.profile!=='formal'||formalBodySource(canonical,result))){
+    coverage=await installCapacityBaselineGuard(store,canonical,result.pricingRevision,{recordingContext,recordingKey});
+    // The guarded installation itself rechecks source coverage before creating
+    // any protection. Do not repeat its full source scan in this transaction.
+    if(recordingContext)result.contextCoverage={verified:true,scope:'original-context-source-only'};
+   }else if(recordingContext)result.contextCoverage=await verifyDatasetContexts(store,canonical,{recordingKey,at});
    return result;
   },{level:'REPEATABLE READ',readOnly:!trackCoverage});
  }catch(error){if(!open(isOpen))fail('capacity_profile_binding_closed');if(['capacity_profile_source_mismatch','capacity_profile_binding_closed'].includes(error?.message))throw error;fail('capacity_profile_verification_unavailable');}
@@ -55,7 +60,8 @@ export async function createCapacityProfileBinding({laboratory,manifest,store,re
  if(usageWindow(Date.now()).start!==usageWindow(at).start)fail('capacity_profile_verification_stale');
  if(verified?.verified!==true||verified.manifestHash!==canonical.manifestHash||verified.source!=='isolated-synthetic-dataset')fail('capacity_profile_dataset_unverified');
  if(!matchesBodyDistribution(canonical,verified.bodyDistribution)||verified.bodyDistributionMappingVerified!==true)fail('capacity_profile_body_distribution_mismatch');
- const formalDatasetVerified=formalSource(canonical,verified);
+ if(recordingContext&&verified.contextCoverage?.verified!==true)fail('capacity_profile_context_unverified');
+ const formalDatasetVerified=formalBodySource(canonical,verified)&&verified.contextCoverage?.verified===true;
  if(canonical.profile==='formal'&&!formalDatasetVerified)fail('capacity_profile_formal_dataset_incomplete');
  const binding=Object.freeze(Object.create(null));bindings.set(binding,{profile:canonical.profile,isOpen,formalDatasetVerified,coverage,store});return binding;
 }

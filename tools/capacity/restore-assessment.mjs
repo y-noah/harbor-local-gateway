@@ -5,7 +5,7 @@ import {join,resolve} from 'node:path';
 import {PostgresStore} from '../../postgres-store.mjs';
 import {digestFile} from '../../migration-artifacts.mjs';
 import {validateRollback} from '../../postgres-recovery.mjs';
-import {fixtureDatabase,verifyDataset} from './dataset.mjs';
+import {fixtureDatabase,verifyDataset,verifyDatasetContexts} from './dataset.mjs';
 import {isOwnedLaboratory,isOwnedMaterialRoot,ownedProcessProof} from './owned-runtime.mjs';
 import {requestCapacityTarget} from './http-client.mjs';
 import {assessRecovery} from './assessments.mjs';
@@ -29,8 +29,8 @@ export function readObservedCapacityRestoreWindow(value,{manifestHash,sourceClus
 
 // This records an owned-host rehearsal. Its measured timing cannot grant the
 // formal capacity gate: that also needs the real scale, topology and load run.
-export async function createCapacityRestoreAssessment({laboratory,manifest,requirements,hooks,onDiagnostic,recordingKey}={}){
-  if(!Buffer.isBuffer(recordingKey)||recordingKey.length!==32||!isOwnedLaboratory(laboratory)||!laboratory.recovery||!Array.isArray(requirements)||!requirements.length||requirements.length>64||!hooks||['processes','restartRuntime','verifyRecovered'].some(key=>typeof hooks[key]!=='function'))fail('capacity_restore_configuration');
+export async function createCapacityRestoreAssessment({laboratory,manifest,requirements,hooks,onDiagnostic,recordingKey,recordingContext=false}={}){
+  if(typeof recordingContext!=='boolean'||!Buffer.isBuffer(recordingKey)||recordingKey.length!==32||!isOwnedLaboratory(laboratory)||!laboratory.recovery||!Array.isArray(requirements)||!requirements.length||requirements.length>64||!hooks||['processes','restartRuntime','verifyRecovered'].some(key=>typeof hooks[key]!=='function'))fail('capacity_restore_configuration');
   if(hooks.beforeFault!==undefined&&typeof hooks.beforeFault!=='function')fail('capacity_restore_configuration');
   if(onDiagnostic!==undefined&&typeof onDiagnostic!=='function')fail('capacity_restore_configuration');const diagnostic=(stage,error)=>{if(!onDiagnostic)return;const value={stage,event:error?'failure':'start'};if(error){value.category=['Error','TypeError','RangeError','AggregateError','AppError'].includes(error.name)?error.name:'Other';const code=error.code;if(typeof code==='string'&&(/^[A-Z0-9]{5}$/.test(code)||/^(?:capacity_|backup_|recording_)[a-z0-9_]{1,80}$/.test(code)||['ENOENT','EACCES','EPERM','ECONNRESET','ENOTCONN','EPIPE','ENOSPC','ETIMEDOUT'].includes(code)))value.code=code;}try{const result=onDiagnostic(Object.freeze(value));if(result&&typeof result.then==='function')void Promise.resolve(result).catch(()=>{});}catch{}};
   const materialRoots=laboratory.materialRoots,ids=new Set(materialRoots.map(root=>root.id));
@@ -65,9 +65,10 @@ export async function createCapacityRestoreAssessment({laboratory,manifest,requi
       diagnosticStage='restore_materials';diagnostic(diagnosticStage);for(const root of materialRoots){const recoveredRoot=restored.files.roots.find(entry=>entry.id===root.id&&entry.source===root.path);if(!recoveredRoot||resolve(recoveredRoot.destination)!==join(destination,root.id))fail('capacity_restore_material_root_mismatch');for(const entry of required.filter(entry=>entry.root===root)){const digest=await checkMaterial(entry,recoveredRoot.destination);if(JSON.stringify(digest)!==JSON.stringify(materialDigests.get(entry)))fail('capacity_restore_material_digest_mismatch');}try{await lstat(root.path);fail('capacity_restore_material_destination_exists');}catch(error){if(error.code!=='ENOENT')throw error;}await rename(recoveredRoot.destination,root.path);}materialFilesVerified=true;
       diagnosticStage='verify_database';diagnostic(diagnosticStage);const recoveredStore=new PostgresStore({...database,statementTimeoutMs:600000});try{await ownership(recoveredStore);await recoveredStore.verifySchema();const included=await recoveredStore.get("SELECT id,snapshot FROM harbor_capacity.restore_probes WHERE id=$1 AND kind='checkpoint'",receipt.id),excluded=await recoveredStore.get('SELECT id FROM harbor_capacity.restore_probes WHERE id=$1',receipt.excluded);if(!included||included.snapshot!==receipt.snapshot||excluded)fail('capacity_restore_point_data_mismatch');
         signal?.throwIfAborted();diagnosticStage='verify_seed';diagnostic(diagnosticStage);
-        const seed=await recoveredStore.transaction(()=>verifyDataset(recoveredStore,manifest,{recordingKey:key,seedOnly:true}),{level:'REPEATABLE READ',readOnly:true});
+        const seed=await recoveredStore.transaction(async()=>{const verified=await verifyDataset(recoveredStore,manifest,{recordingKey:key,seedOnly:true});if(recordingContext&&verified.verified)verified.contextCoverage=await verifyDatasetContexts(recoveredStore,manifest,{recordingKey:key,signal});return verified;},{level:'REPEATABLE READ',readOnly:true});
         seedVerification=Object.fromEntries(['verified','verificationScope','manifestHash','pricingRevision','totalMetadata','metadata7d','metadata30d','seedBodyRequests','activeBodyRequests'].map(field=>[field,seed[field]]));
-        if(!seed.verified)fail('capacity_restore_seed_unverified');
+        if(recordingContext)seedVerification.contextCoverage=seed.contextCoverage??null;
+        if(!seed.verified)fail('capacity_restore_seed_unverified');if(recordingContext&&!seed.contextCoverage?.verified)fail('capacity_restore_context_unverified');
       }finally{await recoveredStore.close();}
       signal?.throwIfAborted();diagnosticStage='restart_runtime';diagnostic(diagnosticStage);const restarted=await hooks.restartRuntime({database,storageDatabase:{connection:{...laboratory.connection,host:laboratory.socketDirectory,port:laboratory.databasePort,database:fixtureDatabase(manifest)}},pgDataDir:laboratory.dataDirectory,materialRoots,signal});for(const [role,process] of [['gateway',restarted.gateway],['worker',restarted.worker]])if(ownedProcessProof(laboratory.runtime,process?.child).role!==role||oldPids.includes(process.child.pid))fail('capacity_restore_restarted_process_not_owned');
       diagnosticStage='ready_check';diagnostic(diagnosticStage);const origin=new URL(restarted.gateway.ready.origin);if(origin.protocol!=='http:'||origin.hostname!=='127.0.0.1')fail('capacity_restore_ready_origin_invalid');const health=await requestCapacityTarget({origin:origin.origin,path:'/ready',mode:'json',signal,timeoutMs:10000});if(!health.success||health.json?.ready!==true)fail('capacity_restore_gateway_not_ready');await restarted.worker.command('status');

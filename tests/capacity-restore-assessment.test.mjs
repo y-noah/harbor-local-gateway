@@ -9,7 +9,7 @@ import {join} from 'node:path';
 import {once} from 'node:events';
 import {PostgresStore} from '../postgres-store.mjs';
 import {createPrivatePostgres,isOwnedMaterialRoot} from '../tools/capacity/owned-runtime.mjs';
-import {datasetManifest,createDatasetDatabase,seedDataset,fixtureDatabase,verifyDataset,fixtureId} from '../tools/capacity/dataset.mjs';
+import {datasetManifest,createDatasetDatabase,seedDataset,seedDatasetContexts,fixtureDatabase,verifyDataset,fixtureId} from '../tools/capacity/dataset.mjs';
 import {createCapacityRestoreAssessment,isObservedRestoreAssessment,readObservedCapacityRestoreWindow} from '../tools/capacity/restore-assessment.mjs';
 import {validateRollback} from '../postgres-recovery.mjs';
 import {summarizeCapacityCoverage} from '../tools/capacity/coverage-adapter.mjs';
@@ -95,3 +95,14 @@ function assertObservedCoverage(evidence,manifest,sourceCluster){
  assert.equal(summarize([samples[0],fault,{...samples[2],metadata7d:1}]).passed,false);assert.equal(summarize([samples[0],fault,{...samples[2],pricing_revision:'other-price'}]).passed,false);
  const foreign='f'.repeat(64);evidence.hostRestoreRpo.qualification.seedDataset.manifestHash=foreign;assert.equal(readObservedCapacityRestoreWindow(evidence,{...identity,manifestHash:foreign}),null,'tampering with public corpus identity cannot move the restore to another corpus');assert.ok(readObservedCapacityRestoreWindow(evidence,identity));
 }
+
+
+test('restored historical context loss rejects before restarting application processes',integration,async()=>{
+ const owned=await setup();let controller,restarted=false,probed=false;
+ try{
+  const {lab,manifest,recordingKey,fixture}=owned,{requirements}=await materials(lab),current=await processes(lab);await seedDatasetContexts(fixture.store,manifest,{recordingKey});
+  await fixture.store.run('DELETE FROM harbor.recording_context_snapshots WHERE request_id=$1',fixtureId(manifest.runId,'request',0));
+  controller=await createCapacityRestoreAssessment({laboratory:lab,manifest,recordingKey,recordingContext:true,requirements,hooks:{processes:()=>current,restartRuntime:async()=>{restarted=true;return current;},verifyRecovered:async()=>{probed=true;return {};}}});await controller.prepare();await controller.checkpoint();const result=await controller.run();
+  assert.equal(result.hostRestoreRpo.qualification.passed,false);assert.equal(result.hostRestoreRpo.qualification.failure,'capacity_restore_context_unverified');assert.equal(result.hostRestoreRpo.qualification.seedDataset.verified,true);assert.equal(result.hostRestoreRpo.qualification.seedDataset.contextCoverage.verified,false);assert.ok(result.hostRestoreRpo.qualification.seedDataset.contextCoverage.missing.includes('context_source_mismatch'));assert.equal(restarted,false);assert.equal(probed,false);assert.equal(result.timing.hostReadyAt,null);
+ }finally{await controller?.close();await owned.close();}
+});
