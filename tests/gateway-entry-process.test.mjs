@@ -6,10 +6,31 @@ import {once} from 'node:events';
 import {mkdtemp,rm,lstat,access} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {fileURLToPath} from 'node:url';
 import {gatewayClientAddress} from '../gateway-transport.mjs';
 import {createGatewayEntryProcess,validateGatewayEntryProcessConfig} from '../gateway-entry-process.mjs';
 const limits={maxInflightRequests:2,maxQueuedRequests:3,maxQueuedBytes:32768,maxRequestBytes:4096,maxWaitMs:1000};
 const listen=(server,options)=>new Promise((resolve,reject)=>{server.once('error',reject);server.listen(options,()=>resolve(server.address()));});
+const run=promisify(execFile),upgradePath=fileURLToPath(new URL('../ci/postgres-upgrade-deploy.py',import.meta.url));
+const drainDriver=`import http.client,importlib.util,json,socket,sys
+from types import SimpleNamespace
+s=importlib.util.spec_from_file_location('upgrade',sys.argv[1]);u=importlib.util.module_from_spec(s);s.loader.exec_module(u)
+class Client(http.client.HTTPConnection):
+ def connect(self):
+  self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);self.sock.settimeout(3);self.sock.connect(sys.argv[2])
+def state(command=None,epoch=None,slot=None):
+ c=Client('localhost',timeout=3)
+ try:
+  body=None if command is None else json.dumps({'command':command,'expectedEpoch':epoch,**({'slot':slot} if slot else {})})
+  c.request('GET' if command is None else 'POST','/state' if command is None else '/control',body=body,headers={} if command is None else {'Content-Type':'application/json'})
+  r=c.getresponse();v=json.loads(r.read())
+  if r.status!=200:raise RuntimeError(v['error']['code'])
+  return v
+ finally:c.close()
+print(json.dumps(u.drain_active_entry(SimpleNamespace(entry_state=state))))
+`;
 async function call(options,body){return new Promise((resolve,reject)=>{const req=http.request({...options,agent:false},res=>{let text='';res.on('data',chunk=>text+=chunk);res.once('end',()=>resolve({status:res.statusCode,text,value:()=>JSON.parse(text)}));res.on('error',reject);});req.on('error',reject);req.end(body);});}
 async function fixture(t,{timeout=80,handler}={}){
  const dir=await mkdtemp(join(tmpdir(),'entry-process-')),servers=[],runtime=[];t.after(async()=>{await Promise.all(runtime.map(item=>item.shutdown()));for(const server of servers){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}await rm(dir,{recursive:true,force:true});});
@@ -24,6 +45,21 @@ test('real private control CAS and held queue activate only preconfigured slots'
  const waiting=f.data();assert.equal((await f.command('drain',1)).value().phase,'drained');assert.equal((await f.command('activate',2,'candidate')).status,200);assert.equal((await waiting).text,'candidate');assert.equal((await f.data()).text,'candidate');
  const value=(await f.state()).value();assert.deepEqual(Object.keys(value).sort(),['epoch','slot','phase','state','inflight','queued','reservedQueuedBytes'].sort());assert.equal(value.epoch,3);assert.equal((await call({host:'127.0.0.1',port:f.config.listenPort,path:'/state'})).text,'candidate','public listener forwards paths, never exposes control');await runtime.shutdown();await assert.rejects(access(f.controlPath));
 });
+for(const timeout of [false,true])test(`root upgrade drains a busy real entry and ${timeout?'resumes queued traffic after timeout':'preserves queued traffic until drain succeeds'}`,{skip:process.platform==='win32',timeout:6000},async t=>{
+ let source,calls=0;
+ const f=await fixture(t,{handler(req,res,slot){req.resume();calls++;if(req.url==='/slow'){source=res;res.write('old-start');return;}res.end(slot);}});f.config.initialSlot='candidate';f.config.drainTimeoutMs=timeout?30:1000;f.config.limits={...limits,maxWaitMs:3000};const runtime=await f.start();
+ const first=call({host:'127.0.0.1',port:f.config.listenPort,path:'/slow'});first.catch(()=>{});await untilState(()=>source!==undefined&&runtime.state().inflight===1);
+ const draining=run('python3',['-c',drainDriver,upgradePath,f.controlPath],{timeout:4000});draining.catch(()=>{});
+ try{
+  await untilState(()=>runtime.state().phase==='holding');const waiting=f.data();waiting.catch(()=>{});await untilState(()=>runtime.state().queued===1);assert.equal(calls,1);
+  if(timeout){await assert.rejects(draining,error=>error.stderr.includes('gateway_entry_drain_timeout'));assert.equal(runtime.state().inflight,1);assert.equal(source.destroyed,false);}
+  else{source.end('-done');assert.equal((await first).text,'old-start-done');const result=JSON.parse((await draining).stdout);assert.equal(result.phase,'drained');assert.equal(result.inflight,0);assert.equal(runtime.state().queued,1);assert.equal(calls,1);}
+  assert.equal((await f.command('resume',runtime.state().epoch)).status,200);assert.equal((await waiting).text,'candidate');assert.equal(calls,2);
+  if(timeout){source.end('-done');assert.equal((await first).text,'old-start-done');}
+  await untilState(()=>runtime.state().inflight===0&&runtime.state().queued===0);assert.equal(runtime.state().phase,'active');
+ }finally{if(!source.destroyed)source.end();await draining.catch(()=>{});await first.catch(()=>{});}
+});
+
 test('invalid control schema paths and oversize bodies cannot change routing',{timeout:5000},async t=>{
  const f=await fixture(t);await f.start();for(const body of [{command:'activate',expectedEpoch:0,slot:'/tmp/evil.sock'},{command:'hold',expectedEpoch:0,path:'/tmp/evil'},{command:'hold',expectedEpoch:-1},null,{},'x'.repeat(2100)]){const result=await call({socketPath:f.controlPath,path:'/control',method:'POST',headers:{'Content-Type':'application/json'}},JSON.stringify(body));assert.equal(result.status,400);}assert.equal((await f.state()).value().epoch,0);
 });

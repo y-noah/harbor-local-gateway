@@ -248,6 +248,17 @@ def deploy(image,config,archive,api):
  need(archive is None,'installed CI image required');ticket=validate_ticket(private_json(TICKET),image,config);verify_installed_tools(ticket);entry=load(api['ENTRY_HELPER'],'runtime_upgrade_entry')
  with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry))
 
+def drain_active_entry(entry):
+ control=entry.entry_state();need(control.get('slot')=='candidate' and control.get('phase')=='active' and type(control.get('inflight')) is int and control['inflight']>=0,'current entry is not active PG')
+ control=entry.entry_state('hold',control['epoch'])
+ # Hold admission before draining: continuously arriving requests cannot keep
+ # the source busy forever. Existing streams retain their original route.
+ # The entry's configured deadline and the unchanged-source recovery bound
+ # this wait; a timeout must resume admission without replacing the source.
+ need(control.get('slot')=='candidate' and control.get('phase')=='holding','entry hold failed')
+ control=entry.entry_state('drain',control['epoch']);need(control.get('phase')=='drained' and control.get('inflight')==0,'entry drain failed')
+ return control
+
 def run_upgrade(image,config,api,ticket,entry):
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
  preflight_timeout=pg.preflight_timeout_seconds(config.get('postgres_preflight_timeout_seconds',30))
@@ -273,13 +284,8 @@ def run_upgrade(image,config,api,ticket,entry):
   return probe(entry,ticket,row,port,path,headers)
  verify_installed_tools(ticket)
  try:
-  record['phase']='waiting-idle';entry.save_json(path/'release.json',record)
-  control=entry.wait_entry_idle();need(control.get('slot')=='candidate' and control.get('phase')=='active' and control.get('inflight')==0,'current entry is not idle PG')
-  control=entry.entry_state('hold',control['epoch'])
-  # A request can arrive between the idle observation and hold. Abort without
-  # waiting behind that request; the unchanged-source recovery resumes ingress.
-  need(control.get('inflight')==0,'entry became busy before hold')
-  control=entry.entry_state('drain',control['epoch']);need(control.get('phase')=='drained' and control.get('inflight')==0,'entry drain failed')
+  record['phase']='waiting-drain';entry.save_json(path/'release.json',record)
+  control=drain_active_entry(entry)
   gate_attempted=True;gate=gate_install(entry,ticket,config);record.update(phase='holding',gate=gate);entry.save_json(path/'release.json',record);record['retiredSqlite']=retire_sqlite(api,ticket);entry.save_json(path/'release.json',record)
   pg_api.update(runtime_upgrade=True,retain_previous=True,activation=activation,http_code=http_code)
   result=pg.deploy(image,config,None,pg_api);new_gateway=api['inspect_container'](api['NAME']);new_worker=api['inspect_container'](api['NAME']+'-worker')
