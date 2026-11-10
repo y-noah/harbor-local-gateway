@@ -120,7 +120,7 @@ async function readRecord(handle,record){
  const from=record.segmentFrom??state.sealed_at;if(at<from)fail('clock_reversed');
  const expected=capacitySeedWindowCounts(record.manifest,at),lost7=rangeLosses(record.losses,capacitySeedWindowIndexRanges(record.manifest,at,'7d')),lost30=rangeLosses(record.losses,capacitySeedWindowIndexRanges(record.manifest,at,'30d'));
  const lost=record.losses.reduce((count,byte)=>count+popcount[byte],0);
- const facts={protected:true,sealed:true,available:true,method:'monotone-seed-loss-lower-bound',from,through:at,pricingRevision:state.pricing_revision,lostSeedRows:lost,metadata7d:expected.metadata7d-lost7,metadata30d:expected.metadata30d-lost30,segments:record.segments.map(row=>({...row})),formalQualified:false};
+ const facts={protected:true,sealed:true,available:true,method:'monotone-seed-loss-lower-bound',manifestHash:record.manifest.manifestHash,sourceCluster:record.identity.cluster,sourceDatabase:record.identity.database,from,through:at,pricingRevision:state.pricing_revision,lostSeedRows:lost,metadata7d:expected.metadata7d-lost7,metadata30d:expected.metadata30d-lost30,segments:record.segments.map(row=>({...row})),formalQualified:false};
  const {segments,...interval}=facts;record.lastFacts=Object.freeze(interval);return facts;
 }
 export async function readCapacityBaselineGuard(handle){return serialized(handle,record=>readRecord(handle,record));}
