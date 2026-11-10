@@ -128,6 +128,56 @@ export async function verifyDataset(store,manifest,{recordingKey,at=Date.now(),s
 }
 
 
+async function contextCipherHashes(store,ids,contextKeyVersion){
+ return new Map((await store.all(`SELECT s.request_id,CASE WHEN BOOL_AND(COALESCE(o.key_version=$2 AND o.state='complete' AND o.scope_digest=s.scope_digest AND p.object_id IS NOT NULL AND p.ordinal>=1 AND p.ordinal<=o.parts,false)) AND COUNT(DISTINCT ref.ordinal)=MAX(s.components) AND MIN(ref.ordinal)=1 AND MAX(ref.ordinal)=COUNT(DISTINCT ref.ordinal) THEN md5(string_agg(md5(jsonb_build_array(r.member_id,r.session_id,session.member_id,r.recording_state,c.expires_at,s.member_id,s.session_id,encode(s.scope_digest,'hex'),s.key_version,s.state,s.reason,s.coverage,s.seen,s.components,s.bytes,s.expires_at,s.created,encode(s.fingerprint,'hex'),ref.ordinal,ref.truncated,o.id,encode(o.scope_digest,'hex'),encode(o.fingerprint,'hex'),o.key_version,o.state,o.kind,o.bytes,o.parts,p.ordinal,p.bytes,md5(p.content_cipher))::text),'' ORDER BY ref.ordinal,p.ordinal)) ELSE NULL END value
+  FROM harbor.recording_context_snapshots s JOIN harbor.requests r ON r.id=s.request_id LEFT JOIN harbor.sessions session ON session.id=r.session_id JOIN harbor.recordings c ON c.request_id=s.request_id LEFT JOIN harbor.recording_context_references ref ON ref.request_id=s.request_id LEFT JOIN harbor.recording_context_objects o ON o.id=ref.object_id LEFT JOIN harbor.recording_context_parts p ON p.object_id=o.id WHERE s.request_id=ANY($1::text[]) AND s.key_version=$2 GROUP BY s.request_id`,ids,contextKeyVersion)).map(row=>[row.request_id,row.value]));
+}
+
+// Source coverage is separate from index/storage/runtime qualification. This
+// verifier never creates missing receipts or repairs the original corpus.
+export async function verifyDatasetContexts(store,manifest,{recordingKey,at=Date.now(),signal}={}){
+ if(!Number.isSafeInteger(at)||at<0)throw Error('capacity_dataset_window_invalid');
+ if(!store.context.getStore())return store.transaction(()=>verifyDatasetContexts(store,manifest,{recordingKey,at,signal}),{level:'REPEATABLE READ',readOnly:true});
+ if(!['repeatable read','serializable'].includes((await store.get("SELECT current_setting('transaction_isolation') isolation")).isolation))throw Error('capacity_dataset_verification_snapshot_required');
+ signal?.throwIfAborted();const marker=await owned(store,manifest);
+ if(!Buffer.isBuffer(recordingKey)||recordingKey.length!==32||marker.recording_key_digest!==digest(recordingKey))throw Error('capacity_dataset_recording_key_invalid');
+ const report={manifestHash:manifest.manifestHash,observedAt:at,scope:'original-context-source-only',verified:false,receipts:0,active:0,expired:0,mismatches:0,readableSizes:[],missing:[],formalQualified:false};
+ if(!(await store.get("SELECT to_regclass('harbor_capacity.context_receipts') present")).present)return {...report,missing:['context_receipts_missing']};
+ const contexts=new RecordingContextStore(store,{encryptionKey:recordingKey,clock:()=>at}),generator=digest(readFileSync(new URL('./context-payload.mjs',import.meta.url))),samples=new Map();let cursor=-1;
+ for(;;){
+  signal?.throwIfAborted();
+  const rows=await store.all(`SELECT b.*,r.id source_id,r.member_id source_member,r.session_id source_session,session.member_id session_member,c.expires_at body_expires,s.request_id snapshot_id,s.member_id snapshot_member,s.session_id snapshot_session,s.state,s.reason,s.bytes,s.components,s.seen,s.expires_at snapshot_expires
+   FROM harbor_capacity.context_receipts b LEFT JOIN harbor.requests r ON r.id=b.request_id LEFT JOIN harbor.sessions session ON session.id=r.session_id LEFT JOIN harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.recording_context_snapshots s ON s.request_id=r.id WHERE b.fixture_index>$1 ORDER BY b.fixture_index LIMIT $2`,cursor,manifest.batchSize);
+  if(!rows.length)break;
+  const live=rows.filter(row=>Number.isSafeInteger(row.fixture_index)&&row.fixture_index>=0&&row.fixture_index<manifest.bodyRequests&&fixtureTimestamp(manifest,row.fixture_index)+30*86400000>at),hashes=await contextCipherHashes(store,live.map(row=>row.request_id),contexts.keyVersion);
+  for(const row of rows){
+   report.receipts++;const index=row.fixture_index;
+   if(!Number.isSafeInteger(index)||index<0||index>=manifest.bodyRequests){report.mismatches++;continue;}
+   const expires=fixtureTimestamp(manifest,index)+30*86400000,employee=index%manifest.employees,member=fixtureId(manifest.runId,'member',employee),session=fixtureId(manifest.runId,'session',employee*manifest.sessionsPerEmployee+Math.floor(index/manifest.employees)%manifest.sessionsPerEmployee),bytes=bodyBytes(manifest,index),active=expires>at;
+   if(active)report.active++;else report.expired++;
+   if(row.request_id!==fixtureId(manifest.runId,'request',index)||row.source_id!==row.request_id||row.source_member!==member||row.source_session!==session||row.session_member!==member||row.generator_hash!==generator||row.source_bytes!==bytes||!/^[a-f0-9]{64}$/.test(row.content_hash)||row.body_expires!==expires&&!(row.body_expires===null&&!active)){report.mismatches++;continue;}
+   if(!active)continue;
+   if(row.snapshot_id!==row.request_id||row.snapshot_member!==member||row.snapshot_session!==session||row.snapshot_expires!==expires||row.state!=='complete'||row.reason!==null||row.components!==5||row.seen!==5||row.bytes!==bytes||!hashes.get(row.request_id)||hashes.get(row.request_id)!==row.cipher_hash){report.mismatches++;continue;}
+   if(!samples.has(bytes))samples.set(bytes,row);
+  }
+  cursor=rows.at(-1).fixture_index;
+ }
+ // The positive keyset cursor must not conceal corrupt negative receipts.
+ if(await store.get('SELECT request_id FROM harbor_capacity.context_receipts WHERE fixture_index<0 LIMIT 1'))report.mismatches++;
+ for(const [bytes,row] of samples){
+  signal?.throwIfAborted();const components=new Map();let after={component:0,part:0};
+  for(;;){signal?.throwIfAborted();const page=await contexts.read(row.request_id,{after});if(page.state!=='complete')throw Error('capacity_context_source_unreadable');for(const part of page.parts){const item=components.get(part.component)??{kind:part.kind,text:''};item.text+=part.text;components.set(part.component,item);}if(!page.hasMore)break;after=page.next;}
+  const decoded=[...components.values()].map(row=>({kind:row.kind,content:JSON.parse(row.text)})),expected=capacityHistoricalContext(row.fixture_index,bytes);
+  if(JSON.stringify(decoded)!==JSON.stringify(expected.components)||expected.contentHash!==row.content_hash){report.mismatches++;continue;}
+  report.readableSizes.push(bytes);
+ }
+ const expectedActive=capacitySeedActiveBodyRanges(manifest,at).reduce((n,[first,end])=>n+end-first,0);
+ if(report.receipts!==manifest.bodyRequests)report.missing.push('context_receipt_coverage_incomplete');
+ if(report.active!==expectedActive)report.missing.push('context_active_coverage_incomplete');
+ if(report.mismatches)report.missing.push('context_source_mismatch');
+ signal?.throwIfAborted();report.readableSizes.sort((a,b)=>a-b);report.verified=!report.missing.length;return report;
+}
+
 // Explicit construction stage only. It does not extend verifyDataset or mint a
 // formal profile until context coverage, indexes and storage are also checked.
 export async function seedDatasetContexts(store,manifest,{recordingKey,signal,onProgress=async()=>{},first=0,until=manifest.bodyRequests}={}){
@@ -137,8 +187,7 @@ export async function seedDatasetContexts(store,manifest,{recordingKey,signal,on
  signal?.throwIfAborted();
  await store.query('CREATE TABLE IF NOT EXISTS harbor_capacity.context_receipts(request_id text PRIMARY KEY,fixture_index bigint UNIQUE NOT NULL,generator_hash text NOT NULL,source_bytes bigint NOT NULL,content_hash text NOT NULL,cipher_hash text NOT NULL)');
  const contextGenerator=digest(readFileSync(new URL('./context-payload.mjs',import.meta.url))),contexts=new RecordingContextStore(store,{encryptionKey:recordingKey,clock:()=>manifest.anchor}),contextKeyVersion=contexts.keyVersion;
- const cipherHashes=async ids=>new Map((await store.all(`SELECT s.request_id,CASE WHEN BOOL_AND(COALESCE(o.key_version=$2 AND o.state='complete' AND o.scope_digest=s.scope_digest AND p.object_id IS NOT NULL AND p.ordinal>=1 AND p.ordinal<=o.parts,false)) AND COUNT(DISTINCT ref.ordinal)=MAX(s.components) AND MIN(ref.ordinal)=1 AND MAX(ref.ordinal)=COUNT(DISTINCT ref.ordinal) THEN md5(string_agg(md5(jsonb_build_array(r.member_id,r.session_id,session.member_id,r.recording_state,c.expires_at,s.member_id,s.session_id,encode(s.scope_digest,'hex'),s.key_version,s.state,s.reason,s.coverage,s.seen,s.components,s.bytes,s.expires_at,s.created,encode(s.fingerprint,'hex'),ref.ordinal,ref.truncated,o.id,encode(o.scope_digest,'hex'),encode(o.fingerprint,'hex'),o.key_version,o.state,o.kind,o.bytes,o.parts,p.ordinal,p.bytes,md5(p.content_cipher))::text),'' ORDER BY ref.ordinal,p.ordinal)) ELSE NULL END value
-  FROM harbor.recording_context_snapshots s JOIN harbor.requests r ON r.id=s.request_id LEFT JOIN harbor.sessions session ON session.id=r.session_id JOIN harbor.recordings c ON c.request_id=s.request_id LEFT JOIN harbor.recording_context_references ref ON ref.request_id=s.request_id LEFT JOIN harbor.recording_context_objects o ON o.id=ref.object_id LEFT JOIN harbor.recording_context_parts p ON p.object_id=o.id WHERE s.request_id=ANY($1::text[]) AND s.key_version=$2 GROUP BY s.request_id`,ids,contextKeyVersion)).map(row=>[row.request_id,row.value]));
+ const cipherHashes=ids=>contextCipherHashes(store,ids,contextKeyVersion);
  let snapshots=0,reused=0;
  for(let batch=first;batch<until;batch+=manifest.batchSize){
   const end=Math.min(until,batch+manifest.batchSize);signal?.throwIfAborted();
