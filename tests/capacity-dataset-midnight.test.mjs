@@ -24,6 +24,7 @@ test('preparation across midnight verifies full seed separately from current win
   const purge=await jobs.claim(['recording.purge']);assert.ok(purge);await jobs.complete(purge,await backend.handlers['recording.purge'](purge));
   assert.equal((await store.get('SELECT COUNT(*) n FROM harbor.recordings WHERE request_id=ANY($1::text[])',expired.map(row=>row.request_id))).n,0);
   const checked=await verifyDataset(store,manifest,{recordingKey});assert.equal(checked.verified,true,'the real purge may delete only canonically expired seed recordings');assert.equal(checked.seedBodyRequests,130);assert.equal(checked.bodyRequests+checked.expiredSeedBodyRequests,130);
+  assert.equal((await verifyDataset(store,manifest,{recordingKey,seedOnly:true})).verified,true,'original seed selection preserves legal expiry semantics');
   const options={laboratory:lab,manifest,store,recordingKey,isOpen:()=>true};assert.equal(assertCapacityProfileBinding(await createCapacityProfileBinding(options),'selfcheck').datasetVerified,true);
   await store.transaction(async()=>{await store.run('UPDATE harbor_capacity.body_receipts SET request_id=$1 WHERE request_id=$2','missing-seed-request',expired[0].request_id);assert.equal((await verifyDataset(store,manifest,{recordingKey})).verified,false);throw Error('rollback-orphan-receipt');}).catch(error=>{assert.equal(error.message,'rollback-orphan-receipt');});
   const live=await store.get('SELECT request_id FROM harbor.recordings WHERE expires_at>$1 LIMIT 1',Date.now());

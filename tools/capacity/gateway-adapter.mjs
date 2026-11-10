@@ -273,7 +273,7 @@ export async function createTarget({profile='selfcheck',coverageVariants=profile
       let preRestoreDispatches;const restorationAuxiliary=await observations.createAuxiliaryScope({id:'recovery-readiness'});
       const dispatchCounts=()=>ledgerRoot.sourceIntegrity();
       const requirements=[['configuration','runtime-configuration.json','file'],['key_encryption','data/key-encryption.key','file'],['recording_key','data/recording-encryption.key','file'],['device_material','certificates','directory'],['account_material','runtime/accounts','directory'],['metering_spool','data/metering-spool','directory'],['recording_spool','data/recording-spool','directory']].map(([role,relative,kind])=>({role,root:materialRoot,relative,kind}));
-      const physicalRestore=await createCapacityRestoreAssessment({laboratory:lab,manifest,requirements,onDiagnostic:onRestoreDiagnostic,hooks:{
+      const physicalRestore=await createCapacityRestoreAssessment({laboratory:lab,manifest,recordingKey,requirements,onDiagnostic:onRestoreDiagnostic,hooks:{
         processes:()=>{preRestoreDispatches=dispatchCounts();return {gateway,worker};},
         restartRuntime:async({database:restoredDatabase,storageDatabase,pgDataDir,signal:restoreSignal})=>{
           const restoredConfiguration=JSON.parse(await readFile(runtimeConfigurationFile,'utf8'));if(restoredConfiguration.config!==undefined||restoredConfiguration.loadAccountMaterials!==true||restoredConfiguration.dataDir!==dataDir||restoredConfiguration.runtimeDir!==runtimeDir||restoredConfiguration.certificateDirectory!==certificateDirectory)throw new Error('capacity_restore_configuration_mismatch');
