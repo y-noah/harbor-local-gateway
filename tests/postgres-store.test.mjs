@@ -1143,6 +1143,22 @@ test('R47 paged member and Key twelve-hour usage excludes the observation instan
   const state=createPostgresStateQueries(store,{clock:()=>at,encryptionKey:legacy.encryptionKey});try{const old=await state.read(),queries=createPostgresMemberQueries(store,{clock:()=>at,encryptionKey:legacy.encryptionKey}),employee=await queries.detail(member.memberId),key=(await queries.keys(memberQuery(new URLSearchParams(),{keys:true}))).rows[0];assert.equal(employee.standard.requests,5);assert.equal(employee.standard_12h.requests,2);assert.deepEqual(employee.standard_12h,old.members[0].standard_12h);assert.deepEqual(key.standard_12h,old.keys[0].standard_12h);}finally{await state.close();}
 });
 
+test('员工和Key窄聚合跨费率去重IP并保留精确金额与近12小时边界',integration,async t=>{
+  const {store}=await fixture(t);await store.migrate();await store.initializePricing();const {member,legacy}=await legacyMember(t,store),at=Date.now(),a=(await store.get('SELECT id FROM harbor.pricing_versions LIMIT 1')).id,b='synthetic-usage-book-b';
+  await store.run('INSERT INTO harbor.pricing_versions(id,created,book) SELECT $1,created,book FROM harbor.pricing_versions WHERE id=$2',b,a);
+  const rows=[
+    [a,a,'priced','900719925474099300001',-1000,'synthetic-ip-a'],[b,b,'priced','20',-2000,'synthetic-ip-a'],
+    [a,b,'priced','50',-3000,'synthetic-ip-b'],['synthetic-missing-book','synthetic-missing-book','priced','70',-4000,'synthetic-ip-b'],
+    [b,b,'manual','30',-12*3600000-1,'synthetic-ip-b'],[a,a,'pending',null,-5000,'synthetic-ip-a']
+  ];
+  for(const [version,projection,state,total,offset,ip] of rows){const id=randomUUID();await store.run('INSERT INTO harbor.requests(id,member_id,key_id,started,ended,status,ip,model,price_version) VALUES($1,$2,$3,$4,$5,\'ok\',$6,\'gpt-6.1-sol\',$7)',id,member.memberId,member.keyId,at+offset-100,at+offset,ip,version);await store.run('INSERT INTO harbor.request_prices(request_id,state,revision,input_atoms,output_atoms,cached_atoms,adjustment_atoms,total_atoms,measured_at) VALUES($1,$2,$3,$4,0,0,0,$4,$5)',id,state,projection,total,at);}
+  const state=createPostgresStateQueries(store,{clock:()=>at,encryptionKey:legacy.encryptionKey});try{
+    const old=await state.read(),queries=createPostgresMemberQueries(store,{clock:()=>at,encryptionKey:legacy.encryptionKey}),employee=await queries.detail(member.memberId),key=(await queries.keys(memberQuery(new URLSearchParams(),{keys:true}))).rows[0];
+    for(const row of [employee,key]){assert.equal(row.ips,2);assert.equal(row.used_devices,0);assert.equal(row.unverified_requests,6);assert.equal(row.standard.requests,6);assert.equal(row.standard.known,3);assert.equal(row.standard.unpriced,2);assert.equal(row.standard.pending,1);assert.equal(row.standard_12h.requests,5);assert.equal(row.standard_12h.known,2);assert.deepEqual(row.standard.revisions,[a,b].sort());assert.equal(row.standard.total_exact,'900719925.474099300051');assert.equal(row.standard_12h.total_exact,'900719925.474099300021');}
+    assert.deepEqual(employee.standard,old.members[0].standard);assert.deepEqual(employee.standard_12h,old.members[0].standard_12h);assert.deepEqual(key.standard,old.keys[0].standard);assert.deepEqual(key.standard_12h,old.keys[0].standard_12h);
+  }finally{await state.close();}
+});
+
 test('PostgreSQL type template history is paged and restoring creates a new version without rewriting employees or old templates',integration,async t=>withGateway(t,async({store,password,open})=>{
   const app=await open(),origin=await listenGateway(app),cookie=await gatewayLogin(origin,password),request=async(path,method='GET',body)=>{const r=await fetch(origin+'/api/admin/'+path,{method,headers:{cookie,'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});return {status:r.status,value:await r.json()};};
   assert.equal((await fetch(origin+'/api/admin/member-types/usage-a/templates')).status,401);const first={allowed_models:['gpt-6.1-sol'],usage_limits:{enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'2.00'}]}},second={allowed_models:['gpt-6-astra'],usage_limits:{enabled:false,rules:[]}};

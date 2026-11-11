@@ -45,7 +45,7 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
     const rows=await store.all(`WITH data AS (
       SELECT r.member_id,m.name member_name,COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model,${businessOutcomes?'r.business_status':'r.status'} status,r.started,r.ended,
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
-        CASE WHEN ${validPrice} THEN p.revision ELSE NULL END revision,
+        r.price_version revision,
         ${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms ELSE NULL END ${f}`).join(',')}
       FROM harbor.requests r LEFT JOIN harbor.members m ON m.id=r.member_id${joins}${scope.where}
     ),partial AS MATERIALIZED(SELECT chosen_model,member_id,MIN(member_name) member_name,revision,${referencePartialAggregateSql()}

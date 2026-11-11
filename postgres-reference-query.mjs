@@ -35,10 +35,11 @@ export function referenceAggregateSql({condition='',prefix=''}={}){return refere
 // Partial groups keep NUMERIC sums and duration counts. Only the final result
 // converts amounts to text; neither rounded money nor averages are re-averaged.
 export function referencePartialAggregateSql({standardOnly=false}={}){return referenceSql({partial:true,standardOnly});}
-export function referenceRollupAggregateSql({standardOnly=false}={}){
-  return [...['requests',...(standardOnly?[]:['success','active']),'known','pending','unpriced','expired','unmetered'].map(name=>`COALESCE(SUM(${name}),0)::bigint ${name}`),
-    ...(standardOnly?[]:['SUM(duration_sum)/NULLIF(SUM(duration_count),0) average_ms']),
-    ...fields.map(field=>`COALESCE(SUM(${field}),0)::text ${field}`),
-    'ARRAY_AGG(DISTINCT revision) FILTER(WHERE known>0 AND revision IS NOT NULL) revisions'].join(',');
+export function referenceRollupAggregateSql({standardOnly=false,condition='',prefix=''}={}){
+  const filter=predicate=>condition||predicate?` FILTER(WHERE ${[condition,predicate].filter(Boolean).join(' AND ')})`:'';
+  return [...['requests',...(standardOnly?[]:['success','active']),'known','pending','unpriced','expired','unmetered'].map(name=>`COALESCE(SUM(${name})${filter()},0)::bigint ${prefix}${name}`),
+    ...(standardOnly?[]:[`SUM(duration_sum)${filter()}/NULLIF(SUM(duration_count)${filter()},0) ${prefix}average_ms`]),
+    ...fields.map(field=>`COALESCE(SUM(${field})${filter()},0)::text ${prefix}${field}`),
+    `ARRAY_AGG(DISTINCT revision)${filter('known>0 AND revision IS NOT NULL')} ${prefix}revisions`].join(',');
 }
 export const aggregateSql=referenceAggregateSql();
