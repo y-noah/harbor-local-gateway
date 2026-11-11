@@ -1,3 +1,4 @@
+import {once as eventOnce} from 'node:events';
 import {createPostgresChatState} from '../postgres-chat-state.mjs';
 import {chatSettlementFacts,digestChatMessages} from '../chat-facts.mjs';
 import {spawn} from 'node:child_process';
@@ -182,7 +183,9 @@ test('R21 slow uploads protect routing until every same-member body completes or
   await wait(()=>handler.status().preparing===2);
   response=await send();assert.equal(response.status,409);assert.equal((await response.json()).error.code,'session_busy');assert.equal(calls,1);
   // Finishing one body must not clear the other upload's reference count.
-  uploads[0].end('synthetic","stream":false}');await wait(()=>handler.status().preparing===1);
+  // Body-read completion precedes async routing; wait for its actual rejection before releasing the sibling.
+  const completedUpload=eventOnce(uploads[0],'response',{signal:AbortSignal.timeout(5000)});
+  uploads[0].end('synthetic","stream":false}');const [uploadResult]=await completedUpload;assert.equal(uploadResult.statusCode,409);assert.equal(calls,1);await wait(()=>handler.status().preparing===1);
   response=await send();assert.equal(response.status,409);await response.json();assert.equal((await store.get('SELECT route_version FROM harbor.sessions WHERE id=$1',before.id)).route_version,0);
   uploads[1].destroy();await wait(()=>handler.status().preparing===0);
   response=await send();assert.equal(response.status,200);await response.json();const after=await store.get('SELECT * FROM harbor.sessions WHERE id=$1',before.id);assert.equal(after.account_id,'b');assert.equal(after.route_version,1);assert.equal(calls,2);
@@ -2591,8 +2594,14 @@ test('PostgreSQL Chat queue serializes one account and queued client cancellatio
 
 for(const scenario of ['timeout','disabled-key'])test('PostgreSQL Chat queued '+scenario+' is rejected without starting another CLI',integration,async t=>withGateway(t,async({store,member,open})=>{
  await prepareHttpChat(store,member);const secondKey=await otherHttpChatKey(store,'chat-waiter'),held=heldHttpChat(),app=await open({executor:held.executor,chat:{waitMs:scenario==='timeout'?100:120000}}),origin=await listenGateway(app),first=sendHttpChat(origin,member.secret,{messages:[{role:'user',content:'first'}]});let second;
- try{await gatewayWait(()=>held.calls.length===1);second=sendHttpChat(origin,secondKey,{messages:[{role:'user',content:'waiter'}]});await gatewayWait(()=>app.status().chat.queued===1);if(scenario==='disabled-key'){await store.run("UPDATE harbor.keys SET enabled=0 WHERE id='chat-waiter-key'");held.gates[0]();assert.equal((await first).status,200);}const rejected=await second;assert.equal(rejected.status,scenario==='timeout'?503:403);assert.equal(held.calls.length,1);const row=await store.get("SELECT * FROM harbor.requests WHERE member_id='chat-waiter'");assert.equal(row.status,'rejected');assert.equal(row.reserved,0);assert.equal(row.usage_unknown,0);if(scenario==='timeout'){held.gates[0]();await first;}
- }finally{for(const release of held.gates)release();await first.catch(()=>{});await second?.catch(()=>{});}
+ let mockedQueueClock=false;
+ try{await gatewayWait(()=>held.calls.length===1);if(scenario==='timeout'){t.mock.timers.enable({apis:['setTimeout']});mockedQueueClock=true;}second=sendHttpChat(origin,secondKey,{messages:[{role:'user',content:'waiter'}]});
+  if(scenario==='timeout'){
+   // Keep the 100ms deadline pending until the queue state is observed, even on a busy CI host.
+   const deadline=Date.now()+5000;while(app.status().chat.queued!==1){assert.ok(Date.now()<deadline,'chat did not enter queue');await new Promise(setImmediate);}
+   t.mock.timers.tick(100);t.mock.timers.reset();mockedQueueClock=false;
+  }else await gatewayWait(()=>app.status().chat.queued===1);if(scenario==='disabled-key'){await store.run("UPDATE harbor.keys SET enabled=0 WHERE id='chat-waiter-key'");held.gates[0]();assert.equal((await first).status,200);}const rejected=await second;assert.equal(rejected.status,scenario==='timeout'?503:403);assert.equal(held.calls.length,1);const row=await store.get("SELECT * FROM harbor.requests WHERE member_id='chat-waiter'");assert.equal(row.status,'rejected');assert.equal(row.reserved,0);assert.equal(row.usage_unknown,0);if(scenario==='timeout'){held.gates[0]();await first;}
+ }finally{if(mockedQueueClock)t.mock.timers.reset();for(const release of held.gates)release();await first.catch(()=>{});await second?.catch(()=>{});}
 }));
 
 test('PostgreSQL Chat queued work follows a disabled account new binding while in-flight billing stays with its old account',integration,async t=>withGateway(t,async({store,member,password,open})=>{
