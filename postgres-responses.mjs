@@ -136,28 +136,28 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
-      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams)||await memberAdmin.handle(path,req.method,payload,url.searchParams);if(result){json(res,result.status,result.value);return true;}
+      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams)||await memberAdmin.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){json(res,result.status,result.value);return true;}
     }
     if((path==='/api/admin/history'||path.startsWith('/api/admin/history/'))&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      if(path==='/api/admin/history'){json(res,200,await queryQueue.run(()=>history.list(historyQuery(url.searchParams))));return true;}
+      if(path==='/api/admin/history'){json(res,200,await queryQueue.run(()=>history.list(historyQuery(url.searchParams)),{signal:bodySignal}));return true;}
       const match=path.match(/^\/api\/admin\/history\/nightly\/(\d{4}-\d{2}-\d{2}(?:-\d{4})?)(\/(?:items|revisions))?$/);if(!match)throw new AppError(404,'历史查询入口不存在');
       const params=url.searchParams;
       const allowed=match[2]==='/items'?['section','after','limit','revision']:match[2]==='/revisions'?['after','limit']:['revision'];
       for(const name of params.keys())if(!allowed.includes(name)||params.getAll(name).length!==1)throw new AppError(400,'夜间历史查询参数无效');
       for(const name of ['after','limit','revision'])if(params.has(name)&&!/^\d+$/.test(params.get(name)))throw new AppError(400,'夜间历史分页无效');
       const revision=params.has('revision')?Number(params.get('revision')):undefined,paging={after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)};
-      const result=await queryQueue.run(()=>match[2]==='/revisions'?history.revisions(match[1],paging):match[2]?history.page(match[1],{...paging,revision,section:params.get('section')??'moves'}):history.nightly(match[1],{revision}));json(res,200,result);return true;
+      const result=await queryQueue.run(()=>match[2]==='/revisions'?history.revisions(match[1],paging):match[2]?history.page(match[1],{...paging,revision,section:params.get('section')??'moves'}):history.nightly(match[1],{revision}),{signal:bodySignal});json(res,200,result);return true;
     }
     if(await pricingAdmin.handle(req,res,{signal:bodySignal}))return true;
     if(path==='/api/admin/state'&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      const value=await states.read(stateQuery(url.searchParams));
+      const value=await states.read(stateQuery(url.searchParams),{signal:bodySignal});
       json(res,200,{...value,...(adminStateContext?await adminStateContext():{}),busy:active.size,queue:chat?.status().queued??0,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0)});return true;
     }
     if(path==='/api/admin/requests'&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      json(res,200,await queries.read(requestsQuery(url.searchParams,{usageTypes:true})));return true;
+      json(res,200,await queries.read(requestsQuery(url.searchParams,{usageTypes:true}),{signal:bodySignal}));return true;
     }
     const contextDetail=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]{1,80})\/context$/);
     if(contextDetail&&req.method==='GET'){

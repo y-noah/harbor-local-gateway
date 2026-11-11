@@ -173,5 +173,5 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         requests:requests.map(row=>decorate(row,window.start)),totals:totals||{requests:0,success:0,standard:empty},daily:daily.sort((a,b)=>a.day.localeCompare(b.day)),audit};
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {read:query=>{const input={...query};return queue.run(()=>execute(input));},close:()=>queue.close(),status:()=>queue.status()};
+  return {read:(query,{signal}={})=>{const input={...query};return queue.run(()=>execute(input),{signal});},close:()=>queue.close(),status:()=>queue.status()};
 }

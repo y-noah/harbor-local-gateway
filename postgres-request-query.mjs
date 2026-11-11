@@ -74,5 +74,5 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
       return {...metadata,...(query.view==='summary'?{}:await list(query,current)),...(query.view==='list'?{}:await statistics(query,current))};
     },{level:'REPEATABLE READ'});
   };
-  return {read:query=>{const input={...query};return queue.run(()=>execute(input));},close:()=>queue.close(),status:()=>queue.status(),queue};
+  return {read:(query,{signal}={})=>{const input={...query};return queue.run(()=>execute(input),{signal});},close:()=>queue.close(),status:()=>queue.status(),queue};
 }

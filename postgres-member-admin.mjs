@@ -35,16 +35,16 @@ export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,c
       keyId,memberId,hash(secret),secret.slice(0,11),expires,clock(),quota,encryptStoredKey(encryptionKey,secret,keyId),allowedModels===null?null:JSON.stringify(allowedModels),JSON.stringify(modelSource));
     await audit('key.create',keyId);if(allowedModels!==null)await audit('key.models',{key:keyId,allowed_models:allowedModels});return {keyId,secret};
   }
-  async function handle(path,method,payload,params){
+  async function handle(path,method,payload,params,{signal}={}){
     if(method==='GET'){
       params??=new URLSearchParams();
-      if(path==='/api/admin/members')return {status:200,value:await queries.list(memberQuery(params))};
-      if(path==='/api/admin/members/selection'){if(params.has('view'))throw new AppError(400,'筛选选择不接受视图参数');return {status:200,value:await queries.selection(memberQuery(params))};}
-      if(path==='/api/admin/keys')return {status:200,value:await queries.keys(memberQuery(params,{keys:true}))};
+      if(path==='/api/admin/members')return {status:200,value:await queries.list(memberQuery(params),{signal})};
+      if(path==='/api/admin/members/selection'){if(params.has('view'))throw new AppError(400,'筛选选择不接受视图参数');return {status:200,value:await queries.selection(memberQuery(params),{signal})};}
+      if(path==='/api/admin/keys')return {status:200,value:await queries.keys(memberQuery(params,{keys:true}),{signal})};
       const copyPolicy=path.match(/^\/api\/admin\/keys\/([a-f0-9-]{36})\/policy$/);
-      if(copyPolicy){if([...params.keys()].length)throw new AppError(400,'Key权限摘要不接受查询参数');return {status:200,value:await queries.keyPolicy(copyPolicy[1])};}
+      if(copyPolicy){if([...params.keys()].length)throw new AppError(400,'Key权限摘要不接受查询参数');return {status:200,value:await queries.keyPolicy(copyPolicy[1],{signal})};}
       const detail=path.match(/^\/api\/admin\/members\/([a-f0-9-]{36})(\/keys)?$/);
-      if(detail){if(!detail[2]&&[...params.keys()].length)throw new AppError(400,'员工详情不接受查询参数');return {status:200,value:detail[2]?await queries.keys(memberQuery(params,{keys:true}),{memberId:detail[1],reveal:true}):await queries.detail(detail[1])};}
+      if(detail){if(!detail[2]&&[...params.keys()].length)throw new AppError(400,'员工详情不接受查询参数');return {status:200,value:detail[2]?await queries.keys(memberQuery(params,{keys:true}),{memberId:detail[1],reveal:true,signal}):await queries.detail(detail[1],{signal})};}
     }
     const actionResult=await actions.handle(path,method,payload,params);if(actionResult)return actionResult;
     const batchResult=await batches.handle(path,method,payload,params);if(batchResult)return batchResult;
@@ -62,7 +62,7 @@ export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,c
     if(typeMatch&&method==='PATCH')return {status:200,value:await store.transaction(async()=>types.changeType(await activeMember(typeMatch[1]),payload))};
     const limitMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/usage-limits$/);
     if(limitMatch&&['GET','PATCH'].includes(method)){
-      return {status:200,value:await queryQueue.run(async()=>{if(method==='PATCH')await limits.save(limitMatch[1],payload);return readLimits.status(limitMatch[1]);})};
+      return {status:200,value:await queryQueue.run(async()=>{if(method==='PATCH')await limits.save(limitMatch[1],payload);return readLimits.status(limitMatch[1]);},method==='GET'?{signal}:{})};
     }
     const memberMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
     if(memberMatch&&['PATCH','DELETE'].includes(method))return {status:200,value:await store.transaction(async()=>{
