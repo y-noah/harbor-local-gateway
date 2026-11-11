@@ -751,6 +751,34 @@ test('R2 member limit loading shows retry/close for network and HTTP errors and 
 });
 
 
+test('支持完整页的服务一次读取明细与汇总并保留分页快照和统计水位',async()=>{
+ const calls=[],data={snapshot:'stable',watermark:'same-read',watermarkKind:'postgres_visibility',observedAt:1234,pagination:{page:2,pageSize:20,total:41,totalPages:3,nextCursor:'next'},rows:[],summary:{requests:41,success:40,active:0,average_ms:1,standard:{total:2}},byModel:[],byMember:[],models:['synthetic-model'],members:[]};
+ const page=await ui(path=>{calls.push(new URL(path,'http://localhost'));return response(data);});page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';requestsFilters.page=2;requestsFilters.pageSize=20;requestsPageSnapshot='stable';requestsCursors=new Map([[2,'previous']]);");
+ await page.run("loadRequests('',{preservePage:true})");await new Promise(setImmediate);
+ assert.equal(calls.length,1);assert.equal(calls[0].searchParams.get('view'),'all');assert.equal(calls[0].searchParams.get('snapshot'),'stable');assert.equal(calls[0].searchParams.get('cursor'),'previous');assert.equal(page.run('requestsFilters.page'),2);assert.equal(page.run('requestsCursors.get(3)'),'next');assert.equal(page.run('requestsData.statisticsAt'),1234);assert.equal(page.run('requestsData.statisticsWatermark'),'same-read');assert.equal(page.run('requestsData.statisticsWatermarkKind'),'postgres_visibility');assert.match(page.node('#content').innerHTML,/title="统计时间/);assert.doesNotMatch(page.node('#content').innerHTML,/不同读取快照|汇总独立加载中/);
+});
+
+test('完整页服务的模型统计仍直接读取summary而不加载明细',async()=>{
+ const calls=[],page=await ui(path=>{calls.push(new URL(path,'http://localhost'));return response({snapshot:'stats',observedAt:1,summary:{requests:0,success:0,active:0,average_ms:0,standard:{}},byModel:[],byMember:[],models:[],members:[]});});page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';requestStatisticsTab='model';");await page.run('loadRequests()');assert.equal(calls.length,1);assert.equal(calls[0].searchParams.get('view'),'summary');assert.equal(page.run('requestsData.listLoaded'),false);
+});
+
+test('完整页的JSON或代理HTML服务端错误仅降级一次且保留独立明细与汇总',async()=>{
+ for(const proxyHtml of [false,true]){
+  const calls=[];let releaseSummary;const page=await ui(path=>{const view=new URL(path,'http://localhost').searchParams.get('view');calls.push(view);if(view==='all')return proxyHtml?{ok:false,status:502,json:async()=>{throw SyntaxError('synthetic HTML');}}:response({error:{message:'synthetic unavailable'}},503);if(view==='list')return response({snapshot:'fallback',watermark:1,pagination:{page:1,pageSize:20,total:3,totalPages:1},rows:[]});return new Promise(resolve=>releaseSummary=()=>resolve(response({summary:{requests:3,success:3,active:0,average_ms:1,standard:{}},byModel:[],byMember:[],models:[],members:[],observedAt:2,watermark:1})));});
+  page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';");await page.run('loadRequests()');assert.deepEqual(calls,['all','list','summary']);assert.match(page.node('#content').innerHTML,/共 3 条/);assert.match(page.node('#content').innerHTML,/汇总独立加载中/);releaseSummary();await new Promise(setImmediate);assert.equal(page.run('requestsData.summary.requests'),3);assert.equal(page.run('requestsPageSnapshot'),'fallback');assert.deepEqual(calls,['all','list','summary']);
+ }
+});
+
+test('完整页的权限筛选或网络错误不盲目降级',async()=>{
+ for(const status of [400,401,403,null]){
+  const calls=[],page=await ui(path=>{calls.push(path);if(status===null)throw TypeError('synthetic network failure');return response({error:{message:'synthetic denied'}},status);});page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';");await page.run('loadRequests()');assert.equal(calls.length,1,String(status));assert.equal(page.run('requestsData'),null);
+ }
+});
+
+test('旧完整页的迟到服务端错误不能触发降级或覆盖新筛选',async()=>{
+ const pending=[],page=await ui((path,options)=>new Promise(resolve=>pending.push({path,signal:options.signal,resolve})));page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';");const first=page.run('loadRequests()'),second=page.run("requestsFilters.model='changed';loadRequests()");assert.equal(pending[0].signal.aborted,true);pending[1].resolve(response({snapshot:'new',watermark:1,pagination:{page:1,pageSize:20,total:1,totalPages:1},rows:[],summary:{requests:1,success:1,active:0,average_ms:1,standard:{}},byModel:[],byMember:[],models:['changed'],members:[]}));await second;pending[0].resolve(response({error:{message:'synthetic old failure'}},503));await first;assert.equal(pending.length,2);assert.equal(page.run('requestsData.snapshot'),'new');assert.equal(page.run('requestsData.summary.requests'),1);
+});
+
 test('request metadata renders before statistics and a stale summary cannot overwrite a new filter',async()=>{
  const pending=[];const page=await ui((path,options)=>new Promise(resolve=>pending.push({path,signal:options.signal,release:body=>resolve(response(body))})));
  page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';");

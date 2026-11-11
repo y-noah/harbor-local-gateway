@@ -105,7 +105,7 @@ async function api(path,method='GET',data,credential='',signal){
   const epoch=authEpoch;
   const r=await fetch(path,{method,signal,headers:{...(credential?{Authorization:'Bearer '+credential}:{}),...(data!==undefined?{'Content-Type':'application/json'}:{})},...(data!==undefined?{body:JSON.stringify(data)}:{})});
   if(r.status===401&&path.startsWith('/api/admin/')&&epoch===authEpoch){admin=false;authEpoch++;state=null;showLogin();}
-  let b;try{b=await r.json();}catch{throw Error(r.ok?'服务返回了空或无效响应，请刷新页面后重试':'请求失败（HTTP '+r.status+'），请稍后重试');}
+  let b;try{b=await r.json();}catch{throw Object.assign(Error(r.ok?'服务返回了空或无效响应，请刷新页面后重试':'请求失败（HTTP '+r.status+'），请稍后重试'),{status:r.status});}
   if(!r.ok){const error=Error(b?.error?.message||'请求失败（HTTP '+r.status+'）');error.status=r.status;throw error;}
   if(!b||typeof b!=='object')throw Error('服务返回了无效响应，请刷新页面后重试');
   if(path.startsWith('/api/admin/')&&epoch!==authEpoch)throw Error('登录状态已变更，请重新操作');
@@ -427,12 +427,20 @@ async function loadRequests(automaticScope='',{preservePage=false}={}){
       if(stats.snapshot)requestsPageSnapshot=stats.snapshot;
       requestsData={...stats,listLoaded:false,rows:[],pagination:{page:1,pageSize:filters.pageSize,total:stats.summary.requests,totalPages:Math.max(1,Math.ceil(stats.summary.requests/filters.pageSize))},statisticsAt:stats.observedAt,statisticsWatermark:stats.watermark,statisticsWatermarkKind:stats.watermarkKind};requestsLoading=false;connectionState('服务在线');render();return;
     }
-    const data=await api('/api/admin/requests?'+query,'GET',undefined,'',signal);
+    if(state?.capabilities?.requestPageSummary)query.set('view','all');
+    let data;
+    try{data=await api('/api/admin/requests?'+query,'GET',undefined,'',signal);}
+    catch(error){
+      if(query.get('view')!=='all'||error.status<500||error.status>599||!Number.isInteger(error.status)||!current())throw error;
+      // Preserve the independent list path when a combined server query fails.
+      query.set('view','list');data=await api('/api/admin/requests?'+query,'GET',undefined,'',signal);
+    }
     if(!current())return;
     if(automaticScope&&automaticRefreshScope()!==automaticScope)return;
     connectionState('服务在线');
     if(data.snapshot)requestsPageSnapshot=data.snapshot;
     if(data.pagination.nextCursor)requestsCursors.set(data.pagination.page+1,data.pagination.nextCursor);
+    if(data.summary)Object.assign(data,{statisticsAt:data.observedAt,statisticsWatermark:data.watermark,statisticsWatermarkKind:data.watermarkKind});
     data.models??=requestsData?.models||[];data.members??=requestsData?.members||[];
     const changed=requestsSnapshot(data)!==requestsSnapshot(requestsData);requestsData=data;requestsFilters.page=data.pagination.page;requestsLoading=false;if(!automaticScope||changed||data.summary?.active>0)render();
     if(!data.summary){

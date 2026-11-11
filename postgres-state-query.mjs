@@ -87,14 +87,14 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,standard:usage(row.id)}));
       if(view==='accounts'){
         const rows=accounts.length?await store.all(`WITH source AS (
-          SELECT r.account_id,r.status,r.started,r.ended,
+          SELECT r.account_id,
             CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
             r.price_version revision,
             ${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms END ${f}`).join(',')}
           FROM harbor.requests r${joins} WHERE r.usage_at>=$1 AND r.usage_at<$2 AND r.account_id=ANY($3::text[])
         ), partial AS MATERIALIZED (
-          SELECT account_id,revision,${referencePartialAggregateSql()} FROM source GROUP BY account_id,revision
-        ) SELECT account_id,${referenceRollupAggregateSql()} FROM partial GROUP BY account_id`,window.start,window.end,accounts.map(row=>row.id)):[];
+          SELECT account_id,revision,${referencePartialAggregateSql({standardOnly:true})} FROM source GROUP BY account_id,revision
+        ) SELECT account_id,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY account_id`,window.start,window.end,accounts.map(row=>row.id)):[];
         const usage=new Map(rows.map(row=>[row.account_id,aggregate(row).standard])),empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(f=>[f,'0']))}).standard;
         return {view:'accounts',usageMetric:referenceMetric,usageWindow:window,observedAt:at,peopleLoaded:false,
           accounts:accountData(id=>usage.get(id)||empty),...(balancingReader?{balancing:await balancingReader(at)}:{})};

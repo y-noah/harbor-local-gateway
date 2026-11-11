@@ -21,11 +21,11 @@ export function aggregate(row){
 
 // Fixed SQL callers can aggregate several windows in one scan without duplicating
 // request rows. Every amount remains NUMERIC until its text/BigInt boundary.
-function referenceSql({condition='',prefix='',partial=false}={}){
+function referenceSql({condition='',prefix='',partial=false,standardOnly=false}={}){
   const filter=predicate=>condition||predicate?` FILTER(WHERE ${[condition,predicate].filter(Boolean).map(value=>'('+value+')').join(' AND ')})`:'',
     count=(name,predicate)=>`COUNT(*)${filter(predicate)} ${prefix}${name}`;
-  return [count('requests'),count('success',"status='ok'"),count('active',"status IN ('queued','running')"),
-    ...(partial?[`SUM(ended-started)${filter('ended>=started')} ${prefix}duration_sum`,count('duration_count','ended>=started')]:[`AVG(ended-started)${filter('ended>=started')} ${prefix}average_ms`]),count('known','total IS NOT NULL'),
+  return [count('requests'),...(standardOnly?[]:[count('success',"status='ok'"),count('active',"status IN ('queued','running')"),
+    ...(partial?[`SUM(ended-started)${filter('ended>=started')} ${prefix}duration_sum`,count('duration_count','ended>=started')]:[`AVG(ended-started)${filter('ended>=started')} ${prefix}average_ms`])]),count('known','total IS NOT NULL'),
     count('pending',"total IS NULL AND price_state='pending'"),count('unpriced',"total IS NULL AND (price_state='unpriced' OR price_state IS NULL)"),
     count('expired',"total IS NULL AND price_state='expired'"),count('unmetered',"total IS NULL AND price_state NOT IN ('pending','unpriced','expired')"),
     ...fields.map(field=>partial?`SUM(${field})${filter()} ${prefix}${field}`:`COALESCE(SUM(${field})${filter()},0)::text ${prefix}${field}`),
@@ -34,10 +34,10 @@ function referenceSql({condition='',prefix='',partial=false}={}){
 export function referenceAggregateSql({condition='',prefix=''}={}){return referenceSql({condition,prefix});}
 // Partial groups keep NUMERIC sums and duration counts. Only the final result
 // converts amounts to text; neither rounded money nor averages are re-averaged.
-export function referencePartialAggregateSql(){return referenceSql({partial:true});}
-export function referenceRollupAggregateSql(){
-  return [...['requests','success','active','known','pending','unpriced','expired','unmetered'].map(name=>`COALESCE(SUM(${name}),0)::bigint ${name}`),
-    'SUM(duration_sum)/NULLIF(SUM(duration_count),0) average_ms',
+export function referencePartialAggregateSql({standardOnly=false}={}){return referenceSql({partial:true,standardOnly});}
+export function referenceRollupAggregateSql({standardOnly=false}={}){
+  return [...['requests',...(standardOnly?[]:['success','active']),'known','pending','unpriced','expired','unmetered'].map(name=>`COALESCE(SUM(${name}),0)::bigint ${name}`),
+    ...(standardOnly?[]:['SUM(duration_sum)/NULLIF(SUM(duration_count),0) average_ms']),
     ...fields.map(field=>`COALESCE(SUM(${field}),0)::text ${field}`),
     'ARRAY_AGG(DISTINCT revision) FILTER(WHERE known>0 AND revision IS NOT NULL) revisions'].join(',');
 }
