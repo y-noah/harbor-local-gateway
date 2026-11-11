@@ -152,12 +152,12 @@ select:not([multiple]):not([size]){appearance:none;padding-right:38px;background
 .record-navigation>input{flex:0 0 240px;width:240px;margin-left:auto}
 .member-controls>.member-filters{grid-template-columns:220px 180px 150px}
 .member-bulk-menu>summary{min-height:40px;display:flex;align-items:center;justify-content:center}
-.sidebar-status{flex-direction:column;align-items:stretch;padding:0;gap:10px}
-.sidebar-status>.sidebar-connection{padding:0 10px}
-#refresh{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:40px;border:1px solid #dce3dc;border-radius:8px;background:#fff;color:#315c48;font-size:13.2px}
-#refresh:hover{background:#edf4ef;border-color:#abc6b5}
+
+
+
+
 #refresh[aria-busy=true] .sidebar-icon{animation:harbor-refresh-spin .8s linear infinite}
-@media(max-width:760px){#refresh{flex-direction:column;gap:4px;padding:8px 2px}#refresh span{font-size:11px;line-height:1.3;white-space:normal}}
+
 
 .page-size-control{display:inline-flex;align-items:center;gap:6px;margin:0;font-size:13.2px;white-space:nowrap}.page-size-control select{width:82px;margin:0;height:38px;padding-top:6px;padding-bottom:6px}.pager{flex-wrap:wrap;gap:12px}.panel:has(>.compact-history-filters)>.panel-heading{padding-top:14px;padding-bottom:14px}
 
@@ -166,3 +166,27 @@ body{font-size:17.6px}
 @keyframes harbor-refresh-spin{to{transform:rotate(360deg)}}
 
 .guide-notice{border:1px solid var(--line);border-radius:8px;background:white;margin-bottom:16px}.guide-notice>summary{padding:12px 16px;color:#53695d;font-size:13.2px;cursor:pointer}
+
+.type-list-actions{margin-bottom:18px}.type-template-card .type-card-actions .actions{gap:10px}
+
+/* 导航可以单独一行；筛选及其操作按钮共用一条横向工具栏。 */
+.page-toolbar{display:flex;align-items:flex-end;gap:14px;min-width:0;max-width:100%;overflow-x:auto;flex-wrap:nowrap;margin-bottom:16px;padding-bottom:4px}
+.page-toolbar>.actions,.page-toolbar>.member-bulk-bar,.page-toolbar>.member-management-actions{flex:0 0 auto;flex-wrap:nowrap;margin:0;width:auto;white-space:nowrap}
+.page-toolbar>.filter-grid,.page-toolbar>.toolbar{margin:0;padding-bottom:0}
+.page-toolbar button,.page-toolbar summary,.recording-filter-row button{flex-shrink:0;white-space:nowrap;min-height:44px}
+.account-pool-controls>.account-pool-filters{flex:1 0 min-content;min-width:min-content;display:grid;grid-template-columns:minmax(190px,1.1fr) repeat(4,minmax(140px,1fr)) max-content;grid-auto-columns:auto;overflow:visible;width:auto;max-width:none}
+.account-pool-controls>.account-pool-toolbar{flex:0 0 auto;flex-wrap:nowrap;width:auto}
+.member-controls>.member-filters{flex:1 0 min-content;min-width:min-content;width:auto;grid-template-columns:minmax(180px,220px) minmax(140px,180px) minmax(110px,150px)}
+.overview-controls>.overview-filters{flex:1 0 auto;margin:0}.overview-controls>.actions{margin-left:auto}
+.request-controls>.request-filters{flex:1 0 min-content;min-width:min-content;overflow:visible;width:auto;max-width:none}
+.recording-query-form .recording-filter-row{display:flex;align-items:flex-end;flex-wrap:nowrap;gap:12px;overflow-x:auto;padding-bottom:4px}
+.recording-filter-row>label{flex:1 0 160px;width:160px;max-width:none}
+.recording-filter-row>.recording-owner-filter,.recording-filter-row>.query-actions{flex:0 0 auto;white-space:nowrap}
+.recording-owner-filter .filter-label{display:block;font-size:14.3px;font-weight:600;margin:16px 0 8px}
+.recording-owner-filter .query-owner{min-height:44px;flex-wrap:nowrap;gap:8px}
+.recording-owner-filter .query-owner strong{max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.recording-filter-row>.query-actions{margin:0;padding:0;border:0;align-self:flex-end}
+.connection-tabs{flex-wrap:nowrap;overflow-x:auto}.connection-tabs>button{flex:0 0 auto;white-space:nowrap}.connection-tabs>[data-action=download-access-guide]{margin-left:auto}
+
+@media(max-width:760px){.sidebar-status{flex-direction:row;align-items:center;justify-content:center;gap:4px}.sidebar-status>.sidebar-connection{flex:0 0 auto}}
+@media(prefers-reduced-motion:reduce){#refresh[aria-busy=true] .sidebar-icon{animation:none}}

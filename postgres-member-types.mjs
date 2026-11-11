@@ -4,7 +4,8 @@ import {createPostgresMemberLimits} from './postgres-member-limits.mjs';
 
 const fail=(status,message,code='invalid_member_type')=>{throw new AppError(status,message,code);};
 const version=value=>Number.isSafeInteger(value)&&value>=0;
-const description=value=>{if(typeof value!=='string'||!value.trim()||value.length>400)fail(400,'使用类型说明须为1至400字');return value.trim();};
+const description=value=>{if(typeof value!=='string'||value.trim().length>400)fail(400,'使用类型说明最多400字');return value.trim();};
+function typeCode(number){let code='';for(;number>0;number=Math.floor((number-1)/26))code=String.fromCharCode(65+(number-1)%26)+code;return code;}
 export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,queryQueue}={}){
   const limits=createPostgresMemberLimits(store,{clock});
   const read=operation=>queryQueue?queryQueue.run(operation):operation();
@@ -28,6 +29,19 @@ export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,
       return {types:rows.map(({allowed_models,usage_limits,...type})=>({...type,configured:type.default_version!==null,defaults:type.default_version===null?null:{allowed_models,usage_limits}}))};
     },{level:'REPEATABLE READ',readOnly:true}));
   }
+  async function create(payload){
+    if(!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).some(key=>!['name','description'].includes(key)))fail(400,'使用类型字段无效');
+    const title=name(payload.name),detail=description(payload.description??'');
+    return store.transaction(async()=>{
+      await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor.member-types.create',0))");
+      const used=new Set((await store.all('SELECT code FROM harbor.member_types')).map(row=>row.code));
+      let ordinal=1;while(used.has(typeCode(ordinal)))ordinal++;
+      const value={id:id(),code:typeCode(ordinal),name:title,description:detail,enabled:1,version:0,default_version:null,updated:clock()};
+      await store.run('INSERT INTO harbor.member_types(id,code,name,description,enabled,version,default_version,updated) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',value.id,value.code,value.name,value.description,value.enabled,value.version,value.default_version,value.updated);
+      await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),clock(),'member.type.create',JSON.stringify({type:value.id,code:value.code}));
+      return {...value,configured:false,defaults:null,members:0};
+    });
+  }
   async function save(typeId,payload){
     if(!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).some(key=>!['name','description','enabled','defaults','restore_version','expected_version'].includes(key))||!version(payload.expected_version)||!['name','description','enabled','defaults','restore_version'].some(key=>Object.hasOwn(payload,key)))fail(400,'使用类型配置字段无效');
     if(Object.hasOwn(payload,'restore_version')&&(!version(payload.restore_version)||payload.restore_version<1||Object.keys(payload).some(key=>!['restore_version','expected_version'].includes(key))))fail(400,'恢复版本须单独提交，不可混合其他配置');
@@ -41,7 +55,7 @@ export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,
       }
       const next={name:payload.name===undefined?previous.name:name(payload.name),description:payload.description===undefined?previous.description:description(payload.description),enabled:payload.enabled===undefined?previous.enabled:bool(payload.enabled),version:previous.version+1,default_version:nextDefault,updated:clock()};
       await store.run('UPDATE harbor.member_types SET name=$1,description=$2,enabled=$3,version=$4,default_version=$5,updated=$6 WHERE id=$7',next.name,next.description,next.enabled,next.version,nextDefault,next.updated,typeId);
-      await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),clock(),'member.type.configure',JSON.stringify({type:typeId,version:next.version,template:nextDefault,previous:previous.default_version,...(restored?{restored_from:payload.restore_version}:{})}));
+      await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),clock(),'member.type.configure',JSON.stringify({type:typeId,code:previous.code,version:next.version,template:nextDefault,previous:previous.default_version,...(restored?{restored_from:payload.restore_version}:{}),...(payload.name!==undefined?{name_changed:next.name!==previous.name}:{}),...(payload.description!==undefined?{description_changed:next.description!==previous.description}:{}),...(payload.enabled!==undefined?{enabled_before:!!previous.enabled,enabled_after:!!next.enabled}:{})}));
       return {id:typeId,code:previous.code,...next,configured:nextDefault!==null,...(defaults?{defaults}:{})};
     });
   }
@@ -73,6 +87,7 @@ export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,
   }
   async function handle(path,method,payload,params=new URLSearchParams()){
     if(path==='/api/admin/member-types'&&method==='GET')return {status:200,value:await list()};
+    if(path==='/api/admin/member-types'&&method==='POST')return {status:201,value:await create(payload)};
     const versions=path.match(/^\/api\/admin\/member-types\/([a-zA-Z0-9-]{1,80})\/templates$/);if(versions&&method==='GET')return {status:200,value:await history(versions[1],params)};
     const match=path.match(/^\/api\/admin\/member-types\/([a-zA-Z0-9-]{1,80})$/);if(match&&method==='PATCH')return {status:200,value:await save(match[1],payload)};
     return null;
