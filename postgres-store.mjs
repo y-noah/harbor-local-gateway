@@ -42,13 +42,17 @@ function databaseTransport(connectionString,connection,allowPlaintextLocalNetwor
 }
 export class PostgresStore{
   #connections=new WeakMap();
-  constructor({connectionString,connection,poolSize=12,connectionTimeoutMs=3000,statementTimeoutMs=10000,allowPlaintextLocalNetwork=false,Client}={}){
+  constructor({connectionString,connection,poolSize=12,connectionTimeoutMs=3000,statementTimeoutMs=10000,allowPlaintextLocalNetwork=false,maxParallelWorkersPerGather,Client}={}){
     if(!connectionString&&!connection)throw new AppError(503,'请配置PostgreSQL连接','database_configuration');
     if(!Number.isInteger(poolSize)||poolSize<1||poolSize>64||!Number.isInteger(connectionTimeoutMs)||connectionTimeoutMs<100||connectionTimeoutMs>30000||!Number.isInteger(statementTimeoutMs)||statementTimeoutMs<100||statementTimeoutMs>600000)throw new AppError(503,'数据库资源配置无效','database_configuration');
+    if(maxParallelWorkersPerGather!==undefined&&(!Number.isInteger(maxParallelWorkersPerGather)||maxParallelWorkersPerGather<0||maxParallelWorkersPerGather>1024))throw new AppError(503,'数据库查询并行度无效','database_configuration');
     this.context=new AsyncLocalStorage();this.savepoint=0;this.poolErrors=0;
     if(typeof allowPlaintextLocalNetwork!=='boolean')throw new AppError(503,'数据库传输配置无效','database_configuration');
     if(Client!==undefined&&typeof Client!=='function')throw new AppError(503,'数据库连接实现无效','database_configuration');
-    this.pool=new pg.Pool({...databaseTransport(connectionString,connection,allowPlaintextLocalNetwork),max:poolSize,connectionTimeoutMillis:connectionTimeoutMs,
+    const transport=databaseTransport(connectionString,connection,allowPlaintextLocalNetwork);
+    // Preserve resolved PGOPTIONS while bounding this pool's parallel worker fan-out.
+    if(maxParallelWorkersPerGather!==undefined)transport.options=[transport.options,'-c max_parallel_workers_per_gather='+maxParallelWorkersPerGather].filter(Boolean).join(' ');
+    this.pool=new pg.Pool({...transport,max:poolSize,connectionTimeoutMillis:connectionTimeoutMs,
       ...(Client?{Client}:{}),
       idleTimeoutMillis:10000,statement_timeout:statementTimeoutMs,idle_in_transaction_session_timeout:30000,
       types:{getTypeParser:(oid,format)=>oid===20&&format!=='binary'?integer:pg.types.getTypeParser(oid,format)}});

@@ -324,6 +324,13 @@ test('large user, tool and final-only assistant text are chunked below the event
   assert.deepEqual(actual,text);
 });
 
+test('PostgreSQL management parallelism validates resources and preserves existing connection options',async()=>{
+  for(const value of [-1,1.5,1025,'0',null,false])assert.throws(()=>new PostgresStore({connection:{host:'/tmp/fixture'},maxParallelWorkersPerGather:value}),{code:'database_configuration'});
+  const store=new PostgresStore({connection:{host:'/tmp/fixture',options:'-c application_name=parallel_fixture'},maxParallelWorkersPerGather:0});
+  try{assert.match(store.pool.options.options,/-c application_name=parallel_fixture/);assert.match(store.pool.options.options,/-c max_parallel_workers_per_gather=0$/);}finally{await store.close();}
+  for(const value of ['',-1,1.5,1025,null,false,'2;select 1'])await assert.rejects(createPostgresGateway({env:{},resources:{queryParallelWorkers:value}}),{code:'gateway_configuration'});
+});
+
 test('PostgreSQL configuration rejects unsafe resources and verifies remote TLS by default',async()=>{
   for(const config of [{},{connection:{host:'/tmp/test'},poolSize:0},{connection:{host:'/tmp/test'},statementTimeoutMs:0},{connectionString:'https://not-postgres'},{connectionString:'postgresql://example.invalid/test?sslmode=disable'},{connection:{host:'example.invalid',ssl:{rejectUnauthorized:false}}}])assert.throws(()=>new PostgresStore(config),{status:503});
   const store=new PostgresStore({connection:{host:'example.invalid',database:'test'}});assert.equal(store.pool.options.ssl.rejectUnauthorized,true);await store.close();
@@ -879,6 +886,22 @@ async function withGateway(t,run,{migrated=true,legacy=true}={}){
 async function deviceGatewayRequest(origin,path,{method='POST',body,agent,headers={}}={}){return new Promise((resolve,reject)=>{
   const bytes=body===undefined?undefined:Buffer.from(JSON.stringify(body)),req=https.request(new URL(path,origin),{method,agent,headers:{...headers,...(bytes?{'content-type':'application/json','content-length':bytes.length}:{})}},res=>{const parts=[];res.on('data',part=>parts.push(part));res.on('end',()=>{const raw=Buffer.concat(parts).toString();let value;try{value=JSON.parse(raw);}catch{}resolve({status:res.statusCode,value,headers:res.headers,raw});});});req.setTimeout(10000,()=>req.destroy(Error('synthetic TLS timeout')));req.on('error',reject);req.end(bytes);
 });}
+test('PostgreSQL management pool avoids parallel shared memory while inference settings and results remain intact',integration,async t=>withGateway(t,async context=>{
+  const db={...options(context.name),connection:{options:'-c max_parallel_workers_per_gather=2 -c min_parallel_table_scan_size=0 -c parallel_setup_cost=0 -c parallel_tuple_cost=0'}};
+  const app=await context.open({database:db}),setting=async store=>(await store.get('SHOW max_parallel_workers_per_gather')).max_parallel_workers_per_gather;
+  assert.equal(await setting(app.queryStore),'0');assert.equal(await setting(app.store),'2');assert.equal(await setting(app.recordingStore),'2');
+  await app.store.query('CREATE TABLE public.synthetic_parallel_usage AS SELECT i::int value FROM generate_series(1,10000) i');
+  await app.store.query('ALTER TABLE public.synthetic_parallel_usage SET (parallel_workers=2)');await app.store.query('ANALYZE public.synthetic_parallel_usage');
+  const sql='SELECT SUM(value)::text total FROM public.synthetic_parallel_usage',plan=async store=>(await store.get('EXPLAIN (FORMAT JSON,COSTS OFF) '+sql))['QUERY PLAN'];
+  assert.match(JSON.stringify(await plan(app.store)),/Gather/);assert.doesNotMatch(JSON.stringify(await plan(app.queryStore)),/Gather/);
+  assert.equal((await app.queryStore.get(sql)).total,(await app.store.get(sql)).total);
+  const origin=await listenGateway(app),cookie=await gatewayLogin(origin,context.password);
+  const pages=await Promise.all([1,2].map(()=>fetch(origin+'/api/admin/keys?page_size=20',{headers:{cookie}})));for(const page of pages){assert.equal(page.status,200);assert.ok((await page.json()).rows.length);}
+  await app.close();
+  const overridden=await context.open({database:db,resources:{corePoolSize:1,queryPoolSize:1,recordingPoolSize:1,queryParallelWorkers:1}});assert.equal(await setting(overridden.queryStore),'1');assert.equal(await setting(overridden.store),'2');await overridden.close();
+  const preferred=await context.open({database:db,resources:{corePoolSize:1,queryPoolSize:1,recordingPoolSize:1,queryParallelWorkers:0}});assert.equal(await setting(preferred.queryStore),'0');assert.equal(await setting(preferred.store),'2');
+}));
+
 async function enrolledGateway(t,context,extra={}){
   const ca=await certificateFixture(context.root),app=await context.open({...extra,devices:{issuer:ca.issuer,tls:{key:ca.key,cert:ca.cert,ca:ca.ca,port:0}}}),plain=await listenGateway(app),address=await app.deviceTls.listen(),origin='https://127.0.0.1:'+address.port,anon=new https.Agent({ca:ca.ca}),cookie=await gatewayLogin(plain,context.password),keys=await clientKey(context.root,'shared-device-client');let client;
   t.after(()=>{anon.destroy();client?.agent.destroy();ca.issuer.close();});

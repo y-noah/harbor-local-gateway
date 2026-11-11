@@ -95,6 +95,9 @@ export async function createPostgresGateway(options={}){
   const env=options.env||process.env,network=networkConfig(env),database=options.database||{connectionString:env.HARBOR_DATABASE_URL};
   const clock=options.clock||Date.now,data=resolve(options.dataDir||env.HARBOR_DATA_DIR||join(root,'data')),runtime=resolve(options.runtimeDir||env.HARBOR_RUNTIME_DIR||join(root,'runtime'));
   const resources={corePoolSize:12,queryPoolSize:3,recordingPoolSize:2,...options.resources};
+  const queryParallelWorkers=options.resources?.queryParallelWorkers===undefined?0:options.resources.queryParallelWorkers;
+  if(!Number.isInteger(queryParallelWorkers)||queryParallelWorkers<0||queryParallelWorkers>1024)throw new AppError(503,'管理查询并行度无效','gateway_configuration');
+  resources.queryParallelWorkers=queryParallelWorkers;
   const cliProcesses=createCliProcessBudget(options.cliProcesses,{spawnProcess:options.cliSpawner});
   const spawnFor=(accountId,context)=>(binary,args,spawnOptions)=>cliProcesses.spawn(accountId,binary,args,spawnOptions,context);
   const jsonParser=createJsonParser(options.jsonParsing,{workerFactory:options.jsonParserWorker});
@@ -133,7 +136,8 @@ export async function createPostgresGateway(options={}){
     guardClient.on('end',loseOwnership);
     if(!(await guardClient.query('SELECT pg_try_advisory_lock($1) acquired',[gatewayLock])).rows[0].acquired)throw new AppError(503,'此数据库已有活动网关，暂不支持多实例','gateway_already_running');
     store=new PostgresStore({...database,poolSize:resources.corePoolSize});
-    queryStore=new PostgresStore({...database,poolSize:resources.queryPoolSize});recordingStore=new PostgresStore({...database,poolSize:resources.recordingPoolSize});
+    // Admin requests remain concurrent, without parallel-query shared-memory amplification.
+    queryStore=new PostgresStore({...database,poolSize:resources.queryPoolSize,maxParallelWorkersPerGather:resources.queryParallelWorkers});recordingStore=new PostgresStore({...database,poolSize:resources.recordingPoolSize});
     try{await store.verifySchema();}catch(e){if(e.code==='42P01')throw new AppError(503,'数据库尚未迁移，请先运行db:migrate','database_migration_required');throw e;}
     const contextSchemaVersion=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,{available:contextAvailable}=recordingContextConfiguration({env,enabled:options.recording?.contextEnabled,schemaVersion:contextSchemaVersion});
     await store.initializePricing();
