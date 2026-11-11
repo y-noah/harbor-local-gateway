@@ -1469,8 +1469,8 @@ test('关闭或更换弹窗后迟到IP查询和旧分配预览不能重新打开
 });
 
 test('关闭管理弹窗后迟到的启停删除操作不能关闭或重开其他弹窗',async()=>{
- for(const [action,id] of [['toggle-member','member-one'],['toggle-key','key-one'],['confirm-remove-key','key-one'],['confirm-disable-account','api-one'],['confirm-remove-account','api-one'],['disable-session','session-one'],['cancel-login','api-one']]){
-  let release;const state={...snapshot(),accounts:managedAccounts(),members:[{id:'member-one',name:'合成迟到员工',enabled:1}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1}]},page=await ui((path,options)=>['PATCH','DELETE','POST'].includes(options.method)?new Promise(resolve=>release=()=>resolve(response({ok:true,moved:0}))):response(state));page.run('admin=true;state='+JSON.stringify(state)+';modal("原管理")');const pending=page.click(action,id);await new Promise(setImmediate);await page.click('close');page.run('modal("新管理")');release();await pending;assert.equal(page.node('#modal').open,true,action);assert.equal(page.node('#modal-content').innerHTML,'新管理',action);
+ for(const [action,id] of [['toggle-member','member-one'],['toggle-key','key-one'],['confirm-remove-key','key-one'],['confirm-disable-account','api-one'],['confirm-remove-account','api-one'],['disable-session','session-one'],['nightly-session','session-one'],['cancel-login','api-one']]){
+  let release;const state={...snapshot(),accounts:managedAccounts(),members:[{id:'member-one',name:'合成迟到员工',enabled:1}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1}],sessions:[{id:'session-one',nightly_enabled:1}]},page=await ui((path,options)=>['PATCH','DELETE','POST'].includes(options.method)?new Promise(resolve=>release=()=>resolve(response({ok:true,moved:0}))):response(state));page.run('admin=true;state='+JSON.stringify(state)+';modal("原管理")');const pending=page.click(action,id);await new Promise(setImmediate);await page.click('close');page.run('modal("新管理")');release();await pending;assert.equal(page.node('#modal').open,true,action);assert.equal(page.node('#modal-content').innerHTML,'新管理',action);
  }
 });
 
