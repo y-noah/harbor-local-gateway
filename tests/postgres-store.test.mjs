@@ -763,7 +763,7 @@ test('PostgreSQL overview batches exact seven-day and twelve-hour usage, preserv
   const compact=await reader.read({view:'overview'});
   assert.equal(compact.view,'overview');assert.deepEqual(compact.totals,{requests:value.totals.requests,success:value.totals.success});
   assert.deepEqual(compact.daily,value.daily.map(({day,requests})=>({day,requests})));
-  assert.deepEqual(compact.accounts,value.accounts.map(({id,name,kind,auth_mode,enabled,state})=>({id,name,kind,auth_mode,enabled,state})));
+  assert.deepEqual(compact.accounts,value.accounts.map(({id,name,kind,auth_mode,enabled,state,platform_models})=>({id,name,kind,auth_mode,enabled,state,platform_models})));
   assert.equal(compact.memberCount,value.memberCount);assert.deepEqual(compact.sessions,[]);assert.deepEqual(compact.keys,[]);assert.deepEqual(compact.requests,[]);
   assert.equal(compact.totals.standard,undefined);
   for(const params of ['view=invalid','view=overview&view=full'])assert.throws(()=>stateQuery(new URLSearchParams(params)),{status:400});
