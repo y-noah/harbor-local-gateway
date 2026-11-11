@@ -17,19 +17,23 @@ const run=promisify(execFile),upgradePath=fileURLToPath(new URL('../ci/postgres-
 const drainDriver=`import http.client,importlib.util,json,socket,sys
 from types import SimpleNamespace
 s=importlib.util.spec_from_file_location('upgrade',sys.argv[1]);u=importlib.util.module_from_spec(s);s.loader.exec_module(u)
+s=importlib.util.spec_from_file_location('entry',sys.argv[3]);entry=importlib.util.module_from_spec(s);s.loader.exec_module(entry)
+entry.private_json=lambda path:{'drainTimeoutMs':int(sys.argv[4])}
 class Client(http.client.HTTPConnection):
  def connect(self):
-  self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);self.sock.settimeout(3);self.sock.connect(sys.argv[2])
-def state(command=None,epoch=None,slot=None):
- c=Client('localhost',timeout=3)
+  self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);self.sock.settimeout(self.timeout);self.sock.connect(sys.argv[2])
+def state(command=None,epoch=None,slot=None,*,timeout=3):
+ c=Client('localhost',timeout=timeout)
  try:
   body=None if command is None else json.dumps({'command':command,'expectedEpoch':epoch,**({'slot':slot} if slot else {})})
   c.request('GET' if command is None else 'POST','/state' if command is None else '/control',body=body,headers={} if command is None else {'Content-Type':'application/json'})
   r=c.getresponse();v=json.loads(r.read())
   if r.status!=200:raise RuntimeError(v['error']['code'])
+  if command is None and v.get('inflight',0)>0:sys.stderr.write('entry_waiting_busy\\n');sys.stderr.flush()
   return v
  finally:c.close()
-print(json.dumps(u.drain_active_entry(SimpleNamespace(entry_state=state))))
+entry.entry_state=state
+print(json.dumps(u.drain_active_entry(SimpleNamespace(entry_state=state,wait_entry_idle=entry.wait_entry_idle))))
 `;
 async function call(options,body){return new Promise((resolve,reject)=>{const req=http.request({...options,agent:false},res=>{let text='';res.on('data',chunk=>text+=chunk);res.once('end',()=>resolve({status:res.statusCode,text,value:()=>JSON.parse(text)}));res.on('error',reject);});req.on('error',reject);req.end(body);});}
 async function fixture(t,{timeout=80,handler}={}){
@@ -45,17 +49,15 @@ test('real private control CAS and held queue activate only preconfigured slots'
  const waiting=f.data();assert.equal((await f.command('drain',1)).value().phase,'drained');assert.equal((await f.command('activate',2,'candidate')).status,200);assert.equal((await waiting).text,'candidate');assert.equal((await f.data()).text,'candidate');
  const value=(await f.state()).value();assert.deepEqual(Object.keys(value).sort(),['epoch','slot','phase','state','inflight','queued','reservedQueuedBytes'].sort());assert.equal(value.epoch,3);assert.equal((await call({host:'127.0.0.1',port:f.config.listenPort,path:'/state'})).text,'candidate','public listener forwards paths, never exposes control');await runtime.shutdown();await assert.rejects(access(f.controlPath));
 });
-for(const timeout of [false,true])test(`root upgrade drains a busy real entry and ${timeout?'resumes queued traffic after timeout':'preserves queued traffic until drain succeeds'}`,{skip:process.platform==='win32',timeout:6000},async t=>{
+for(const timeout of [false,true])test(`root upgrade keeps a busy entry forwarding and ${timeout?'times out without holding admission':'drains only after source requests finish'}`,{skip:process.platform==='win32',timeout:6000},async t=>{
  let source,calls=0;
  const f=await fixture(t,{handler(req,res,slot){req.resume();calls++;if(req.url==='/slow'){source=res;res.write('old-start');return;}res.end(slot);}});f.config.initialSlot='candidate';f.config.drainTimeoutMs=timeout?30:1000;f.config.limits={...limits,maxWaitMs:3000};const runtime=await f.start();
  const first=call({host:'127.0.0.1',port:f.config.listenPort,path:'/slow'});first.catch(()=>{});await untilState(()=>source!==undefined&&runtime.state().inflight===1);
- const draining=run('python3',['-c',drainDriver,upgradePath,f.controlPath],{timeout:4000});draining.catch(()=>{});
+ const draining=run('python3',['-c',drainDriver,upgradePath,f.controlPath,fileURLToPath(new URL('../ci/gateway-entry-controller.py',import.meta.url)),String(f.config.drainTimeoutMs)],{timeout:4000});draining.catch(()=>{});let waitingBusy=false;draining.child.stderr.on('data',data=>{if(data.toString().includes('entry_waiting_busy'))waitingBusy=true;});
  try{
-  await untilState(()=>runtime.state().phase==='holding');const waiting=f.data();waiting.catch(()=>{});await untilState(()=>runtime.state().queued===1);assert.equal(calls,1);
-  if(timeout){await assert.rejects(draining,error=>error.stderr.includes('gateway_entry_drain_timeout'));assert.equal(runtime.state().inflight,1);assert.equal(source.destroyed,false);}
-  else{source.end('-done');assert.equal((await first).text,'old-start-done');const result=JSON.parse((await draining).stdout);assert.equal(result.phase,'drained');assert.equal(result.inflight,0);assert.equal(runtime.state().queued,1);assert.equal(calls,1);}
-  assert.equal((await f.command('resume',runtime.state().epoch)).status,200);assert.equal((await waiting).text,'candidate');assert.equal(calls,2);
-  if(timeout){source.end('-done');assert.equal((await first).text,'old-start-done');}
+  await untilState(()=>waitingBusy);assert.equal((await f.data()).text,'candidate');assert.equal(runtime.state().phase,'active');assert.equal(runtime.state().queued,0);assert.equal(calls,2);
+  if(timeout){await assert.rejects(draining,error=>error.stderr.includes('entry_idle_timeout'));assert.equal(runtime.state().epoch,0);assert.equal(runtime.state().inflight,1);assert.equal(source.destroyed,false);source.end('-done');assert.equal((await first).text,'old-start-done');}
+  else{source.end('-done');assert.equal((await first).text,'old-start-done');const result=JSON.parse((await draining).stdout);assert.equal(result.phase,'drained');assert.equal(result.inflight,0);const waiting=f.data();waiting.catch(()=>{});await untilState(()=>runtime.state().queued===1);assert.equal(calls,2);assert.equal((await f.command('resume',runtime.state().epoch)).status,200);assert.equal((await waiting).text,'candidate');assert.equal(calls,3);}
   await untilState(()=>runtime.state().inflight===0&&runtime.state().queued===0);assert.equal(runtime.state().phase,'active');
  }finally{if(!source.destroyed)source.end();await draining.catch(()=>{});await first.catch(()=>{});}
 });

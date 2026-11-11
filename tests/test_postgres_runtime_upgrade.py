@@ -180,11 +180,11 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
    self.assertEqual(upgrade.gate_install(entry,ticket(),CONFIG),snapshot);script=entry.execute.call_args.kwargs['body'];self.assertEqual(script.count('ct state new'),2);self.assertNotIn('systemctl',script);upgrade.gate_remove(entry,snapshot)
   with patch.object(upgrade,'gate_snapshot',return_value={'unknown':True}),self.assertRaises(RuntimeError):upgrade.gate_remove(entry,snapshot)
  def test_orchestration_success_pg_rollback_and_unknown_shutdown_keep_sqlite_untouched(self):
-  for outcome in ['success','busy-source','hold-race','bad-inflight','bad-inflight-unhealthy','drain-nonzero','drain-timeout','drain-timeout-unhealthy','pg-rollback','preflight-rejected','preflight-rejected-stale-worker','preflight-rejected-core-unready','preflight-rejected-source-changed','preflight-rejected-source-stopped','preflight-rejected-network-changed','unknown-stop','unknown-stop-healthy','commit-unknown']:
+  for outcome in ['success','busy-source','idle-timeout','hold-race','bad-inflight','bad-inflight-unhealthy','drain-nonzero','drain-timeout','drain-timeout-unhealthy','pg-rollback','preflight-rejected','preflight-rejected-stale-worker','preflight-rejected-core-unready','preflight-rejected-source-changed','preflight-rejected-source-stopped','preflight-rejected-network-changed','unknown-stop','unknown-stop-healthy','commit-unknown']:
    with self.subTest(outcome=outcome),tempfile.TemporaryDirectory() as directory:
     t=ticket();old=active();old_gateway=target(t);old_gateway.update(Id=t['from']['containerId'],Image=t['from']['imageId']);old_gateway['Config'].update(Image=OLD);old_worker=copy.deepcopy(old_gateway);old_worker['Id']=t['from']['workerId'];old_worker['Config']['Cmd']=['node','/app/postgres-worker.mjs'];rows={NAME:old_gateway,NAME+'-worker':old_worker};docker_calls=[]
     entry=Mock();entry.ACTIVE=Path(directory)/'active.json';entry.STATE=Path(directory)/'controller.json';entry.CANDIDATE_PROFILE=Path(directory)/'candidate.json';data={str(entry.ACTIVE):old,str(entry.STATE):{'phase':'activated','candidate':old['candidate'],'activeRuntimeConfig':{'bridge':{'address':'192.0.2.1'}}},str(entry.CANDIDATE_PROFILE):{'socketPath':'/run/harbor-entry/candidate.sock'}};entry.active_record.return_value=(copy.deepcopy(old),{},old_gateway);entry.private_json.side_effect=lambda p:copy.deepcopy(data[str(p)]);entry.save_json.side_effect=lambda p,v:data.__setitem__(str(p),copy.deepcopy(v));entry.fingerprint=upgrade.digest
-    control={'slot':'candidate','phase':'active','inflight':9 if outcome=='busy-source' else -1 if outcome.startswith('bad-inflight') else 0,'epoch':0}
+    control={'slot':'candidate','phase':'active','inflight':9 if outcome in ['busy-source','idle-timeout'] else -1 if outcome.startswith('bad-inflight') else 0,'epoch':0}
     def entry_state(command=None,epoch=None,slot=None):
      if command:
       self.assertEqual(epoch,control['epoch']);control['epoch']+=1
@@ -202,7 +202,14 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
       elif command=='activate':self.assertEqual(control['phase'],'drained');control['phase']='active';self.assertEqual(slot,'candidate')
      return dict(control)
     entry.entry_state.side_effect=entry_state
-    entry.wait_entry_idle.side_effect=AssertionError('must not wait for global idle before holding admission')
+    def wait_idle():
+     self.assertEqual(control['phase'],'active')
+     self.assertFalse(any(c.args and c.args[0] in ['hold','drain'] for c in entry.entry_state.call_args_list))
+     if outcome=='idle-timeout':raise RuntimeError('entry_idle_timeout')
+     if outcome.startswith('bad-inflight'):raise RuntimeError('entry_idle_count')
+     control['inflight']=0
+     return dict(control)
+    entry.wait_entry_idle.side_effect=wait_idle
     entry.candidate_slot_ready.return_value=not outcome.endswith('unhealthy')
     if outcome=='commit-unknown':entry.restore_active.side_effect=RuntimeError('publication outcome unknown')
     composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.SourcePreflightRejected=pg.SourcePreflightRejected;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']}
@@ -226,7 +233,7 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
      docker_calls.append(args);self.assertEqual(args[0],'rename');key=next(k for k,v in rows.items() if v['Id']==args[1]);rows[args[2]]=rows.pop(key)
     api={'NAME':NAME,'inspect_container':rows.get,'inspect_image':Mock(),'docker':docker,'postgres_preflight_timeout_seconds':999};config={**CONFIG,'postgres_preflight_timeout_seconds':300}
     with patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot',return_value={'candidateNetworkIdentity':{'id':'6'*64}}),patch.object(upgrade,'gate_install',return_value={'owned':True}) as install_gate,patch.object(upgrade,'gate_remove') as remove_gate,patch.object(upgrade,'probe',return_value=503 if outcome=='preflight-rejected-core-unready' else 200) as core_probe,patch.object(upgrade,'verify_installed_tools'):
-     if outcome in ['success','busy-source','hold-race']:
+     if outcome in ['success','busy-source']:
       result=upgrade.run_upgrade(IMAGE,config,api,t,entry);self.assertEqual(result['contract'],upgrade.CONTRACT);self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64);self.assertEqual(control['phase'],'active');self.assertEqual(len(docker_calls),2);remove_gate.assert_called_once()
      else:
       with self.assertRaisesRegex(RuntimeError,'entry drain failed' if outcome=='drain-nonzero' else ''):upgrade.run_upgrade(IMAGE,config,api,t,entry)
@@ -243,13 +250,18 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
        self.assertEqual(control['phase'],'holding' if outcome.endswith('unhealthy') else 'active')
        self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
        entry.candidate_slot_ready.assert_called_once_with('192.0.2.1',8092)
+      if outcome in ['idle-timeout','hold-race']:
+       install_gate.assert_not_called();composition.deploy.assert_not_called();composition.verify_started_composition.assert_not_called();entry.refresh_active.assert_not_called();remove_gate.assert_not_called()
+       self.assertEqual(control['phase'],'active');self.assertFalse(any(c.args and c.args[0]=='drain' for c in entry.entry_state.call_args_list))
+       if outcome=='idle-timeout':self.assertFalse(any(c.args and c.args[0]=='hold' for c in entry.entry_state.call_args_list))
+       self.assertEqual(rows[NAME]['Id'],t['from']['containerId']);self.assertTrue(rows[NAME]['State']['Running']);self.assertTrue(rows[NAME+'-worker']['State']['Running'])
       if outcome.startswith('bad-inflight'):
        install_gate.assert_not_called();composition.deploy.assert_not_called();composition.verify_started_composition.assert_not_called();entry.refresh_active.assert_not_called();remove_gate.assert_not_called()
        self.assertEqual(control['phase'],'active');self.assertFalse(any(call.args and call.args[0] in ['hold','drain'] for call in entry.entry_state.call_args_list))
        self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
       if outcome=='unknown-stop-healthy':self.assertTrue(old_gateway['State']['Running']);self.assertTrue(old_worker['State']['Running']);composition.verify_started_composition.assert_not_called();self.assertEqual(data[str(upgrade.release_path(t['deploymentId'])/'release.json')]['phase'],'stop-unknown')
       if outcome=='commit-unknown':self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64)
-     entry.wait_entry_idle.assert_not_called()
+     entry.wait_entry_idle.assert_called_once()
      self.assertEqual(composition.image_proof.call_args.args[0]['postgres_preflight_timeout_seconds'],300)
      self.assertTrue(all(call[0]=='rename' for call in docker_calls));self.assertFalse(any('sqlite' in str(call) for call in docker_calls))
 

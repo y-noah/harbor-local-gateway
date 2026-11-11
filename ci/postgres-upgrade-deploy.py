@@ -249,13 +249,14 @@ def deploy(image,config,archive,api):
  with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry))
 
 def drain_active_entry(entry):
- control=entry.entry_state();need(control.get('slot')=='candidate' and control.get('phase')=='active' and type(control.get('inflight')) is int and control['inflight']>=0,'current entry is not active PG')
+ # Keep admission active while long requests finish. A busy source must not
+ # turn a failed release into a long queue for unrelated clients.
+ control=entry.wait_entry_idle()
+ need(control.get('slot')=='candidate' and control.get('phase')=='active' and control.get('inflight')==0,'current entry is not idle PG')
  control=entry.entry_state('hold',control['epoch'])
- # Hold admission before draining: continuously arriving requests cannot keep
- # the source busy forever. Existing streams retain their original route.
- # The entry's configured deadline and the unchanged-source recovery bound
- # this wait; a timeout must resume admission without replacing the source.
- need(control.get('slot')=='candidate' and control.get('phase')=='holding','entry hold failed')
+ # New traffic can win the observation/hold race. Fail immediately so the
+ # unchanged-source recovery resumes forwarding instead of waiting behind it.
+ need(control.get('slot')=='candidate' and control.get('phase')=='holding' and control.get('inflight')==0,'entry became busy before hold')
  control=entry.entry_state('drain',control['epoch']);need(control.get('phase')=='drained' and control.get('inflight')==0,'entry drain failed')
  return control
 
@@ -284,7 +285,7 @@ def run_upgrade(image,config,api,ticket,entry):
   return probe(entry,ticket,row,port,path,headers)
  verify_installed_tools(ticket)
  try:
-  record['phase']='waiting-drain';entry.save_json(path/'release.json',record)
+  record['phase']='waiting-idle';entry.save_json(path/'release.json',record)
   control=drain_active_entry(entry)
   gate_attempted=True;gate=gate_install(entry,ticket,config);record.update(phase='holding',gate=gate);entry.save_json(path/'release.json',record);record['retiredSqlite']=retire_sqlite(api,ticket);entry.save_json(path/'release.json',record)
   pg_api.update(runtime_upgrade=True,retain_previous=True,activation=activation,http_code=http_code)
