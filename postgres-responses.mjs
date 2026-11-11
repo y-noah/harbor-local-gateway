@@ -1,5 +1,5 @@
 import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
-import {beginAdminRequestTiming,finishAdminRequestTiming} from './admin-request-timing.mjs';
+import {beginAdminRequestTiming,finishAdminRequestTiming,registerAdminRequestTimingSignal,wrapAdminQueryTimingQueue} from './admin-request-timing.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {createRequestStreamTiming} from './request-stream-timing.mjs';
 import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
@@ -64,7 +64,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const execution=createInferenceBudget({...executionOptions,maxConcurrent,maxPerMember:Math.min(maxPerMember,maxConcurrent)});
   const preparation=createRoutingPreparation({maxWaiting:maxConcurrent,stageObserver});
   const sessionHandoffs=createSessionRequestHandoff({maxTickets:maxConcurrent,maxPending:maxPendingHandoffs,maxWaiting:Math.max(1,Math.floor(maxConcurrent/2)),maxWaitingPerMember:Math.max(1,Math.floor(maxPerMember/2)),stageObserver});
-  const queryQueue=requestQueries?.queue||createPostgresQueryQueue();
+  const queryQueue=requestQueries?.queue||wrapAdminQueryTimingQueue(createPostgresQueryQueue());
   const handoffAdmin=createPostgresSessionHandoffs(store,{gate:sessionHandoffs,readStore:queryStore,queryQueue,clock,isStopping:()=>stopping,validateTarget:async(account,model,signal)=>{if(!model)return true;const transport=await transportForAccount(account);if(typeof transport.models!=='function')return false;const models=await transport.models({binary:codexBinary,home:account.auth_mode==='openai_api'?account.id:account.home,signal});return models.some(item=>item.slug===model);}});
   const queries=requestQueries||createPostgresRequestQueries(queryStore,{clock,queryQueue,businessOutcomes:true,readInputPreviews:typeof recordingReader?.previews==='function'?ids=>recordingReader.previews(ids):undefined});
   const adminRouter=createPostgresRouter(store,{clock,isStopping:()=>stopping,extraRuntime}),readRouter=createPostgresRouter(queryStore,{clock});
@@ -324,6 +324,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     beginAdminRequestTiming(req,res);
     const path=new URL(req.url,'http://localhost').pathname,modelRequest=req.method==='POST'&&(path==='/v1/responses'||path.startsWith('/v1/')&&codexJsonRoutes.has(path.slice(3))),stage=modelRequest?stages.capture():{emit:()=>false};
     const receipt={callbackCompleted:false,nested:false,published:false,publish(type,details){if(this.published)return false;this.published=true;return stage.emit(type,details);}},body=new AbortController();
+    registerAdminRequestTimingSignal(res,body.signal);
     const bodyEnd=()=>{stage.emit('body-end');receipt.timing?.bodyEnd();},closed=()=>{if(!res.writableEnded)body.abort();};
     if(modelRequest){
       receipt.timing=createRequestStreamTiming();let responseEnded=false,routeEnded=false,finalized=false;

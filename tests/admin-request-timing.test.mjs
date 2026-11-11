@@ -64,12 +64,12 @@ test('real Unix entry forwards app timing and response bytes without identity me
  },{entry:true});const reply=await request(server);assert.match(reply.headers['server-timing'],/^app;dur=\d+\.\d{2}$/);assert.equal(reply.body,'{"ok":true}');assert.equal(reply.headers['content-length'],'11');
 });
 
-test('two concurrent responses keep independent monotonic starts',async t=>{
- let now=0,release;const entered=new Promise(resolve=>release=resolve),timing=createAdminRequestTiming({clock:()=>now});
+test('two concurrent responses keep independent monotonic starts',{timeout:5000},async t=>{
+ let now=0,release,firstEntered;const entered=new Promise(resolve=>release=resolve),ready=new Promise(resolve=>firstEntered=resolve),timing=createAdminRequestTiming({clock:()=>now});
  const server=await fixture(t,async(req,res)=>{
-  if(req.url.endsWith('first')){timing.begin(req,res);await entered;now=30;}else{now=10;timing.begin(req,res);release();}
+  if(req.url.endsWith('first')){timing.begin(req,res);firstEntered();await entered;now=30;}else{now=10;timing.begin(req,res);release();}
   const encoded='{}';timing.finish(res,200,{authenticated:true});res.writeHead(200,{'Content-Type':'application/json'});res.end(encoded);
- });const first=request(server,{path:'/api/admin/first'}),second=request(server,{path:'/api/admin/second'});const [a,b]=await Promise.all([first,second]);assert.equal(a.headers['server-timing'],'app;dur=30.00');assert.equal(b.headers['server-timing'],'app;dur=0.00');
+ });const first=request(server,{path:'/api/admin/first'});await ready;const second=request(server,{path:'/api/admin/second'});const [a,b]=await Promise.all([first,second]);assert.equal(a.headers['server-timing'],'app;dur=30.00');assert.equal(b.headers['server-timing'],'app;dur=0.00');
 });
 
 test('client cancellation keeps close handling intact and cannot add late headers',async t=>{
