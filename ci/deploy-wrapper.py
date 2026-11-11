@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import syslog
 import time
 import importlib.util
 import stat
@@ -294,6 +295,20 @@ def receive_deployment_image(stream,payload,config,action):
         return None,'installed'
     return (receive_archive(stream,STACK+'/import') if transport=='ssh_archive' else None),transport
 
+def log_image_stage_error(action,error,module=None):
+    try:
+        event={'event':'harbor_image_stage_error','action':action if action in ('prepare-image','image-stage-status','image-stage-plan') else 'unknown'}
+        kind=type(error).__name__
+        event['type']=kind if kind in ('ValueError','RuntimeError','OSError','PermissionError','FileNotFoundError','BlockingIOError','TimeoutError','CalledProcessError','TimeoutExpired','TarError','ReadError','EOFError','KeyError','TypeError','JSONDecodeError','SyntaxError') else 'Exception'
+        if module is not None and type(error) is getattr(module,'Refused',None):
+            event['type']='Refused'
+            if len(error.args)==1 and isinstance(error.args[0],str) and re.fullmatch(r'image_stage_[a-z_]{1,64}',error.args[0]):event['code']=error.args[0]
+        if isinstance(error,OSError) and type(error.errno) is int and 0<error.errno<4096:event['errno']=error.errno
+        syslog.openlog('harbor-image-stage',syslog.LOG_PID,syslog.LOG_DAEMON)
+        syslog.syslog(syslog.LOG_ERR,json.dumps(event,sort_keys=True,separators=(',',':')))
+    except Exception:
+        pass
+
 def main():
     os.umask(0o077)
     request=sys.stdin.buffer.readline(4097)
@@ -304,24 +319,29 @@ def main():
     config=json.loads(Path(CONFIG).read_text())
     if not isinstance(payload,dict):raise ValueError('Only a deployment request is allowed')
     if payload.get('action') in ('prepare-image','image-stage-status','image-stage-plan'):
-        # Transport can install verified OCI bytes, never authorize or execute a
-        # release. A status read must remain available while the importer holds
-        # the ordinary deployment lock.
-        if type(config.get('image_staging_enabled',False)) is not bool or config.get('image_staging_enabled') is not True:raise ValueError('Image staging requires the root opt-in')
-        helper=Path(IMAGE_STAGE_HELPER)
-        for target in [*reversed(helper.parents),helper]:
-            info=target.lstat()
-            if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('Image stage helper is not root controlled')
-        spec=importlib.util.spec_from_file_location('harbor_release_image',helper)
-        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-        module.identity(payload,config)
-        if payload['action'] in ('image-stage-status','image-stage-plan'):
-            result=module.handle(payload,sys.stdin.buffer,config)
-        else:
-            with open('/run/harbor-gateway-deploy.lock','a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        module=None
+        try:
+            # Transport can install verified OCI bytes, never authorize or execute a
+            # release. A status read must remain available while the importer holds
+            # the ordinary deployment lock.
+            if type(config.get('image_staging_enabled',False)) is not bool or config.get('image_staging_enabled') is not True:raise ValueError('Image staging requires the root opt-in')
+            helper=Path(IMAGE_STAGE_HELPER)
+            for target in [*reversed(helper.parents),helper]:
+                info=target.lstat()
+                if stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022:raise ValueError('Image stage helper is not root controlled')
+            spec=importlib.util.spec_from_file_location('harbor_release_image',helper)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            module.identity(payload,config)
+            if payload['action'] in ('image-stage-status','image-stage-plan'):
                 result=module.handle(payload,sys.stdin.buffer,config)
-        print(json.dumps({'image_staging':result},sort_keys=True))
+            else:
+                with open('/run/harbor-gateway-deploy.lock','a') as lock:
+                    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    result=module.handle(payload,sys.stdin.buffer,config)
+            print(json.dumps({'image_staging':result},sort_keys=True))
+        except Exception as error:
+            log_image_stage_error(payload['action'],error,module)
+            raise
         return
     action=deployment_action(payload,config)
     if action=='deploy-static':

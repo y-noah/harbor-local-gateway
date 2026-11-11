@@ -12,6 +12,8 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).parents[1]
@@ -269,6 +271,83 @@ class ImageStageTests(unittest.TestCase):
                 broken = {**row, field: value}
                 with self.subTest(field=field), patch.object(s.subprocess, 'run', return_value=Mock(returncode=0, stdout=json.dumps([row, broken]).encode())), self.assertRaises(s.Refused):
                     s.native_proof(stage, s.identity(request, CONFIG), config)
+
+    @contextmanager
+    def wrapper_stage_context(self, action, module, config=None):
+        payload = {'action': action}
+        stream = io.BytesIO(json.dumps(payload).encode() + b'\n')
+        stderr, stdout = io.StringIO(), io.StringIO()
+        trusted = Mock(st_mode=stat.S_IFREG | 0o600, st_uid=0)
+        with ExitStack() as stack:
+            for obj, name, value in [(w.sys, 'stdin', Mock(buffer=stream)), (w.sys, 'stderr', stderr), (w.sys, 'stdout', stdout), (w.Path, 'lstat', Mock(return_value=trusted)), (w.Path, 'read_text', Mock(return_value=json.dumps(CONFIG if config is None else config))), (w.importlib.util, 'spec_from_file_location', Mock(return_value=Mock(loader=Mock()))), (w.importlib.util, 'module_from_spec', Mock(return_value=module)), (w.fcntl, 'flock', Mock())]:
+                stack.enter_context(patch.object(obj, name, value))
+            stack.enter_context(patch('builtins.open'))
+            openlog = stack.enter_context(patch.object(w.syslog, 'openlog'))
+            log = stack.enter_context(patch.object(w.syslog, 'syslog'))
+            yield log, openlog, stderr, stdout
+
+    def test_wrapper_stage_success_never_logs(self):
+        for action in ['prepare-image', 'image-stage-plan', 'image-stage-status']:
+            module = SimpleNamespace(Refused=s.Refused, identity=Mock(), handle=Mock(return_value={'phase': 'absent'}))
+            with self.subTest(action=action), self.wrapper_stage_context(action, module) as (log, openlog, stderr, stdout):
+                w.main()
+                log.assert_not_called();openlog.assert_not_called();self.assertEqual(stderr.getvalue(), '')
+                self.assertEqual(json.loads(stdout.getvalue()), {'image_staging': {'phase': 'absent'}})
+
+    def test_wrapper_stage_refusal_logs_only_fixed_code_and_keeps_the_original_error(self):
+        for action in ['prepare-image', 'image-stage-plan', 'image-stage-status']:
+            error = s.Refused('image_stage_disk_budget')
+            module = SimpleNamespace(Refused=s.Refused, identity=Mock(), handle=Mock(side_effect=error))
+            with self.subTest(action=action), self.wrapper_stage_context(action, module) as (log, openlog, stderr, stdout):
+                with self.assertRaises(s.Refused) as caught:w.main()
+                self.assertIs(caught.exception, error)
+                openlog.assert_called_once_with('harbor-image-stage', w.syslog.LOG_PID, w.syslog.LOG_DAEMON)
+                log.assert_called_once();self.assertEqual(log.call_args.args[0], w.syslog.LOG_ERR)
+                self.assertEqual(json.loads(log.call_args.args[1]), {'event': 'harbor_image_stage_error', 'action': action, 'type': 'Refused', 'code': 'image_stage_disk_budget'})
+                self.assertEqual(stderr.getvalue(), '');self.assertEqual(stdout.getvalue(), '')
+
+    def test_wrapper_stage_diagnostic_rejects_sensitive_or_untrusted_error_text(self):
+        class ForeignRefused(ValueError):pass
+        sensitive = 'hg_SYNTHETIC_SECRET /private/customer/path token=DO_NOT_LOG'
+        variants = [s.Refused(sensitive), s.Refused('image_stage_disk_budget '+sensitive), s.Refused('image_stage_'+('x'*65)), s.Refused('image_stage_disk_budget\n'), ValueError('image_stage_disk_budget'), ForeignRefused('image_stage_disk_budget'), RuntimeError(sensitive), OSError(28, sensitive, '/private/customer/path'), subprocess.CalledProcessError(3, ['command', sensitive], output=sensitive, stderr=sensitive)]
+        for error in variants:
+            module = SimpleNamespace(Refused=s.Refused, identity=Mock(), handle=Mock(side_effect=error))
+            with self.subTest(kind=type(error).__name__), self.wrapper_stage_context('prepare-image', module) as (log, openlog, stderr, stdout):
+                with self.assertRaises(type(error)) as caught:w.main()
+                self.assertIs(caught.exception, error)
+                message = log.call_args.args[1];data = json.loads(message)
+                self.assertNotIn('code', data)
+                for text in ['hg_SYNTHETIC_SECRET', '/private', 'token=', 'DO_NOT_LOG', 'command', 'ForeignRefused']:
+                    self.assertNotIn(text, message)
+                if isinstance(error, OSError):self.assertEqual(data['errno'], 28)
+                self.assertEqual(stderr.getvalue(), '');self.assertEqual(stdout.getvalue(), '')
+
+    def test_wrapper_stage_logging_failure_never_replaces_the_main_error(self):
+        for failing in ['openlog', 'syslog']:
+            error = s.Refused('image_stage_disk_budget')
+            module = SimpleNamespace(Refused=s.Refused, identity=Mock(), handle=Mock(side_effect=error))
+            with self.subTest(failing=failing), self.wrapper_stage_context('image-stage-status', module) as (log, openlog, stderr, stdout):
+                (openlog if failing=='openlog' else log).side_effect=OSError('syslog unavailable')
+                with self.assertRaises(s.Refused) as caught:w.main()
+                self.assertIs(caught.exception, error)
+                self.assertEqual(stderr.getvalue(), '');self.assertEqual(stdout.getvalue(), '')
+
+    def test_wrapper_stage_disabled_switch_stays_disabled_and_logs_safe_category(self):
+        module = SimpleNamespace(Refused=s.Refused, identity=Mock(), handle=Mock())
+        with self.wrapper_stage_context('prepare-image', module, {**CONFIG, 'image_staging_enabled': False}) as (log, openlog, stderr, stdout):
+            with self.assertRaisesRegex(ValueError, 'root opt-in'):w.main()
+            module.identity.assert_not_called();module.handle.assert_not_called()
+            self.assertEqual(json.loads(log.call_args.args[1])['type'], 'ValueError')
+            self.assertNotIn('code', json.loads(log.call_args.args[1]))
+
+    def test_wrapper_stage_cli_stderr_and_nonzero_exit_remain_compatible(self):
+        source = (ROOT / 'ci/deploy-wrapper.py').read_text()
+        error = s.Refused('image_stage_disk_budget')
+        module = SimpleNamespace(Refused=s.Refused, identity=Mock(), handle=Mock(side_effect=error))
+        with self.wrapper_stage_context('prepare-image', module) as (log, openlog, stderr, stdout):
+            with self.assertRaises(SystemExit) as caught:exec(compile(source, 'deploy-wrapper.py', 'exec'), {'__name__': '__main__'})
+            self.assertEqual(caught.exception.code, 1);self.assertEqual(stderr.getvalue(), 'Harbor deployment failed: Refused\n')
+            self.assertEqual(stdout.getvalue(), '');self.assertEqual(json.loads(log.call_args.args[1])['code'], 'image_stage_disk_budget')
 
     def test_wrapper_status_does_not_acquire_the_import_or_deployment_lock(self):
         module = Mock();module.handle.return_value = {'phase': 'importing'}
