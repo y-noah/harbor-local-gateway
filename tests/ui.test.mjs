@@ -182,7 +182,7 @@ test('new Key using an employee applied default omits a permission override inst
 
 test('scheduled transfer settings show actual times and retain explicit 02:00 expiry with legacy compatibility',async()=>{
   for(const enabled of [false,true]){
-    const page=await ui(()=>response({})),state={...snapshot(),balancing:{settings:{nightly:enabled,quietMinutes:30},transfers:{times:['02:00','10:00','13:00','16:00','20:00'],version:2,next:Date.parse('2026-11-03T13:00:00+08:00')}}};page.run('admin=true;state='+JSON.stringify(state));await page.click('balancing-settings');assert.match(page.node('#modal-content').innerHTML,/02:00、10:00、13:00、16:00、20:00/);assert.match(page.node('#modal-content').innerHTML,/下一时点/);assert.match(page.node('#modal-content').innerHTML,/最近执行/);assert.match(page.node('#modal-content').innerHTML,/data-action="transfer-schedule"/);await page.click('transfer-schedule');assert.match(page.node('#modal-content').innerHTML,/Asia\/Shanghai/);assert.match(page.node('#modal-content').innerHTML,enabled?/自动调度已开启/:/保存时点不会开启调度/);
+    const page=await ui(()=>response({})),state={...snapshot(),balancing:{settings:{nightly:enabled,quietMinutes:30},transfers:{times:['02:00','10:00','13:00','16:00','20:00'],version:2,next:Date.parse('2026-11-03T13:00:00+08:00')}}};page.run('admin=true;state='+JSON.stringify(state));await page.click('balancing-settings');assert.match(page.node('#modal-content').innerHTML,/02:00、10:00、13:00、16:00、20:00/);assert.match(page.node('#modal-content').innerHTML,/下一时点/);assert.match(page.node('#modal-content').innerHTML,/最近执行/);assert.match(page.node('#modal-content').innerHTML,/data-action="transfer-schedule"/);await page.click('transfer-schedule');assert.match(page.node('#modal-content').innerHTML,/北京时间/);assert.match(page.node('#modal-content').innerHTML,enabled?/自动调度已开启/:/保存时点不会开启调度/);
   }
   const legacy=await ui(()=>response({}));legacy.run('admin=true;state='+JSON.stringify({...snapshot(),balancing:{settings:{nightly:false,quietMinutes:30}}}));await legacy.click('balancing-settings');assert.doesNotMatch(legacy.node('#modal-content').innerHTML,/data-action="transfer-schedule"/);assert.match(legacy.node('#modal-content').innerHTML,/北京时间每日 02:00 调整/);
 });
@@ -537,7 +537,7 @@ test('temporary weight editor uses server version and offers explicit automatic 
  const calls=[],data={...snapshot(),accounts:[{id:'a',name:'Account A',kind:'codex',enabled:1,state:'ready'},{id:'b',name:'Account B',kind:'codex',enabled:1,state:'ready'}],balancing:{settings:{weighted:true},weights:{mode:'manual',configuration:{mode:'manual',weights:{a:100,b:0},expires:1800000000000,version:7},accounts:[{id:'a',automatic:68.965,effective:100},{id:'b',automatic:31.035,effective:0}]}}};
  const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/state'?data:{ok:true});});
  page.run('admin=true;state='+JSON.stringify(data)+';');await page.click('routing-weights');
- const html=page.node('#modal-content').innerHTML;assert.match(html,/value="100"/);assert.match(html,/value="0"/);assert.match(html,/每天北京时间02:00恢复自动/);assert.match(html,/0权重不参与兜底/);assert.match(html,/订阅额度为0也可设置正权重/);
+ const html=page.node('#modal-content').innerHTML;assert.match(html,/value="100"/);assert.match(html,/value="0"/);assert.match(html,/当前手动设置到期/);assert.match(html,/权重合计须为100%/);assert.doesNotMatch(html,/每天北京时间02:00恢复自动|0权重不参与兜底|重复额度查询不会覆盖/);
  await page.click('routing-auto');const saved=calls.find(([p])=>p==='/api/admin/balancing/weights');assert.deepEqual(JSON.parse(saved[1].body),{mode:'auto',expected_version:7});
 });
 
@@ -1466,6 +1466,18 @@ test('原生关闭事件到达前重开同一入口也清空旧批量选择，�
 
 test('关闭或更换弹窗后迟到IP查询和旧分配预览不能重新打开旧视图',async()=>{
  for(const action of ['ips','balancing-preview']){let release;const page=await ui(()=>new Promise(resolve=>release=()=>resolve(response([]))));page.run('admin=true;state='+JSON.stringify(snapshot())+';modal("管理")');const pending=page.click(action,'member-one');await new Promise(setImmediate);await page.click('close');page.run('modal("新管理")');release();await pending;assert.equal(page.node('#modal-content').innerHTML,'新管理');}
+});
+
+test('关闭管理弹窗后迟到的启停删除操作不能关闭或重开其他弹窗',async()=>{
+ for(const [action,id] of [['toggle-member','member-one'],['toggle-key','key-one'],['confirm-remove-key','key-one'],['confirm-disable-account','api-one'],['confirm-remove-account','api-one'],['disable-session','session-one'],['cancel-login','api-one']]){
+  let release;const state={...snapshot(),accounts:managedAccounts(),members:[{id:'member-one',name:'合成迟到员工',enabled:1}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1}]},page=await ui((path,options)=>['PATCH','DELETE','POST'].includes(options.method)?new Promise(resolve=>release=()=>resolve(response({ok:true,moved:0}))):response(state));page.run('admin=true;state='+JSON.stringify(state)+';modal("原管理")');const pending=page.click(action,id);await new Promise(setImmediate);await page.click('close');page.run('modal("新管理")');release();await pending;assert.equal(page.node('#modal').open,true,action);assert.equal(page.node('#modal-content').innerHTML,'新管理',action);
+ }
+});
+
+test('关闭编辑表单后迟到的名称模型和负载设置保存不关闭新弹窗',async()=>{
+ for(const [action,id] of [['edit-member','member-one'],['key-models','key-one'],['balancing-settings','']]){
+  let release;const state={...snapshot(),accounts:[],members:[{id:'member-one',name:'合成保存员工',enabled:1}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1,allowed_models:null,model_policy_version:0}],balancing:{settings:{weighted:false,failover:false,nightly:false,quietMinutes:30}}},page=await ui((path,options)=>options.method==='PATCH'?new Promise(resolve=>release=()=>resolve(response({ok:true}))):response(path==='/api/admin/pricing'?{rates:[]}:state));page.run('admin=true;state='+JSON.stringify(state)+';modal("原管理")');await page.click(action,id);useSyntheticForm(page,{name:'更新名称',model_policy_mode:'all',weighted:'false',failover:'false',nightly:'false',quietMinutes:'30'});const pending=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false}}}});await new Promise(setImmediate);await page.click('close');page.run('modal("另一个编辑")');release();await pending;assert.equal(page.node('#modal').open,true,action);assert.equal(page.node('#modal-content').innerHTML,'另一个编辑',action);
+ }
 });
 
 test('统计Tab仅显示相应筛选，切换时清除不可见条件并重新查询',async()=>{
