@@ -1,3 +1,4 @@
+import {dockerRunnerTag} from './postgres-runner-routing.mjs';
 import {readFile,writeFile,lstat,readdir} from 'node:fs/promises';
 import {resolve,join} from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -16,9 +17,9 @@ export function parseDigestManifest(text,context,role){
  if(expected.some(([key,value],index)=>lines[index]!==`${key}=${value}`)||!/^digest=sha256:[a-f0-9]{64}$/.test(lines[7])||!/^parent=(none|sha256:[a-f0-9]{64})$/.test(lines[8]))fail();
  return {repository,digest:lines[7].slice(7),parent:lines[8].slice(7),producer};
 }
-export function candidateChildPipeline(context,gateway,postgres){
+export function candidateChildPipeline(context,gateway,postgres,runnerTag){
  if(gateway.parent!=='none'||postgres.parent!==gateway.digest)fail();
- return {workflow:{rules:[{if:'$CI_PIPELINE_SOURCE == "parent_pipeline"'},{when:'never'}]},stages:['verify'],default:{tags:['aistrong'],interruptible:true},verify_postgres_candidate:{stage:'verify',image:{name:`${gateway.repository}@${gateway.digest}`,entrypoint:['']},services:[{name:`${postgres.repository}@${postgres.digest}`,alias:'harbor-pg'}],variables:{DOCKER_AUTH_CONFIG:'{"auths":{"${HARBOR_REGISTRY_HOST}":{"username":"${GATEWAY_REGISTRY_USERNAME}","password":"${GATEWAY_REGISTRY_PASSWORD}"}}}',CI:'true',HARBOR_PRIVATE_CANDIDATE_SERVICE:'1',HARBOR_CANDIDATE_TEST:'1',POSTGRES_DB:'harbor_ci',POSTGRES_USER:'harbor_ci',POSTGRES_PASSWORD:'harbor-ci-test-only',HARBOR_TEST_DATABASE_URL:'postgresql://harbor_ci:harbor-ci-test-only@harbor-pg:5432/harbor_ci'},script:['node /app/ci/postgres-candidate-check.mjs']}};
+ return {workflow:{rules:[{if:'$CI_PIPELINE_SOURCE == "parent_pipeline"'},{when:'never'}]},stages:['verify'],default:{tags:[dockerRunnerTag(runnerTag)],interruptible:true},verify_postgres_candidate:{stage:'verify',image:{name:`${gateway.repository}@${gateway.digest}`,entrypoint:['']},services:[{name:`${postgres.repository}@${postgres.digest}`,alias:'harbor-pg'}],variables:{DOCKER_AUTH_CONFIG:'{"auths":{"${HARBOR_REGISTRY_HOST}":{"username":"${GATEWAY_REGISTRY_USERNAME}","password":"${GATEWAY_REGISTRY_PASSWORD}"}}}',CI:'true',HARBOR_PRIVATE_CANDIDATE_SERVICE:'1',HARBOR_CANDIDATE_TEST:'1',POSTGRES_DB:'harbor_ci',POSTGRES_USER:'harbor_ci',POSTGRES_PASSWORD:'harbor-ci-test-only',HARBOR_TEST_DATABASE_URL:'postgresql://harbor_ci:harbor-ci-test-only@harbor-pg:5432/harbor_ci'},script:['node /app/ci/postgres-candidate-check.mjs']}};
 }
 export async function generateCandidatePipeline({env=process.env,directory=process.cwd()}={}){
  const context=digestContext(env),root=join(directory,'.ci-image-digests',context.pipeline),names=await readdir(root),rows=[];
@@ -26,6 +27,6 @@ export async function generateCandidatePipeline({env=process.env,directory=proce
   const name=`${role}-${producer}.manifest`;if(names.filter(value=>value.startsWith(role+'-')&&value.endsWith('.manifest')).length!==1)fail();
   const path=join(root,name),info=await lstat(path);if(!info.isFile()||info.isSymbolicLink()||info.size>4096)fail();rows.push(parseDigestManifest(await readFile(path,'utf8'),context,role));
  }
- const output=join(directory,'postgres-candidate-child.yml');await writeFile(output,JSON.stringify(candidateChildPipeline(context,...rows),null,2)+'\n',{flag:'wx',mode:0o600});return output;
+ const output=join(directory,'postgres-candidate-child.yml');await writeFile(output,JSON.stringify(candidateChildPipeline(context,...rows,env.HARBOR_DOCKER_RUNNER_TAG),null,2)+'\n',{flag:'wx',mode:0o600});return output;
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).href)generateCandidatePipeline().catch(()=>{process.stderr.write('harbor_image_digest_invalid\n');process.exitCode=1;});

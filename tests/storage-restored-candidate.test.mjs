@@ -23,5 +23,5 @@ test('actual CI candidate context rejects mismatched producer and OCI digest rat
 });
 
 test('default candidate capability module loads without namespace tooling or a compiler being packaged',async()=>{
- const root=await mkdtemp(join(tmpdir(),'harbor-restored-default-'));try{await mkdir(join(root,'ci'),{mode:0o700});for(const name of ['storage-restored-candidate.mjs','ci/postgres-candidate-pipeline.mjs'])await writeFile(join(root,name),await readFile(new URL('../'+name,import.meta.url)),{mode:0o600});const api=await import(new URL('file://'+join(root,'storage-restored-candidate.mjs')).href);assert.throws(()=>api.inspectTaskRestoredCandidate({}),/storage_restored_candidate_binding/);}finally{await rm(root,{recursive:true,force:true});}
+ const root=await mkdtemp(join(tmpdir(),'harbor-restored-default-'));try{await mkdir(join(root,'ci'),{mode:0o700});for(const name of ['storage-restored-candidate.mjs','ci/postgres-candidate-pipeline.mjs','ci/postgres-runner-routing.mjs'])await writeFile(join(root,name),await readFile(new URL('../'+name,import.meta.url)),{mode:0o600});const api=await import(new URL('file://'+join(root,'storage-restored-candidate.mjs')).href);assert.throws(()=>api.inspectTaskRestoredCandidate({}),/storage_restored_candidate_binding/);}finally{await rm(root,{recursive:true,force:true});}
 });
