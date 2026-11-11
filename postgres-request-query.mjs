@@ -28,8 +28,8 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
     if(query.status){args.push(query.status);clauses.push('r.status=$'+args.length);}
     return {window,snapshot,args,where:' WHERE '+clauses.join(' AND '),observedAt:at,watermark:createHash('sha256').update(visible).digest('hex').slice(0,24),watermarkKind:'postgres_visibility'};
   }
-  async function list(query,scope){
-    const {where,args,window,snapshot}=scope,total=(await store.get('SELECT COUNT(*) n FROM harbor.requests r'+where,...args)).n;
+  async function list(query,scope,total){
+    const {where,args,window,snapshot}=scope;if(total===undefined)total=(await store.get('SELECT COUNT(*) n FROM harbor.requests r'+where,...args)).n;
     const totalPages=Math.max(1,Math.ceil(total/query.pageSize)),page=query.cursor?query.page:Math.min(query.page,totalPages),extra=[];let seek='';
     if(query.cursor){const key=cursor(query.cursor);if(!key||key.snapshot!==snapshot||!Number.isSafeInteger(key.started)||typeof key.id!=='string'||!key.id.length||key.id.length>100||/[\x00-\x1f]/.test(key.id))invalid();extra.push(key.started,key.id);seek=` AND (r.started,r.id)<($${args.length+1},$${args.length+2})`;}
     const values=[...args,...extra,query.pageSize+1],limit='$'+values.length;
@@ -60,7 +60,7 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
       return String(a[key]).localeCompare(String(b[key]));};
     byModel.sort(sort('model'));byMember.sort(sort('member_id'));
     const models=(await store.all("SELECT DISTINCT COALESCE(billing_model,model) model FROM harbor.requests WHERE usage_at>=$1 AND usage_at<$2 AND COALESCE(billing_model,model) IS NOT NULL AND COALESCE(billing_model,model)<>'' ORDER BY model",scope.window.start,scope.window.end)).map(r=>r.model);
-    const members=await store.all('SELECT DISTINCT m.id,m.name,m.removed_at FROM harbor.requests r JOIN harbor.members m ON m.id=r.member_id WHERE r.usage_at>=$1 AND r.usage_at<$2 ORDER BY m.name,m.id',scope.window.start,scope.window.end);
+    const members=await store.all('SELECT m.id,m.name,m.removed_at FROM harbor.members m WHERE EXISTS(SELECT 1 FROM harbor.requests r WHERE r.member_id=m.id AND r.usage_at>=$1 AND r.usage_at<$2) ORDER BY m.name,m.id',scope.window.start,scope.window.end);
     return {summary,byModel,byMember,models,members};
   }
   const execute=async query=>{
@@ -71,7 +71,8 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
     if(!query.snapshot)await store.run('DELETE FROM harbor.request_query_snapshots WHERE expires_at<=$1 OR id IN (SELECT id FROM harbor.request_query_snapshots WHERE expires_at>$1 ORDER BY created DESC,id DESC OFFSET $2)',at,maxSnapshots-1);
     return store.transaction(async()=>{
       const current=await scope(query,at),{args,where,...metadata}=current;
-      return {...metadata,...(query.view==='summary'?{}:await list(query,current)),...(query.view==='list'?{}:await statistics(query,current))};
+      const stats=query.view==='list'?null:await statistics(query,current);
+      return {...metadata,...(query.view==='summary'?{}:await list(query,current,stats?.summary.requests)),...(stats??{})};
     },{level:'REPEATABLE READ'});
   };
   return {read:(query,{signal}={})=>{const input={...query};return queue.run(()=>execute(input),{signal});},close:()=>queue.close(),status:()=>queue.status(),queue};
