@@ -44,6 +44,16 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
     const rows=scope==='member'?await store.all('SELECT member_id owner_id,COUNT(*) total FROM harbor.employee_devices WHERE member_id=ANY($1::text[]) GROUP BY member_id',ids):await store.all(`SELECT k.id owner_id,COUNT(d.id) total FROM harbor.keys k LEFT JOIN harbor.employee_devices d ON d.member_id=k.member_id AND (d.allowed_key_ids IS NULL OR d.allowed_key_ids ? k.id) AND (k.device_ids IS NULL OR k.device_ids ? d.id) WHERE k.id=ANY($1::text[]) GROUP BY k.id`,ids);
     return new Map(rows.map(row=>[row.owner_id,row.total]));
   }
+  async function keyExpirations(ids,at){
+    if(!ids.length)return new Map();
+    const rows=await store.all(`SELECT member_id,
+      COUNT(*) FILTER(WHERE expires IS NULL) permanent,
+      COUNT(*) FILTER(WHERE expires IS NOT NULL AND expires<=$2) expired,
+      MIN(expires) FILTER(WHERE expires>$2) next,
+      MAX(expires) FILTER(WHERE expires IS NOT NULL AND expires<=$2) last_expired
+      FROM harbor.keys WHERE member_id=ANY($1::text[]) AND removed_at IS NULL GROUP BY member_id`,ids,at);
+    return new Map(rows.map(({member_id,...value})=>[member_id,value]));
+  }
   async function member(row,data,at,deviceCounts,{metadata=false}={}){
     const {default_models,usage_limits,usage_limits_version,...view}=row,configuration=postgresMemberLimitConfiguration({usage_limits,usage_limits_version});
     return {...view,default_models:storedModelAllowlist(default_models),usage_limits:configuration,...(metadata?{}:{limit_usage:configuration.enabled?(await limits.status(row.id,at)).usage:[],...used(data,row.id)}),registered_devices:(deviceCounts??await registered('member',[row.id])).get(row.id)??0};
@@ -57,7 +67,7 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL) key_count,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL AND k.model_source->>'kind'='custom') key_exceptions
       FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE ${condition.where} ORDER BY m.created DESC,m.id DESC LIMIT $${n+1} OFFSET $${n+2}`,...condition.values,query.pageSize,(page-1)*query.pageSize);
-    const metadata=query.view==='list',ids=rows.map(row=>row.id),data=metadata?null:await usage('member',ids,at),deviceCounts=await registered('member',ids),items=[];for(const row of rows)items.push(await member(row,data,at,deviceCounts,{metadata}));
+    const metadata=query.view==='list',ids=rows.map(row=>row.id),data=metadata?null:await usage('member',ids,at),deviceCounts=await registered('member',ids),expirations=await keyExpirations(ids,at),items=[];for(const row of rows)items.push(await member({...row,key_expiration:expirations.get(row.id)??{permanent:0,expired:0,next:null,last_expired:null}},data,at,deviceCounts,{metadata}));
     return budget({rows:items,types,pagination:{page,pageSize:query.pageSize,total,totalPages},filters:query,observedAt:at,...(metadata?{usagePending:items.length>0}:{})});
   });}
   async function detail(memberId){return read(async()=>{
@@ -80,5 +90,10 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
     if(rows.length>maxSelection)fail(413,'筛选结果超过批量容量，请缩小范围','member_selection_capacity');
     return budget({members:rows,total:rows.length,filters:query,observedAt:clock()});
   });}
-  return {list,detail,keys,selection};
+  async function keyPolicy(keyId){return read(async()=>{
+    const row=await store.get('SELECT k.allowed_models,m.usage_limits,m.usage_limits_version FROM harbor.keys k JOIN harbor.members m ON m.id=k.member_id WHERE k.id=$1 AND k.removed_at IS NULL AND m.removed_at IS NULL',keyId);
+    if(!row)fail(404,'Key不存在或已移除','key_not_found');
+    return {allowed_models:storedModelAllowlist(row.allowed_models),usage_limits:postgresMemberLimitConfiguration(row)};
+  });}
+  return {list,detail,keys,selection,keyPolicy};
 }

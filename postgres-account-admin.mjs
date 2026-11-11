@@ -1,4 +1,5 @@
 import {createPostgresAccountPackages} from './postgres-account-packages.mjs';
+import {createPostgresSubscriptionPrices,subscriptionMonthlyUsd} from './postgres-subscription-price.mjs';
 import {mkdir,rmdir} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {AppError,id,hash,encryptStoredKey} from './store.mjs';
@@ -13,6 +14,7 @@ export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,c
   if(typeof runtime!=='string'||!runtime||!router||typeof router.disableAccount!=='function'||typeof router.block!=='function'||typeof checkApi!=='function'||typeof checkSubscription!=='function')throw new AppError(503,'账号管理依赖尚未配置完整','account_configuration');
   const queue=createPostgresQueryQueue(checks),pending=new Map(),controllers=new Set();let stopping=false;
   const packages=createPostgresAccountPackages(store,{clock,queryQueue:queue,onChange:()=>router.syncWeights('package')});
+  const subscriptionPrices=createPostgresSubscriptionPrices(store,{clock});
   const quotas=readQuota?createPostgresAccountQuotas(store,{router,packages,queue,readQuota,clock,parallelism:checks.maxConcurrent??2}):null;
   const login=startLogin?createPostgresAccountLogin(store,{startLogin,reserveLogin,clock,local,onReady:account=>quotas?.refresh(account,{force:true}),checkSubscription:(account,options)=>queue.run(()=>checkSubscription(account,options))}):null;
   const running=()=>{if(stopping)throw new AppError(503,'账号管理正在关闭','service_stopping');};
@@ -54,18 +56,23 @@ export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,c
   }
   async function handle(path,method,payload={}){
     if(stopping)throw new AppError(503,'账号管理正在关闭','service_stopping');
+    const subscription=path.match(/^\/api\/admin\/accounts\/([a-zA-Z0-9-]+)\/subscription$/);
+    if(subscription&&method==='GET')return {status:200,value:await queue.run(()=>subscriptionPrices.read(subscription[1]))};
+    if(subscription&&method==='PATCH')return {status:200,value:await subscriptionPrices.save(subscription[1],payload)};
     if(/^\/api\/admin\/(account-packages|accounts\/[^/]+\/package)(?:\/|$)/.test(path)){if(path==='/api/admin/account-packages/coverage'&&method==='GET')return {status:200,value:await router.readView({explanation:true,packagePreview:true})};const result=await packages.handle(path,method,payload);if(result)return result;}
     if(path.startsWith('/api/admin/platform/')&&platform)return platform.handle(path,method,payload);
     if(quotas&&path==='/api/admin/quotas/refresh'&&method==='POST')return {status:200,value:await quotas.refreshAll({force:true})};
     if(path==='/api/admin/accounts'&&method==='POST'){
       const kind=payload.kind||'codex',mode=payload.auth_mode||'subscription',accountId=id(),accountName=name(payload.name);
       if(!['codex','claude'].includes(kind)||!['subscription','openai_api'].includes(mode)||mode==='openai_api'&&kind!=='codex')throw new AppError(400,'不支持的账号类型');
+      if(payload.subscription_monthly_usd!==undefined){if(kind!=='codex'||mode!=='subscription')throw new AppError(400,'仅Codex官方订阅可设置订阅月费');subscriptionMonthlyUsd(payload.subscription_monthly_usd);}
       const secret=mode==='openai_api'?apiKeyValue(payload.api_key):null,encrypted=secret?cipher(secret,accountId):null,home=join(resolve(runtime),'accounts',accountId);let created=false;
       try{
         await mkdir(join(resolve(runtime),'accounts'),{recursive:true,mode:0o700});await mkdir(home,{mode:0o700});created=true;
         await mutate(async()=>{
           const share=mode==='openai_api'?await weight(accountId,payload.api_weight??0):0;
           await store.run("INSERT INTO harbor.accounts(id,name,home,kind,auth_mode,api_weight,state,api_secret_cipher,api_secret_digest) VALUES($1,$2,$3,$4,$5,$6,'offline',$7,$8)",accountId,accountName,home,kind,mode,share,encrypted,secret?hash(secret):null);if(mode!=='openai_api')await packages.attach(accountId,payload.package??{template_id:null});else if(payload.package!==undefined)throw new AppError(400,'API账号使用人工预算，不适用订阅套餐');await audit('account.create',accountId);
+          if(payload.subscription_monthly_usd!==undefined)await subscriptionPrices.save(accountId,{monthly_usd:payload.subscription_monthly_usd,expected_version:0});
         });return {status:201,value:{id:accountId}};
       }catch(error){if(created)await rmdir(home).catch(()=>{});throw error;}
     }
