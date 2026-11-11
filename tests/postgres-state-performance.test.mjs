@@ -22,6 +22,7 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
     const at=Date.parse('2026-11-08T10:00:00+08:00'),window=usageWindow(at),member=randomUUID(),accounts=[randomUUID(),randomUUID()],sessions=Array.from({length:27},()=>randomUUID()),revision=(await store.get('SELECT id FROM harbor.pricing_versions LIMIT 1')).id;
     await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',member,'合成概览员工',at);
     for(const [index,id] of accounts.entries())await store.run("INSERT INTO harbor.accounts(id,name,home) VALUES($1,$2,'synthetic')",id,'合成概览账号'+index);
+    await store.run("UPDATE harbor.accounts SET kind='qwen',auth_mode='platform',platform_models=$2 WHERE id=$1",accounts[1],JSON.stringify(['synthetic-model']));
     for(const [index,id] of sessions.entries())await store.run('INSERT INTO harbor.sessions(id,member_id,account_id,created,updated) VALUES($1,$2,$3,$4,$4)',id,member,accounts[0],at-index);
     const records=[
       {ended:window.start,session:sessions[26]},
@@ -48,6 +49,11 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
       try{
         const full=await reader.read({people:'all',sessionPage:page}),compact=await reader.read({people:'none',sessionPage:page});
         assert.deepEqual(compact,{...full,members:[],keys:[],peopleLoaded:false});
+        const sessionView=await reader.read({view:'sessions',sessionPage:page});
+        assert.equal(sessionView.view,'sessions');assert.deepEqual(sessionView.sessions,full.sessions);assert.deepEqual(sessionView.sessionsPagination,full.sessionsPagination);assert.deepEqual(sessionView.usageWindow,full.usageWindow);
+        assert.deepEqual(sessionView.requests,[]);assert.deepEqual(sessionView.audit,[]);assert.deepEqual(sessionView.members,[]);assert.deepEqual(sessionView.keys,[]);assert.deepEqual(sessionView.daily,[]);
+        for(const field of ['totals','balancing','recentUsageWindow','memberCount','keyCount'])assert.equal(Object.hasOwn(sessionView,field),false,field+' is not needed by the sessions page');
+        assert.deepEqual(sessionView.accounts.map(row=>row.id),full.accounts.map(row=>row.id));
         const accountsView=await reader.read({view:'accounts'});
         assert.equal(accountsView.view,'accounts');
         assert.deepEqual(accountsView.accounts,full.accounts);
@@ -58,11 +64,15 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
         assert.deepEqual(compact.recentUsageWindow,{start:observedAt-12*3600000,end:observedAt,hours:12});
         assert.equal(compact.memberCount,1);assert.equal(compact.keyCount,0);
         const light=await reader.read({view:'overview'});
+        for(const entry of [sessionView,light])assert.equal(entry.accounts.find(row=>row.id===accounts[1]).platform_models,JSON.stringify(['synthetic-model']));
         assert.deepEqual(light.totals,{requests:compact.totals.requests,success:compact.totals.success});
         assert.deepEqual(light.daily,compact.daily.map(({day,requests})=>({day,requests})));
         if(observedAt===at)assert.deepEqual(light,withoutIndex);
 
         if(observedAt===at){
+          if(page===1)for(const filters of [{sessionQ:'合成概览员工'},{sessionQ:'no-synthetic-match'},{sessionAccount:accounts[0]},{sessionAccount:accounts[1]},{sessionStatus:'enabled'},{sessionStatus:'disabled'},{sessionType:'unclassified'}]){
+            const original=await reader.read({...filters,people:'none',sessionPageSize:20}),selected=await reader.read({...filters,view:'sessions',sessionPageSize:20});assert.deepEqual(selected.sessions,original.sessions);assert.deepEqual(selected.sessionsPagination,original.sessionsPagination);
+          }
           assert.equal(compact.totals.requests,5);assert.equal(compact.totals.standard.unpriced,1);assert.equal(compact.totals.standard.total_exact,'36028.797018963972');
           assert.equal(compact.sessionsPagination.total,27);assert.equal(compact.sessionsPagination.page,page===1?1:2);
           assert.equal(compact.sessions.length,page===1?25:2);

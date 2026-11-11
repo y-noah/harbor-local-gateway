@@ -190,3 +190,7 @@ body{font-size:17.6px}
 
 @media(max-width:760px){.sidebar-status{flex-direction:row;align-items:center;justify-content:center;gap:4px}.sidebar-status>.sidebar-connection{flex:0 0 auto}}
 @media(prefers-reduced-motion:reduce){#refresh[aria-busy=true] .sidebar-icon{animation:none}}
+
+.dialog-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.dialog-heading>h2{margin:0;min-width:0}.dialog-heading>.actions{margin:0;flex-shrink:0;gap:8px}.type-template-card .type-description{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.type-template-card .type-card-actions{margin-top:16px}
+
+.management-section{padding:18px 0;border-top:1px solid var(--line)}.management-section:first-of-type{padding-top:0;border-top:0}.management-section>h3{margin:0 0 14px}.management-section.danger-section>h3{color:#ae5949}
