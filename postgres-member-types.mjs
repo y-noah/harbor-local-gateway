@@ -8,7 +8,7 @@ const description=value=>{if(typeof value!=='string'||value.trim().length>400)fa
 function typeCode(number){let code='';for(;number>0;number=Math.floor((number-1)/26))code=String.fromCharCode(65+(number-1)%26)+code;return code;}
 export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,queryQueue}={}){
   const limits=createPostgresMemberLimits(store,{clock});
-  const read=operation=>queryQueue?queryQueue.run(operation):operation();
+  const read=(operation,{signal}={})=>queryQueue?queryQueue.run(operation,{signal}):operation();
   const row=(target,typeId,lock='')=>target.get('SELECT * FROM harbor.member_types WHERE id=$1'+lock,typeId);
   async function template(target,type){
     return type.default_version===null?null:await target.get('SELECT version,created,allowed_models,usage_limits FROM harbor.member_type_templates WHERE type_id=$1 AND version=$2',type.id,type.default_version);
@@ -21,13 +21,13 @@ export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,
     for(const account of platforms){let models;try{models=JSON.parse(account.platform_models);}catch{}for(const model of Array.isArray(models)?models:[]){const value=typeof model==='string'?model:model?.id;if(typeof value==='string')known.add(account.kind+'/'+value);}}
     if(allowed.some(model=>!known.has(model)))fail(400,'请选择本地模型目录中的具体模型ID','member_type_model_unknown');return allowed;
   }
-  async function list(){
+  async function list({signal}={}){
     return read(()=>readStore.transaction(async()=>{
       const rows=await readStore.all(`SELECT t.*,p.created configured_at,p.allowed_models,p.usage_limits,
         (SELECT COUNT(*) FROM harbor.members m WHERE m.usage_type_id=t.id AND m.removed_at IS NULL) members
         FROM harbor.member_types t LEFT JOIN harbor.member_type_templates p ON p.type_id=t.id AND p.version=t.default_version ORDER BY t.code,t.id`);
       return {types:rows.map(({allowed_models,usage_limits,...type})=>({...type,configured:type.default_version!==null,defaults:type.default_version===null?null:{allowed_models,usage_limits}}))};
-    },{level:'REPEATABLE READ',readOnly:true}));
+    },{level:'REPEATABLE READ',readOnly:true}),{signal});
   }
   async function create(payload){
     if(!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).some(key=>!['name','description'].includes(key)))fail(400,'使用类型字段无效');
@@ -74,7 +74,7 @@ export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,
     const source=mode=>mode==='template'?{kind:'type',type_id:type.id,template_version:type.default_version}:{kind:'custom'};
     return {type,allowed,limits:configuration,sources:{models:source(modelMode),limits:source(limitMode)}};
   }
-  async function history(typeId,params){
+  async function history(typeId,params,{signal}={}){
     if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'模板历史分页无效');
     const after=Number(params.get('after')??0),limit=Number(params.get('limit')??25);if(!version(after)||!Number.isSafeInteger(limit)||limit<1||limit>100)fail(400,'模板历史分页无效');
     return read(()=>readStore.transaction(async()=>{
@@ -83,12 +83,12 @@ export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,
       let bytes=0;const selected=[];for(const entry of rows.slice(0,limit)){if(entry.bytes+1024>262144)fail(503,'单个模板超出历史读取容量','member_type_history_capacity');if(selected.length&&bytes+entry.bytes+1024>262144)break;bytes+=entry.bytes+1024;selected.push(entry.version);}
       const data=selected.length?await readStore.all('SELECT version,created,allowed_models,usage_limits FROM harbor.member_type_templates WHERE type_id=$1 AND version=ANY($2::bigint[]) ORDER BY version DESC',typeId,selected):[];
       return {type:{id:type.id,code:type.code,name:type.name,version:type.version,default_version:type.default_version},items:data.map(({allowed_models,usage_limits,...item})=>({...item,defaults:{allowed_models,usage_limits}})),after:selected.at(-1)??after,has_more:rows.length>selected.length,window,observedAt:at};
-    },{level:'REPEATABLE READ',readOnly:true}));
+    },{level:'REPEATABLE READ',readOnly:true}),{signal});
   }
-  async function handle(path,method,payload,params=new URLSearchParams()){
-    if(path==='/api/admin/member-types'&&method==='GET')return {status:200,value:await list()};
+  async function handle(path,method,payload,params=new URLSearchParams(),{signal}={}){
+    if(path==='/api/admin/member-types'&&method==='GET')return {status:200,value:await list({signal})};
     if(path==='/api/admin/member-types'&&method==='POST')return {status:201,value:await create(payload)};
-    const versions=path.match(/^\/api\/admin\/member-types\/([a-zA-Z0-9-]{1,80})\/templates$/);if(versions&&method==='GET')return {status:200,value:await history(versions[1],params)};
+    const versions=path.match(/^\/api\/admin\/member-types\/([a-zA-Z0-9-]{1,80})\/templates$/);if(versions&&method==='GET')return {status:200,value:await history(versions[1],params,{signal})};
     const match=path.match(/^\/api\/admin\/member-types\/([a-zA-Z0-9-]{1,80})$/);if(match&&method==='PATCH')return {status:200,value:await save(match[1],payload)};
     return null;
   }

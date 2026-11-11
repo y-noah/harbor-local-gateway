@@ -96,5 +96,5 @@ export function createPostgresTypeStatistics(store,{clock=Date.now,queryQueue,pa
       if(Buffer.byteLength(JSON.stringify(result))>pageBytes)capacity();return result;
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {read:value=>{if(closed)return Promise.reject(new AppError(503,'类型统计查询已关闭','query_closed'));const query=normalize(value),operation=queue.run(()=>execute(query));operations.add(operation);operation.then(()=>operations.delete(operation),()=>operations.delete(operation));return operation;},close:async()=>{closed=true;if(!queryQueue)await queue.close();await Promise.allSettled([...operations]);},status:()=>({...queue.status(),closed:closed||queue.status().closed}),queue};
+  return {read:(value,{signal}={})=>{if(closed)return Promise.reject(new AppError(503,'类型统计查询已关闭','query_closed'));const query=normalize(value),operation=queue.run(()=>execute(query),{signal});operations.add(operation);operation.then(()=>operations.delete(operation),()=>operations.delete(operation));return operation;},close:async()=>{closed=true;if(!queryQueue)await queue.close();await Promise.allSettled([...operations]);},status:()=>({...queue.status(),closed:closed||queue.status().closed}),queue};
 }

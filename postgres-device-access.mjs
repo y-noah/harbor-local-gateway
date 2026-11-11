@@ -17,7 +17,7 @@ const dto=row=>({id:row.id,member_id:row.member_id,name:row.name,system:row.syst
 export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQueue,readStore=store,invitationMs=3600000,maxInvitationMs=86400000,challengeMs=300000,maxChallenges=10,maxDevices=1000}={}){
   const issuerConfigured=!!issuer;if(issuer!==undefined&&(!issuer||typeof issuer.inspect!=='function'||typeof issuer.issue!=='function')||typeof clock!=='function'||![invitationMs,maxInvitationMs,challengeMs,maxChallenges,maxDevices].every(Number.isSafeInteger)||invitationMs<60000||maxInvitationMs>86400000||maxInvitationMs<invitationMs||challengeMs<10000||challengeMs>600000||maxChallenges<1||maxChallenges>100||maxDevices<1||maxDevices>10000)fail(503,'设备接入配置无效','device_configuration');
   issuer??={inspect:()=>fail(503,'设备CA尚未配置，已有强制策略仍执行','device_ca_unavailable'),issue:()=>fail(503,'设备CA尚未配置，已有强制策略仍执行','device_ca_unavailable')};
-  const read=op=>queryQueue?queryQueue.run(()=>readStore.transaction(op,{level:'REPEATABLE READ',readOnly:true})):readStore.transaction(op,{level:'REPEATABLE READ',readOnly:true});
+  const read=(op,{signal}={})=>queryQueue?queryQueue.run(()=>readStore.transaction(op,{level:'REPEATABLE READ',readOnly:true}),{signal}):readStore.transaction(op,{level:'REPEATABLE READ',readOnly:true});
   const audit=(action,value)=>store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),clock(),action,JSON.stringify(value));
   async function member(memberId,{lock=false,target=store}={}){const value=await target.get('SELECT id,enabled,device_mode,device_policy_version FROM harbor.members WHERE id=$1 AND removed_at IS NULL'+(lock?' FOR UPDATE':''),memberId);if(!value)fail(404,'员工不存在','device_member_not_found');return value;}
   async function scope(){return store.transaction(async()=>{let row=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='device.instance_scope'");if(!row){await store.run("INSERT INTO harbor.gateway_settings(name,value) VALUES('device.instance_scope',$1) ON CONFLICT(name) DO NOTHING",randomBytes(32).toString('hex'));row=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='device.instance_scope'");}if(!hex(row.value))fail(503,'设备实例作用域损坏','device_configuration');return row.value;});}
@@ -128,7 +128,7 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
     if(!object(payload,['name','enabled','expected_version'])||!version(payload.expected_version)||payload.name===undefined&&payload.enabled===undefined||payload.enabled!==undefined&&typeof payload.enabled!=='boolean')fail(400,'设备修改参数无效');const initial=await store.get('SELECT member_id FROM harbor.employee_devices WHERE id=$1',deviceId);if(!initial)fail(404,'设备不存在');
     return store.transaction(async()=>{await member(initial.member_id,{lock:true});const value=await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1 FOR UPDATE',deviceId);if(value.version!==payload.expected_version)fail(409,'设备已变化','device_conflict');let state=value.state;if(payload.enabled!==undefined){if(!['approved','disabled'].includes(state))fail(409,'此设备不能直接恢复，需重新核验','device_state_invalid');state=payload.enabled?'approved':'disabled';}await store.run('UPDATE harbor.employee_devices SET name=$1,state=$2,version=version+1 WHERE id=$3',payload.name===undefined?value.name:text(payload.name,80),state,deviceId);await audit('device.update',{device:deviceId,member:value.member_id,state});return dto(await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1',deviceId));});
   }
-  async function list(params){
+  async function list(params,{signal}={}){
     if([...params.keys()].some(key=>!['member_id','key_id','state','page','page_size'].includes(key)||params.getAll(key).length!==1))fail(400,'设备查询参数无效');const page=Number(params.get('page')??1),pageSize=Number(params.get('page_size')??25),memberId=params.get('member_id'),keyId=params.get('key_id'),state=params.get('state');if(!Number.isSafeInteger(page)||page<1||!Number.isSafeInteger(pageSize)||pageSize<1||pageSize>100||memberId&&!identityIdentifier(memberId)||keyId&&!identityIdentifier(keyId)||state&&!['pending','approved','disabled','needs_review','replaced'].includes(state))fail(400,'设备查询参数无效');
     return read(async()=>{
       const at=clock(),window=usageWindow(at),values=[],where=['m.removed_at IS NULL'];
@@ -147,11 +147,11 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
       if(state){requestValues.push(state);requestWhere.push('EXISTS(SELECT 1 FROM harbor.employee_devices sd WHERE sd.id=r.device_id AND sd.state=$'+requestValues.length+')');}
       const summary=await readStore.get(`SELECT COUNT(DISTINCT r.device_id) used_devices,COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests FROM harbor.requests r JOIN harbor.members rm ON rm.id=r.member_id WHERE ${requestWhere.join(' AND ')}`,...requestValues);
       return {rows:rows.map(row=>({...dto(row),fingerprint:hex(row.fingerprint)?row.fingerprint:null,member_name:row.member_name,request_count:row.request_count})),summary:{registered_devices:total,...summary},...(owner?{member:{id:owner.id,device_mode:owner.device_mode,device_policy_version:owner.device_policy_version}}:{}),pagination:{page:current,pageSize,total,totalPages},observedAt:at};
-    });
+    },{signal});
   }
-  async function handle(path,method,payload,params=new URLSearchParams()){
+  async function handle(path,method,payload,params=new URLSearchParams(),{signal}={}){
     if(path==='/api/admin/device-invitations'&&method==='POST')return {status:201,value:await invite(payload)};
-    if(path==='/api/admin/devices'&&method==='GET')return {status:200,value:await list(params)};
+    if(path==='/api/admin/devices'&&method==='GET')return {status:200,value:await list(params,{signal})};
     const renewal=path.match(/^\/api\/admin\/devices\/([a-f0-9-]{36})\/cancel-renewal$/);if(renewal&&method==='POST')return {status:200,value:await cancelRenewal(renewal[1],payload)};
     const device=path.match(/^\/api\/admin\/devices\/([a-f0-9-]{36})(\/approve)?$/);if(device&&method===(device[2]?'POST':'PATCH'))return {status:200,value:await (device[2]?approve(device[1],payload):update(device[1],payload))};
     const employee=path.match(/^\/api\/admin\/members\/([a-zA-Z0-9-]{1,80})\/device-policy$/);if(employee&&['GET','PATCH'].includes(method))return {status:200,value:await policy(employee[1],method==='PATCH'?payload:undefined)};

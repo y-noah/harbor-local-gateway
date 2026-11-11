@@ -13,7 +13,7 @@ const stopped=signal=>{if(signal?.aborted)fail(503,'批量访问操作已停止'
 // and admission. Metadata in the preview never includes a Key secret or digest.
 export function createPostgresMemberActions(store,{jobs=createPostgresJobs(store),readStore=store,queryQueue,clock=Date.now,maxMembers=1000,maxKeys=10000,maxKeysPerMember=1000,maxPreviewBytes=4194304,pageBytes=262144,ttlMs=3600000}={}){
   if(!Number.isInteger(maxMembers)||maxMembers<1||maxMembers>10000||!Number.isInteger(maxKeys)||maxKeys<1||maxKeys>100000||!Number.isInteger(maxKeysPerMember)||maxKeysPerMember<1||maxKeysPerMember>10000||!Number.isInteger(maxPreviewBytes)||maxPreviewBytes<1024||maxPreviewBytes>67108864||!Number.isInteger(pageBytes)||pageBytes<1024||pageBytes>2097152||!Number.isInteger(ttlMs)||ttlMs<60000||ttlMs>86400000)fail(503,'批量访问操作资源配置无效','member_action_configuration');
-  const read=op=>queryQueue?queryQueue.run(op):op();
+  const read=(op,{signal}={})=>queryQueue?queryQueue.run(op,{signal}):op();
   const ids=(value,max,label)=>{if(!Array.isArray(value)||!value.length||value.length>max||value.some(item=>!entityId(item))||new Set(value).size!==value.length)fail(400,label+'须为不重复的明确ID列表');return [...value].sort();};
   async function snapshot(target,memberId,{lock=false,keys=null}={}){
     const owner=await target.get('SELECT id,enabled,access_version,usage_type_id,usage_type_version,defaults_version FROM harbor.members WHERE id=$1 AND removed_at IS NULL'+(lock?' FOR UPDATE':''),memberId);if(!owner)return null;
@@ -49,13 +49,13 @@ export function createPostgresMemberActions(store,{jobs=createPostgresJobs(store
       return {id:batchId,status:'preview',members:owners.length,keys:keyCount,operation,expires:at+ttlMs};
     },{level:'REPEATABLE READ'});
   }
-  async function detail(batchId,{after=0,limit=25}={}){
+  async function detail(batchId,{after=0,limit=25,signal}={}){
     if(!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>100)fail(400,'访问操作分页无效');
     return read(()=>readStore.transaction(async()=>{
       const batch=await getBatch(readStore,batchId),counts=await readStore.all('SELECT status,COUNT(*) count FROM harbor.member_action_items WHERE batch_id=$1 GROUP BY status',batchId),rows=await readStore.all('SELECT ordinal,member_id,member_name,selected_keys,before_state,desired_state,notes,status,reason,after_state FROM harbor.member_action_items WHERE batch_id=$1 AND ordinal>$2 ORDER BY ordinal LIMIT $3',batchId,after,limit+1),items=[];let bytes=0;
       for(const row of rows.slice(0,limit)){const size=Buffer.byteLength(JSON.stringify(row));if(size>pageBytes)fail(503,'单名员工结果超过页面容量','member_action_capacity');if(items.length&&bytes+size>pageBytes)break;items.push(row);bytes+=size;}
       const job=batch.job_id?await readStore.get('SELECT status,error_code FROM harbor.background_jobs WHERE id=$1',batch.job_id):null;return {...batch,counts:Object.fromEntries(counts.map(row=>[row.status,row.count])),items,after:items.at(-1)?.ordinal??after,has_more:rows.length>items.length,job_status:job?.status??null,execution_failed:batch.status==='queued'&&['failed','cancelled'].includes(job?.status)};
-    },{level:'REPEATABLE READ',readOnly:true}));
+    },{level:'REPEATABLE READ',readOnly:true}),{signal});
   }
   async function submit(batchId){return store.transaction(async()=>{
     const batch=await getBatch(store,batchId,{lock:true});if(batch.status!=='preview')return {id:batchId,status:batch.status,job_id:batch.job_id};if(batch.expires<=clock())fail(410,'访问操作预览已过期，请重新生成','member_action_expired');const job=await jobs.enqueue('member.actions',{id:'member.actions:'+batchId,target:batchId,payload:{batch_id:batchId}});await store.run("UPDATE harbor.member_action_batches SET status='queued',job_id=$1 WHERE id=$2",job.id,batchId);return {id:batchId,status:'queued',job_id:job.id};
@@ -89,15 +89,15 @@ export function createPostgresMemberActions(store,{jobs=createPostgresJobs(store
     }
     return jobs.commitEffect(job,async()=>{await store.run("UPDATE harbor.member_action_batches SET status='completed',finished=$1 WHERE id=$2 AND status='queued'",clock(),batchId);const counts=await store.all('SELECT status,COUNT(*) count FROM harbor.member_action_items WHERE batch_id=$1 GROUP BY status',batchId);return {id:batchId,counts:Object.fromEntries(counts.map(row=>[row.status,row.count]))};});
   }
-  async function list(params){
+  async function list(params,{signal}={}){
     if([...params.keys()].some(key=>!['before','limit'].includes(key)||params.getAll(key).length!==1)||params.has('before')&&!uuid(params.get('before'))||params.has('limit')&&!/^[1-9]\d*$/.test(params.get('limit')))fail(400,'访问操作记录分页无效');const limit=Number(params.get('limit')??25);if(!Number.isInteger(limit)||limit>100)fail(400,'访问操作记录分页无效');
-    return read(()=>readStore.transaction(async()=>{const window=usageWindow(clock()),cursor=params.has('before')?await getBatch(readStore,params.get('before')):null,rows=await readStore.all(`SELECT b.id,b.created,b.status,b.direction,b.parent_id,b.operation,(SELECT COUNT(*) FROM harbor.member_action_items i WHERE i.batch_id=b.id) members FROM harbor.member_action_batches b WHERE b.created>=$1 AND b.created<$2 AND ($3::bigint IS NULL OR (b.created,b.id)<($3,$4)) ORDER BY b.created DESC,b.id DESC LIMIT $5`,window.start,window.end,cursor?.created??null,cursor?.id??'',limit+1),items=rows.slice(0,limit);return {items,before:items.at(-1)?.id??null,has_more:rows.length>limit};},{level:'REPEATABLE READ',readOnly:true}));
+    return read(()=>readStore.transaction(async()=>{const window=usageWindow(clock()),cursor=params.has('before')?await getBatch(readStore,params.get('before')):null,rows=await readStore.all(`SELECT b.id,b.created,b.status,b.direction,b.parent_id,b.operation,(SELECT COUNT(*) FROM harbor.member_action_items i WHERE i.batch_id=b.id) members FROM harbor.member_action_batches b WHERE b.created>=$1 AND b.created<$2 AND ($3::bigint IS NULL OR (b.created,b.id)<($3,$4)) ORDER BY b.created DESC,b.id DESC LIMIT $5`,window.start,window.end,cursor?.created??null,cursor?.id??'',limit+1),items=rows.slice(0,limit);return {items,before:items.at(-1)?.id??null,has_more:rows.length>limit};},{level:'REPEATABLE READ',readOnly:true}),{signal});
   }
-  async function handle(path,method,payload,params=new URLSearchParams()){
-    if(path==='/api/admin/member-action-batches'&&method==='GET')return {status:200,value:await list(params)};
+  async function handle(path,method,payload,params=new URLSearchParams(),{signal}={}){
+    if(path==='/api/admin/member-action-batches'&&method==='GET')return {status:200,value:await list(params,{signal})};
     if(path==='/api/admin/member-action-batches/preview'&&method==='POST')return {status:201,value:await preview(payload)};
     const match=path.match(/^\/api\/admin\/member-action-batches\/([a-f0-9-]{36})(?:\/(execute|retry|undo))?$/);if(!match)return null;
-    if(method==='GET'&&!match[2]){if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'访问操作分页无效');return {status:200,value:await detail(match[1],{after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)})};}
+    if(method==='GET'&&!match[2]){if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'访问操作分页无效');return {status:200,value:await detail(match[1],{signal,after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)})};}
     if(method==='POST'&&match[2]){if(!object(payload,[])||Object.keys(payload).length)fail(400,'执行只能确认原固定预览，不能替换目标');return {status:match[2]==='execute'?202:201,value:await (match[2]==='execute'?submit(match[1]):derived(match[1],match[2]))};}
     if(method==='DELETE'&&!match[2])return {status:200,value:await cancel(match[1])};return null;
   }

@@ -12,7 +12,7 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,con
   if(!jobs||!crypto||!recordings||!Number.isInteger(maxRows)||maxRows<1||maxRows>1000000||!Number.isSafeInteger(maxBytes)||maxBytes<1024||maxBytes>4294967296||!Number.isInteger(chunkBytes)||chunkBytes<1024||chunkBytes>1048576||!Number.isInteger(ttlMs)||ttlMs<60000||ttlMs>86400000||!Number.isInteger(batchRows)||batchRows<1||batchRows>100||!Number.isInteger(maxPageBytes)||maxPageBytes<2048||maxPageBytes>1048576)fail(503,'导出资源配置无效','recording_export_configuration');
   if(contexts!==undefined&&(!contexts||typeof contexts.describeSnapshot!=='function'||typeof contexts.readObject!=='function'))fail(503,'上下文导出依赖无效','recording_export_configuration');
   const contextExport=contexts?createPostgresRecordingContextExport(store,{contexts,chunkBytes}):null;
-  const read=op=>queryQueue?queryQueue.run(op):op();
+  const read=(op,{signal}={})=>queryQueue?queryQueue.run(op,{signal}):op();
   async function enqueue(input){
     if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(key=>!['include_body','format','filters'].includes(key))||typeof input.include_body!=='boolean'||!['csv','jsonl'].includes(input.format)||input.include_body&&input.format!=='jsonl'||!input.filters||typeof input.filters!=='object'||Array.isArray(input.filters)||Object.values(input.filters).some(value=>typeof value!=='string'))fail(400,'导出须明确格式、是否包含正文和筛选');
     const query=recordingQuery(new URLSearchParams(input.filters),{clock,devices}),window=usageWindow(clock());if(!input.include_body&&(query.from<window.start||query.to>window.end))fail(400,'元数据导出仅允许近7个北京时间自然日');
@@ -27,8 +27,8 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,con
   }
   async function row(id){if(typeof id!=='string'||!/^recording\.export:[a-f0-9-]{36}$/.test(id))fail(404,'导出任务不存在','recording_export_not_found');const value=await store.get('SELECT e.*,j.status job_status,j.error_code job_error FROM harbor.recording_exports e JOIN harbor.background_jobs j ON j.id=e.id WHERE e.id=$1',id);if(!value)fail(404,'导出任务不存在','recording_export_not_found');return value;}
   const publicState=(value,at)=>({id:value.id,status:value.expires<=at||value.source_expired?'expired':value.status,job_status:value.job_status,rows:value.rows,bytes:value.bytes,chunks:value.chunks,created:value.created,expires:value.expires,completed:value.completed,error_code:value.error_code||value.job_error,include_body:value.options.include_body,format:value.options.format,limits:{rows:value.options.max_rows,bytes:value.options.max_bytes},download_ready:value.status==='complete'&&value.expires>at&&!value.source_expired});
-  async function status(id){return read(async()=>publicState(await row(id),clock()));}
-  async function list(params=new URLSearchParams()){return read(async()=>{
+  async function status(id,{signal}={}){return read(async()=>publicState(await row(id),clock()),{signal});}
+  async function list(params=new URLSearchParams(),{signal}={}){return read(async()=>{
     if(!(params instanceof URLSearchParams)||[...params.keys()].some(key=>!['before','limit'].includes(key)||params.getAll(key).length!==1))fail(400,'导出历史分页参数无效');
     const limit=params.has('limit')?Number(params.get('limit')):25,at=clock(),window=usageWindow(at);if(!Number.isInteger(limit)||limit<1||limit>100)fail(400,'导出历史每页须为1至100条');let cursor=null;
     if(params.has('before'))try{const encoded=params.get('before');if(!encoded||encoded.length>1024||!/^[A-Za-z0-9_-]+$/.test(encoded))throw Error();cursor=JSON.parse(Buffer.from(encoded,'base64url').toString());if(Object.keys(cursor).sort().join(',')!=='at,id,start'||cursor.start!==window.start||!Number.isSafeInteger(cursor.at)||cursor.at<window.start||cursor.at>=window.end||typeof cursor.id!=='string'||!/^recording\.export:[a-f0-9-]{36}$/.test(cursor.id))throw Error();}catch{fail(400,'导出历史游标已失效，请重新查询','recording_export_cursor_invalid');}
@@ -39,7 +39,7 @@ export function createPostgresRecordingExports(store,{jobs,crypto,recordings,con
       FROM harbor.recording_exports e JOIN harbor.background_jobs j ON j.id=e.id WHERE e.created>=$1 AND e.created<$2${seek} ORDER BY e.created DESC,e.id DESC LIMIT $${values.length}`,...values);
     const items=[];let bytes=512;for(const value of rows.slice(0,limit)){const item=publicState(value,at),size=Buffer.byteLength(JSON.stringify(item))+1;if(bytes+size>maxPageBytes){if(!items.length)fail(503,'导出历史元数据超过响应预算','recording_export_capacity');break;}bytes+=size;items.push(item);}
     const last=items.at(-1),next_cursor=last&&rows.length>items.length?Buffer.from(JSON.stringify({start:window.start,at:last.created,id:last.id})).toString('base64url'):null;return {items,next_cursor};
-  });}
+  },{signal});}
 
   async function cancel(id){return store.transaction(async()=>{const value=await row(id);if(['cancelled','expired'].includes(value.status))return {id,status:value.status};if(value.status==='complete')fail(409,'导出已完成，可等待到期清理');await jobs.cancel(id);await store.run("UPDATE harbor.recording_exports SET status='cancelled',error_code='admin_cancelled' WHERE id=$1",id);await store.run('DELETE FROM harbor.recording_export_chunks WHERE export_id=$1',id);if(contextExport)await contextExport.release(id);return {id,status:'cancelled'};});}
   async function execute(job,{signal}={}){

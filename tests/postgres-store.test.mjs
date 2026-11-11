@@ -1446,6 +1446,17 @@ for(const phase of ['checking','applying'])test('PostgreSQL handoff '+phase+' ex
   }finally{release();store.run=run;await service.close();}
 });
 
+test('PostgreSQL authenticated administrator JSON reports only response-local application timing',integration,async t=>withGateway(t,async({password,open})=>{
+ const app=await open(),origin=await listenGateway(app);
+ let response=await fetch(origin+'/api/admin/state');assert.equal(response.status,401);assert.equal(response.headers.get('server-timing'),null);await response.arrayBuffer();
+ const cookie=await gatewayLogin(origin,password),headers={cookie};
+ for(const path of ['/api/admin/status','/api/admin/state?view=overview&people=none','/api/admin/members?view=list','/api/admin/keys','/api/admin/requests?view=all','/api/admin/type-statistics','/api/admin/pricing','/api/admin/recordings/status','/api/admin/recordings/exports','/api/admin/extra-usage/policy']){
+  response=await fetch(origin+path,{headers});assert.equal(response.status,200,path);assert.match(response.headers.get('server-timing'),/^app;dur=\d+\.\d{2}$/);assert.equal(response.headers.get('cache-control'),'no-store');assert.equal(response.headers.get('timing-allow-origin'),null);await response.json();
+ }
+ response=await fetch(origin+'/api/admin/members',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({name:'合成计时员工',quota:null,expires:null})});assert.equal(response.status,201);assert.equal(response.headers.get('server-timing'),null);await response.json();
+ for(const path of ['/health','/api/auth/session','/api/admin/nonexistent','/api/admin/requests?unsupported=true']){response=await fetch(origin+path,{headers});assert.equal(response.headers.get('server-timing'),null);await response.arrayBuffer();}
+}));
+
 test('PostgreSQL application boots real auth/static/request/admin paths and isolates saturated query and recording pools from inference',integration,async t=>withGateway(t,async({store,member,password,open})=>{
   let calls=0;const app=await open({responsesTransport:controlledResponses(async()=>{calls++;})}),origin=await listenGateway(app);
   assert.equal((await fetch(origin+'/health')).status,200);assert.equal((await fetch(origin+'/ready')).status,200);

@@ -88,12 +88,12 @@ test('PG管理适配器鉴权、读取body和GET/PATCH/refresh入口',integratio
  let authenticated=false;const admin=createPostgresPricingAdmin(store,{clock:()=>at,adminAuthenticated:async()=>authenticated,fetchImpl:async()=>new Response(page('admin-model'))});
  const send=async(path,method='GET',payload)=>{
   const req=Readable.from(payload?[Buffer.from(JSON.stringify(payload))]:[]);req.url=path;req.method=method;req.headers={'content-type':'application/json'};
-  const res={writeHead(status,headers){this.status=status;this.headers=headers;},end(value){this.value=JSON.parse(value);}};const handled=await admin.handle(req,res);return {handled,...res};
+  const res={headers:{},getHeader(name){return this.headers[name];},setHeader(name,value){this.headers[name]=value;},writeHead(status,headers){this.status=status;Object.assign(this.headers,headers);},end(value){this.value=JSON.parse(value);}};const handled=await admin.handle(req,res);return {handled,...res};
  };
  try{assert.equal((await send('/other')).handled,false);await assert.rejects(send('/api/admin/pricing'),{status:401});authenticated=true;
-  const initial=await send('/api/admin/pricing');assert.equal(initial.status,200);assert.equal(initial.headers['Cache-Control'],'no-store');
-  assert.equal((await send('/api/admin/pricing','PATCH',{expectedVersion:0,enabled:false})).value.settings.enabled,false);
-  assert.ok((await send('/api/admin/pricing/refresh','POST')).value.rates.some(r=>r.model==='admin-model'));await assert.rejects(send('/api/admin/pricing','DELETE'),{status:405});
+  const initial=await send('/api/admin/pricing');assert.equal(initial.status,200);assert.equal(initial.headers['Cache-Control'],'no-store');assert.match(initial.headers['Server-Timing'],/^app;dur=\d+\.\d{2}$/);
+  const configured=await send('/api/admin/pricing','PATCH',{expectedVersion:0,enabled:false});assert.equal(configured.value.settings.enabled,false);assert.equal(configured.headers['Server-Timing'],undefined);
+  const refreshed=await send('/api/admin/pricing/refresh','POST');assert.ok(refreshed.value.rates.some(r=>r.model==='admin-model'));assert.equal(refreshed.headers['Server-Timing'],undefined);await assert.rejects(send('/api/admin/pricing','DELETE'),{status:405});
  }finally{await admin.close();}
 }));
 

@@ -54,12 +54,12 @@ export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,c
       }finally{controllers.delete(controller);}
     }).finally(()=>pending.delete(key));pending.set(key,task);return task;
   }
-  async function handle(path,method,payload={}){
+  async function handle(path,method,payload={},options={}){
     if(stopping)throw new AppError(503,'账号管理正在关闭','service_stopping');
     const subscription=path.match(/^\/api\/admin\/accounts\/([a-zA-Z0-9-]+)\/subscription$/);
-    if(subscription&&method==='GET')return {status:200,value:await queue.run(()=>subscriptionPrices.read(subscription[1]))};
+    if(subscription&&method==='GET')return {status:200,value:await queue.run(()=>subscriptionPrices.read(subscription[1]),{signal:options.signal})};
     if(subscription&&method==='PATCH')return {status:200,value:await subscriptionPrices.save(subscription[1],payload)};
-    if(/^\/api\/admin\/(account-packages|accounts\/[^/]+\/package)(?:\/|$)/.test(path)){if(path==='/api/admin/account-packages/coverage'&&method==='GET')return {status:200,value:await router.readView({explanation:true,packagePreview:true})};const result=await packages.handle(path,method,payload);if(result)return result;}
+    if(/^\/api\/admin\/(account-packages|accounts\/[^/]+\/package)(?:\/|$)/.test(path)){if(path==='/api/admin/account-packages/coverage'&&method==='GET')return {status:200,value:await router.readView({explanation:true,packagePreview:true})};const result=await packages.handle(path,method,payload,method==='GET'?options:{});if(result)return result;}
     if(path.startsWith('/api/admin/platform/')&&platform)return platform.handle(path,method,payload);
     if(quotas&&path==='/api/admin/quotas/refresh'&&method==='POST')return {status:200,value:await quotas.refreshAll({force:true})};
     if(path==='/api/admin/accounts'&&method==='POST'){

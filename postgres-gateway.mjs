@@ -1,4 +1,5 @@
 import {recordingContextConfiguration} from './recording-context-configuration.mjs';
+import {beginAdminRequestTiming,finishAdminRequestTiming} from './admin-request-timing.mjs';
 import {postgresShutdownConfiguration,installPostgresGatewayShutdown} from './postgres-shutdown.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {RecordingContextStore} from './recording-context-store.mjs';
@@ -41,7 +42,7 @@ import {createPostgresNightly} from './postgres-nightly.mjs';
 import {createPlatformTransport} from './platforms.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
-const json=(res,status,value)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8'});res.end(JSON.stringify(value));};
+const json=(res,status,value,authenticated=false)=>{const encoded=JSON.stringify(value);finishAdminRequestTiming(res,status,{authenticated});res.writeHead(status,{'content-type':'application/json; charset=utf-8'});res.end(encoded);};
 const missing=async path=>{try{await lstat(path);return false;}catch(e){if(e.code==='ENOENT')return true;throw e;}};
 async function privateFile(path){
   const info=await lstat(path);
@@ -206,6 +207,7 @@ export async function createPostgresGateway(options={}){
     await nightly.recover();requireOwnership();
     const status=()=>({...handler.status(),jsonParsing:jsonParser.status(),cliProcesses:cliProcesses.status(),nightly:nightly.status(),ownership:!lostOwnership,interruptedOnStartup:interrupted,accountChecks:accountAdmin.status(),pools:{core:store.status(),query:queryStore.status(),recording:recordingStore.status()},recording:buffer.status(),recordingStorage:recordingMonitor.status(),recordingCapture:{enabled:recordingEnabled,effective:recordingEnabled&&recordingMonitor.captureAllowed(),reason:!recordingEnabled?'capture_disabled':recordingMonitor.snapshot().status==='low'?'storage_low':recordingMonitor.captureAllowed()?null:'storage_unknown'},devices:{...handler.deviceAccess.status(),tls:deviceTls?.status()??null},eventLoop:{meanMs:Number.isFinite(loop.mean)?loop.mean/1e6:0,maxMs:loop.max/1e6}});
     async function handle(req,res){
+      beginAdminRequestTiming(req,res);
       const body=new AbortController(),closed=()=>{if(!res.writableEnded)body.abort();};res.on('close',closed);
       res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');
       res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
@@ -215,12 +217,12 @@ export async function createPostgresGateway(options={}){
         if(req.method==='GET'&&path==='/health')return json(res,200,{ok:true,service:'harbor',storage:'postgres'});
         if(req.method==='GET'&&path==='/ready'){const databaseReady=!closing&&!lostOwnership&&await store.ready(),ready=databaseReady&&!closing&&!lostOwnership;return json(res,ready?200:503,{ready});}
         if(closing||lostOwnership)throw new AppError(503,closing?'服务正在排空':'服务实例所有权已丢失',closing?'service_stopping':'gateway_ownership_lost');
-        if(await extraUsageAdmin.handle(req,res))return;
+        if(await extraUsageAdmin.handle(req,res,{signal:body.signal}))return;
         if(req.method==='GET'&&['/','/app.js','/style.css'].includes(path)){res.setHeader('Content-Type',path==='/'?'text/html; charset=utf-8':path.endsWith('.js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8');return res.end(files.get(path==='/'?'index.html':path.slice(1)));}
         if(path==='/api/auth/login'&&req.method==='POST'){await auth.loginAsync((await requestBodies.read(req,{owner:'login',signal:body.signal})).password,res);return json(res,200,{ok:true});}
         if(path==='/api/auth/logout'&&req.method==='POST'){auth.logout(req,res);return json(res,200,{ok:true});}
         if(path==='/api/auth/session'&&req.method==='GET')return json(res,200,{authenticated:auth.authenticated(req)});
-        if(path==='/api/admin/status'&&req.method==='GET'){if(!auth.authenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');return json(res,200,status());}
+        if(path==='/api/admin/status'&&req.method==='GET'){if(!auth.authenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');return json(res,200,status(),true);}
         if(await handler.handle(req,res))return;
         throw new AppError(404,'此入口尚未接入PostgreSQL开发服务','not_found');
       }catch(error){

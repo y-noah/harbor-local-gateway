@@ -1,11 +1,12 @@
 import {AppError,id} from './store.mjs';
+import {beginAdminRequestTiming,finishAdminRequestTiming} from './admin-request-timing.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 
 const fail=(status,code,message='额外额度管理操作未完成，请核对状态后重试')=>{throw new AppError(status,message,code);};
 const accountId=value=>typeof value==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(value);
 const actorValid=value=>value&&Object.keys(value).length===1&&typeof value.session_ref==='string'&&/^[a-f0-9]{64}$/.test(value.session_ref);
 const extraPage=params=>{if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'extra_preview_page_invalid');return {after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)};};
-const json=(res,status,value)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(value));};
+const json=(res,status,value)=>{const encoded=JSON.stringify(value);finishAdminRequestTiming(res,status,{authenticated:true});res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(encoded);};
 
 // The security callback is bound to the gateway's controlled Host/Origin rules.
 // It is mandatory even when this handler is mounted behind the same guard.
@@ -43,19 +44,19 @@ export function createPostgresExtraUsageAdmin({service,reader=service,policyPrev
   const job={id:id(),account_id:owner,state:'queued',created_at:clock(),finished_at:null,verification:'pending',reason:null,components:{extra:{state:'queued',verification:'pending',reason:null},subscription:{state:refreshSubscriptionQuota?'queued':'unsupported',verification:'pending',reason:refreshSubscriptionQuota?null:'subscription_quota_not_supported'}}};jobs.set(job.id,job);pending.set(owner,job.id);
   const task=refreshQueue.run(async()=>{job.state='running';const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),refreshTimeoutMs);timer.unref();controllers.add(controller);try{await refreshComponent(job,'subscription',controller.signal);await refreshComponent(job,'extra',controller.signal);const states=Object.values(job.components).map(value=>value.state);job.verification=job.components.extra.verification;if(!refreshSubscriptionQuota){job.state=job.components.extra.state;job.reason=job.components.extra.reason;}else{job.state=states.every(state=>state==='unsupported')?'unsupported':states.every(state=>state==='cancelled')?'cancelled':states.some(state=>['verified','refreshed','pending_verification','rejected'].includes(state))?'completed':states.some(state=>state==='failed')?'failed':'completed';job.reason=states.some(state=>['failed','cancelled','unsupported'].includes(state))?'refresh_components_incomplete':null;}}finally{clearTimeout(timer);controllers.delete(controller);}}).catch(()=>{job.state='failed';job.reason='extra_refresh_not_started';for(const component of Object.values(job.components))if(component.state==='queued'){component.state='not_started';component.reason='refresh_not_started';}}).finally(()=>{job.finished_at=clock();pending.delete(owner);tasks.delete(task);});tasks.add(task);return publicJob(job);
  }
- async function perform(req,res){
+ async function perform(req,res,{signal}={}){
   const url=new URL(req.url,'http://localhost'),global=url.pathname==='/api/admin/extra-usage/policy',extra=/^\/api\/admin\/extra-usage\/(coverage|policy\/preview|batches(?:\/preview|\/[a-f0-9-]{36}(?:\/(?:execute|retry))?)?)$/.exec(url.pathname),match=/^\/api\/admin\/accounts\/([^/]+)\/extra-usage(?:\/(manual|reset-card-used|refresh|records)(?:\/([^/]+))?)?$/.exec(url.pathname);
   if(!global&&!match&&!extra)return false;
   if(!await adminAuthenticated(req))fail(401,'admin_required','请先输入管理密码登录');
   if(!await acceptsAdminRequest(req))fail(403,'admin_origin_forbidden','不允许此Host或跨站请求');
   running();if(!extra&&match?.[2]!=='records'&&[...url.searchParams.keys()].length)fail(400,'extra_admin_query_invalid');
-  if(extra){if(!batches)fail(503,'extra_batch_unavailable');const route=extra[1],detail=/^batches\/([a-f0-9-]{36})(?:\/(execute|retry))?$/.exec(route);if(req.method==='GET'){const value=await readQueue.run(()=>route==='coverage'?batches.coverage(url.searchParams):route==='batches'?batches.list(url.searchParams):detail&&!detail[2]?batches.detail(detail[1],extraPage(url.searchParams)):fail(405,'method_not_allowed'));json(res,200,value);return true;}if(req.method!=='POST'||[...url.searchParams.keys()].length)fail(405,'method_not_allowed');const actor=await adminSession(req);if(!actorValid(actor))fail(403,'extra_admin_context_required');try{const payload=await requestBodies.read(req,{maxBytes:maxBodyBytes,owner:'extra-admin:'+actor.session_ref});running();let value,status=201;if(route==='policy/preview')value=await batches.previewPolicy(payload,actor);else if(route==='batches/preview')value=await batches.previewAccounts(payload,actor);else if(detail&&detail[2]){if(!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).length)fail(400,'extra_preview_confirm_invalid');value=await(detail[2]==='execute'?batches.submit(detail[1],actor):batches.retryAccounts(detail[1],actor));status=detail[2]==='execute'?202:201;}else fail(405,'method_not_allowed');json(res,status,value);return true;}finally{requestBodies.release(req);}}
+  if(extra){if(!batches)fail(503,'extra_batch_unavailable');const route=extra[1],detail=/^batches\/([a-f0-9-]{36})(?:\/(execute|retry))?$/.exec(route);if(req.method==='GET'){const value=await readQueue.run(()=>route==='coverage'?batches.coverage(url.searchParams):route==='batches'?batches.list(url.searchParams):detail&&!detail[2]?batches.detail(detail[1],extraPage(url.searchParams)):fail(405,'method_not_allowed'),{signal});json(res,200,value);return true;}if(req.method!=='POST'||[...url.searchParams.keys()].length)fail(405,'method_not_allowed');const actor=await adminSession(req);if(!actorValid(actor))fail(403,'extra_admin_context_required');try{const payload=await requestBodies.read(req,{maxBytes:maxBodyBytes,owner:'extra-admin:'+actor.session_ref});running();let value,status=201;if(route==='policy/preview')value=await batches.previewPolicy(payload,actor);else if(route==='batches/preview')value=await batches.previewAccounts(payload,actor);else if(detail&&detail[2]){if(!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).length)fail(400,'extra_preview_confirm_invalid');value=await(detail[2]==='execute'?batches.submit(detail[1],actor):batches.retryAccounts(detail[1],actor));status=detail[2]==='execute'?202:201;}else fail(405,'method_not_allowed');json(res,status,value);return true;}finally{requestBodies.release(req);}}
   let owner;if(match){try{owner=decodeURIComponent(match[1]);}catch{fail(400,'extra_account_id_invalid');}if(!accountId(owner))fail(400,'extra_account_id_invalid');}
   const method=req.method,action=match?.[2],jobId=match?.[3];
   if(method==='GET'){
-   if(global){json(res,200,await readQueue.run(()=>reader.readPolicy()));return true;}
-   if(action==='records'&&!jobId){if(!batches)fail(503,'extra_batch_unavailable');json(res,200,await readQueue.run(()=>batches.records(owner,url.searchParams)));return true;}
-   if(!action){json(res,200,await readQueue.run(()=>reader.readAccount(owner)));return true;}
+   if(global){json(res,200,await readQueue.run(()=>reader.readPolicy(),{signal}));return true;}
+   if(action==='records'&&!jobId){if(!batches)fail(503,'extra_batch_unavailable');json(res,200,await readQueue.run(()=>batches.records(owner,url.searchParams),{signal}));return true;}
+   if(!action){json(res,200,await readQueue.run(()=>reader.readAccount(owner),{signal}));return true;}
    if(action==='refresh'&&jobId){purge();const job=jobs.get(jobId);if(!job||job.account_id!==owner)fail(404,'extra_refresh_not_found','刷新任务记录已过期或被回收，请重新读取账号权益结果；不要自动重新提交刷新');json(res,200,publicJob(job));return true;}
    fail(405,'method_not_allowed');
   }
@@ -70,7 +71,7 @@ export function createPostgresExtraUsageAdmin({service,reader=service,policyPrev
    fail(405,'method_not_allowed');
   }finally{requestBodies.release(req);}
  }
- const handle=(req,res)=>{const operation=perform(req,res);requests.add(operation);void operation.then(()=>requests.delete(operation),()=>requests.delete(operation));return operation;};
+ const handle=(req,res,options={})=>{beginAdminRequestTiming(req,res);const operation=perform(req,res,req.method==='GET'?options:{});requests.add(operation);void operation.then(()=>requests.delete(operation),()=>requests.delete(operation));return operation;};
  const close=()=>closePromise??=(async()=>{stopping=true;for(const controller of controllers)controller.abort();await Promise.all([readQueue.close(),refreshQueue.close()]);await Promise.allSettled([...requests,...tasks]);})();
  return Object.freeze({handle,close,status:()=>({reads:readQueue.status(),refresh:refreshQueue.status(),jobs:jobs.size,pending:pending.size,requests:requests.size,stopping})});
 }

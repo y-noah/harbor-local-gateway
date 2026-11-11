@@ -1,4 +1,5 @@
 import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
+import {beginAdminRequestTiming,finishAdminRequestTiming} from './admin-request-timing.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {createRequestStreamTiming} from './request-stream-timing.mjs';
 import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
@@ -37,7 +38,7 @@ import {createSessionRequestHandoff} from './session-request-handoff.mjs';
 import {createPostgresSessionHandoffs} from './postgres-session-handoffs.mjs';
 import {replayableResponsesInput,replayableResponsesEvent} from './responses-replay-context.mjs';
 
-const json=(res,status,value)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(value));};
+const json=(res,status,value)=>{const encoded=JSON.stringify(value);finishAdminRequestTiming(res,status,{authenticated:true});res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(encoded);};
 async function sse(res,event,signal,sessionId,output,timing,contentToken){
   if(output)return writeOutput(res,event,{output,signal,timing,contentToken,prefix:'event: '+event.type+'\ndata: ',suffix:'\n\n',headers:{'Content-Type':'text/event-stream; charset=utf-8','X-Accel-Buffering':'no','X-Harbor-Session':sessionId}});
   if(res.destroyed||signal.aborted)throw new AppError(499,'客户端已断开','request_cancelled');
@@ -85,7 +86,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   async function handleRoute(req,res,bodySignal,stage,receipt){
     const url=new URL(req.url,'http://localhost'),path=url.pathname;
     if(recordingAdmin&&await recordingAdmin.handle(req,res))return true;
-    if(await typeStatisticsAdmin.handle(req,res))return true;
+    if(await typeStatisticsAdmin.handle(req,res,{signal:bodySignal}))return true;
     if(path.startsWith('/api/device/enroll/')&&req.method==='POST'){
       const payload=await requestBodies.read(req,{owner:'device-enrollment',maxBytes:65536,signal:bodySignal});
       const result=await deviceAccess.publicHandle(path,req.method,payload,req);if(result){json(res,result.status,result.value);return true;}
@@ -93,7 +94,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     if(/^\/api\/admin\/(devices|device-invitations)(?:\/|$)/.test(path)){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',maxBytes:65536,signal:bodySignal}):{};
-      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams);if(result){json(res,result.status,result.value);return true;}
+      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){json(res,result.status,result.value);return true;}
     }
     if(path==='/api/me'&&req.method==='GET'){const secret=String(req.headers.authorization||'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at:clock()});await deviceAccess.authorize(member,req);json(res,200,await selfQuery(secret));return true;}
     if(await clientCatalog.handle(req,res))return true;
@@ -105,7 +106,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
       if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');
-      const handoff=await handoffAdmin.handle(path,req.method,payload);if(handoff){json(res,handoff.status,handoff.value);return true;}
+      const handoff=await handoffAdmin.handle(path,req.method,payload,req.method==='GET'?{signal:bodySignal}:{});if(handoff){json(res,handoff.status,handoff.value);return true;}
       if(path==='/api/admin/balancing/plans'&&req.method==='POST'){
         if(Object.keys(payload).length)throw new AppError(400,'规划预览无需额外参数');
         const result=await store.transaction(async()=>{if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');const result=await planning.enqueue();if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');return result;});
@@ -116,11 +117,11 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         let result;
         if(planPath[2]){
           const params=url.searchParams;if([...params.keys()].some(key=>!['section','after','limit'].includes(key))||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))throw new AppError(400,'规划分页参数无效','planning_query_invalid');
-          result=await queryQueue.run(()=>planningReader.page(planPath[1],{section:params.get('section')??'moves',after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)}));
-        }else result=await queryQueue.run(()=>planningReader.status(planPath[1]));
+          result=await queryQueue.run(()=>planningReader.page(planPath[1],{section:params.get('section')??'moves',after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)}),{signal:bodySignal});
+        }else result=await queryQueue.run(()=>planningReader.status(planPath[1]),{signal:bodySignal});
         json(res,200,result);return true;
       }
-      if(path==='/api/admin/balancing/explanation'&&req.method==='GET'){json(res,200,await queryQueue.run(()=>readRouter.readView({explanation:true})));return true;}
+      if(path==='/api/admin/balancing/explanation'&&req.method==='GET'){json(res,200,await queryQueue.run(()=>readRouter.readView({explanation:true}),{signal:bodySignal}));return true;}
       if(path==='/api/admin/balancing'&&req.method==='PATCH'){json(res,200,await adminRouter.saveSettings(payload));return true;}
       if(path==='/api/admin/balancing/schedule'&&req.method==='PATCH'){json(res,200,await adminRouter.saveTransferSchedule(payload));return true;}
       if(path==='/api/admin/balancing/weights'&&req.method==='PATCH'){const result=await adminRouter.saveWeights(payload);await handoffAdmin.reconcileAutomatic();json(res,200,result);return true;}
@@ -130,13 +131,13 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
-      const result=await accountAdmin.handle(path,req.method,payload);if(result){void chat?.wake();json(res,result.status,result.value);return true;}
+      const result=await accountAdmin.handle(path,req.method,payload,req.method==='GET'?{signal:bodySignal}:{});if(result){void chat?.wake();json(res,result.status,result.value);return true;}
     }
     if(/^\/api\/admin\/(members|keys|member-types|member-config-batches|member-action-batches)(?:\/|$)/.test(path)){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
-      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams)||await memberAdmin.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){json(res,result.status,result.value);return true;}
+      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{})||await memberAdmin.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){json(res,result.status,result.value);return true;}
     }
     if((path==='/api/admin/history'||path.startsWith('/api/admin/history/'))&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
@@ -170,15 +171,15 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         if(contextReader)return contextReader.read(contextDetail[1],options);
         if(!await queryStore.get('SELECT id FROM harbor.requests WHERE id=$1',contextDetail[1]))throw new AppError(404,'请求不存在');
         return {state:'unavailable',parts:[],next:{component:0,part:0},hasMore:false};
-      }));return true;
+      },{signal:bodySignal}));return true;
     }
     const detail=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]{1,80})(\/recording)?$/);
     if(detail&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      if(!detail[2]){json(res,200,await queryQueue.run(()=>postgresRequestObservation(queryStore,detail[1],clock())));return true;}
+      if(!detail[2]){json(res,200,await queryQueue.run(()=>postgresRequestObservation(queryStore,detail[1],clock()),{signal:bodySignal}));return true;}
       for(const key of url.searchParams.keys())if(!['after','limit'].includes(key)||url.searchParams.getAll(key).length!==1)throw new AppError(400,'正文分页无效');
       const numeric=(name,fallback)=>url.searchParams.has(name)&&/^\d+$/.test(url.searchParams.get(name))?Number(url.searchParams.get(name)):url.searchParams.has(name)?NaN:fallback;
-      json(res,200,await queryQueue.run(()=>recordingReader.read(detail[1],{after:numeric('after',0),limit:numeric('limit',32)})));return true;
+      json(res,200,await queryQueue.run(()=>recordingReader.read(detail[1],{after:numeric('after',0),limit:numeric('limit',32)}),{signal:bodySignal}));return true;
     }
     const jsonPath=path.startsWith('/v1/')&&codexJsonRoutes.has(path.slice(3))?path.slice(3):null;
     if((path!=='/v1/responses'&&!jsonPath)||req.method!=='POST')return false;
@@ -320,6 +321,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     }
   }
   const handle=async(req,res)=>{
+    beginAdminRequestTiming(req,res);
     const path=new URL(req.url,'http://localhost').pathname,modelRequest=req.method==='POST'&&(path==='/v1/responses'||path.startsWith('/v1/')&&codexJsonRoutes.has(path.slice(3))),stage=modelRequest?stages.capture():{emit:()=>false};
     const receipt={callbackCompleted:false,nested:false,published:false,publish(type,details){if(this.published)return false;this.published=true;return stage.emit(type,details);}},body=new AbortController();
     const bodyEnd=()=>{stage.emit('body-end');receipt.timing?.bodyEnd();},closed=()=>{if(!res.writableEnded)body.abort();};

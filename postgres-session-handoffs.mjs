@@ -173,10 +173,10 @@ export function createPostgresSessionHandoffs(store,{gate,readStore=store,queryQ
       const handle=gate.register({memberId:row.member_id,sessionId:row.session_id,decisionId:row.id}),observed=watch(row,handle);observed.activate();
     }
   }
-  async function handle(path,method,payload){
+  async function handle(path,method,payload,{signal}={}){
     const match=path.match(/^\/api\/admin\/sessions\/([a-zA-Z0-9-]{1,80})\/handoffs(?:\/([a-zA-Z0-9-]{1,80}))?$/);if(!match)return null;
     if(method==='POST'&&!match[2])return {status:202,value:await request(match[1],payload)};
-    if(method==='GET'&&!match[2])return {status:200,value:await (queryQueue?queryQueue.run(()=>latest(match[1])):latest(match[1]))};
+    if(method==='GET'&&!match[2])return {status:200,value:await (queryQueue?queryQueue.run(()=>latest(match[1]),{signal}):latest(match[1]))};
     if(method==='DELETE'&&match[2])return {status:200,value:await cancel(match[1],match[2])};
     throw new AppError(405,'不支持的会话交接操作');
   }

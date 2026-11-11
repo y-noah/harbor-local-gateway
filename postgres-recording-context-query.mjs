@@ -6,8 +6,8 @@ import {normalizeSearch} from './recording-search-index.mjs';
 const fail=()=>{throw new AppError(400,'上下文分页已失效，请重新查询','recording_cursor_invalid');};
 export function createPostgresRecordingContextQueries(store,{crypto,clock=Date.now,queryQueue,devices=false,maxCandidates=500,maxPageBytes=131072}={}){
  if(!crypto||!Number.isInteger(maxCandidates)||maxCandidates<1||maxCandidates>10000||!Number.isInteger(maxPageBytes)||maxPageBytes<1024||maxPageBytes>2097152)throw new AppError(503,'上下文查询预算无效','recording_query_configuration');
- const read=operation=>queryQueue?queryQueue.run(operation):operation();
- async function search(query){return read(async()=>{
+ const read=(operation,{signal}={})=>queryQueue?queryQueue.run(operation,{signal}):operation();
+ async function search(query,{signal}={}){return read(async()=>{
   const at=clock(),key=createHash('sha256').update('context:'+JSON.stringify(Object.fromEntries(Object.entries(query).filter(([name])=>!['limit','cursor'].includes(name))))).digest('hex');let cursor;
   if(query.cursor)try{cursor=JSON.parse(Buffer.from(query.cursor,'base64url').toString());if(Object.keys(cursor).sort().join(',')!=='at,id,key,ordinal,watermark'||cursor.key!==key||!Number.isSafeInteger(cursor.at)||!Number.isSafeInteger(cursor.watermark)||typeof cursor.id!=='string'||!/^[a-f0-9-]{36}$/.test(cursor.id)||!Number.isSafeInteger(cursor.ordinal)||cursor.ordinal<1)fail();}catch{fail();}
   if(query.device&&!devices)throw new AppError(400,'设备正文筛选尚未启用','recording_query_invalid');
@@ -39,6 +39,6 @@ export function createPostgresRecordingContextQueries(store,{crypto,clock=Date.n
   }
   const hasMore=Boolean(last)&&checked<rows.length,next=hasMore?Buffer.from(JSON.stringify({key,at:last.indexed_at,id:last.object_id,ordinal:last.ordinal,watermark})).toString('base64url'):null;
   return {items,next,has_more:hasMore,candidate_limited:rows.length>maxCandidates&&checked>=maxCandidates,observed_at:at,index_watermark:watermark,range:{from:query.from,to:query.to},search_kind:'case_insensitive_literal_context_indexed',association:'shared_object_once_per_part'};
- });}
+ },{signal});}
  return {search};
 }

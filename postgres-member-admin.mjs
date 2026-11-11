@@ -46,9 +46,9 @@ export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,c
       const detail=path.match(/^\/api\/admin\/members\/([a-f0-9-]{36})(\/keys)?$/);
       if(detail){if(!detail[2]&&[...params.keys()].length)throw new AppError(400,'员工详情不接受查询参数');return {status:200,value:detail[2]?await queries.keys(memberQuery(params,{keys:true}),{memberId:detail[1],reveal:true,signal}):await queries.detail(detail[1],{signal})};}
     }
-    const actionResult=await actions.handle(path,method,payload,params);if(actionResult)return actionResult;
-    const batchResult=await batches.handle(path,method,payload,params);if(batchResult)return batchResult;
-    const typeResult=await types.handle(path,method,payload,params);if(typeResult)return typeResult;
+    const actionResult=await actions.handle(path,method,payload,params,method==='GET'?{signal}:{});if(actionResult)return actionResult;
+    const batchResult=await batches.handle(path,method,payload,params,method==='GET'?{signal}:{});if(batchResult)return batchResult;
+    const typeResult=await types.handle(path,method,payload,params,method==='GET'?{signal}:{});if(typeResult)return typeResult;
     if(path==='/api/admin/members'&&method==='POST'){
       const b=payload,memberName=name(b.name),quota=integer(b.quota,'额度',{nullable:true}),expires=expiry(b.expires),allowed=b.type_id===undefined?modelAllowlist(b.allowed_models===undefined?null:b.allowed_models):undefined;
       return {status:201,value:await store.transaction(async()=>{
