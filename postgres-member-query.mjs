@@ -22,9 +22,9 @@ export function memberConditions(query,{alias='m',start=1}={}){
 }
 const memberColumns='m.id,m.name,m.enabled,m.access_version,m.device_mode,m.device_policy_version,m.created,m.usage_limits,m.usage_limits_version,m.usage_type_id,m.usage_type_version,m.default_models,m.default_models_set,m.defaults_version,m.configuration_source,t.code usage_type_code,t.name usage_type_name,t.description usage_type_description';
 export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,queryQueue,pageBytes=524288,maxSelection=1000}={}){
-  const limits=createPostgresMemberLimits(store,{clock}),read=(op,{signal}={})=>{const execute=async()=>{const error=await rollupInitialization;if(error)throw error;return store.transaction(op,{level:'REPEATABLE READ',readOnly:true});};return queryQueue?queryQueue.run(execute,{signal}):execute();};
+  let rollupInitialization;
+  const limits=createPostgresMemberLimits(store,{clock}),read=(op,{signal}={})=>{const execute=async()=>{const error=await (rollupInitialization??=verifyUsageRollupAvailability(store).then(()=>null,error=>error));if(error)throw error;return store.transaction(op,{level:'REPEATABLE READ',readOnly:true});};return queryQueue?queryQueue.run(execute,{signal}):execute();};
   if(!Number.isSafeInteger(pageBytes)||pageBytes<1024||pageBytes>2097152||!Number.isSafeInteger(maxSelection)||maxSelection<1||maxSelection>10000)fail(503,'员工页面字节预算无效','member_query_configuration');
-  const rollupInitialization=verifyUsageRollupAvailability(store).then(()=>null,error=>error);
   const empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(field=>[field,'0']))}).standard;
   async function usage(scope,ids,at){
     if(!ids.length)return new Map();const window=usageWindow(at);

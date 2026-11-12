@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
+import {createUsageRollupRuntime} from './usage-rollup-fixture.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
 import {createPostgresStateQueries} from '../postgres-state-query.mjs';
 import {createPostgresRouter} from '../postgres-routing.mjs';
@@ -12,7 +13,7 @@ function gate(){let resolve;const promise=new Promise(r=>resolve=r);return {prom
 async function fixture(run){
  let lab,store,readStore,legacyStore;const readers=[];
  try{
-  lab=await createPrivatePostgres({binDirectory:process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory:process.env.HARBOR_CAPACITY_PG_LIB});store=new PostgresStore({connection:lab.connection});readStore=new PostgresStore({connection:lab.connection,poolSize:1});legacyStore=new PostgresStore({connection:lab.connection,poolSize:1});await store.migrate();await store.initializePricing();
+  lab=await createPrivatePostgres({binDirectory:process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory:process.env.HARBOR_CAPACITY_PG_LIB});store=new PostgresStore({connection:lab.connection});readStore=new PostgresStore({connection:lab.connection,poolSize:1});legacyStore=new PostgresStore({connection:lab.connection,poolSize:1});await store.migrate();await createUsageRollupRuntime(store);await store.initializePricing();
   await store.query("INSERT INTO harbor.accounts(id,name,home,state,api_secret_digest) VALUES('a','合成账号A','synthetic-a','ready',NULL),('b','合成账号B','synthetic-b','ready','synthetic-digest'),('empty','合成空账号','synthetic-empty','offline',NULL)");await store.run("UPDATE harbor.accounts SET auth_mode='openai_api',api_weight=10 WHERE id='b'");
   await store.query("INSERT INTO harbor.pricing_versions(id,created,book) VALUES('synthetic-v1',0,'{}'),('synthetic-v2',0,'{}')");
   const window=usageWindow(at),times=[window.start-1,window.start,window.start+1,window.start+3600000-1,window.start+3600000,at-1,at,window.end-1,window.end];

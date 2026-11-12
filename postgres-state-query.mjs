@@ -34,7 +34,7 @@ function validateSessionFilters({sessionQ='',sessionType='',sessionAccount='',se
 export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,queryQueue,balancingReader,maxPeople=1000}={}){
   const queue=queryQueue||createPostgresQueryQueue();
   if(!Number.isSafeInteger(maxPeople)||maxPeople<1||maxPeople>10000)throw new AppError(503,'兼容员工状态容量无效','state_configuration');
-  const rollupInitialization=verifyUsageRollupAvailability(store).then(()=>null,error=>error);
+  let rollupInitialization;
   async function loadSessionPage({window,sessionPage,sessionPageSize,sessionQ,sessionType,sessionAccount,sessionStatus}){
       const sessionArgs=[window.start,window.end],conditions=['s.updated>=$1','s.updated<$2'];
       const filter=(sql,value)=>{sessionArgs.push(value);conditions.push(sql.replaceAll('?',String(sessionArgs.length)));};
@@ -176,5 +176,5 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         requests:requests.map(row=>decorate(row,window.start)),totals:totals||{requests:0,success:0,standard:empty},daily:daily.sort((a,b)=>a.day.localeCompare(b.day)),audit};
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {read:(query,{signal}={})=>{const input={...query};return queue.run(async()=>{if(input.view==='accounts'){const initializationError=await rollupInitialization;if(initializationError)throw initializationError;}return execute(input);},{signal});},close:()=>queue.close(),status:()=>queue.status()};
+  return {read:(query,{signal}={})=>{const input={...query};return queue.run(async()=>{if(input.view==='accounts'){const initializationError=await (rollupInitialization??=verifyUsageRollupAvailability(store).then(()=>null,error=>error));if(initializationError)throw initializationError;}return execute(input);},{signal});},close:()=>queue.close(),status:()=>queue.status()};
 }

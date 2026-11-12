@@ -29,8 +29,8 @@ async function until(predicate){const deadline=Date.now()+3000;while(!predicate(
 const readStopped=()=>new AppError(503,'合成读取已进入事务','synthetic_read_started');
 
 test('已取消的管理读取不进入事务，旧调用继续执行且signal不写入查询参数',async()=>{
- const queue=createPostgresQueryQueue(),controller=new AbortController(),reason=Error('synthetic cancellation');controller.abort(reason);let transactions=0,runs=0;
- const store={transaction:async()=>{transactions++;throw readStopped();},run:async()=>{runs++;}};
+ const queue=createPostgresQueryQueue(),controller=new AbortController(),reason=Error('synthetic cancellation');controller.abort(reason);let transactions=0,runs=0,initializationReads=0;
+ const store={transaction:async()=>{transactions++;throw readStopped();},run:async()=>{runs++;},get:async(sql,name)=>{assert.equal(sql,'SELECT value FROM harbor.gateway_settings WHERE name=$1');assert.equal(name,'schema.usage-hour-rollups');initializationReads++;return undefined;}};
  const states=createPostgresStateQueries(store,{queryQueue:queue}),requests=createPostgresRequestQueries(store,{queryQueue:queue}),members=createPostgresMemberAdmin(store,{queryQueue:queue});
  const query={view:'overview',people:'none'};
  try{
@@ -38,17 +38,18 @@ test('已取消的管理读取不进入事务，旧调用继续执行且signal�
   await assert.rejects(requests.read({view:'all'},{signal:controller.signal}),error=>error===reason);
   const paths=['/api/admin/members','/api/admin/members/selection','/api/admin/keys','/api/admin/members/'+memberId,'/api/admin/members/'+memberId+'/keys','/api/admin/keys/'+memberId+'/policy','/api/admin/members/'+memberId+'/usage-limits',...remainingReadPaths.filter(path=>/\/(member-types|member-config-batches|member-action-batches)(?:\/|$)/.test(path))];
   for(const path of paths)await assert.rejects(members.handle(path,'GET',{},new URLSearchParams(),{signal:controller.signal}),error=>error===reason);
-  assert.equal(transactions,0);assert.equal(runs,0);assert.deepEqual(query,{view:'overview',people:'none'});
+  assert.equal(transactions,0);assert.equal(runs,0);assert.equal(initializationReads,0);assert.deepEqual(query,{view:'overview',people:'none'});
   await assert.rejects(states.read(query),{code:'synthetic_read_started'});assert.equal(transactions,1);
   await assert.rejects(requests.read({view:'all'}),{code:'synthetic_read_started'});assert.equal(transactions,2);
   await assert.rejects(members.handle('/api/admin/members','GET',{},new URLSearchParams()),{code:'synthetic_read_started'});assert.equal(transactions,3);
+  await assert.rejects(members.handle('/api/admin/members','GET',{},new URLSearchParams()),{code:'synthetic_read_started'});assert.equal(transactions,4);assert.equal(initializationReads,1);
  }finally{await queue.close();}
 });
 
 async function fixture(t,{write=false}={}){
  const directory=await mkdtemp(join(tmpdir(),'harbor-admin-cancel-')),recording=join(directory,'recording'),metering=join(directory,'metering');await mkdir(recording);await mkdir(metering);
  const queue=createPostgresQueryQueue({maxConcurrent:1,maxQueued:4,queueTimeoutMs:3000}),gate=deferred(),closed=new Set();let transactionGate=false,transactions=0,finished=0,businessWrites=0,reads=0;
- const store={transaction:async operation=>{transactions++;if(transactionGate)await gate.promise;if(write)return operation();throw readStopped();},run:async sql=>{if(/^(INSERT INTO harbor\.(members|keys)\b|UPDATE harbor.members SET usage_limits=)/.test(sql))businessWrites++;},get:async()=>{reads++;return {id:memberId,default_models_set:0,enabled:1,usage_limits:'{"enabled":false,"rules":[]}',usage_limits_version:0,book:'{}'};},all:async()=>{reads++;return [];}};
+ const store={transaction:async operation=>{transactions++;if(transactionGate)await gate.promise;if(write)return operation();throw readStopped();},run:async sql=>{if(/^(INSERT INTO harbor\.(members|keys)\b|UPDATE harbor.members SET usage_limits=)/.test(sql))businessWrites++;},get:async sql=>{reads++;if(sql==='SELECT value FROM harbor.gateway_settings WHERE name=$1')return undefined;return {id:memberId,default_models_set:0,enabled:1,usage_limits:'{"enabled":false,"rules":[]}',usage_limits_version:0,book:'{}'};},all:async()=>{reads++;return [];}};
  const queries=createPostgresRequestQueries(store,{queryQueue:queue});
  const handler=createPostgresResponsesHandler({store,recordings:{},buffer:{directory:recording},meteringRecovery:{directory:metering,settle(){},flush:async()=>{},status:()=>({}),close:async()=>{}},resolveRoute:async()=>{},checkLimits:async()=>{},transportForAccount:async()=>{},adminAuthenticated:async()=>true,requestQueries:queries,keyEncryptionKey:Buffer.alloc(32,1),recordingEnabled:false});
  const clients=new Set(),server=http.createServer((req,res)=>{res.once('close',()=>closed.add(req.url));void handler.handle(req,res).then(done=>{if(!done&&!res.destroyed){res.statusCode=404;res.end();}},error=>{if(!res.destroyed){res.statusCode=error.status??500;res.end('{}');}}).finally(()=>finished++);});
