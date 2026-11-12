@@ -1,5 +1,6 @@
 import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
 import {beginAdminRequestTiming,finishAdminRequestTiming,registerAdminRequestTimingSignal,wrapAdminQueryTimingQueue} from './admin-request-timing.mjs';
+import {createAdminJsonCompression} from './admin-json-compression.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {createRequestStreamTiming} from './request-stream-timing.mjs';
 import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
@@ -65,6 +66,8 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const preparation=createRoutingPreparation({maxWaiting:maxConcurrent,stageObserver});
   const sessionHandoffs=createSessionRequestHandoff({maxTickets:maxConcurrent,maxPending:maxPendingHandoffs,maxWaiting:Math.max(1,Math.floor(maxConcurrent/2)),maxWaitingPerMember:Math.max(1,Math.floor(maxPerMember/2)),stageObserver});
   const queryQueue=requestQueries?.queue||wrapAdminQueryTimingQueue(createPostgresQueryQueue());
+  const adminJsonCompression=createAdminJsonCompression();
+  const usageJson=async(req,res,value,signal)=>adminJsonCompression.send(req,res,JSON.stringify(value),{authenticated:true,signal,beforeHeaders:()=>finishAdminRequestTiming(res,200,{authenticated:true})});
   const handoffAdmin=createPostgresSessionHandoffs(store,{gate:sessionHandoffs,readStore:queryStore,queryQueue,clock,isStopping:()=>stopping,validateTarget:async(account,model,signal)=>{if(!model)return true;const transport=await transportForAccount(account);if(typeof transport.models!=='function')return false;const models=await transport.models({binary:codexBinary,home:account.auth_mode==='openai_api'?account.id:account.home,signal});return models.some(item=>item.slug===model);}});
   const queries=requestQueries||createPostgresRequestQueries(queryStore,{clock,queryQueue,businessOutcomes:true,readInputPreviews:typeof recordingReader?.previews==='function'?ids=>recordingReader.previews(ids):undefined});
   const adminRouter=createPostgresRouter(store,{clock,isStopping:()=>stopping,extraRuntime}),readRouter=createPostgresRouter(queryStore,{clock});
@@ -137,7 +140,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
-      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{})||await memberAdmin.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){json(res,result.status,result.value);return true;}
+      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{})||await memberAdmin.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){if(path==='/api/admin/members'&&req.method==='GET'&&result.status===200)await usageJson(req,res,result.value,bodySignal);else json(res,result.status,result.value);return true;}
     }
     if((path==='/api/admin/history'||path.startsWith('/api/admin/history/'))&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
@@ -158,7 +161,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     }
     if(path==='/api/admin/requests'&&req.method==='GET'){
       if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      json(res,200,await queries.read(requestsQuery(url.searchParams,{usageTypes:true}),{signal:bodySignal}));return true;
+      await usageJson(req,res,await queries.read(requestsQuery(url.searchParams,{usageTypes:true}),{signal:bodySignal}),bodySignal);return true;
     }
     const contextDetail=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]{1,80})\/context$/);
     if(contextDetail&&req.method==='GET'){
@@ -348,5 +351,5 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       requestBodies.release(req);
     }
   };
-  return {handle,stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({streamTiming:{...timingPersistence},clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),tickPricing:()=>pricingAdmin.tick(),closeQueries:async()=>{await pricingAdmin.close();return Promise.all([typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]);},drain:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
+  return {handle,stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({streamTiming:{...timingPersistence},clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),tickPricing:()=>pricingAdmin.tick(),closeQueries:async()=>{await pricingAdmin.close();return Promise.all([adminJsonCompression.close(),typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]);},drain:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
 }

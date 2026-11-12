@@ -1458,6 +1458,20 @@ test('PostgreSQL authenticated administrator JSON reports only response-local ap
  for(const path of ['/health','/api/auth/session','/api/admin/nonexistent','/api/admin/requests?unsupported=true']){response=await fetch(origin+path,{headers});assert.equal(response.headers.get('server-timing'),null);await response.arrayBuffer();}
 }));
 
+test('PostgreSQL compresses only usage lists while keeping credentials, errors and writes unchanged',integration,async t=>withGateway(t,async({store,member,password,open})=>{
+ const at=Date.now(),requests=[];assert.equal(typeof member.memberId,'string');assert.equal(typeof member.keyId,'string');
+ for(let i=0;i<24;i++){const id=randomUUID();requests.push(id);await store.run("INSERT INTO harbor.requests(id,member_id,key_id,account_id,started,ended,status,ip,model,billing_model,usage_unknown,recording_state,business_status) VALUES($1,$2,$3,'synthetic-runtime',$4,$5,'ok','127.0.0.1','gpt-6.1-sol','gpt-6.1-sol',1,'disabled','success')",id,member.memberId,member.keyId,at-i*1000,at-i*1000+1);}
+ const app=await open({clock:()=>at}),origin=await listenGateway(app);let response=await fetch(origin+'/api/admin/requests?view=all',{headers:{'Accept-Encoding':'gzip'}});assert.equal(response.status,401);assert.equal(response.headers.get('content-encoding'),null);assert.equal(response.headers.get('server-timing'),null);await response.arrayBuffer();
+ const cookie=await gatewayLogin(origin,password),headers={cookie};
+ for(const path of ['/api/admin/requests?view=all&page_size=20','/api/admin/members?view=list','/api/admin/members']){
+  const plain=await fetch(origin+path,{headers:{...headers,'Accept-Encoding':'identity'}});assert.equal(plain.status,200,path);assert.equal(plain.headers.get('content-encoding'),null);const expected=await plain.json();
+  const target=path+(path.startsWith('/api/admin/requests?')?'&snapshot='+encodeURIComponent(expected.snapshot):''),compressed=await fetch(origin+target,{headers:{...headers,'Accept-Encoding':'gzip'}});assert.equal(compressed.status,200);assert.equal(compressed.headers.get('content-encoding'),'gzip');assert.match(compressed.headers.get('vary'),/(?:^|,\s*)Accept-Encoding(?:,|$)/i);assert.equal(compressed.headers.get('cache-control'),'no-store');assert.equal(compressed.headers.get('timing-allow-origin'),null);assert.match(compressed.headers.get('server-timing'),/^app;dur=\d+\.\d{2}, qwait;dur=\d+\.\d{2}, qwork;dur=\d+\.\d{2}$/);
+  const text=await compressed.text(),actual=JSON.parse(text),withoutVisibility=({watermark,...rest})=>rest;assert.ok(Number(compressed.headers.get('content-length'))<Buffer.byteLength(text));assert.deepEqual(withoutVisibility(actual),withoutVisibility(expected));
+ }
+ for(const path of ['/api/admin/keys','/api/admin/members/'+member.memberId+'/keys','/api/admin/state?view=accounts&people=none','/api/admin/requests/'+requests[0],'/api/admin/recordings/status']){response=await fetch(origin+path,{headers:{...headers,'Accept-Encoding':'gzip'}});assert.equal(response.status,200,path);assert.equal(response.headers.get('content-encoding'),null,path);await response.json();}
+ response=await fetch(origin+'/api/admin/members',{method:'POST',headers:{...headers,'Accept-Encoding':'gzip','Content-Type':'application/json'},body:JSON.stringify({name:'合成压缩边界员工',quota:null,expires:null})});assert.equal(response.status,201);assert.equal(response.headers.get('content-encoding'),null);assert.equal(response.headers.get('server-timing'),null);await response.json();
+}));
+
 test('PostgreSQL application boots real auth/static/request/admin paths and isolates saturated query and recording pools from inference',integration,async t=>withGateway(t,async({store,member,password,open})=>{
   let calls=0;const app=await open({responsesTransport:controlledResponses(async()=>{calls++;})}),origin=await listenGateway(app);
   assert.equal((await fetch(origin+'/health')).status,200);assert.equal((await fetch(origin+'/ready')).status,200);
