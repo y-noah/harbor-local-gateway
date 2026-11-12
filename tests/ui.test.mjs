@@ -1508,6 +1508,44 @@ test('关闭编辑表单后迟到的名称模型和负载设置保存不关闭�
  }
 });
 
+test('用户筛选排除已移除员工，停用员工可选且历史请求和统计保留原名',async()=>{
+ const members=[{id:'active-member',name:'在用员工',enabled:1,removed_at:null},{id:'disabled-member',name:'停用员工',enabled:0,removed_at:null},{id:'removed-member',name:'已移除测试员工',enabled:1,removed_at:123}];
+ const data={rows:[{id:'historical-request',started:1,ended:2,status:'ok',member_id:'removed-member',member_name:'已移除测试员工',standard:{}}],pagination:{page:1,pageSize:20,total:1,totalPages:1},summary:{requests:1,success:1,active:0,average_ms:1,standard:{}},byModel:[],byMember:[{member_id:'removed-member',member_name:'已移除测试员工',requests:1,success:1,standard:{}}],models:[],members};
+ const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(snapshot())+';requestsData='+JSON.stringify(data));
+ for(const view of ['list','member_name']){
+  page.run('requestStatisticsTab='+JSON.stringify(view));const html=page.run('requestsSection()'),options=html.match(/<select id="requests-member"[^>]*>([\s\S]*?)<\/select>/)[1];
+  assert.match(options,/value="active-member"/);assert.match(options,/value="disabled-member"/);assert.doesNotMatch(options,/removed-member|已移除/);assert.match(html,/已移除测试员工/);
+ }
+ assert.deepEqual(JSON.parse(page.run('JSON.stringify(requestsData)')),data);
+});
+
+test('分页和完整页创建固定会话的员工下拉均不提供已移除员工',async()=>{
+ const members=[{id:'active-member',name:'在用员工',enabled:1,removed_at:null},{id:'removed-member',name:'已移除测试员工',enabled:1,removed_at:123}];
+ for(const paged of [false,true]){
+  const page=await ui(()=>response({rows:members,pagination:{page:1,pageSize:20,total:2,totalPages:1}}));const state={...(paged?pagedSnapshot():snapshot()),accounts:[{id:'api-account',name:'合成API账号',auth_mode:'openai_api'}],members,keys:[]};
+  page.run('admin=true;state='+JSON.stringify(state));await page.click('create-fixed-session','api-account');const html=page.node('#modal-content').innerHTML;
+  assert.match(html,/value="active-member"/);assert.doesNotMatch(html,/removed-member|已移除测试员工/);assert.deepEqual(JSON.parse(page.run('JSON.stringify(state.members)')),members);
+ }
+});
+
+test('确认已选用户移除后重查全部第一页，缺失用户不推断为移除',async()=>{
+ for(const view of ['list','member_name'])for(const source of ['cached','response','missing']){
+  const calls=[],member={id:'chosen-member',name:'原员工名',removed_at:123},data={rows:[],pagination:{page:1,pageSize:20,total:0,totalPages:1},summary:{requests:0,success:0,active:0,average_ms:0,standard:{}},byModel:[],byMember:[],models:[],members:source==='missing'?[]:[member]};
+  const page=await ui(path=>{calls.push(new URL(path,'http://localhost').searchParams);return response(data);});
+  page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="requests";recordView="requests";requestStatisticsTab='+JSON.stringify(view)+';requestsFilters.member="chosen-member";requestsFilters.member_missing="1";requestsFilters.page=3;requestsPageSnapshot="old-snapshot";requestsCursors.set(3,"old-cursor");requestsData='+JSON.stringify(source==='cached'?data:null));
+  await page.run('loadRequests("",{preservePage:true})');
+  if(source==='missing'){assert.equal(page.run('requestsFilters.member'),'chosen-member');assert.equal(calls.length,1);assert.equal(calls[0].get('member'),'chosen-member');}
+  else{assert.equal(page.run('requestsFilters.member'),'');assert.equal(page.run('requestsFilters.member_missing'),undefined);assert.equal(calls.length,source==='cached'?1:2);const final=calls.at(-1);assert.equal(final.get('member'),null);assert.equal(final.get('member_missing'),null);assert.equal(final.get('page'),'1');assert.equal(final.get('snapshot'),null);assert.equal(final.get('cursor'),null);}
+ }
+});
+
+test('明细的后台汇总确认用户移除时重载全部，旧姓名数据不改写',async()=>{
+ const calls=[],removed={id:'chosen-member',name:'历史员工名',removed_at:123};let summaries=0;
+ const page=await ui(path=>{const query=new URL(path,'http://localhost').searchParams;calls.push(query);return response(query.get('view')==='summary'?{summary:{requests:1,success:1,active:0,average_ms:1,standard:{}},byModel:[],byMember:[{member_name:'历史员工名',requests:1,standard:{}}],members:summaries++===0?[removed]:[],models:[]}:{rows:[],snapshot:'list-snapshot',pagination:{page:1,pageSize:20,total:0,totalPages:1}});});
+ page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="requests";recordView="requests";requestsFilters.member="chosen-member"');await page.run('loadRequests()');await new Promise(setImmediate);await new Promise(setImmediate);
+ assert.equal(page.run('requestsFilters.member'),'');assert.equal(calls.filter(query=>query.get('view')==='list').length,2);assert.equal(calls.filter(query=>query.get('view')==='list').at(-1).get('member'),null);assert.equal(removed.name,'历史员工名');
+});
+
 test('统计Tab仅显示相应筛选，切换时清除不可见条件并重新查询',async()=>{
  const paths=[],data={rows:[],pagination:{page:1,pageSize:20,total:0,totalPages:1},byModel:[],byMember:[],models:['gpt-6.1-sol'],members:[{id:'member-one',name:'合成员工'}],summary:{requests:0,success:0,active:0,average_ms:0,standard:{total:0}}},page=await ui(path=>{paths.push(path);return response(data);}),state=pagedSnapshot();state.capabilities.typeStatistics=true;state.capabilities.deviceAccess=true;
  page.run('admin=true;state='+JSON.stringify(state)+';tab="requests";recordView="requests";requestsData='+JSON.stringify(data)+';requestsFilters={member:"member-one",model:"gpt-6.1-sol",type:"usage-a",device:"unknown",outcome:"ok",page:1,pageSize:20};');await page.click('request-statistics-tab','model');const model=page.run('requestsSection()');assert.match(model,/id="requests-model"/);assert.doesNotMatch(model,/id="requests-(member|type|device)"/);assert.ok(paths.length>0);const query=new URL(paths[0],'http://synthetic.invalid').searchParams;assert.equal(query.get('model'),'gpt-6.1-sol');assert.equal(query.has('member'),false);assert.equal(query.has('type'),false);assert.equal(query.has('device'),false);
