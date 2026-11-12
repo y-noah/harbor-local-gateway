@@ -27,3 +27,13 @@ test('真实PG小时汇总CLI显式安装、有界回填、校验后发布、禁
 test('小时汇总CLI非法参数在连接前拒绝、不泄漏环境凭据',async()=>{
  const run=promisify(execFile);await assert.rejects(run(process.execPath,[new URL('../postgres-usage-rollups-cli.mjs',import.meta.url).pathname,'install','--publish-ready'],{env:{...process.env,HARBOR_DATABASE_URL:'synthetic-secret-not-a-url'},timeout:5000}),error=>error.code===1&&error.stderr.includes('参数无效')&&!error.stderr.includes('synthetic-secret'));
 });
+
+test('真实PG CLI支持本机保障五列激活合同，缺显式角色原子拒绝',integration,async()=>{
+ const admin=new PostgresStore(options()),name='harbor_local_cli_'+randomUUID().replaceAll('-','');let store;
+ try{
+  await admin.query('CREATE DATABASE '+name);store=new PostgresStore(options(name));await store.migrate();const role=await createUsageRollupRuntime(store,{activationContract:'local-assurance'});
+  await assert.rejects(runUsageRollupsCommand(['install'],options(name)),e=>e.code==='usage_rollup_runtime_required');assert.equal((await store.get("SELECT to_regclass('harbor.usage_hour_buckets') name")).name,null);assert.equal((await store.get("SELECT has_database_privilege($1,current_database(),'TEMP') temporary",role)).temporary,false);
+  assert.deepEqual(await runUsageRollupsCommand(['install','--runtime-role='+role],options(name)),{action:'install',installed:true,changed:true,ready:false});
+  assert.deepEqual(await runUsageRollupsCommand(['install','--runtime-role='+role],options(name)),{action:'install',installed:true,changed:false,ready:false});
+ }finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+name);await admin.query('DROP ROLE IF EXISTS '+name+'_runtime');await admin.close();}
+});

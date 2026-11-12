@@ -63,3 +63,24 @@ test('PG函数STRICT/稳定性/并行属性篡改拒启动，正常缺投影仍�
  assert.equal((await reconcileUsageRollups(store,{publishReady:true})).valid,true);
  const row=await store.get(usageRollupMoneySql('member'),['m'],0,3600000,0,0);assert.equal(row.requests,1);assert.equal(row.unpriced,1);assert.equal(row.known,0);
 }));
+
+test('PG本机保障五列激活合同须显式安全角色，拒绝无效绑定且真实写后可幂等安装',integration,async()=>{
+ const admin=new PostgresStore(options()),name='harbor_local_'+randomUUID().replaceAll('-','');let store;
+ try{
+  await admin.query('CREATE DATABASE '+name);store=new PostgresStore(options(name));await store.migrate();const role=await createUsageRollupRuntime(store,{activationContract:'local-assurance'});
+  assert.deepEqual((await store.all("SELECT column_name FROM information_schema.columns WHERE table_schema='harbor_operator' AND table_name='activation' ORDER BY ordinal_position")).map(row=>row.column_name),['singleton','database_oid','state','local_release_id','local_contract']);
+  const unchanged=async()=>{assert.equal((await store.get("SELECT to_regclass('harbor.usage_hour_buckets') name")).name,null);assert.equal((await store.get("SELECT count(*) n FROM harbor.gateway_settings WHERE name='schema.usage-hour-rollups'")).n,0);assert.equal((await store.get("SELECT has_database_privilege($1,current_database(),'TEMP') temporary",role)).temporary,false);};
+  await assert.rejects(migrateUsageRollups(store,{apply:true}),e=>e.code==='usage_rollup_runtime_required');await unchanged();
+  // Mutations are rolled back independently, including contract checks removed only inside this synthetic transaction.
+  for(const sql of ["ALTER TABLE harbor_operator.activation DROP CONSTRAINT activation_local_contract_check;UPDATE harbor_operator.activation SET local_contract='unknown'","UPDATE harbor_operator.activation SET local_release_id='invalid'","ALTER TABLE harbor_operator.activation DROP CONSTRAINT activation_state_check;UPDATE harbor_operator.activation SET state='active'","UPDATE harbor_operator.activation SET database_oid='0'","DELETE FROM harbor_operator.activation"]){
+   await assert.rejects(store.transaction(async()=>{await store.query(sql);await migrateUsageRollups(store,{apply:true,runtimeRole:role});}),e=>e.code==='usage_rollup_runtime_invalid');await unchanged();
+  }
+  for(const unsafe of ['ALTER ROLE "'+role+'" INHERIT','GRANT CREATE ON SCHEMA harbor TO "'+role+'"','GRANT "'+role+'" TO CURRENT_USER','CREATE TABLE public.synthetic_owned(x int);ALTER TABLE public.synthetic_owned OWNER TO "'+role+'"']){
+   await assert.rejects(store.transaction(async()=>{await store.query(unsafe);await migrateUsageRollups(store,{apply:true,runtimeRole:role});}),e=>e.code==='usage_rollup_runtime_invalid');await unchanged();
+  }
+  assert.equal(await migrateUsageRollups(store,{apply:true,runtimeRole:role}),true);await store.initializePricing();await store.query("INSERT INTO harbor.members(id,name,created) VALUES('m','synthetic',0)");await store.query("INSERT INTO harbor.keys(id,member_id,digest,prefix,created) VALUES('k','m','synthetic','synthetic',0)");
+  const asRuntime=operation=>store.transaction(async()=>{await store.query('SET LOCAL ROLE "'+role+'"');return operation();});
+  const id=await asRuntime(()=>store.observe({id:'m',key_id:'k'},'synthetic','synthetic','gpt-6.1-sol',{at:1000}));await asRuntime(()=>store.finish(id,{input:1000,output:100,cached:100,usageKnown:true},2000));assert.equal((await reconcileUsageRollups(store)).valid,true);
+  assert.equal((await store.get("SELECT count(*) n FROM pg_class WHERE relowner=(SELECT oid FROM pg_roles WHERE rolname=$1) AND relpersistence='t' AND relkind='r'",role)).n,3);assert.equal(await migrateUsageRollups(store,{apply:true,runtimeRole:role}),false);await verifyUsageRollups(store);
+ }finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+name);await admin.query('DROP ROLE IF EXISTS '+name+'_runtime');await admin.close();}
+});

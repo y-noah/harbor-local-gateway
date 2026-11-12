@@ -18,10 +18,20 @@ const identifier=value=>'"'+value.replaceAll('"','""')+'"';
 async function usageRuntimeRole(store,explicit){
  if(explicit!==undefined&&(typeof explicit!=='string'||!/^[a-z_][a-z0-9_]{0,62}$/.test(explicit)))throw new AppError(400,'汇总运行角色无效','usage_rollup_runtime_invalid');
  const activation=await store.get("SELECT to_regclass('harbor_operator.activation') relation");let role=explicit;
- if(activation.relation){const trusted=await store.get('SELECT runtime,database_oid FROM harbor_operator.activation WHERE singleton');const current=await store.get('SELECT oid::text oid FROM pg_database WHERE datname=current_database()');if(!trusted||trusted.database_oid!==current.oid||explicit!==undefined&&explicit!==trusted.runtime)throw new AppError(409,'汇总运行角色与受信部署记录不一致','usage_rollup_runtime_invalid');role=trusted.runtime;}
+ if(activation.relation){
+  const trusted=await store.get('SELECT * FROM harbor_operator.activation WHERE singleton'),current=await store.get('SELECT oid::text oid FROM pg_database WHERE datname=current_database()');
+  if(!trusted||trusted.database_oid!==current.oid)throw new AppError(409,'汇总运行角色与受信部署记录不一致','usage_rollup_runtime_invalid');
+  if(Object.hasOwn(trusted,'runtime')){
+   if(explicit!==undefined&&explicit!==trusted.runtime)throw new AppError(409,'汇总运行角色与受信部署记录不一致','usage_rollup_runtime_invalid');role=trusted.runtime;
+  }else{
+   if(trusted.local_contract!=='local-assurance-v1'||typeof trusted.local_release_id!=='string'||!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(trusted.local_release_id)||trusted.state!=='pending')throw new AppError(409,'汇总运行角色与受信部署记录不一致','usage_rollup_runtime_invalid');
+   if(explicit===undefined)throw new AppError(400,'本机保障迁移须显式指定已核实的运行角色','usage_rollup_runtime_required');
+  }
+ }
  if(typeof role!=='string'||!/^[a-z_][a-z0-9_]{0,62}$/.test(role))throw new AppError(400,'请指定受控运行角色或提供受信部署记录','usage_rollup_runtime_required');
+ // TEMP relations are expected runtime staging; ownership of any persistent or foreign-database object remains unsafe.
  const actual=await store.get('SELECT rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls FROM pg_roles WHERE rolname=$1',role);
- if(!actual||Object.values(actual).some(Boolean)||await store.get("SELECT 1 FROM pg_auth_members WHERE roleid=(SELECT oid FROM pg_roles WHERE rolname=$1) OR member=(SELECT oid FROM pg_roles WHERE rolname=$1)",role)||await store.get("SELECT 1 FROM pg_shdepend WHERE refclassid='pg_authid'::regclass AND refobjid=(SELECT oid FROM pg_roles WHERE rolname=$1) AND deptype='o' LIMIT 1",role))throw new AppError(409,'汇总运行角色超出最小权限边界','usage_rollup_runtime_invalid');
+ if(!actual||Object.values(actual).some(Boolean)||await store.get("SELECT 1 FROM pg_auth_members WHERE roleid=(SELECT oid FROM pg_roles WHERE rolname=$1) OR member=(SELECT oid FROM pg_roles WHERE rolname=$1)",role)||await store.get("SELECT 1 FROM pg_shdepend d WHERE refclassid='pg_authid'::regclass AND refobjid=(SELECT oid FROM pg_roles WHERE rolname=$1) AND deptype='o' AND NOT (d.dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND d.classid='pg_class'::regclass AND EXISTS(SELECT 1 FROM pg_class c WHERE c.oid=d.objid AND c.relpersistence='t')) LIMIT 1",role))throw new AppError(409,'汇总运行角色超出最小权限边界','usage_rollup_runtime_invalid');
  const privilege=await store.get("SELECT has_schema_privilege($1,'harbor','CREATE') OR has_schema_privilege($1,'public','CREATE') unsafe",role);if(privilege.unsafe)throw new AppError(409,'汇总运行角色不得拥有schema创建权限','usage_rollup_runtime_invalid');return role;
 }
 async function grantUsageRuntime(store,role,names){
