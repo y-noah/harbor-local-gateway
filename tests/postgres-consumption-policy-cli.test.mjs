@@ -6,6 +6,7 @@ import {promisify} from 'node:util';
 import {PostgresStore} from '../postgres-store.mjs';
 import {createUsageRollupRuntime} from './usage-rollup-fixture.mjs';
 import {consumptionPolicyArguments,runConsumptionPolicyCommand} from '../postgres-consumption-policy-cli.mjs';
+import {postgresCliTlsFixture} from './postgres-cli-tls-fixture.mjs';
 const url=process.env.HARBOR_TEST_DATABASE_URL,real={skip:!url?'需独占私有PG':false,timeout:30000},exec=promisify(execFile),script=new URL('../postgres-consumption-policy-cli.mjs',import.meta.url).pathname;
 function options(database='postgres'){const target=new URL(url);target.pathname='/'+database;return {connectionString:target.href,allowPlaintextLocalNetwork:true,poolSize:2,connectionTimeoutMs:500,statementTimeoutMs:5000};}
 async function fixture(t,{migrationOptions={},activationContract='operator'}={}){
@@ -31,7 +32,7 @@ test('invalid arguments fail before connection and CLI errors never expose URL o
 test('real PG default verify is read-only; require-installed fails without installing or leaking pool',real,async t=>{
  const f=await fixture(t),before=await snapshot(f.store);assert.deepEqual(await runConsumptionPolicyCommand([],options(f.name)),{action:'verify',installed:false});assert.deepEqual(await snapshot(f.store),before);await noOtherConnections(f.store);
  await assert.rejects(runConsumptionPolicyCommand(['verify','--require-installed'],options(f.name)),{code:'database_migration_required'});assert.deepEqual(await snapshot(f.store),before);await noOtherConnections(f.store);
- const run=await exec(process.execPath,[script],{env:{...process.env,HARBOR_DATABASE_URL:options(f.name).connectionString},timeout:10000});assert.deepEqual(JSON.parse(run.stdout),{action:'verify',installed:false});assert.equal(run.stderr,'');await noOtherConnections(f.store);
+ const tls=await postgresCliTlsFixture(t,options(f.name).connectionString),run=await exec(process.execPath,[script],{env:{...process.env,HARBOR_DATABASE_URL:tls.connectionString},timeout:10000});assert.deepEqual(JSON.parse(run.stdout),{action:'verify',installed:false});assert.equal(run.stderr,'');assert.ok(tls.handshakes()>0);await noOtherConnections(f.store);
 });
 test('real PG install verifies extension, repeats idempotently and preserves core22/optional23/24',real,async t=>{
  for(const [version,migrationOptions] of [[22,{}],[23,{recordingContext:true}],[24,{recordingContextIndex:true}]]){
@@ -46,7 +47,8 @@ test('real restricted runtime verifies only and cannot install even an already i
  assert.deepEqual(await runConsumptionPolicyCommand(['verify'],runtimeOptions),{action:'verify',installed:false});
  await assert.rejects(runConsumptionPolicyCommand(['install'],runtimeOptions),{code:'consumption_migration_owner_invalid'});assert.equal((await f.store.get("SELECT value FROM harbor.gateway_settings WHERE name='schema.key-consumption-policy'")),undefined);
  await runConsumptionPolicyCommand(['install'],options(f.name));const before=await snapshot(f.store);assert.deepEqual(await runConsumptionPolicyCommand(['verify','--require-installed'],runtimeOptions),{action:'verify',installed:true});await assert.rejects(runConsumptionPolicyCommand(['install'],runtimeOptions),{code:'consumption_migration_owner_invalid'});assert.deepEqual(await snapshot(f.store),before);
- await assert.rejects(exec(process.execPath,[script,'install'],{env:{...process.env,HARBOR_DATABASE_URL:runtime.href},timeout:10000}),error=>{assert.equal(error.code,1);assert.equal(error.stderr.includes(password),false);assert.equal(error.stderr.includes(runtime.href),false);assert.equal(JSON.parse(error.stderr).error.code,'consumption_migration_owner_invalid');return true;});
+ const tls=await postgresCliTlsFixture(t,runtime.href);
+ await assert.rejects(exec(process.execPath,[script,'install'],{env:{...process.env,HARBOR_DATABASE_URL:tls.connectionString},timeout:10000}),error=>{assert.equal(error.code,1);assert.equal(error.stderr.includes(password),false);assert.equal(error.stderr.includes(runtime.href),false);assert.equal(error.stderr.includes(tls.connectionString),false);assert.equal(JSON.parse(error.stderr).error.code,'consumption_migration_owner_invalid');return true;});assert.ok(tls.handshakes()>0);
  assert.equal((await f.store.get('SELECT count(*) n FROM pg_stat_activity WHERE datname=current_database() AND usename=$1',f.role)).n,0);
 });
 test('real local-assurance install requires explicit runtime role and rolls back omitted or mismatching role',real,async t=>{
