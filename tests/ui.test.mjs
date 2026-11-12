@@ -900,7 +900,7 @@ test('设备页面按服务端全量summary显示且迟到响应不能污染其�
  let release;const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response(deviceDirectory()));}));page.run('admin=true;state='+JSON.stringify(deviceSnapshot())+';tab="members";');const pending=page.click('member-devices','member-one');await new Promise(setImmediate);await page.click('close');page.run('modal("另一个弹窗")');release();await pending;assert.equal(page.node('#modal-content').innerHTML,'另一个弹窗');assert.equal(page.run('deviceView'),null);
 });
 test('设备只在可见待审批目录轮询，编辑关闭切页隐藏后不再自动读取',async()=>{
- let reads=0;const page=await ui(()=>{reads++;return response(deviceDirectory());});page.run('admin=true;state='+JSON.stringify(deviceSnapshot())+';tab="members";');await page.click('member-devices','member-one');assert.match(page.node('#devices-content').innerHTML,/登记 29 · 近7天使用 7 · 未认证请求 3/);await handoffPoll(page);assert.equal(reads,2);page.run('document.hidden=true');await handoffPoll(page);assert.equal(reads,2);page.run('document.hidden=false');await page.click('device-rename','11111111-1111-1111-1111-111111111111');await handoffPoll(page);assert.equal(reads,2);assert.match(page.node('#modal-content').innerHTML,/修改设备名称/);await page.click('close');await handoffPoll(page);assert.equal(reads,2);await page.click('member-devices','member-one');page.run('setTab("accounts")');assert.equal(page.run('deviceView'),null);
+ let reads=0;const page=await ui(()=>{reads++;return response(deviceDirectory());});page.run('admin=true;state='+JSON.stringify(deviceSnapshot())+';tab="members";');await page.click('member-devices','member-one');assert.match(page.node('#devices-content').innerHTML,/登记 29 · 近7天使用 7/);assert.doesNotMatch(page.node('#devices-content').innerHTML,/未认证请求/);await handoffPoll(page);assert.equal(reads,2);page.run('document.hidden=true');await handoffPoll(page);assert.equal(reads,2);page.run('document.hidden=false');await page.click('device-rename','11111111-1111-1111-1111-111111111111');await handoffPoll(page);assert.equal(reads,2);assert.match(page.node('#modal-content').innerHTML,/修改设备名称/);await page.click('close');await handoffPoll(page);assert.equal(reads,2);await page.click('member-devices','member-one');page.run('setTab("accounts")');assert.equal(page.run('deviceView'),null);
 });
 test('设备启停使用读取版本，409后不隐瞒冲突并读取新目录',async()=>{
  const writes=[];let reads=0;const row={...deviceDirectory().rows[0],state:'approved',hardware_state:'reported',version:7};const page=await ui((path,options)=>{if(options.method==='PATCH'){writes.push(JSON.parse(options.body));return response({error:{message:'设备已变化'}},409);}reads++;return response(deviceDirectory({rows:[row]}));});page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));await page.click('member-devices','member-one');await page.click('device-toggle',row.id);assert.deepEqual(writes,[{expected_version:7,enabled:false}]);assert.equal(reads,2);assert.match(page.node('#toast').textContent,/设备已变化/);
@@ -913,24 +913,26 @@ test('访问批次刷新失败禁用执行，迟到结果不能污染新弹窗',
  let reads=0,writes=0;const page=await ui((_path,options)=>{if(options.method==='POST'){writes++;return response({});}return ++reads===1?response(accessBatchRecord()):response({error:{message:'合成查询失败'}},503);});page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));await page.click('access-batch-open','access-one');await page.click('access-batch-refresh');await page.click('access-batch-execute');assert.equal(writes,0);assert.match(page.node('#access-batch-content').innerHTML,/上次快照/);let release;const other=await ui(()=>new Promise(resolve=>{release=()=>resolve(response(accessBatchRecord()));}));other.run('admin=true;state='+JSON.stringify(deviceSnapshot()));const pending=other.click('access-batch-open','access-one');await new Promise(setImmediate);await other.click('close');other.run('modal("其他内容")');release();await pending;assert.equal(other.node('#modal-content').innerHTML,'其他内容');
 });
 test('请求设备列与详情只读当时快照，不将来源IP推断为设备',async()=>{
- const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));const html=page.run('requestTable([{id:"request",started:1,ended:2,ip:"sensitive-network",device_name:"当时设备",device_system:"合成系统",device_auth_state:"authenticated",device_id:"11111111-1111-1111-1111-111111111111",standard:{}}])');assert.match(html,/当时设备/);assert.match(html,/设备已认证/);assert.ok(!html.includes('sensitive-network'));const unknown=page.run('phaseDetail({id:"r",ip:"sensitive-network",timeline:[]})');assert.match(unknown,/历史未记录/);assert.ok(!unknown.includes('sensitive-network'));
+ const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));const html=page.run('requestTable([{id:"request",started:1,ended:2,ip:"sensitive-network",device_name:"当时设备",device_system:"合成系统",device_auth_state:"authenticated",device_id:"11111111-1111-1111-1111-111111111111",standard:{}}])');assert.match(html,/当时设备/);assert.match(html,/11111111-1111-1111-1111-111111111111/);assert.doesNotMatch(html,/设备已认证|设备认证/);assert.ok(!html.includes('sensitive-network'));const unknown=page.run('phaseDetail({id:"r",ip:"sensitive-network",timeline:[]})');assert.match(unknown,/未获取设备标识/);assert.ok(!unknown.includes('sensitive-network'));
 });
-test('请求身份缺项区分未认证与历史未知，列表和详情不显示空字段',async()=>{
+test('请求身份直接显示已有设备标识，缺失时不推断设备或展示认证提示',async()=>{
  const page=await ui(()=>response({}));
- for(const [row,expected] of [[{status:'rejected',device_auth_state:'compatible_unverified'},['未记录账号','未认证设备','兼容模式未认证']],[{},['未记录账号','未记录设备','历史未记录']],[{account_id:'account',device_id:'device',device_auth_state:'authenticated'},['账号名称未记录','设备名称未记录','设备已认证']]]){
+ for(const [row,expected] of [[{status:'rejected',device_auth_state:'compatible_unverified'},['未记录账号','未获取设备标识']],[{},['未记录账号','未获取设备标识']],[{account_id:'account',device_id:'registered-device',device_auth_state:'authenticated'},['账号名称未记录','registered-device']],[{device_id:'registered-compatible',device_auth_state:'compatible_unverified'},['未记录账号','registered-compatible']],[{device_id:'credentials-device',device_auth_state:'unverified_hardware'},['未记录账号','credentials-device']],[{device_id:'   '},['未记录账号','未获取设备标识']]]){
   page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,standard:{},ip:'never-display-network',...row}));
   const list=page.run('requestTable([record])'),detail=page.run('phaseDetail(record)');
   for(const value of expected){assert.ok(list.includes(value));assert.ok(detail.includes(value));}
+  for(const html of [list,detail])assert.doesNotMatch(html,/未认证设备|兼容模式未认证|仅凭据认证|设备已认证|设备认证/);
+  if(row.device_id?.trim())assert.match(list,/data-action="requests-device"/);else assert.doesNotMatch(list,/data-action="requests-device"/);
   assert.ok(!list.includes('<small> ·'));assert.ok(!detail.includes('Key：—…'));assert.ok(!list.includes('never-display-network'));assert.ok(!detail.includes('never-display-network'));
   assert.match(detail,/Key：未记录 Key/);assert.match(detail,/客户端：未记录客户端/);
  }
- const compatible=page.run('phaseDetail({device_auth_state:"compatible_unverified"})');assert.match(compatible,/设备系统：未认证，无法确认/);assert.match(compatible,/凭据代次：不适用/);
+ const compatible=page.run('phaseDetail({device_auth_state:"compatible_unverified"})');assert.match(compatible,/设备系统：系统未记录/);assert.match(compatible,/设备标识：未获取设备标识/);assert.match(compatible,/凭据代次：未记录/);
 });
 test('请求身份保留已有历史字段和零代次，全部文本继续转义',async()=>{
- const page=await ui(()=>response({}));page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,member_name:'员工<one>',account_name:'账号<one>',model:'模型<one>',device_id:'device',device_name:'设备<one>',device_system:'系统<one>',device_auth_state:'authenticated',device_generation:0,key_prefix:'key<one>',key_removed_at:1,agent:'客户端<one>',standard:{}}));
+ const page=await ui(()=>response({}));page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,member_name:'员工<one>',account_name:'账号<one>',model:'模型<one>',device_id:'device<one>',device_name:'设备<one>',device_system:'系统<one>',device_auth_state:'authenticated',device_generation:0,key_prefix:'key<one>',key_removed_at:1,agent:'客户端<one>',standard:{}}));
  const list=page.run('requestTable([record])'),detail=page.run('phaseDetail(record)');
- for(const value of ['员工','账号','模型','设备','系统']){assert.ok(list.includes(value+'&lt;one&gt;'));assert.ok(detail.includes(value+'&lt;one&gt;'));}
- assert.match(detail,/凭据代次：0/);assert.match(detail,/key&lt;one&gt;…（已删除）/);assert.match(detail,/客户端&lt;one&gt;/);assert.ok(!detail.includes('<one>'));
+ for(const value of ['员工','账号','模型','设备','系统','device']){assert.ok(list.includes(value+'&lt;one&gt;'));assert.ok(detail.includes(value+'&lt;one&gt;'));}
+ assert.match(detail,/凭据代次：0/);assert.match(detail,/key&lt;one&gt;…（已删除）/);assert.match(detail,/客户端&lt;one&gt;/);assert.ok(!detail.includes('<one>'));assert.ok(!list.includes('<one>'));
 });
 test('Key设备范围409保留跨页选择，读取新版本前禁止重发，翻页失败显示原因',async()=>{
  const id='11111111-1111-1111-1111-111111111111',old='22222222-2222-2222-2222-222222222222';let keyReads=0,deviceReads=0;const writes=[];
@@ -1723,4 +1725,13 @@ test('同scope刷新后详情独立读取最新权限，不因统计失败被禁
 test('实际响应页码被clamp时不把原页完整数据套到新页',async()=>{
  const {page,pending}=await memberRefreshFixture();page.run('memberFilters.page=2;');const pageTwo=page.run('loadMembers()');const full=memberRefreshPage('member-two','21.00',{pagination:{page:2,pageSize:20,total:21,totalPages:2}});memberRefreshPair(pending).meta.release({...full,usagePending:true});memberRefreshPair(pending).usage.release(full);await pageTwo;await new Promise(setImmediate);assert.equal(page.run('membersData.rows[0].id'),'member-two');
  const next=page.run('loadMembers()'),fresh=memberRefreshPair(pending.slice(2));fresh.meta.release(memberRefreshPage('member-one','0',{usagePending:true,pagination:{page:1,pageSize:20,total:1,totalPages:1}}));await next;await new Promise(setImmediate);assert.equal(page.run('memberFilters.page'),1);assert.equal(page.run('membersData.rows[0].id'),'member-one');assert.equal(page.run('membersData.usagePending'),true);fresh.usage.release(memberRefreshPage('member-one','12.00',{pagination:{page:1,pageSize:20,total:1,totalPages:1}}));await new Promise(setImmediate);assert.equal(page.run('membersData.rows[0].standard.total'),'12.00');
+});
+
+test('设备摘要仅展示登记和使用数量，不将IP或认证计数当作设备标识',async()=>{
+ const page=await ui(()=>response({}));
+ assert.equal(page.run('deviceSummary({registered_devices:0,ips:5,unverified_requests:9})'),'尚未登记设备');
+ assert.equal(page.run('deviceSummary({registered_devices:3,used_devices:2,unverified_requests:9})'),'登记 3 · 近7天使用 2');
+ assert.match(page.run('deviceSummary({registered_devices:3},{pending:true})'),/使用统计加载中/);
+ assert.match(page.run('deviceSummary({registered_devices:3},{error:true})'),/使用统计未加载/);
+ assert.equal(page.run('deviceSummary({})'),'设备信息未加载');
 });
