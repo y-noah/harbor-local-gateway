@@ -1186,6 +1186,20 @@ test('鉴权成功立即显示shell和局部loading，不等待慢state且不显
  assert.equal(page.run('admin'),true);assert.equal(page.node('#shell').classList.values.has('hidden'),false);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.equal(page.run('state'),null);assert.match(page.node('#content').innerHTML,/aria-busy="true"/);assert.equal(page.node('#admin-input').value,'');
  release(response(snapshot()));await pending;assert.equal(submit.disabled,false);assert.match(page.node('#content').innerHTML,/最近 7 天请求/);assert.equal(page.run('tab'),'overview');
 });
+test('登录成功附带总览时直接使用同份数据，避免重复状态请求',async()=>{
+ const initialState={...snapshot(),keys:[],sessions:[],audit:[],view:'overview',peopleLoaded:false,capabilities:{pagedMembers:true}},calls=[];
+ const page=await ui((path,options)=>{calls.push({path,body:options?.body});if(path==='/api/auth/login')return response({ok:true,initialState});throw Error('不应重复请求首屏状态');});
+ page.node('#admin-input').value='synthetic';await page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});
+ assert.equal(calls.length,1);assert.equal(JSON.parse(calls[0].body).includeOverview,true);assert.equal(page.run('admin'),true);assert.equal(page.run('state.view'),'overview');assert.match(page.node('#content').innerHTML,/最近 7 天请求/);
+});
+test('登录附带不完整或非总览数据时仍按原接口读取，迟到响应不能恢复已退出身份',async()=>{
+ for(const initialState of [{view:'overview'},{...snapshot(),view:'accounts',peopleLoaded:false}]){
+  const calls=[],page=await ui(path=>{calls.push(path);return response(path==='/api/auth/login'?{ok:true,initialState}:snapshot());});
+  await page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});assert.equal(calls.filter(path=>path.startsWith('/api/admin/state')).length,1);assert.equal(page.run('admin'),true);
+ }
+ let release;const page=await ui(()=>new Promise(resolve=>release=resolve));const pending=page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});
+ page.run('authEpoch++;state=null;showLogin();');release(response({ok:true,initialState:{...snapshot(),view:'overview',peopleLoaded:false}}));await pending;assert.equal(page.run('admin'),false);assert.equal(page.run('state'),null);
+});
 test('首屏state失败保留shell，明确提示失败并通过原入口重试',async()=>{
  let attempts=0;const page=await ui(path=>path==='/api/auth/login'?response({ok:true}):++attempts===1?response({error:{message:'合成读取失败'}},503):response(snapshot()));await page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});
  assert.equal(page.run('admin'),true);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.match(page.node('#content').innerHTML,/工作空间读取失败/);assert.match(page.node('#content').innerHTML,/合成读取失败/);assert.equal(page.run('state'),null);await page.click('retry-workspace');assert.match(page.node('#content').innerHTML,/最近 7 天请求/);assert.equal(page.run('tab'),'overview');assert.equal(attempts,2);

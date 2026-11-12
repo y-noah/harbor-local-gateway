@@ -198,13 +198,14 @@ function automaticRefreshScope(){
   if(['overview','accounts','sessions'].includes(tab))return 'state:'+tab;
   return '';
 }
+function loginOverview(value){return value?.view==='overview'&&value.peopleLoaded===false&&value.totals&&Array.isArray(value.accounts)&&Array.isArray(value.daily)&&Array.isArray(value.members)&&!value.members.length&&Array.isArray(value.keys)&&!value.keys.length?value:null;}
 function stateSnapshot(value){const {recentUsageWindow,...data}=value||{};return JSON.stringify(data);}
 function requestsSnapshot(value){const {observedAt,...data}=value||{};return JSON.stringify(data);}
 async function automaticRefresh(){
   const scope=automaticRefreshScope();if(!scope||autoRefreshPending||sessionsLoading||requestsLoading)return;
   autoRefreshPending=true;try{await refresh(true,scope);}finally{autoRefreshPending=false;}
 }
-async function refresh(renderPage=true,automaticScope='',{preserveRequestsPage=false}={}){
+async function refresh(renderPage=true,automaticScope='',{preserveRequestsPage=false,initialState=null}={}){
   if(!admin)return;if(!state){initialLoadError='';if(renderPage)render();}const priorSessionError=tab==='sessions'?sessionsLoadError:'';const epoch=authEpoch,version=++refreshVersion,foreground=renderPage&&!automaticScope&&!!state,scope=pageScope();if(foreground){foregroundRefreshVersion=version;foregroundRefreshScope=scope;}syncLoadingRegions();
   const params=new URLSearchParams();if(tab==='sessions'){params.set('session_page',sessionsPage);params.set('session_page_size',sessionsPageSize);}if(!state||pagedPeople())params.set('people','none');if(tab==='sessions'&&state?.capabilities?.sessionStateView)params.set('view','sessions');else if(tab==='accounts'&&state?.capabilities?.accountStateView)params.set('view','accounts');else if(tab==='overview'&&(!state||pagedPeople())||state?.capabilities?.sessionStateView&&!['accounts','sessions'].includes(tab)||state?.view==='accounts'&&!needsFullState())params.set('view','overview');const sessionSelection=tab==='sessions'&&state?.capabilities?.sessionFilters?{...sessionsFilters}:emptySessionFilters();for(const [key,value] of Object.entries(sessionSelection))if(value)params.set('session_'+key,value);const query=params.size?'?'+params:'';
   // Independent page queries must not wait for the more expensive global
@@ -219,7 +220,7 @@ async function refresh(renderPage=true,automaticScope='',{preserveRequestsPage=f
   }:{};
   const pageLoadCompletion=Promise.allSettled(Object.values(pageLoads));
   try{
-    const next=await api('/api/admin/state'+query);
+    const next=initialState??await api('/api/admin/state'+query);
     if(!admin||epoch!==authEpoch||version!==refreshVersion||automaticScope&&automaticRefreshScope()!==automaticScope||foreground&&pageScope()!==scope)return;
     if(tab==='sessions'&&$('#modal').open)return;
     const changed=stateSnapshot(next)!==stateSnapshot(state)||!!priorSessionError;state=next;if(tab==='sessions'&&next.view!=='overview'){sessionsConfirmedFilters={...sessionSelection};sessionsConfirmedSnapshot={sessions:(next.sessions||[]).map(row=>({...row})),pagination:next.sessionsPagination?{...next.sessionsPagination}:null,usageWindow:next.usageWindow?{start:next.usageWindow.start,end:next.usageWindow.end}:null};sessionsLoadError='';}if(state.capabilities?.accountPackages&&tab==='accounts'&&!packageCatalog&&!packageCatalogController)void loadPackageCatalog();if(state.capabilities?.typeStatistics&&!(tab==='requests'&&recordView==='recordings')&&!typeCatalog.length&&!typeCatalogController)void loadTypeCatalog();sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=validPageSize(next.sessionsPagination?.pageSize,sessionsPageSize);sessionsLoading=false;
@@ -1846,7 +1847,7 @@ document.addEventListener('click',async e=>{
     if(action==='export'){const epoch=authEpoch,r=await fetch('/api/admin/export');if(!r.ok)throw Error('导出失败');const blob=await r.blob();if(!admin||epoch!==authEpoch)return;const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='Harbor-使用记录.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);return;}
   }catch(err){toast(err.message);}finally{el.disabled=false;foregroundButton(el,false);}
 });
-$('#login-form').onsubmit=async e=>{e.preventDefault();const submit=e.submitter,epoch=authEpoch,submission=++loginSubmission;submit.disabled=true;try{await api('/api/auth/login','POST',{password:$('#admin-input').value});if(epoch!==authEpoch)return;authEpoch++;admin=true;$('#admin-input').value='';if(submission===loginSubmission)submit.disabled=false;render();await refresh();}catch(err){if(epoch===authEpoch)toast(err.message);}finally{if(submission===loginSubmission)submit.disabled=false;}};
+$('#login-form').onsubmit=async e=>{e.preventDefault();const submit=e.submitter,epoch=authEpoch,submission=++loginSubmission;submit.disabled=true;try{const includeOverview=tab==='overview',login=await api('/api/auth/login','POST',{password:$('#admin-input').value,...(includeOverview?{includeOverview:true}:{})});if(epoch!==authEpoch)return;authEpoch++;admin=true;$('#admin-input').value='';if(submission===loginSubmission)submit.disabled=false;render();const initialState=includeOverview&&tab==='overview'?loginOverview(login.initialState):null;await refresh(true,'',{initialState});}catch(err){if(epoch===authEpoch)toast(err.message);}finally{if(submission===loginSubmission)submit.disabled=false;}};
 $('#employee-entry').onclick=()=>{connectionView='test';tab='playground';render();};$('#refresh').onclick=async()=>{const button=$('#refresh');if(button.disabled||manualRefreshPending)return;const epoch=authEpoch;manualRefreshPending=true;button.disabled=true;button.setAttribute?.('aria-busy','true');try{if(admin&&tab==='accounts')await api('/api/admin/quotas/refresh','POST',{});if(epoch===authEpoch&&admin)await refresh();}catch(error){if(epoch===authEpoch)toast(error.message);}finally{manualRefreshPending=false;button.disabled=false;button.setAttribute?.('aria-busy','false');}};$('#logout').onclick=async()=>{if(sending)return toast('请等待当前请求完成后退出');try{await api('/api/auth/logout','POST',{});authEpoch++;admin=false;state=null;testKey='';platformModels=[];chatModel='codex';chat=[];chatSession='';chatOwner='';draft='';showLogin();}catch(err){toast(err.message);}};
 setInterval(()=>{void automaticRefresh();},12000);
 $('#modal').oncancel=e=>{e.preventDefault();close();};

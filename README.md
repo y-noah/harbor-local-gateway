@@ -107,6 +107,8 @@ PG18.6基础镜像可用默认关闭的 `HARBOR_CACHE_POSTGRES_BASE=1` 显式显
 
 ## 密码登录
 
+PG 登录请求可选 `includeOverview:true`，仅在密码验证成功后附带与普通总览读取相同的 `initialState`，固定 `view=overview&people=none`。页面复用该响应，减少首屏一次串行往返；未请求、旧服务或首屏读取失败时仍沿原状态接口加载。鉴权、Cookie、七天范围与查询队列不变，不预载员工、Key或正文。
+
 首次部署自动生成 36 位随机管理密码，找回副本保存在应用目录的 `管理密码.txt`；请勿分享此文件。服务配置保存加盐 scrypt 哈希。登录状态使用 HttpOnly、SameSite=Strict Cookie，有效期 12 小时；退出或服务重启后失效。连续 5 次错误密码会暂停登录 1 分钟。启动器不再通过 URL 自动登录，浏览器不保存管理令牌到网页存储。员工 API Key 与管理密码相互独立。
 
 同一主机并行运行多个实例时，可在各自 `data/settings.json` 显式设置不同的 `adminCookieName`（例如 `harbor_session_preview`），避免浏览器在不同端口覆盖管理登录。名称须为1–64位ASCII字符、字母开头，仅含字母、数字、下划线或连字符；空值、非法类型及其他字符均拒绝启动，PG预检也校验。未设置时沿用 `harbor_session`；名称在启动时固定，不从请求Host或转发头派生。变更后重启并重新登录；只读取和注销当前名称，不回退读取或清除其他名称的Cookie。删除此字段或设回 `harbor_session` 即恢复默认，但同主机不同端口再次共用该名称。配置不修改管理密码、员工Key或Cookie原有属性，也不提供端口间安全隔离；preview仅修改自己的独立配置，原实例保持不变。

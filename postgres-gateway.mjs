@@ -225,7 +225,18 @@ export async function createPostgresGateway(options={}){
         if(closing||lostOwnership)throw new AppError(503,closing?'服务正在排空':'服务实例所有权已丢失',closing?'service_stopping':'gateway_ownership_lost');
         if(await extraUsageAdmin.handle(req,res,{signal:body.signal}))return;
         if(req.method==='GET'&&['/','/app.js','/style.css'].includes(path)){res.setHeader('Content-Type',path==='/'?'text/html; charset=utf-8':path.endsWith('.js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8');return res.end(files.get(path==='/'?'index.html':path.slice(1)));}
-        if(path==='/api/auth/login'&&req.method==='POST'){await auth.loginAsync((await requestBodies.read(req,{owner:'login',signal:body.signal})).password,res);return json(res,200,{ok:true});}
+        if(path==='/api/auth/login'&&req.method==='POST'){
+          const input=await requestBodies.read(req,{owner:'login',signal:body.signal});
+          if(!input||typeof input!=='object'||Array.isArray(input))throw new AppError(400,'登录内容无效');
+          if(input.includeOverview!==undefined&&typeof input.includeOverview!=='boolean')throw new AppError(400,'登录首屏选项无效');
+          await auth.loginAsync(input.password,res);
+          let initialState;
+          if(input.includeOverview){
+            try{initialState=await handler.initialOverview({signal:body.signal});}
+            catch(error){if(body.signal.aborted)throw error;}
+          }
+          return json(res,200,{ok:true,...(initialState?{initialState}:{})});
+        }
         if(path==='/api/auth/logout'&&req.method==='POST'){auth.logout(req,res);return json(res,200,{ok:true});}
         if(path==='/api/auth/session'&&req.method==='GET')return json(res,200,{authenticated:auth.authenticated(req)});
         if(path==='/api/admin/status'&&req.method==='GET'){if(!auth.authenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');return json(res,200,status(),true);}
