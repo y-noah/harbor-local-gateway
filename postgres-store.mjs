@@ -1,4 +1,5 @@
 import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
+import {migrateUsageRollups} from './postgres-usage-rollups.mjs';
 import {migrateRecordingRetention} from './recording-retention.mjs';
 import pg from 'pg';
 import {requestParameters,safeUpstreamRequestId} from './request-parameters.mjs';
@@ -95,7 +96,7 @@ export class PostgresStore{
     finally{client.release(scope.connection.error??undefined);}
   }
   async migrate(options={}){
-    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(name=>!['recordingContext','recordingContextIndex','recordingRetentionUnlimited'].includes(name))||['recordingContext','recordingContextIndex','recordingRetentionUnlimited'].some(name=>options[name]!==undefined&&typeof options[name]!=='boolean')||options.recordingContext===false&&options.recordingContextIndex===true)throw new AppError(503,'数据库迁移选项无效','database_configuration');
+    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(name=>!['recordingContext','recordingContextIndex','recordingRetentionUnlimited','usageHourRollups'].includes(name))||['recordingContext','recordingContextIndex','recordingRetentionUnlimited','usageHourRollups'].some(name=>options[name]!==undefined&&typeof options[name]!=='boolean')||options.recordingContext===false&&options.recordingContextIndex===true)throw new AppError(503,'数据库迁移选项无效','database_configuration');
     return this.transaction(async()=>{
       // The bridge recognizes only the exact known additive migrations. It never enables
       // context storage by merely starting a gateway or calling migrate().
@@ -114,7 +115,8 @@ export class PostgresStore{
         await this.query(sql);await this.run('INSERT INTO harbor.schema_migrations VALUES($1,$2,$3)',version,checksum,Date.now());changed=true;
       }
       const retentionChanged=await migrateRecordingRetention(this,{apply:options.recordingRetentionUnlimited===true});
-      return {version,changed:changed||retentionChanged};
+      const usageChanged=await migrateUsageRollups(this,{apply:options.usageHourRollups===true});
+      return {version,changed:changed||retentionChanged||usageChanged};
     });
   }
   async verifySchema(){
@@ -126,6 +128,7 @@ export class PostgresStore{
       if(rows[index].version!==index+1||rows[index].checksum!==createHash('sha256').update(sql).digest('hex'))throw new AppError(503,'数据库迁移校验值不匹配，禁止启动','database_migration_conflict');
     }
     await migrateRecordingRetention(this);
+    await migrateUsageRollups(this);
     if(!await this.ready())throw new AppError(503,'数据库数据契约不兼容','database_contract_invalid');
     return true;
   }

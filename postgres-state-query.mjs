@@ -6,6 +6,7 @@ import {referenceMetric} from './pricing.mjs';
 import {postgresMemberLimitConfiguration} from './postgres-member-limits.mjs';
 import {fields,validPrice,joins,decorate,aggregate,aggregateSql,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
+import {verifyUsageRollupAvailability,usageRollupsReady,usageRollupMoneySql} from './postgres-usage-rollups.mjs';
 
 export function stateQuery(params){
   const value={sessionPage:1,sessionPageSize:25};
@@ -33,6 +34,7 @@ function validateSessionFilters({sessionQ='',sessionType='',sessionAccount='',se
 export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,queryQueue,balancingReader,maxPeople=1000}={}){
   const queue=queryQueue||createPostgresQueryQueue();
   if(!Number.isSafeInteger(maxPeople)||maxPeople<1||maxPeople>10000)throw new AppError(503,'兼容员工状态容量无效','state_configuration');
+  const rollupInitialization=verifyUsageRollupAvailability(store).then(()=>null,error=>error);
   async function loadSessionPage({window,sessionPage,sessionPageSize,sessionQ,sessionType,sessionAccount,sessionStatus}){
       const sessionArgs=[window.start,window.end],conditions=['s.updated>=$1','s.updated<$2'];
       const filter=(sql,value)=>{sessionArgs.push(value);conditions.push(sql.replaceAll('?',String(sessionArgs.length)));};
@@ -86,7 +88,8 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       const packages=createPostgresAccountPackages(store,{clock}),packagePolicy=await packages.policy(),accounts=await packages.decorate(await store.all('SELECT id,name,kind,auth_mode,route_epoch,platform_config,platform_models,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id'));
       const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,standard:usage(row.id)}));
       if(view==='accounts'){
-        const rows=accounts.length?await store.all(`WITH source AS (
+        const useRollups=accounts.length&&await usageRollupsReady(store);
+        const rows=accounts.length?useRollups?await store.all(usageRollupMoneySql('account'),accounts.map(row=>row.id),window.start,window.end,0,0):await store.all(`WITH source AS (
           SELECT r.account_id,
             CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
             r.price_version revision,
@@ -95,7 +98,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         ), partial AS MATERIALIZED (
           SELECT account_id,revision,${referencePartialAggregateSql({standardOnly:true})} FROM source GROUP BY account_id,revision
         ) SELECT account_id,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY account_id`,window.start,window.end,accounts.map(row=>row.id)):[];
-        const usage=new Map(rows.map(row=>[row.account_id,aggregate(row).standard])),empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(f=>[f,'0']))}).standard;
+        const usage=new Map(rows.map(row=>[useRollups?row.owner_id:row.account_id,aggregate(row).standard])),empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(f=>[f,'0']))}).standard;
         return {view:'accounts',usageMetric:referenceMetric,usageWindow:window,observedAt:at,peopleLoaded:false,
           accounts:accountData(id=>usage.get(id)||empty),...(balancingReader?{balancing:await balancingReader(at)}:{})};
       }
@@ -173,5 +176,5 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         requests:requests.map(row=>decorate(row,window.start)),totals:totals||{requests:0,success:0,standard:empty},daily:daily.sort((a,b)=>a.day.localeCompare(b.day)),audit};
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {read:(query,{signal}={})=>{const input={...query};return queue.run(()=>execute(input),{signal});},close:()=>queue.close(),status:()=>queue.status()};
+  return {read:(query,{signal}={})=>{const input={...query};return queue.run(async()=>{if(input.view==='accounts'){const initializationError=await rollupInitialization;if(initializationError)throw initializationError;}return execute(input);},{signal});},close:()=>queue.close(),status:()=>queue.status()};
 }

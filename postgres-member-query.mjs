@@ -1,3 +1,4 @@
+import {verifyUsageRollupAvailability,usageRollupsReady,usageRollupMoneySql} from './postgres-usage-rollups.mjs';
 import {AppError,usageWindow,storedModelAllowlist,revealStoredKey} from './store.mjs';
 import {fields,validPrice,joins,aggregate,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresMemberLimits,postgresMemberLimitConfiguration} from './postgres-member-limits.mjs';
@@ -21,12 +22,19 @@ export function memberConditions(query,{alias='m',start=1}={}){
 }
 const memberColumns='m.id,m.name,m.enabled,m.access_version,m.device_mode,m.device_policy_version,m.created,m.usage_limits,m.usage_limits_version,m.usage_type_id,m.usage_type_version,m.default_models,m.default_models_set,m.defaults_version,m.configuration_source,t.code usage_type_code,t.name usage_type_name,t.description usage_type_description';
 export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,queryQueue,pageBytes=524288,maxSelection=1000}={}){
-  const limits=createPostgresMemberLimits(store,{clock}),read=(op,{signal}={})=>queryQueue?queryQueue.run(()=>store.transaction(op,{level:'REPEATABLE READ',readOnly:true}),{signal}):store.transaction(op,{level:'REPEATABLE READ',readOnly:true});
+  const limits=createPostgresMemberLimits(store,{clock}),read=(op,{signal}={})=>{const execute=async()=>{const error=await rollupInitialization;if(error)throw error;return store.transaction(op,{level:'REPEATABLE READ',readOnly:true});};return queryQueue?queryQueue.run(execute,{signal}):execute();};
   if(!Number.isSafeInteger(pageBytes)||pageBytes<1024||pageBytes>2097152||!Number.isSafeInteger(maxSelection)||maxSelection<1||maxSelection>10000)fail(503,'员工页面字节预算无效','member_query_configuration');
+  const rollupInitialization=verifyUsageRollupAvailability(store).then(()=>null,error=>error);
   const empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(field=>[field,'0']))}).standard;
   async function usage(scope,ids,at){
     if(!ids.length)return new Map();const window=usageWindow(at);
-    const rows=await store.all(`WITH identity AS (
+    const useRollups=await usageRollupsReady(store);
+    const rollupSql=`WITH identity AS (
+      SELECT r.${scope}_id owner_id,COUNT(DISTINCT r.ip) ips,COUNT(DISTINCT r.device_id) used_devices,
+        COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(r.started) last_seen
+      FROM harbor.requests r WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3 GROUP BY r.${scope}_id
+    ),money AS (${usageRollupMoneySql(scope)}) SELECT i.*,m.* FROM identity i JOIN money m USING(owner_id)`;
+    const rows=await store.all(useRollups?rollupSql:`WITH identity AS (
       SELECT r.${scope}_id owner_id,COUNT(DISTINCT r.ip) ips,COUNT(DISTINCT r.device_id) used_devices,
         COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(r.started) last_seen
       FROM harbor.requests r WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3 GROUP BY r.${scope}_id
