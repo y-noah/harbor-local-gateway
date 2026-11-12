@@ -8,11 +8,13 @@ import {chatSettlementFacts,validateLegacyChat} from './chat-facts.mjs';
 import {ConversationCapture,currentInput} from './conversation-capture.mjs';
 import {sanitizeRecord} from './record-redaction.mjs';
 import {observeRequestContextAsync,incompleteRequestContext} from './recording-context-capture.mjs';
+import {createPostgresLegacyConsumptionGuard} from './postgres-legacy-consumption-guard.mjs';
 
 const fail=(status,message,code)=>new AppError(status,message,code);
 export function createPostgresChatService({store,buffer,meteringRecovery,checkLimits,runChat,execution,cliProcesses,outputBudget,refreshQuotas=async()=>{},activity,deviceAccess,recordingEnabled=true,captureContext,recordingPolicy=()=>true,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock}),readBody=readJsonBody,reserveTokens=32000,maxRequests=16,maxQueued=5,waitMs=120000,timeoutMs=120000,maxConcurrent=120,maxPerMember=8}={}){
   if(typeof runChat!=='function'||typeof refreshQuotas!=='function'||!activity||![maxRequests,maxQueued,waitMs,timeoutMs].every(Number.isSafeInteger)||maxRequests<1||maxRequests>64||maxQueued<1||maxQueued>64||waitMs<100||waitMs>3600000||timeoutMs<100||timeoutMs>86400000)throw fail(503,'文本执行资源配置无效','chat_configuration');
   const state=createPostgresChatState(store,{checkLimits,clock,reserveTokens,extraRuntime}),queue=[],owners=new Set();let pumping,again=false;
+  const consumption=createPostgresLegacyConsumptionGuard(store,{clock});
   const releaseAccount=id=>{const count=activity.accounts.get(id)-1;if(count)activity.accounts.set(id,count);else activity.accounts.delete(id);void wake();};
   function remove(job){const index=queue.indexOf(job);if(index!==-1)queue.splice(index,1);clearTimeout(job.timer);job.signal.removeEventListener('abort',job.abort);}
   function reject(job,error){job.failure=error;if(job.selecting)return;remove(job);job.reject(error);}
@@ -40,6 +42,7 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
   async function handle(req,res){
     const secret=String(req.headers.authorization||'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at:clock()});
     await deviceAccess?.authorize(member,req);
+    await consumption.check(member);
     if(activity.isStopping())throw fail(503,'服务正在排空','service_stopping');
     if(owners.has(member.id))throw fail(429,'该员工已有文本请求在处理','member_busy');
     if(owners.size>=maxRequests||queue.length>=maxQueued||activity.active.size>=maxConcurrent||(activity.members.get(member.id)||0)>=maxPerMember)throw fail(429,'文本请求容量已满，请稍后重试','chat_queue_full');
@@ -62,7 +65,11 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
       activity.preparing.set(member.id,(activity.preparing.get(member.id)||0)+1);let original,received;
       try{const body=await readBody(req,{owner:'member:'+member.id,signal:controller.signal});if(captureContext)received=body;original=validateLegacyChat(body);}finally{const n=activity.preparing.get(member.id)-1;if(n)activity.preparing.set(member.id,n);else activity.preparing.delete(member.id);}
       await refreshQuotas().catch(()=>{});alive();if(activity.isStopping())throw fail(503,'服务正在排空','service_stopping');
-      admission=await state.admit(secret,original,{headers:req.headers,ip:req.socket.remoteAddress||'unknown',agent:String(req.headers['user-agent']||'').slice(0,200),recordingEnabled:captureEnabled,authorizeDevice:person=>deviceAccess?.authorize(person,req,{phase:'admission'})});extraBoundary=extraRuntime?.boundary({requestId:admission.requestId,protocol:'chat',admittedExtra:admission.extraAdmission.extraReserved});releasePreparation();releasePreparation=null;
+      admission=await store.transaction(async()=>{
+        let snapshot;
+        const admitted=await state.admit(secret,original,{headers:req.headers,ip:req.socket.remoteAddress||'unknown',agent:String(req.headers['user-agent']||'').slice(0,200),recordingEnabled:captureEnabled,authorizeDevice:async person=>{snapshot=await consumption.check(person,{lock:true});return deviceAccess?.authorize(person,req,{phase:'admission'});}});
+        await consumption.record(admitted.requestId,admitted.person,snapshot);return admitted;
+      });extraBoundary=extraRuntime?.boundary({requestId:admission.requestId,protocol:'chat',admittedExtra:admission.extraAdmission.extraReserved});releasePreparation();releasePreparation=null;
       if(!captureEnabled)await store.run('UPDATE harbor.requests SET recording_reason=$1 WHERE id=$2 AND recording_state=\'disabled\'',captureDecision.reason,admission.requestId).catch(()=>{});
       if(captureEnabled){const input=record(()=>currentInput({input:admission.delta}));recordStarted=!!input&&!!writeRecording('start',admission.requestId,input.state);if(!recordStarted)recordFailed=true;
         if(recordStarted)requestContext=await observeRequestContextAsync(captureContext,admission.requestId,received,{signal:controller.signal});

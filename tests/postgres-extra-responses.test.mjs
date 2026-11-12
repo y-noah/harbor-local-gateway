@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import pricingSeed from '../pricing-data.mjs';
+import {modelReleaseSource} from '../model-release-dates.mjs';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -99,8 +101,8 @@ test('非流式仅终态正文配对最终JSON写入，不误报内容丢弃',in
 
 
 test('真实管理入口恢复费率配置和刷新，拒绝未登录并经原请求体读取',integration,async t=>{
- const official='# Pricing\n### Standard pricing data\n| Model | Input | Cached input | Output |\n| --- | --- | --- | --- |\n| synthetic-new-model | $3 | $0.3 | $15 |\n### Batch pricing data\n';let fetched=0;
- const f=await fixture(t,{admin:true,pricingOptions:{fetchImpl:async()=>{fetched++;return new Response(official);}}});
+ const official='# Pricing\n### Standard pricing data\n| Model | Input | Cached input | Output |\n| --- | --- | --- | --- |\n| synthetic-new-model | $3 | $0.3 | $15 |\n### Batch pricing data\n';const releases='# Changelog\n\n## November, 2026\n\n### Nov 10\n\nFeature · Model: synthetic-new-model · API: v1/responses\n\nReleased [Synthetic](https://developers.openai.com/api/docs/models/synthetic-new-model) for synthetic testing.\n';const fetched={pricing:0,releases:0};
+ const f=await fixture(t,{admin:true,pricingOptions:{fetchImpl:async url=>{if(url===pricingSeed.source){fetched.pricing++;return new Response(official);}assert.equal(url,modelReleaseSource,'只允许受控的官方价格与发布日期来源');fetched.releases++;return new Response(releases);}}});
  const call=async(path,method='GET',body,authenticated=true)=>{
   const response=await fetch(f.origin+path,{method,headers:{...(authenticated?{authorization:'Bearer synthetic-admin'}:{}),'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
   return {status:response.status,value:await response.json()};
@@ -110,7 +112,7 @@ test('真实管理入口恢复费率配置和刷新，拒绝未登录并经原�
  const configured=await call('/api/admin/pricing','PATCH',{expectedVersion:initial.value.settings.version,refreshHours:12});
  assert.equal(configured.status,200);assert.equal(configured.value.settings.refreshHours,12);
  assert.equal((await call('/api/admin/pricing','PATCH',{expectedVersion:initial.value.settings.version,refreshHours:6})).status,400);
- const refreshed=await call('/api/admin/pricing/refresh','POST',{});assert.equal(refreshed.status,200);assert.equal(fetched,1);assert.ok(refreshed.value.rates.some(rate=>rate.model==='synthetic-new-model'));
+ const refreshed=await call('/api/admin/pricing/refresh','POST',{});assert.equal(refreshed.status,200);assert.deepEqual(fetched,{pricing:1,releases:1});assert.equal(refreshed.value.rates.find(rate=>rate.model==='synthetic-new-model')?.release_date,'2026-11-10');assert.equal(refreshed.value.modelReleaseState.error,null);assert.ok(refreshed.value.rates.some(rate=>rate.model==='synthetic-new-model'));
  assert.ok(!refreshed.value.rates.some(rate=>rate.model==='codex-auto-review'));
 });
 

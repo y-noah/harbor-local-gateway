@@ -5,6 +5,8 @@ import {realpath} from 'node:fs/promises';
 import {canonicalChatFacts} from './chat-facts.mjs';
 import {AppError} from './store.mjs';
 import {RecordingBuffer} from './recording-buffer.mjs';
+import {canonicalConsumptionSelection,assertConsumptionSelectionUsage} from './consumption-selection.mjs';
+import {normalizeConsumptionAttempts} from './postgres-consumption-policy.mjs';
 
 const statuses=new Set(['ok','failed','unknown','interrupted','cancelled','rejected']);
 function facts(command){
@@ -16,7 +18,9 @@ function facts(command){
   const upstreamRequestId=safeUpstreamRequestId(result.upstreamRequestId);
   const streamTiming=canonicalStreamTiming(result.streamTiming);
   const chat=canonicalChatFacts(result.chat);if(command.type==='settle-chat'&&chat===undefined)throw new AppError(503,'文本会话恢复游标缺失','metering_recovery_invalid');
-  return {type:'settle',requestId:command.requestId,at:command.at,result:{status,input,output,cached,usageKnown:!!usageKnown,...(streamTiming?{streamTiming}:{}),...(actualModel===undefined?{}:{actualModel}),...(upstreamRequestId?{upstreamRequestId}:{}),...(chat===undefined?{}:{chat})}};
+  const consumptionAttempts=result.consumptionAttempts===undefined?undefined:normalizeConsumptionAttempts(result.consumptionAttempts);
+  const consumptionSelection=canonicalConsumptionSelection(result.consumptionSelection,consumptionAttempts);if(consumptionSelection)assertConsumptionSelectionUsage(result);
+  return {type:'settle',requestId:command.requestId,at:command.at,result:{status,input,output,cached,usageKnown:!!usageKnown,...(streamTiming?{streamTiming}:{}),...(actualModel===undefined?{}:{actualModel}),...(upstreamRequestId?{upstreamRequestId}:{}),...(chat===undefined?{}:{chat}),...(consumptionAttempts===undefined?{}:{consumptionAttempts}),...(consumptionSelection===undefined?{}:{consumptionSelection})}};
 }
 
 // Same bounded, fsynced spool mechanism, but a separate directory, encryption

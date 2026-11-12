@@ -9,6 +9,7 @@ import {randomUUID} from 'node:crypto';
 import {runnerEnv,codexAuthArgs} from './codex.mjs';
 import {responseBodyBytes} from './request-body.mjs';
 import {AppError} from './store.mjs';
+import {createApiQuotaRejection} from './consumption-policy.mjs';
 import {readOutputJson} from './output-budget.mjs';
 
 const observeTiming=(timing,method,...args)=>{try{const value=timing?.[method]?.(...args);if(value&&typeof value.then==='function')void Promise.resolve(value).catch(()=>{});}catch{}};
@@ -173,7 +174,7 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     try{result=await fetchImpl((apiKeyMode?'https://api.openai.com/v1':upstreamOrigin)+path,{method:payload?'POST':'GET',headers,body,signal,redirect:'error'});}
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
     observeTiming(timing,'headers');
-    if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?Object.assign(new AppError(429,'官方API额度不足，请在官方账单后台核对','upstream_quota_exhausted'),{routeFailure:'quota_exhausted'}):[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{upstreamRequestId:safeUpstreamRequestId(result.headers.get('x-request-id')),usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
+    if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?createApiQuotaRejection():[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{upstreamRequestId:safeUpstreamRequestId(result.headers.get('x-request-id')),usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
   }
   async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,output,onPhase=()=>{},beforeDispatch,onDispatch=()=>{},timing}){

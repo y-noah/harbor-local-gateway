@@ -12,6 +12,7 @@ import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
 import {retainCodexQuotaDenials,codexQuotaDenials} from './codex-entitlements.mjs';
 import {createBalancer} from './balancing.mjs';
+import {normalizeConsumptionPolicy,normalizeConsumptionPolicyVersion} from './consumption-policy.mjs';
 import {needsReferenceReconciliation} from './pricing.mjs';
 import {runClaude,checkClaudeLogin,claudeEnv} from './claude.mjs';
 import {networkConfig,acceptsRequest} from './network.mjs';
@@ -24,6 +25,19 @@ import {createPlatformTransport} from './platforms.mjs';
 import {createQueryService} from './query-service.mjs';
 
 const root=dirname(fileURLToPath(import.meta.url));
+// SQLite retains its original allocation only. Never accept a source setting
+// whose behavior this entry cannot enforce or persist.
+function sqliteConsumptionInput(payload,{create=false}={}){
+  const invalid=()=>{throw new AppError(400,'消耗来源与预期版本无效','consumption_policy_invalid');};
+  if(!payload||typeof payload!=='object'||Array.isArray(payload))invalid();
+  const policy=Object.hasOwn(payload,'consumption_policy'),expected=Object.hasOwn(payload,'expected_consumption_policy_version');
+  if(Object.hasOwn(payload,'consumption_policy_version')||create&&expected||!create&&policy!==expected)invalid();
+  if(!policy)return;
+  if(payload.consumption_policy===undefined)invalid();
+  const value=normalizeConsumptionPolicy(payload.consumption_policy),version=create?0:normalizeConsumptionPolicyVersion(payload.expected_consumption_policy_version);
+  if(value!=='inherit')throw new AppError(400,'此SQLite入口仅支持跟随现有分配，不能配置独立消耗来源','consumption_policy_unsupported');
+  if(version!==0)throw new AppError(409,'此SQLite入口没有该消耗来源版本','consumption_policy_conflict');
+}
 function equals(a,b){const x=Buffer.from(a||''),y=Buffer.from(b||'');return x.length===y.length&&timingSafeEqual(x,y);}
 const json=(res,status,body)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(body));};
 const body=req=>readJsonBody(req);
@@ -349,7 +363,7 @@ export function createGateway(options={}) {
           return json(res,200,{ok:true,route_version:version});
         }
         if(path==='/api/admin/members'&&method==='POST'){
-          const b=await body(req);return json(res,201,store.createMember(name(b.name),integer(b.quota,'额度',{nullable:true}),expiry(b.expires),modelAllowlist(b.allowed_models===undefined?null:b.allowed_models)));
+          const b=await body(req);sqliteConsumptionInput(b,{create:true});return json(res,201,store.createMember(name(b.name),integer(b.quota,'额度',{nullable:true}),expiry(b.expires),modelAllowlist(b.allowed_models===undefined?null:b.allowed_models)));
         }
         const limitsMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/usage-limits$/);
         if(limitsMatch&&method==='GET')return json(res,200,store.memberLimits.status(limitsMatch[1]));
@@ -368,9 +382,10 @@ export function createGateway(options={}) {
         }
         if(memberMatch&&method==='PATCH'){
           const b=await body(req),m=store.get('SELECT * FROM members WHERE id=? AND removed_at IS NULL',memberMatch[1]);if(!m)throw new AppError(404,'员工不存在或已移除');
+          if(['consumption_policy','consumption_policy_version','expected_consumption_policy_version'].some(field=>Object.hasOwn(b,field)))throw new AppError(400,'请在对应Key中设置消耗来源','consumption_policy_invalid');
           store.run('UPDATE members SET name=?,quota=?,enabled=? WHERE id=?',b.name===undefined?m.name:name(b.name),b.quota===undefined?m.quota:integer(b.quota,'额度',{nullable:true}),b.enabled===undefined?m.enabled:bool(b.enabled),m.id);store.audit('member.update',m.id);return json(res,200,{ok:true});
         }
-        if(path==='/api/admin/keys'&&method==='POST'){const b=await body(req);return json(res,201,store.createKey(b.memberId,expiry(b.expires),b.quota===undefined?null:integer(b.quota,'Key 额度',{nullable:true}),modelAllowlist(b.allowed_models===undefined?null:b.allowed_models)));}
+        if(path==='/api/admin/keys'&&method==='POST'){const b=await body(req);sqliteConsumptionInput(b,{create:true});return json(res,201,store.createKey(b.memberId,expiry(b.expires),b.quota===undefined?null:integer(b.quota,'Key 额度',{nullable:true}),modelAllowlist(b.allowed_models===undefined?null:b.allowed_models)));}
         const keyMatch=path.match(/^\/api\/admin\/keys\/([a-f0-9-]+)$/);
         if(keyMatch&&method==='DELETE'){
           const k=store.get('SELECT * FROM keys WHERE id=? AND removed_at IS NULL',keyMatch[1]);if(!k)throw new AppError(404,'Key 不存在或已删除');
@@ -383,6 +398,7 @@ export function createGateway(options={}) {
         }
         if(keyMatch&&method==='PATCH'){
           const b=await body(req),k=store.get('SELECT * FROM keys WHERE id=? AND removed_at IS NULL',keyMatch[1]);if(!k)throw new AppError(404,'Key 不存在或已删除');
+          sqliteConsumptionInput(b);
           const changesModels=b.allowed_models!==undefined;
           if(changesModels&&b.expected_model_policy_version!==k.model_policy_version)throw new AppError(409,'模型权限已变化，请重新打开设置','model_policy_conflict');
           const allowed=changesModels?(b.allowed_models===null?null:JSON.stringify(modelAllowlist(b.allowed_models))):k.allowed_models;

@@ -3,6 +3,7 @@ import {AppError,hash,id,nextDailyReset,usageWindow} from './store.mjs';
 import {transferSchedule,transferWindow} from './transfer-schedule.mjs';
 import {createPostgresAccountPackages} from './postgres-account-packages.mjs';
 import {createPostgresExtraRuntime,classifyExtraPackage,noteExtraDispatchRoutingLock,readExtraDispatchSettings,registerExtraDispatchPreferenceReader} from './postgres-extra-runtime.mjs';
+import {consumptionSource,consumptionCandidateGroups,normalizeConsumptionPolicy} from './consumption-policy.mjs';
 import {automaticWeights,balanceSettings,routingAutoState,routingDistribution,routingAllocation} from './balancing.mjs';
 
 const failure=(status,message,code)=>{throw new AppError(status,message,code);};
@@ -27,12 +28,19 @@ export async function lockPostgresRouting(store){
   await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-routing-state',0))");
   noteExtraDispatchRoutingLock(store);
 }
+const consumptionScopes=new WeakMap();
+// Minted only by the authenticated consumption adapter, never from payload or
+// headers. Copy the candidate set so later callers cannot broaden the scope.
+export function createPostgresConsumptionRoutingScope({accountIds,source,rebind=false,expectedSession=null,excludeRequestId=null,resumeSession=false}={}){
+  if(!['api','subscription'].includes(source)||!(accountIds instanceof Set)||[...accountIds].some(value=>typeof value!=='string'||!value.length)||typeof rebind!=='boolean'||typeof resumeSession!=='boolean'||resumeSession&&!expectedSession||excludeRequestId!==null&&typeof excludeRequestId!=='string'||expectedSession!==null&&(!expectedSession.id||!expectedSession.account_id||!Number.isSafeInteger(expectedSession.route_version)))failure(503,'来源路由约束无效','consumption_scope_invalid');
+  const token=Object.freeze({});consumptionScopes.set(token,{accountIds:new Set(accountIds),source,rebind,resumeSession,expectedSession:expectedSession&&{id:expectedSession.id,account_id:expectedSession.account_id,route_version:expectedSession.route_version},excludeRequestId});return token;
+}
 export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),isStopping=()=>false,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
   const packages=createPostgresAccountPackages(store,{clock});
   const write=(name,value)=>store.run('INSERT INTO harbor.gateway_settings(name,value) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value',name,JSON.stringify(value));
   const audit=(action,detail,at)=>store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),at,action,JSON.stringify(detail));
-  async function state(at,{protocol='responses',model,force=false,persist=true,persistAuto=true,accountIds,packagePolicyOverride}={}){
-    const saved=await readExtraDispatchSettings(store,async()=>new Map((await store.all("SELECT name,value FROM harbor.gateway_settings WHERE name IN ('balancing','routing_strategy','routing_weights','routing_auto','routing_schedule','account_package_policy')"+(persist?' FOR SHARE':''))).map(row=>[row.name,JSON.parse(row.value)])));
+  async function state(at,{protocol='responses',model,force=false,persist=true,persistAuto=true,accountIds,packagePolicyOverride,scheduleName='routing_schedule'}={}){
+    const saved=await readExtraDispatchSettings(store,async()=>new Map((await store.all("SELECT name,value FROM harbor.gateway_settings WHERE name IN ('balancing','routing_strategy','routing_weights','routing_auto','routing_schedule','routing_schedule.consumption_api','routing_schedule.consumption_subscription','account_package_policy')"+(persist?' FOR SHARE':''))).map(row=>[row.name,JSON.parse(row.value)])));
     const legacy=saved.get('balancing')||{},settings=balanceSettings({...legacy,weighted:(saved.get('routing_strategy')||{}).weighted??legacy.weighted??false});
     let accounts=await packages.routingAccounts({protocol,persist});if(accountIds)accounts=accounts.filter(account=>accountIds.has(account.id));
     const packagePolicy=packagePolicyOverride??saved.get('account_package_policy')??{enabled:false,smoothing_hours:24,version:0},options={packagePolicy,protocol,model};
@@ -44,20 +52,31 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
     const configured=saved.get('routing_weights')||{mode:'auto',weights:{},expires:null,version:0},manualActive=configured.mode==='manual'&&configured.expires>at,effectiveWeighted=settings.weighted||packagePolicy.enabled&&(!system.legacyCompatibility||manualActive);
     const baseDistribution=routingDistribution(accounts,{at,weighted:effectiveWeighted,system,configured}),extraView=await extraRuntime.routingView(accounts,{model,protocol,packagePolicy,distribution:baseDistribution}),distribution=extraView.distribution;
     const select=async()=>{
-      const result=routingAllocation(distribution,saved.get('routing_schedule')||{});
+      const result=routingAllocation(distribution,saved.get(scheduleName)||{});
       if(!result.selected){if(system.strict)failure(503,'没有可比较且额度允许的套餐预算，请完善套餐依据或设置临时人工比例','package_routing_unavailable');failure(503,'没有生效权重大于0的可用账号，请调整权重或等待额度恢复','no_account');}
-      if(result.schedule&&persist)await write('routing_schedule',result.schedule);
+      if(result.schedule&&persist)await write(scheduleName,result.schedule);
       return result.selected;
     };
-    return {settings,packagePolicy,effectiveWeighted,accounts,distribution,extraView,select,schedule:saved.get('routing_schedule')||{}};
+    return {settings,packagePolicy,effectiveWeighted,accounts,distribution,extraView,select,schedule:saved.get(scheduleName)||{}};
   }
-  async function resolve(member,payload,headers={},{preparing:requestPreparing,protocol='responses'}={}){
+  async function resolve(member,payload,headers={},{preparing:requestPreparing,protocol='responses',consumptionScope}={}){
+    const scope=consumptionScope===undefined?null:consumptionScopes.get(consumptionScope);if(consumptionScope!==undefined&&!scope)failure(503,'来源路由约束未经认证','consumption_scope_invalid');
     if(!['responses','images'].includes(protocol))failure(503,'推理通道配置无效','routing_configuration');
     await lockPostgresRouting(store);const at=clock();
     const identity=await findPostgresResponseSession(store,member,payload,headers,{lock:true}),{clientKey,clientSessionId,fixed}=identity;let {session}=identity;
+    if(!session&&scope?.resumeSession&&!fixed)session=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND protocol='responses' FOR UPDATE",scope.expectedSession.id,member.id);
     if(session&&!session.enabled)failure(403,'该会话已被禁止访问','session_disabled');
     if(protocol==='images'&&session&&(await store.get('SELECT auth_mode FROM harbor.accounts WHERE id=$1',session.account_id))?.auth_mode==='openai_api')failure(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');
-    const routing=await state(at,{protocol,model:payload.model});let account=session?routing.accounts.find(a=>a.id===session.account_id):null;
+    if(scope?.expectedSession&&(!session||['id','account_id','route_version'].some(field=>session[field]!==scope.expectedSession[field])))failure(409,'会话绑定已变化','session_route_conflict');
+    const routing=await state(at,{protocol,model:payload.model,...(scope?{accountIds:scope.accountIds,persistAuto:false,scheduleName:'routing_schedule.consumption_'+scope.source}:{})});let account=session?routing.accounts.find(a=>a.id===session.account_id):null;
+    if(scope&&session&&!account){
+      if(fixed||!scope.rebind)failure(409,'固定会话或上下文不允许改变消耗来源','consumption_source_conflict');
+      if(preparing.has(member.id)||requestPreparing?.has(member.id)||await store.get("SELECT id FROM harbor.requests WHERE session_id=$1 AND status IN ('queued','running') AND ($2::text IS NULL OR id<>$2) LIMIT 1",session.id,scope.excludeRequestId))failure(409,'会话仍有请求处理中，暂不能切换','session_busy');
+      const target=await routing.select(),from=session.account_id;
+      const changed=await store.get('UPDATE harbor.sessions SET account_id=$1,upstream_thread=$2,route_version=route_version+1,handoff_requires_replay=1 WHERE id=$3 AND route_version=$4 RETURNING *',target.id,id(),session.id,session.route_version);
+      if(!changed)failure(409,'会话绑定已变化','session_route_conflict');session=changed;account=target;
+      await audit('session.route',{session:session.id,from,to:target.id,reason:'consumption_source'},at);
+    }
     if(session){
       if(!account||!account.enabled||!['ready','degraded'].includes(account.state)&&!account.route_block)failure(503,'会话绑定账号不可用，请新建客户端任务','session_account_unavailable');
       const api=account.auth_mode==='openai_api',blocked=account.route_block&&(api||account.route_block!=='quota_exhausted');
@@ -74,7 +93,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
         if(routing.packagePolicy.enabled&&!api&&routing.distribution.subscriptionMode!=='manual'){
           const items=new Map(routing.distribution.system.packages.items.map(item=>[item.id,item])),source=items.get(account.id),legacy=account.package_selection?.mode==='legacy',legacyGroup=routing.distribution.system.snapshots.get(account.id)?.group;
           const compatible=new Set(routing.accounts.filter(candidate=>candidate.auth_mode==='openai_api'||routing.extraView.decisions.get(candidate.id)?.decision.mode==='extra'&&routing.extraView.decisions.get(candidate.id)?.decision.allowed||source?.comparison_key&&items.get(candidate.id)?.comparison_key===source.comparison_key||legacy&&legacyGroup&&candidate.package_selection?.mode==='legacy'&&routing.distribution.system.snapshots.get(candidate.id)?.group===legacyGroup).map(candidate=>candidate.id));
-          destination=await state(at,{protocol,model:payload.model,accountIds:compatible,persistAuto:false});
+          destination=await state(at,{protocol,model:payload.model,accountIds:scope?new Set([...compatible].filter(accountId=>scope.accountIds.has(accountId))):compatible,persistAuto:false,...(scope?{scheduleName:'routing_schedule.consumption_'+scope.source}:{})});
         }
         const target=await destination.select();
         if(target.id!==account.id){
@@ -205,11 +224,27 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
       await audit('account.route_recover',account.id,at);await state(at,{force:'recovery'});return true;
     });
   }
+  async function catalogCandidates({at=clock(),policy='inherit',model,protocol='responses'}={}){
+    normalizeConsumptionPolicy(policy,{defaultValue:null});if(!['responses','images'].includes(protocol))failure(503,'推理通道配置无效','routing_configuration');
+    const read=async()=>{
+      const whole=await state(at,{protocol,model,persist:false,persistAuto:false}),groups=consumptionCandidateGroups(policy,whole.accounts),candidates=[],sources={};
+      for(const group of groups){
+        const accountIds=new Set(group.candidates.map(account=>account.id)),view=group.source===null?whole:await state(at,{protocol,model,persist:false,persistAuto:false,accountIds});
+        for(const account of view.distribution.eligible){if(!(view.distribution.weights.get(account.id)>0))continue;candidates.push({account,source:consumptionSource(account),eligible:true,support:'unknown',reason:model?'model_support_unverified':'model_not_selected'});}
+      }
+      for(const source of ['api','subscription']){
+        const accounts=whole.accounts.filter(account=>consumptionSource(account)===source),configured=accounts.filter(account=>account.enabled&&['ready','degraded'].includes(account.state)&&(source!=='api'||account.api_weight>0));
+        sources[source]={accountIds:accounts.map(account=>account.id),configuredIds:configured.map(account=>account.id),quotaExhaustedIds:configured.filter(account=>account.route_block==='quota_exhausted').map(account=>account.id)};
+      }
+      return {candidates,sources,policy,model:model??null,protocol};
+    };
+    return store.context.getStore()?read():store.transaction(read,{level:'REPEATABLE READ',readOnly:true});
+  }
   async function selectAccount({at=clock(),protocol='responses',model,accountIds,legacyOrder}={}){await lockPostgresRouting(store);const scoped=await state(at,{protocol,model,accountIds,persistAuto:false});if(scoped.distribution.system.legacyCompatibility&&scoped.distribution.subscriptionMode!=='manual'&&Array.isArray(legacyOrder)){const pool=new Map(scoped.distribution.eligible.map(account=>[account.id,account]));for(const accountId of legacyOrder)if(pool.has(accountId))return pool.get(accountId);}return scoped.select();}
   async function extraDispatchPreference({accountId,model,protocol='responses'}={}){
     const scoped=await state(clock(),{model,protocol,persist:false,persistAuto:false}),manual=scoped.distribution.subscriptionMode==='manual',classification=scoped.extraView.classifications.get(accountId);
     return {mode:classification?.mode,manual,manualPositive:manual&&scoped.distribution.configuration.weights[accountId]>0,accountIds:scoped.accounts.filter(account=>account.auth_mode!=='openai_api').map(account=>account.id),packageAlternatives:scoped.distribution.eligible.filter(account=>account.id!==accountId&&account.auth_mode!=='openai_api'&&scoped.distribution.weights.get(account.id)>0&&['package','package_compatibility'].includes(scoped.extraView.classifications.get(account.id)?.mode)).map(account=>account.id)};
   }
   const dispatchPreference=registerExtraDispatchPreferenceReader(request=>extraDispatchPreference({accountId:request.account_id,model:request.model,protocol:request.source_channel==='responses'?'responses':'images'}));
-  return {dispatchPreference,extraDispatchPreference,selectAccount,resolve,block,disableAccount,recover,syncWeights,saveSettings,saveWeights,saveTransferSchedule,readView};
+  return {dispatchPreference,extraDispatchPreference,selectAccount,catalogCandidates,resolve,block,disableAccount,recover,syncWeights,saveSettings,saveWeights,saveTransferSchedule,readView};
 }

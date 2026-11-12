@@ -1,6 +1,8 @@
 import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
 import {beginAdminRequestTiming,finishAdminRequestTiming,registerAdminRequestTimingSignal,wrapAdminQueryTimingQueue} from './admin-request-timing.mjs';
 import {createAdminJsonCompression} from './admin-json-compression.mjs';
+import {createPostgresConsumptionPolicy} from './postgres-consumption-policy.mjs';
+import {consumptionSource,isTrustedApiQuotaRejection,subscriptionFallbackDecision} from './consumption-policy.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {createRequestStreamTiming} from './request-stream-timing.mjs';
 import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
@@ -55,10 +57,12 @@ async function sse(res,event,signal,sessionId,output,timing,contentToken){
 // Composable asynchronous endpoint. Routing and shared-limit adapters are
 // mandatory: this must never silently replace an existing policy with LRU or
 // an unlimited default while the PostgreSQL migration is being developed.
-export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,checkLimits,transportForAccount,adminAuthenticated,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},pricingOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,captureContext,contextReader,contextIndexEnabled=false,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
+export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,consumptionRouting,sourceAccounts,consumptionPolicyReady,checkLimits,transportForAccount,adminAuthenticated,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},pricingOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,captureContext,contextReader,contextIndexEnabled=false,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
+  if(consumptionRouting!==undefined&&(!consumptionRouting||['read','resolve','fallback'].some(name=>typeof consumptionRouting[name]!=='function'))||sourceAccounts!==undefined&&typeof sourceAccounts!=='function'||consumptionPolicyReady!==undefined&&typeof consumptionPolicyReady!=='function')throw new AppError(503,'消耗来源请求依赖无效','postgres_configuration');
   if(typeof contextIndexEnabled!=='boolean'||captureContext!==undefined&&typeof captureContext!=='function'||contextReader!==undefined&&typeof contextReader?.read!=='function')throw new AppError(503,'上下文采集依赖无效','recording_configuration');
   if(!store||!recordings||!buffer||!meteringRecovery||['settle','flush','status','close'].some(name=>typeof meteringRecovery[name]!=='function')||[resolveRoute,checkLimits,transportForAccount,adminAuthenticated].some(fn=>typeof fn!=='function')||onRouteFailure!==undefined&&typeof onRouteFailure!=='function'||requestQueries!==undefined&&(!requestQueries||['read','close','status'].some(name=>typeof requestQueries[name]!=='function')||!requestQueries.queue||['run','close','status'].some(name=>typeof requestQueries.queue[name]!=='function'))||adminStateContext!==undefined&&typeof adminStateContext!=='function'||typeof recordingEnabled!=='boolean'||![maxConcurrent,maxPerMember].every(n=>Number.isInteger(n)&&n>=1))throw new AppError(503,'PostgreSQL请求处理依赖尚未配置完整','postgres_configuration');
   if(!meteringRecovery.directory||!buffer.directory||realpathSync(meteringRecovery.directory)===realpathSync(buffer.directory))throw new AppError(503,'计量与正文须使用独立恢复目录','metering_configuration');
+  const consumptionPolicies=createPostgresConsumptionPolicy(store,{clock});
   const stages=createStreamingStageObserver(stageObserver);
   const timingPersistence={queued:0,rejected:0};
   const active=new Set(),members=new Map(),preparing=new Map(),accounts=new Map();let stopping=false;
@@ -76,9 +80,9 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const planning=createPostgresPlanningJobs(store,{jobs:createPostgresJobs(store),clock}),planningReader=createPostgresPlanningJobs(queryStore,{jobs:createPostgresJobs(queryStore),clock});
   const history=createPostgresHistoryQueries(queryStore,{clock});
   const pricingAdmin=createPostgresPricingAdmin(store,{...pricingOptions,clock,adminAuthenticated,readStore:queryStore,queryQueue,readBody:(req,{signal}={})=>requestBodies.read(req,{owner:'admin',maxBytes:65536,signal})});
-  const memberAdmin=createPostgresMemberAdmin(store,{clock,readStore:queryStore,encryptionKey:keyEncryptionKey,queryQueue,isBusy:memberId=>members.has(memberId)});
+  const memberAdmin=createPostgresMemberAdmin(store,{clock,readStore:queryStore,encryptionKey:keyEncryptionKey,queryQueue,isBusy:memberId=>members.has(memberId),consumptionReady:consumptionPolicyReady});
   const deviceAccess=createPostgresDeviceAccess(store,{issuer:deviceIssuer,clock,readStore:queryStore,queryQueue});
-  const clientCatalog=createPostgresClientCatalog(store,{deviceAccess,transportForAccount,codexBinary,clock});
+  const clientCatalog=createPostgresClientCatalog(store,{deviceAccess,transportForAccount,sourceAccounts,codexBinary,clock});
   const typeStatisticsAdmin=createPostgresTypeStatisticsAdmin(queryStore,{clock,queryQueue,adminAuthenticated});
   const recordingJobs=recordingBackend??(recordingKey?createPostgresRecordingJobs(store,{...recordingBackendOptions,contextIndex:contextIndexEnabled,contextStorage:!!contextReader,recordingKey,clock,readStore:queryStore,queryQueue,storagePolicy:recordingStoragePolicy,devices:true}):null);
   const recordingAdmin=recordingJobs?createPostgresRecordingAdmin(recordingJobs,{...recordingAdminOptions,adminAuthenticated,requestBodies}):null;
@@ -193,7 +197,8 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     if(active.size>=maxConcurrent||(members.get(member.id)||0)>=maxPerMember)throw new AppError(429,'请求并发已满，请稍后重试','gateway_busy');
     const controller=new AbortController();active.add(controller);members.set(member.id,(members.get(member.id)||0)+1);stage.emit('lease',{lease:'member',action:'acquire'});const observeCancel=()=>stage.emit('cancel');controller.signal.addEventListener('abort',observeCancel,{once:true});
     const close=()=>{if(!res.writableEnded)controller.abort();};res.on('close',close);
-    let output,ticket,releasePreparation,releaseExecution,requestId,routedAccount,contextReplayable=false,contextComplete=false,contextSaved=false,accountTracked=false,capture,requestContext,batch=[],batchBytes=0,flushTimer,recordFailed=false,recordFailureReason=null,recordStarted=false,settlementAttempted=false,dispatched=false,extraBoundary;
+    let output,ticket,releasePreparation,releaseExecution,requestId,routedAccount,contextReplayable=false,contextComplete=false,contextSaved=false,accountTracked=false,capture,requestContext,batch=[],batchBytes=0,flushTimer,recordFailed=false,recordFailureReason=null,recordStarted=false,settlementAttempted=false,dispatched=false,extraBoundary,consumption,attemptIndex=-1,attemptPersistence=Promise.resolve(),upstreamEventSeen=false,currentDispatched=false,actualConsumptionSource=null,actualFallback=false,currentReliable=false,consumptionSelection;
+    const consumptionAttempts=[];
     const record=operation=>{try{return operation();}catch{capture=undefined;recordFailed=true;recordFailureReason??='capture_failed';return undefined;}};
     const writeRecording=(method,...args)=>record(()=>{const result=recordingBufferWrite(buffer,method,...args);if(!result.accepted){recordFailed=true;recordFailureReason??=result.reason;}return result.accepted;});
     const flush=()=>{if(!batch.length)return;const events=batch;batch=[];batchBytes=0;if(recordStarted&&!writeRecording('append',requestId,events))recordFailed=true;};
@@ -203,9 +208,28 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       return result;
     };
     const ensureConnected=()=>{if(controller.signal.aborted||res.destroyed)throw controller.signal.reason instanceof AppError?controller.signal.reason:new AppError(499,'客户端已断开','request_cancelled');};
+    const sourceHeaders=()=>{
+      if(!requestId||res.headersSent||res.destroyed)return;
+      res.setHeader('X-Harbor-Request',requestId);res.setHeader('X-Harbor-Request-Id',requestId);
+      if(consumption?.schemaAvailable&&actualConsumptionSource){res.setHeader('X-Harbor-Consumption-Source',actualConsumptionSource);res.setHeader('X-Harbor-Fallback',String(actualFallback));}
+    };
+    const attemptSnapshot=()=>consumptionAttempts.map(attempt=>({...attempt}));
+    const noteDispatch=(account,{confirmed=true}={})=>{
+      dispatched=true;currentDispatched=true;if(!consumption?.schemaAvailable||attemptIndex>=0)return;
+      const source=consumptionSource(account);if(!source)return;
+      attemptIndex=consumptionAttempts.length;consumptionAttempts.push({source,account_id:account.id,state:confirmed?'dispatched':'unknown',usage_known:false,started:clock()});
+      if(confirmed){actualConsumptionSource=source;actualFallback=consumptionAttempts.length===2;const snapshot=attemptSnapshot();attemptPersistence=attemptPersistence.then(()=>consumptionPolicies.recordAttempts(requestId,member.key_id,snapshot)).catch(()=>{});sourceHeaders();}
+    };
+    const finishAttempt=(value,{failed=false}={})=>{
+      if(attemptIndex<0)return;const attempt=consumptionAttempts[attemptIndex];
+      const counts={input:value.input??0,output:value.output??0,cached:value.cached??0},known=value.usageKnown===true&&Object.values(counts).every(number=>Number.isSafeInteger(number)&&number>=0)&&counts.cached<=counts.input;
+      Object.assign(attempt,{state:failed?isTrustedApiQuotaRejection(value)?'rejected':known?'failed':'unknown':'completed',usage_known:known,ended:clock()});
+      if(known)Object.assign(attempt,counts);else for(const field of ['input','output','cached'])delete attempt[field];
+      if(failed&&typeof value.code==='string'&&/^[a-z][a-z0-9_]{0,79}$/.test(value.code))attempt.error_code=value.code;
+    };
     const settle=async result=>{
-      settlementAttempted=true;const at=clock();
-      receipt.settlement={requestId,at,result:Object.fromEntries(['status','input','output','cached','usageKnown','actualModel','upstreamRequestId'].filter(key=>result[key]!==undefined).map(key=>[key,result[key]]))};
+      settlementAttempted=true;await attemptPersistence;if(consumption?.schemaAvailable)result={...result,consumptionAttempts:consumptionSelection?[{...consumptionSelection.first_attempt}]:attemptSnapshot(),...(consumptionSelection?{consumptionSelection}:{})};const at=clock();
+      receipt.settlement={requestId,at,result:Object.fromEntries(['status','input','output','cached','usageKnown','actualModel','upstreamRequestId','consumptionAttempts','consumptionSelection'].filter(key=>result[key]!==undefined).map(key=>[key,result[key]]))};
       try{await store.finish(requestId,result,at);await extraBoundary?.settle();return true;}
       catch{
         if(!meteringRecovery.settle(requestId,result,at))throw new AppError(503,'用量结算暂存已满，需管理员核对本次请求','metering_unavailable');
@@ -244,10 +268,10 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       // A released savepoint is not proof that its outer transaction committed.
       // This receipt changes observation only; routing and settlement stay intact.
       try{receipt.nested=!!store.context?.getStore?.();}catch{receipt.nested=true;}
-      const route=await store.transaction(async()=>{
+      let route=await store.transaction(async()=>{
         const current=await store.authenticate(secret,{at:clock(),lock:true}),device=await deviceAccess.authorize(current,req,{phase:'admission'});await store.checkModel(current,payload.model,payload.tools);
         await checkLimits(current,payload,{at:clock()});
-        const route=await resolveRoute(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses'});
+        const route=await (consumptionRouting?consumptionRouting.resolve(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses'}):resolveRoute(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses'}));
         if(!route?.session?.id||!route?.account?.id)throw new AppError(503,'会话路由未准备好','session_account_unavailable');
         if(identified.session&&identified.session.id!==route.session.id)throw new AppError(409,'会话关联已变化，请稍后重试','session_route_conflict');
         // Recheck trusted ownership/state, even when an adapter returns stale data.
@@ -259,16 +283,18 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         stage.emit('admission-attempt');releaseExecution=execution.acquire({memberId:current.id,accountId:account.id});if(releaseExecution){stage.emit('lease',{lease:'execution',action:'acquire'});stage.emit('admission-granted');}if(!releaseExecution)throw new AppError(503,'账号执行容量已满，请稍后重试','inference_capacity_busy');
         const requestId=await store.observe(current,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model,{at:clock(),channel:jsonPath?jsonPath.slice(1):'responses',device,parameters:payload});
         await store.run('UPDATE harbor.requests SET account_id=$1,session_id=$2,route_version=$3,recording_state=$4,handoff_input=$5,recording_reason=$7 WHERE id=$6',account.id,session.id,session.route_version,captureEnabled?'pending':'disabled',contextReplayable?'replayable':'opaque',requestId,captureDecision.reason);
+        if(route.consumption?.schemaAvailable)await consumptionPolicies.recordAdmission(requestId,current.key_id,route.consumption);
         await store.run('UPDATE harbor.accounts SET last_used=$1 WHERE id=$2',clock(),account.id);
         const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:jsonPath?'images':'responses'}),fixed:!!identified.fixed};
-        receipt.callbackCompleted=true;return {requestId,account,session,extraAdmission};
+        receipt.callbackCompleted=true;return {requestId,account,session,extraAdmission,...(route.consumption?{consumption:route.consumption}:{})};
       });
       receipt.timing?.preDispatch('admissionEnd');
-      requestId=route.requestId;if(receipt.nested)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:true,recordingExpected:captureEnabled});routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
-      extraBoundary=extraRuntime.boundary({requestId,protocol:jsonPath?'images':'responses',admittedExtra:route.extraAdmission.extraReserved,fixed:route.extraAdmission.fixed,packagePreference:adminRouter.dispatchPreference,
+      requestId=route.requestId;consumption=route.consumption;if(consumption?.schemaAvailable)sourceHeaders();if(receipt.nested)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:true,recordingExpected:captureEnabled});routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
+      const createBoundary=()=>extraRuntime.boundary({requestId,protocol:jsonPath?'images':'responses',admittedExtra:route.extraAdmission.extraReserved,fixed:route.extraAdmission.fixed,packagePreference:adminRouter.dispatchPreference,
         prepare:async request=>{ensureConnected();const current=await store.authenticate(secret,{at:clock(),lock:true});if(current.id!==request.member_id||current.key_id!==request.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});await lockPostgresRouting(store);return ensureConnected;},
         validate:async(account,request)=>{const current=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 FOR SHARE",request.session_id);if(account.id!==route.account.id||account.route_epoch!==route.account.route_epoch||!current||current.id!==route.session.id||current.member_id!==member.id||!current.enabled||current.protocol!=='responses'||current.account_id!==account.id||current.route_version!==request.route_version)throw new AppError(409,'会话或账号身份已变化，请重新请求','session_route_conflict');if(jsonPath&&account.auth_mode==='openai_api')throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');ensureConnected();}
       });
+      extraBoundary=createBoundary();
       releasePreparation();releasePreparation=null;
       if(!identified.session)await ticket.bind(route.session.id);
       const current=captureEnabled?record(()=>jsonPath?{state:'known'}:currentInput(payload)):null;
@@ -283,16 +309,67 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         record(()=>{if(capture){if(jsonPath)captureCodexJsonInput(capture,jsonPath,payload);else capture.input(payload,current);}});flush();flushTimer=setInterval(flush,250);flushTimer.unref();
       }
       receipt.timing?.preDispatch('captureReady');
-      if(!jsonPath||payload.prompt_cache_key!==undefined)payload.prompt_cache_key=route.session.upstream_thread||route.session.id;
-      const transport=await transportForAccount(route.account);
-      ensureConnected();if(jsonPath&&typeof transport.runJson!=='function')throw Object.assign(new AppError(503,'上游JSON通道尚未配置','upstream_configuration'),{usageKnown:true});
-      const reliable=isResponsesDispatchSource(transport);
-      const result=await extraBoundary.run(async({beforeDispatch,onDispatch})=>{
-        if(!reliable)dispatched=true;
-        return (jsonPath?transport.runJson:transport.run).call(transport,{path:jsonPath,binary:codexBinary,home:route.account.auth_mode==='openai_api'?route.account.id:route.account.home,payload,sessionId:route.session.upstream_thread||route.session.id,signal:controller.signal,protocolHeaders:req.headers,collectOutput:!original.stream,output,timing:receipt.timing,
-          beforeDispatch,onDispatch:()=>{receipt.timing?.dispatch();onDispatch();dispatched=true;},
-          onEvent:async event=>{const contentToken=receipt.timing?.upstreamEvent(event);if(!replayableResponsesEvent(event))contextReplayable=false;if(event.type==='response.completed')contextComplete=true;record(()=>capture?.event(event));if(!jsonPath&&original.stream)await sse(res,event,controller.signal,route.session.id,output,receipt.timing,contentToken);else receipt.timing?.retireContent(contentToken);}});
-      },{source:transport});
+      const dispatch=async()=>{
+        attemptIndex=-1;upstreamEventSeen=false;currentDispatched=false;currentReliable=false;
+        const transport=await transportForAccount(route.account);
+        ensureConnected();if(jsonPath&&typeof transport.runJson!=='function')throw Object.assign(new AppError(503,'上游JSON通道尚未配置','upstream_configuration'),{usageKnown:true});
+        const reliable=isResponsesDispatchSource(transport),outbound={...payload};currentReliable=reliable;
+        if(!jsonPath||payload.prompt_cache_key!==undefined)outbound.prompt_cache_key=route.session.upstream_thread||route.session.id;
+        return extraBoundary.run(async({beforeDispatch,onDispatch})=>{
+          if(!reliable)noteDispatch(route.account,{confirmed:false});
+          return (jsonPath?transport.runJson:transport.run).call(transport,{path:jsonPath,binary:codexBinary,home:route.account.auth_mode==='openai_api'?route.account.id:route.account.home,payload:outbound,sessionId:route.session.upstream_thread||route.session.id,signal:controller.signal,protocolHeaders:req.headers,collectOutput:!original.stream,output,timing:receipt.timing,
+            beforeDispatch,onDispatch:()=>{receipt.timing?.dispatch();onDispatch();noteDispatch(route.account);},
+            onEvent:async event=>{upstreamEventSeen=true;if(consumption?.schemaAvailable){actualConsumptionSource=consumptionSource(route.account);actualFallback=consumptionAttempts.length===2;}sourceHeaders();const contentToken=receipt.timing?.upstreamEvent(event);if(!replayableResponsesEvent(event))contextReplayable=false;if(event.type==='response.completed')contextComplete=true;record(()=>capture?.event(event));if(!jsonPath&&original.stream)await sse(res,event,controller.signal,route.session.id,output,receipt.timing,contentToken);else receipt.timing?.retireContent(contentToken);}});
+        },{source:transport});
+      };
+      let result;
+      try{result=await dispatch();}
+      catch(error){
+        finishAttempt(error,{failed:true});
+        const decision=currentReliable&&consumption?.schemaAvailable&&!jsonPath&&consumptionRouting&&subscriptionFallbackDecision({policy:consumption.consumption_policy,account:route.account,error,payload,attempts:consumptionAttempts.length===1?0:1,outputStarted:upstreamEventSeen||res.headersSent||controller.signal.aborted,contextReplayable});
+        if(!decision?.allowed)throw error;
+        await attemptPersistence;await consumptionPolicies.recordAttempts(requestId,member.key_id,attemptSnapshot());
+        await extraBoundary.settle();await extraBoundary.releaseUnused();extraBoundary=undefined;currentDispatched=false;
+        const previous=route.account;
+        if(releaseExecution){releaseExecution();releaseExecution=null;stage.emit('lease',{lease:'execution',action:'release'});}
+        ensureConnected();let nextRelease,preparedRoute,preparedAt;const previousRoute=route;
+        try{
+          const next=await store.transaction(async()=>{
+            const current=await store.authenticate(secret,{at:clock(),lock:true});if(current.id!==member.id||current.key_id!==member.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');
+            await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});ensureConnected();
+            const selected=await consumptionRouting.fallback({member:current,payload,headers:req.headers,options:{preparing,protocol:'responses'},requestId,route,error,attempts:0,outputStarted:false,contextReplayable});
+            const session=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND enabled=1 FOR SHARE",selected.session.id,current.id),account=session&&await store.get("SELECT * FROM harbor.accounts WHERE id=$1 AND enabled=1 AND removed_at IS NULL AND state IN ('ready','degraded') FOR SHARE",session.account_id);
+            if(!account||account.id!==selected.account.id||session.route_version!==selected.session.route_version||account.id===previous.id||session.route_version!==previousRoute.session.route_version+1||account.auth_mode!=='subscription')throw new AppError(409,'备用会话或账号已变化','session_route_conflict');
+            nextRelease=execution.acquire({memberId:current.id,accountId:account.id});if(!nextRelease)throw new AppError(503,'备用账号执行容量已满','inference_capacity_busy');stage.emit('lease',{lease:'execution',action:'acquire'});
+            const updated=await store.run("UPDATE harbor.requests SET account_id=$1,session_id=$2,route_version=$3,status='queued',business_status='running' WHERE id=$4 AND key_id=$5 AND account_id=$6 AND route_version=$7 AND status IN ('queued','running') AND ended IS NULL",account.id,session.id,session.route_version,requestId,current.key_id,previous.id,route.session.route_version);if(updated.changes!==1)throw new AppError(409,'备用派发的原请求已变化','consumption_fallback_conflict');
+            await store.run('UPDATE harbor.accounts SET last_used=$1 WHERE id=$2',clock(),account.id);
+            const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:'responses'}),fixed:false};ensureConnected();
+            preparedAt=clock();preparedRoute={...selected,requestId,account,session,extraAdmission};return preparedRoute;
+          });
+          route=next;consumption=next.consumption;releaseExecution=nextRelease;nextRelease=null;attemptIndex=-1;
+          if(accountTracked){const count=accounts.get(previous.id)-1;if(count)accounts.set(previous.id,count);else accounts.delete(previous.id);}routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
+        }catch(fallbackError){
+          nextRelease?.();if(nextRelease)stage.emit('lease',{lease:'execution',action:'release'});
+          if(preparedRoute){
+            consumptionSelection={version:1,request_id:requestId,member_id:member.id,key_id:member.key_id,session_id:previousRoute.session.id,consumption_policy:'api_first',consumption_policy_version:previousRoute.consumption.consumption_policy_version,from:{account_id:previousRoute.account.id,route_version:previousRoute.session.route_version},to:{account_id:preparedRoute.account.id,route_version:preparedRoute.session.route_version},prepared_at:preparedAt,failed_at:clock(),error_code:'consumption_rebind_commit_unconfirmed',first_attempt:{...consumptionAttempts[0]}};
+            // A failed COMMIT receipt is not a rollback proof. A fresh read can
+            // update local cleanup facts, but settlement always retains the
+            // strict resolution envelope for replay if the database stays down.
+            try{
+              const saved=await store.transaction(()=>store.get('SELECT member_id,key_id,session_id,account_id,route_version,consumption_policy,consumption_policy_version FROM harbor.requests WHERE id=$1',requestId),{level:'REPEATABLE READ',readOnly:true});
+              if(saved&&saved.member_id===member.id&&saved.key_id===member.key_id&&saved.session_id===consumptionSelection.session_id&&saved.consumption_policy===consumptionSelection.consumption_policy&&saved.consumption_policy_version===consumptionSelection.consumption_policy_version&&saved.account_id===consumptionSelection.to.account_id&&saved.route_version===consumptionSelection.to.route_version){
+                route=preparedRoute;consumption=preparedRoute.consumption;attemptIndex=-1;
+                if(accountTracked){const count=accounts.get(previous.id)-1;if(count)accounts.set(previous.id,count);else accounts.delete(previous.id);}routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
+              }
+            }catch{/* The encrypted settlement resolver owns the unknown branch. */}
+            throw new AppError(503,'备用绑定提交结果待核对，本次不再派发模型','consumption_rebind_commit_unconfirmed');
+          }
+          throw fallbackError;
+        }
+        finally{if(onRouteFailure)try{await onRouteFailure(previous,error.routeFailure);}catch{}}
+        extraBoundary=createBoundary();ensureConnected();result=await dispatch();
+      }
+      finishAttempt(result);if(consumption?.schemaAvailable){actualConsumptionSource=consumptionSource(route.account);actualFallback=consumptionAttempts.length===2;}sourceHeaders();
       if(!jsonPath){contextComplete=true;if(!replayableResponsesEvent({type:'response.completed',response:result.response}))contextReplayable=false;}
       if(jsonPath)record(()=>{if(capture)captureCodexJsonOutput(capture,jsonPath,result.response);});
       const recordingResult=finishCapture(jsonPath?undefined:result.response);
@@ -304,12 +381,14 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(!res.destroyed){if(!res.headersSent){res.setHeader('X-Harbor-Request',requestId);if(!settled)res.setHeader('X-Harbor-Usage','pending');}if(!jsonPath&&original.stream){await sse(res,result.terminal,controller.signal,route.session.id,output,receipt.timing,result.timingTerminalObserved?result.timingTerminalToken:receipt.timing?.upstreamEvent(result.terminal));res.end();}else{res.setHeader('X-Harbor-Session',route.session.id);await writeOutput(res,result.response,{output,signal:controller.signal,timing:receipt.timing,contentToken:result.timingTerminalObserved?result.timingTerminalToken:undefined,headers:{'Content-Type':'application/json; charset=utf-8'}});res.end();}}
       return true;
     }catch(error){
+      if(consumption?.fallback&&attemptIndex<0&&consumptionAttempts.length===1){attemptIndex=consumptionAttempts.length;consumptionAttempts.push({source:'subscription',account_id:routedAccount.id,state:'failed',dispatched:false,usage_known:true,started:clock(),ended:clock(),input:0,output:0,cached:0,...(typeof error.code==='string'&&/^[a-z][a-z0-9_]{0,79}$/.test(error.code)?{error_code:error.code}:{})});}
+      if(attemptIndex>=0&&['dispatched','unknown'].includes(consumptionAttempts[attemptIndex]?.state))finishAttempt(error,{failed:true});sourceHeaders();
       dispatched||=extraBoundary?.status().dispatched===true;
       if(requestId){
         if(onRouteFailure&&routedAccount&&error.routeFailure){try{await onRouteFailure(routedAccount,error.routeFailure);}catch{}}
         finishCapture();
         if(recordStarted&&!writeRecording('finish',requestId,{state:'partial',...recordingFinishReason(recordFailed?recordFailureReason??'capture_failed':controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted')}))recordFailed=true;
-        if(!settlementAttempted)await settle({...error,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':controller.signal.aborted?'cancelled':error.status&&error.status<500?'rejected':'failed',usageKnown:!dispatched||!extraBoundary?.status().uncertain&&error.usageKnown===true}).catch(()=>{});
+        if(!settlementAttempted)await settle({...error,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':controller.signal.aborted?'cancelled':error.status&&error.status<500?'rejected':'failed',usageKnown:consumption?.schemaAvailable?!extraBoundary?.status().uncertain&&(!currentDispatched||error.usageKnown===true):!dispatched||!extraBoundary?.status().uncertain&&error.usageKnown===true}).catch(()=>{});
         await saveContext();
       }
       throw controller.signal.reason?.code==='service_shutdown'?controller.signal.reason:error;
@@ -351,5 +430,5 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       requestBodies.release(req);
     }
   };
-  return {handle,stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({streamTiming:{...timingPersistence},clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),tickPricing:()=>pricingAdmin.tick(),closeQueries:async()=>{await pricingAdmin.close();return Promise.all([adminJsonCompression.close(),typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]);},drain:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
+  return {handle,stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({consumptionRouting:{configured:!!consumptionRouting,sourceAccounts:typeof sourceAccounts==='function'},streamTiming:{...timingPersistence},clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),tickPricing:()=>pricingAdmin.tick(),closeQueries:async()=>{await pricingAdmin.close();return Promise.all([adminJsonCompression.close(),typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]);},drain:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
 }

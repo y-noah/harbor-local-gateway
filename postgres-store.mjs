@@ -8,7 +8,9 @@ import {readFile} from 'node:fs/promises';
 import {createHash,randomUUID} from 'node:crypto';
 import {AppError,hash,usageWindow,modelAllowlist,checkAllowedModel} from './store.mjs';
 import seed from './pricing-data.mjs';
+import {canonicalConsumptionSelection,resolveConsumptionSelection,assertConsumptionSelectionUsage} from './consumption-selection.mjs';
 import {canonicalChatFacts} from './chat-facts.mjs';
+import {createPostgresConsumptionPolicy,normalizeConsumptionAttempts} from './postgres-consumption-policy.mjs';
 import {quoteReference,emptyReferenceQuote,publicUsage} from './pricing.mjs';
 
 const integer=value=>{
@@ -218,6 +220,15 @@ export class PostgresStore{
     return this.transaction(async()=>{
       const row=await this.get('SELECT * FROM harbor.requests WHERE id=$1 FOR UPDATE',requestId);
       if(!row)throw new AppError(404,'请求不存在');
+      if(result.consumptionAttempts!==undefined||result.consumptionSelection!==undefined){
+        let attempts=result.consumptionAttempts===undefined?undefined:normalizeConsumptionAttempts(result.consumptionAttempts);
+        const selection=canonicalConsumptionSelection(result.consumptionSelection,attempts);
+        if(selection){assertConsumptionSelectionUsage(result);attempts=resolveConsumptionSelection(row,selection);}
+        if(attempts.length&&attempts.at(-1).account_id!==row.account_id)throw new AppError(409,'消耗尝试与请求账号不一致','consumption_metadata_conflict');
+        // Persist dispatch evidence atomically with billing, including spool
+        // replay. A replay may enrich evidence but never bill a second time.
+        await createPostgresConsumptionPolicy(this).recordAttempts(requestId,row.key_id,attempts);
+      }
       if(!['queued','running'].includes(row.status)||row.ended!==null){
         // The HTTP finish callback arrives after billing. Its bounded summary
         // may be replayed, but must never repeat usage or change business facts.

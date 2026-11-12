@@ -2,12 +2,14 @@ import {verifyUsageRollupAvailability,usageRollupsReady,usageRollupMoneySql} fro
 import {AppError,usageWindow,storedModelAllowlist,revealStoredKey} from './store.mjs';
 import {fields,validPrice,joins,aggregate,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresMemberLimits,postgresMemberLimitConfiguration} from './postgres-member-limits.mjs';
+import {readConsumptionPolicy} from './consumption-policy.mjs';
+import {verifyConsumptionPolicyAvailability} from './postgres-consumption-policy.mjs';
 
 const fail=(status,message,code='member_query_invalid')=>{throw new AppError(status,message,code);};
 export function memberQuery(params,{keys=false}={}){
   const allowed=keys?['page','page_size','q','member_id']:['page','page_size','q','type_id','status','view'];
   if([...params.keys()].some(key=>!allowed.includes(key)||params.getAll(key).length!==1))fail(400,'员工查询参数无效');
-  const value={page:1,pageSize:25,q:params.get('q')??'',typeId:params.get('type_id')??'',status:params.get('status')??'',memberId:params.get('member_id')??''};
+  const value={page:1,pageSize:20,q:params.get('q')??'',typeId:params.get('type_id')??'',status:params.get('status')??'',memberId:params.get('member_id')??''};
   if(params.has('view')){if(params.get('view')!=='list')fail(400,'员工查询视图无效');value.view='list';}
   for(const [key,field] of [['page','page'],['page_size','pageSize']])if(params.has(key)){if(!/^[1-9]\d*$/.test(params.get(key))||!Number.isSafeInteger(Number(params.get(key))))fail(400,'员工分页参数无效');value[field]=Number(params.get(key));}
   if(value.pageSize>100||value.q.length>100||value.q.includes('\0')||!['','enabled','disabled'].includes(value.status)||value.typeId&&!/^(?:unclassified|[a-zA-Z0-9-]{1,80})$/.test(value.typeId)||value.memberId&&!/^[a-f0-9-]{36}$/.test(value.memberId))fail(400,'员工查询参数无效');
@@ -22,8 +24,13 @@ export function memberConditions(query,{alias='m',start=1}={}){
 }
 const memberColumns='m.id,m.name,m.enabled,m.access_version,m.device_mode,m.device_policy_version,m.created,m.usage_limits,m.usage_limits_version,m.usage_type_id,m.usage_type_version,m.default_models,m.default_models_set,m.defaults_version,m.configuration_source,t.code usage_type_code,t.name usage_type_name,t.description usage_type_description';
 export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,queryQueue,pageBytes=524288,maxSelection=1000}={}){
-  let rollupInitialization;
-  const limits=createPostgresMemberLimits(store,{clock}),read=(op,{signal}={})=>{const execute=async()=>{const error=await (rollupInitialization??=verifyUsageRollupAvailability(store).then(()=>null,error=>error));if(error)throw error;return store.transaction(op,{level:'REPEATABLE READ',readOnly:true});};return queryQueue?queryQueue.run(execute,{signal}):execute();};
+  let rollupInitialization,consumptionInitialization,consumptionAvailable=false;
+  const limits=createPostgresMemberLimits(store,{clock}),read=(op,{signal,consumption=false}={})=>{const execute=async()=>{
+    const error=await (rollupInitialization??=verifyUsageRollupAvailability(store).then(()=>null,error=>error));if(error)throw error;
+    if(consumption){const initialized=await (consumptionInitialization??=verifyConsumptionPolicyAvailability(store).then(available=>({available}),error=>{consumptionInitialization=undefined;throw error;}));consumptionAvailable=initialized.available;}
+    return store.transaction(op,{level:'REPEATABLE READ',readOnly:true});
+  };return queryQueue?queryQueue.run(execute,{signal}):execute();};
+  const consumptionView=row=>{if(!consumptionAvailable)return {};try{return readConsumptionPolicy(row,{allowLegacy:false});}catch{fail(503,'Key消耗来源配置无效','consumption_policy_invalid');}};
   if(!Number.isSafeInteger(pageBytes)||pageBytes<1024||pageBytes>2097152||!Number.isSafeInteger(maxSelection)||maxSelection<1||maxSelection>10000)fail(503,'员工页面字节预算无效','member_query_configuration');
   const empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(field=>[field,'0']))}).standard;
   async function usage(scope,ids,at){
@@ -96,9 +103,9 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
     const from=' FROM harbor.keys k JOIN harbor.members m ON m.id=k.member_id WHERE '+where.join(' AND ');
     const owner=memberId?await store.get(`SELECT ${memberColumns} FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE m.id=$1 AND m.removed_at IS NULL`,memberId):null;if(memberId&&!owner)fail(404,'员工不存在或已移除','member_not_found');
     const total=(await store.get('SELECT COUNT(*) total'+from,...values)).total,totalPages=Math.max(1,Math.ceil(total/query.pageSize)),page=Math.min(query.page,totalPages),n=values.length;
-    const rows=await store.all(`SELECT k.id,k.member_id,k.prefix,k.expires,k.enabled,k.access_version,k.device_ids,k.device_policy_version,k.created,m.name member_name,m.enabled member_enabled${reveal?',k.allowed_models,k.model_policy_version,k.model_source,k.digest,k.secret_cipher':''}${from} ORDER BY k.created DESC,k.id DESC LIMIT $${n+1} OFFSET $${n+2}`,...values,query.pageSize,(page-1)*query.pageSize),data=await usage('key',rows.map(row=>row.id),at),deviceCounts=await registered('key',rows.map(row=>row.id));
-    return budget({rows:rows.map(({digest,secret_cipher,allowed_models,...row})=>({...row,...(reveal?{allowed_models:storedModelAllowlist(allowed_models),full_key:revealStoredKey(encryptionKey,{id:row.id,digest,secret_cipher})}:{credentials_deferred:true}),...used(data,row.id),registered_devices:deviceCounts.get(row.id)??0})),...(owner?{member:await member(owner,await usage('member',[memberId],at),at)}:{}),pagination:{page,pageSize:query.pageSize,total,totalPages},observedAt:at});
-  },{signal});}
+    const rows=await store.all(`SELECT k.id,k.member_id,k.prefix,k.expires,k.enabled,k.access_version,k.device_ids,k.device_policy_version,k.created,m.name member_name,m.enabled member_enabled${consumptionAvailable?',k.consumption_policy,k.consumption_policy_version':''}${reveal?',k.allowed_models,k.model_policy_version,k.model_source,k.digest,k.secret_cipher':''}${from} ORDER BY k.created DESC,k.id DESC LIMIT $${n+1} OFFSET $${n+2}`,...values,query.pageSize,(page-1)*query.pageSize),data=await usage('key',rows.map(row=>row.id),at),deviceCounts=await registered('key',rows.map(row=>row.id));
+    return budget({rows:rows.map(({digest,secret_cipher,allowed_models,...row})=>({...row,...consumptionView(row),...(reveal?{allowed_models:storedModelAllowlist(allowed_models),full_key:revealStoredKey(encryptionKey,{id:row.id,digest,secret_cipher})}:{credentials_deferred:true}),...used(data,row.id),registered_devices:deviceCounts.get(row.id)??0})),...(owner?{member:await member(owner,await usage('member',[memberId],at),at)}:{}),pagination:{page,pageSize:query.pageSize,total,totalPages},observedAt:at});
+  },{signal,consumption:true});}
   async function selection(query,{signal}={}){return read(async()=>{
     if(query.typeId&&query.typeId!=='unclassified'&&!await store.get('SELECT id FROM harbor.member_types WHERE id=$1',query.typeId))fail(400,'使用类型不存在');
     const condition=memberConditions(query),rows=await store.all('SELECT m.id,m.access_version,m.usage_type_version,m.defaults_version FROM harbor.members m WHERE '+condition.where+' ORDER BY m.id LIMIT $'+(condition.values.length+1),...condition.values,maxSelection+1);
@@ -106,9 +113,9 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
     return budget({members:rows,total:rows.length,filters:query,observedAt:clock()});
   },{signal});}
   async function keyPolicy(keyId,{signal}={}){return read(async()=>{
-    const row=await store.get('SELECT k.allowed_models,m.usage_limits,m.usage_limits_version FROM harbor.keys k JOIN harbor.members m ON m.id=k.member_id WHERE k.id=$1 AND k.removed_at IS NULL AND m.removed_at IS NULL',keyId);
+    const row=await store.get('SELECT k.allowed_models,m.usage_limits,m.usage_limits_version'+(consumptionAvailable?',k.id key_id,k.member_id,k.model_policy_version,k.consumption_policy,k.consumption_policy_version':'')+' FROM harbor.keys k JOIN harbor.members m ON m.id=k.member_id WHERE k.id=$1 AND k.removed_at IS NULL AND m.removed_at IS NULL',keyId);
     if(!row)fail(404,'Key不存在或已移除','key_not_found');
-    return {allowed_models:storedModelAllowlist(row.allowed_models),usage_limits:postgresMemberLimitConfiguration(row)};
-  },{signal});}
+    return {allowed_models:storedModelAllowlist(row.allowed_models),usage_limits:postgresMemberLimitConfiguration(row),...(consumptionAvailable?{key_id:row.key_id,member_id:row.member_id,model_policy_version:row.model_policy_version,...consumptionView(row)}:{})};
+  },{signal,consumption:true});}
   return {list,detail,keys,selection,keyPolicy};
 }
