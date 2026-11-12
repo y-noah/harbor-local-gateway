@@ -6,6 +6,7 @@ import {PostgresStore} from '../postgres-store.mjs';
 import {usageWindow} from '../store.mjs';
 import {createPostgresPricingRuntime} from '../postgres-pricing-runtime.mjs';
 import {createPostgresPricingAdmin} from '../postgres-pricing-admin.mjs';
+import {modelReleaseSource,modelReleaseSetting} from '../model-release-dates.mjs';
 
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需独立PG测试库':false},at=Date.parse('2026-11-09T12:00:00+08:00');
 const rate={input:'3',cached:'0.3',output:'15',source:'synthetic official fixture'};
@@ -99,7 +100,7 @@ test('PG管理适配器鉴权、读取body和GET/PATCH/refresh入口',integratio
 
 test('PG周期同步遵守开关与间隔，新增官方模型回算且保留既有模型',integration,()=>fixture(async({store,runtime,record,row})=>{
  const id=await record({model:'new-official'});let calls=0,time=at;
- const automatic=createPostgresPricingRuntime(store,{clock:()=>time,fetchImpl:async()=>{calls++;return new Response(page('new-official'));}});
+ const automatic=createPostgresPricingRuntime(store,{clock:()=>time,fetchImpl:async url=>{if(url===modelReleaseSource)return new Response('synthetic unavailable release metadata',{status:503});calls++;return new Response(page('new-official'));}});
  try{
   await runtime.configure({expectedVersion:0,enabled:false});await automatic.tick();assert.equal(calls,0);assert.equal((await row(id)).price_state,'unpriced');
   await runtime.configure({expectedVersion:1,enabled:true,refreshHours:1});await automatic.tick();assert.equal(calls,1);assert.equal((await row(id)).price_state,'priced');
@@ -122,6 +123,21 @@ test('PG回算批次上限100，拒绝超限配置',()=>{
  const valid=createPostgresPricingRuntime({}, {batchSize:100});void valid.close();
  for(const batchSize of [0,101,1000,1.5])assert.throws(()=>createPostgresPricingRuntime({}, {batchSize}),{code:'pricing_configuration'});
 });
+
+test('PG官方发布日期独立保存和失败保留，不改变计价book且状态读取不联网',integration,()=>fixture(async({store})=>{
+ let releaseFailure=false,releaseDay='Nov 8',calls=0;
+ const automatic=createPostgresPricingRuntime(store,{clock:()=>at,fetchImpl:async url=>{
+  calls++;if(url!==modelReleaseSource)return new Response(page('synthetic-release-model'));
+  return releaseFailure?new Response('synthetic unavailable',{status:503}):new Response(`# Changelog\n\n## November, 2026\n\n### ${releaseDay}\n\nFeature · Model: synthetic-release-model\n\nReleased [Synthetic](https://developers.openai.com/api/docs/models/synthetic-release-model) for testing.\n`);
+ }});
+ try{
+  assert.equal((await automatic.status()).rates.find(row=>row.model==='gpt-6.1-sol').release_date,'2026-09-29');assert.equal(calls,0);
+  await automatic.refresh({force:true});const first=await automatic.status(),revision=first.state.active,book=await store.pricingBook(revision);assert.equal(first.rates.find(row=>row.model==='synthetic-release-model').release_date,'2026-11-08');
+  releaseDay='Nov 7';await automatic.refresh({force:true});assert.equal((await automatic.status()).state.active,revision);assert.deepEqual(await store.pricingBook(revision),book);assert.equal((await automatic.status()).rates.find(row=>row.model==='synthetic-release-model').release_date,'2026-11-07');
+  releaseFailure=true;await automatic.refresh({force:true});const failed=await automatic.status();assert.equal(failed.state.active,revision);assert.equal(failed.rates.find(row=>row.model==='synthetic-release-model').release_date,'2026-11-07');assert.match(failed.modelReleaseState.error,/保留已核实/);assert.ok(await store.get('SELECT value FROM harbor.gateway_settings WHERE name=$1',modelReleaseSetting));
+  await automatic.configure({expectedVersion:0,enabled:false});const prior=calls;await automatic.refresh();await automatic.status();assert.equal(calls,prior);
+ }finally{await automatic.close();}
+}));
 
 test('PG发布前已读旧active但迟提交的结算，在完成扫描后仍能回算',integration,()=>fixture(async({store,runtime,record,row})=>{
  const id=await record({ended:null}),get=store.get.bind(store);let release,entered,intercept=true;

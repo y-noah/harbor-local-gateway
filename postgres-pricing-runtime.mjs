@@ -3,6 +3,7 @@ import {AppError,usageWindow} from './store.mjs';
 import seed from './pricing-data.mjs';
 import {fetchOfficialPricing,nextPricingSettings,pricingPublication,quoteReference} from './pricing.mjs';
 import {postgresPricingStatus} from './postgres-observability.mjs';
+import {fetchModelReleaseDates,mergeModelReleaseDates,modelReleaseRegistry,modelReleaseSetting} from './model-release-dates.mjs';
 
 const defaults=()=>({enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[]});
 // No process cache owns the active book: publications and repairs share this
@@ -15,10 +16,10 @@ export function createPostgresPricingRuntime(store,{clock=Date.now,fetchImpl=fet
  function track(operation){assertOpen();const task=operation();operations.add(task);task.finally(()=>operations.delete(task)).catch(()=>{});return task;}
  const set=(name,value)=>store.run('INSERT INTO harbor.gateway_settings(name,value) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value',name,JSON.stringify(value));
  async function read(){
-  const saved=Object.fromEntries((await store.all("SELECT name,value FROM harbor.gateway_settings WHERE name IN ('pricing.settings','pricing.state','pricing.official')")).map(r=>[r.name,JSON.parse(r.value)]));
+  const saved=Object.fromEntries((await store.all("SELECT name,value FROM harbor.gateway_settings WHERE name IN ('pricing.settings','pricing.state','pricing.official','model.release_dates')")).map(r=>[r.name,JSON.parse(r.value)]));
   const state=saved['pricing.state']||{},book=state.active&&await store.pricingBook(state.active);
   if(!book?.rates)throw new AppError(503,'计价版本尚未准备好','pricing_unavailable');
-  return {settings:{...defaults(),...saved['pricing.settings']},state,official:saved['pricing.official']||seed.rates};
+  return {settings:{...defaults(),...saved['pricing.settings']},state,official:saved['pricing.official']||seed.rates,releases:saved[modelReleaseSetting]};
  }
  const locked=operation=>store.transaction(async()=>{
   await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-pricing-state',0))");assertOpen();
@@ -45,8 +46,9 @@ export function createPostgresPricingRuntime(store,{clock=Date.now,fetchImpl=fet
   pending=track(async()=>{
    const initial=await read();
    if(!force&&(!initial.settings.enabled||initial.state.checkedAt&&initial.state.checkedAt>clock()-initial.settings.refreshHours*3600000))return;
+   const [pricingResult,releaseResult]=await Promise.allSettled([fetchOfficialPricing({fetchImpl,signal:abort.signal}),fetchModelReleaseDates({fetchImpl,signal:abort.signal,at:clock()})]);if(closed)return;
    try{
-    const {prices,sourceHash}=await fetchOfficialPricing({fetchImpl,signal:abort.signal});assertOpen();
+    if(pricingResult.status==='rejected')throw pricingResult.reason;const {prices,sourceHash}=pricingResult.value;assertOpen();
     await locked(async current=>{
      const official={...current.official,...prices},at=clock(),state={...current.state,checkedAt:at,lastSuccess:at,error:null,sourceHash};
      await set('pricing.official',official);await publish({...current,official,state});
@@ -59,6 +61,11 @@ export function createPostgresPricingRuntime(store,{clock=Date.now,fetchImpl=fet
       await set('pricing.state',{...current.state,checkedAt:clock(),error:'官方费率更新暂未完成，继续使用上次有效版本'});
     });
    }
+   if(closed)return;
+   await locked(async current=>{
+    const at=clock(),releases=releaseResult.status==='fulfilled'?mergeModelReleaseDates(current.releases,releaseResult.value,at):{...current.releases,dates:modelReleaseRegistry(current.releases,at),checkedAt:at,error:'官方模型发布日期更新暂未完成，保留已核实日期'};
+    await set(modelReleaseSetting,releases);
+   });
    return readStatus();
   }).finally(()=>{pending=null;});return pending;
  }

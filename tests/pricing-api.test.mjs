@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createGateway} from '../server.mjs';
 import {createResponsesTransport} from '../responses.mjs';
+import {modelReleaseSource} from '../model-release-dates.mjs';
 const official=readFileSync(new URL('./fixtures/pricing-standard.md',import.meta.url),'utf8');
 async function setup(t,options={}){
  const root=mkdtempSync(join(tmpdir(),'harbor-pricing-api-'));
@@ -41,7 +42,7 @@ test('manual USD reconciliation is reflected consistently in details, employee u
  const exported=await fetch(a.base+'/api/admin/export',{headers:{Authorization:'Bearer synthetic-pricing-admin'}}),csv=await exported.text();assert.match(csv,/Standard合计参考USD/);assert.match(csv,/"0\.12"/);assert.doesNotMatch(csv,/0\.123456/);assert.doesNotMatch(csv,/输入Token|输出Token/);
 });
 test('source refresh merges current administrator overrides rather than overwriting configuration saved during fetch',async t=>{
- let entered=false,release;const a=await setup(t,{pricingFetch:async()=>{entered=true;await new Promise(r=>release=r);return new Response(official);}});
+ let entered=false,release;const a=await setup(t,{pricingFetch:async url=>{if(url===modelReleaseSource)return new Response('synthetic unavailable release metadata',{status:503});entered=true;await new Promise(r=>release=r);return new Response(official);}});
  const pending=a.call('/api/admin/pricing/refresh','POST',{});await until(()=>entered);
  assert.equal((await a.call('/api/admin/pricing','PATCH',{expectedVersion:0,manualRates:{'gpt-6-astra':{input:'12',cached:'1',output:'50',source:'explicit fixture'}}})).status,200);
  release();const refreshed=await pending;assert.equal(refreshed.body.rates.find(r=>r.model==='gpt-6-astra').input,'12');

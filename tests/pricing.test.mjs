@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {Store,usageWindow} from '../store.mjs';
 import {parseOfficialPrices,quoteReference,publicUsage,exactUsd,referenceMetric} from '../pricing.mjs';
 import {requestsReader,requestObservation} from '../observability.mjs';
+import {modelReleaseSource} from '../model-release-dates.mjs';
 const official=readFileSync(new URL('./fixtures/pricing-standard.md',import.meta.url),'utf8');
 const completed=(model,input,output=0,cached=0)=>({model,input,output,cached,started:Date.now(),ended:Date.now(),status:'ok',usage_unknown:0});
 function fixture(t,options={}){
@@ -66,7 +67,7 @@ test('a response model is authoritative and a manual amount does not invent raw 
  const row=store.get('SELECT * FROM requests WHERE id=?',manual);assert.equal(row.input,0);assert.equal(row.usage_unknown,1);assert.equal(store.pricing.usage(row).adjustment,0.25);assert.equal(store.snapshot().totals.standard.total_exact,'10.25');
 });
 test('automatic source failure retains the prior version, successful refresh adds new models and respects manual overrides',async t=>{
- let text=official,failed=true,calls=0;const {store,add}=fixture(t,{fetchImpl:async()=>{calls++;return failed?new Response('<html>challenge</html>',{status:403}):new Response(text);}});const before=store.pricing.current();await store.pricing.refresh({force:true});assert.equal(store.pricing.current(),before);assert.match(store.pricing.status().state.error,/上次有效/);
+ let text=official,failed=true,calls=0;const {store,add}=fixture(t,{fetchImpl:async url=>{if(url===modelReleaseSource)return new Response('synthetic unavailable release metadata',{status:503});calls++;return failed?new Response('<html>challenge</html>',{status:403}):new Response(text);}});const before=store.pricing.current();await store.pricing.refresh({force:true});assert.equal(store.pricing.current(),before);assert.match(store.pricing.status().state.error,/上次有效/);
  store.pricing.configure({expectedVersion:0,manualRates:{'gpt-6-astra':{input:'12',cached:'1',output:'50',source:'manual fixture'}}});const unknown=add('gpt-future',1000000);assert.equal(store.pricing.usage(store.get('SELECT * FROM requests WHERE id=?',unknown)).total,null);
  text=official.replace('| gpt-6-astra |','| gpt-future | $6.00 | $30.00 | $0.30 | $7.50 | $15.00 | $12.00 | $45.00 | $0.60 | $15.00 | $30.00 |\n| gpt-6-astra |');failed=false;await store.pricing.refresh({force:true});assert.equal(store.pricing.usage(store.get('SELECT * FROM requests WHERE id=?',unknown)).total,6);assert.equal(store.pricing.status().rates.find(r=>r.model==='gpt-6-astra').input,'12');assert.equal(calls,2);
  const stable=store.pricing.current();await store.pricing.refresh({force:true});assert.equal(store.pricing.current(),stable);

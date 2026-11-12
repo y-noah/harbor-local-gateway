@@ -1,5 +1,6 @@
 import {createHash} from 'node:crypto';
 import seed from './pricing-data.mjs';
+import {fetchModelReleaseDates,mergeModelReleaseDates,modelReleaseRegistry,modelReleaseSetting} from './model-release-dates.mjs';
 
 export const referenceMetric='openai-standard-short-usd-v1';
 const scale=1000000000000n;
@@ -140,6 +141,7 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
   const set=(name,value)=>store.run('INSERT INTO gateway_settings(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',name,JSON.stringify(value));
   let settings={enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[],...get('pricing.settings')};
   let official=get('pricing.official')||seed.rates,state=get('pricing.state')||{},closed=false,pending=null;
+  let releases=get(modelReleaseSetting);
   const cache=new Map();const abort=new AbortController();
   const book=id=>{if(!id)return null;if(!cache.has(id)){const r=store.get('SELECT book FROM pricing_versions WHERE id=?',id);if(r)cache.set(id,parse(r.book));}return cache.get(id)||null;};
   function publish(){
@@ -203,10 +205,11 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
       daily:value.daily.map(({tokens,...d})=>({...d,standard:sum('day',d.day)}))};
   }
   function status(){
-    const current=book(state.active),missing=new Map();
+    const current=book(state.active),missing=new Map(),dates=modelReleaseRegistry(releases,clock());
     for(const r of store.all('SELECT * FROM requests WHERE COALESCE(ended,started)>=? AND COALESCE(ended,started)<?',windowStart(clock()),windowStart(clock())+7*86400000)){if(rawQuote(r).state==='unpriced'){const name=r.billing_model||r.model||'未记录';missing.set(name,(missing.get(name)||0)+1);}}
     return {metric:referenceMetric,currency:'USD',basis:seed.basis,source:seed.source,seedCaptured:seed.captured,state:{...state},settings:{...settings},
-      rates:Object.entries(current.rates).map(([model,rate])=>({model,...rate,manual:Object.hasOwn(settings.manualRates,model)})),unpricedModels:[...missing].map(([model,requests])=>({model,requests}))};
+      modelReleaseState:releases?{checkedAt:releases.checkedAt,lastSuccess:releases.lastSuccess,error:releases.error}:null,
+      rates:Object.entries(current.rates).map(([model,rate])=>({model,...rate,manual:Object.hasOwn(settings.manualRates,model),release_date:dates[model]?.date??null,release_date_source:dates[model]?.source??null})),unpricedModels:[...missing].map(([model,requests])=>({model,requests}))};
   }
   function configure(value){
     if(closed)throw Object.assign(new Error('服务正在停止'),{status:503,code:'service_stopping'});
@@ -219,13 +222,16 @@ export function createPricing(store,{clock=Date.now,fetchImpl=fetch,windowStart=
     if(closed)return;if(pending)return pending;
     if(!force&&(!settings.enabled||state.checkedAt&&state.checkedAt>clock()-settings.refreshHours*3600000))return;
     pending=(async()=>{
+      const [pricingResult,releaseResult]=await Promise.allSettled([fetchOfficialPricing({fetchImpl,signal:abort.signal}),fetchModelReleaseDates({fetchImpl,signal:abort.signal,at:clock()})]);if(closed)return;
       try{
-        const {prices,sourceHash}=await fetchOfficialPricing({fetchImpl,signal:abort.signal});if(closed)return;
+        if(pricingResult.status==='rejected')throw pricingResult.reason;const {prices,sourceHash}=pricingResult.value;
         const prior=official,priorState=state;store.db.exec('BEGIN IMMEDIATE');
         try{official={...official,...prices};set('pricing.official',official);state={...state,checkedAt:clock(),lastSuccess:clock(),error:null,sourceHash};publish();backfill({transaction:false});store.db.exec('COMMIT');}
         catch(e){store.db.exec('ROLLBACK');official=prior;state=priorState;throw e;}
-        return status();
-      }catch{if(!closed){state={...state,checkedAt:clock(),error:'官方费率更新暂未完成，继续使用上次有效版本'};set('pricing.state',state);return status();}}
+      }catch{if(!closed){state={...state,checkedAt:clock(),error:'官方费率更新暂未完成，继续使用上次有效版本'};set('pricing.state',state);}}
+      if(closed)return;
+      const nextReleases=releaseResult.status==='fulfilled'?mergeModelReleaseDates(releases,releaseResult.value,clock()):{...releases,dates:modelReleaseRegistry(releases,clock()),checkedAt:clock(),error:'官方模型发布日期更新暂未完成，保留已核实日期'};
+      set(modelReleaseSetting,nextReleases);releases=nextReleases;return status();
     })().finally(()=>pending=null);return pending;
   }
   return {usage,rawQuote,quoteAt,stamp,capture,backfill,summary,decorate,inWindow,snapshot,status,configure,refresh,current:()=>state.active,
