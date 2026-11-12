@@ -8,14 +8,15 @@ const jobId=(id,revision)=>kind+':'+createHash('sha256').update(id+':'+revision)
 const stop=signal=>{if(signal?.aborted)throw new AppError(503,'上下文后台任务已停止','worker_stopping');};
 // The object is shared, but only its authenticated, unexpired request references
 // make it eligible for indexing. Search must apply the same source conditions.
-const live=`EXISTS(SELECT 1 FROM harbor.recording_context_references ref
+const liveSource=references=>`SELECT 1 FROM ${references} ref
  JOIN harbor.recording_context_snapshots s ON s.request_id=ref.request_id
  JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id
  LEFT JOIN harbor.sessions session ON session.id=r.session_id
  WHERE ref.object_id=o.id AND s.scope_digest=o.scope_digest AND s.key_version=o.key_version
  AND s.member_id=r.member_id AND s.session_id IS NOT DISTINCT FROM r.session_id
  AND r.recording_state<>'expired' AND LEAST(s.expires_at,c.expires_at)>$1
- AND (r.session_id IS NULL OR session.member_id=r.member_id))`;
+ AND (r.session_id IS NULL OR session.member_id=r.member_id)`;
+const live=`EXISTS(${liveSource('harbor.recording_context_references')})`;
 function visibleText(content,maxBytes){
  const pending=[content],text=[];let bytes=0;
  while(pending.length){const value=pending.pop();if(value&&typeof value==='object'){
@@ -36,9 +37,15 @@ export function createPostgresRecordingContextJobs(store,{jobs,recordingKey,cryp
   return refill();
  }
  async function refill(){
+  // Keep live-source checks local to each ordered work item. A pulled-up EXISTS
+  // can aggregate all request references before applying the small batch limit.
+  // Materialize this object’s indexed references before joining source snapshots;
+  // an empty/expired prefix must not rescan every snapshot for each work item.
   const at=clock(),rows=await store.all(`SELECT w.object_id,w.revision FROM harbor.recording_context_work w
    JOIN harbor.recording_context_objects o ON o.id=w.object_id
-   WHERE w.revision>w.indexed_revision AND w.last_error IS NULL AND ${live} ORDER BY w.changed,w.object_id LIMIT $2`,at,indexBatch);
+   JOIN LATERAL (WITH object_refs AS MATERIALIZED (SELECT object_id,request_id FROM harbor.recording_context_references WHERE object_id=o.id)
+    ${liveSource('object_refs')} LIMIT 1) source ON true
+   WHERE w.revision>w.indexed_revision AND w.last_error IS NULL ORDER BY w.changed,w.object_id LIMIT $2`,at,indexBatch);
   for(const row of rows){const id=jobId(row.object_id,row.revision),result=await jobs.enqueue(kind,{id,target:row.object_id,payload:{object_id:row.object_id,revision:row.revision}});
    if(!result.created){const task=await store.get('SELECT status FROM harbor.background_jobs WHERE id=$1',id);
     if(['failed','cancelled'].includes(task?.status))await store.run("UPDATE harbor.recording_context_work SET last_error='index_attempts_exhausted' WHERE object_id=$1 AND revision=$2 AND revision>indexed_revision",row.object_id,row.revision);

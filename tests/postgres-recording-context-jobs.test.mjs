@@ -48,6 +48,36 @@ test('真实PG：索引补充只入队待办，上下文版本维护保持定时
  await f.backend.schedule();assert.equal((await f.store.get('SELECT revision FROM harbor.recording_context_work WHERE object_id=$1',before.object_id)).revision,before.revision+1);
 });
 
+test('真实PG：大积压按有界批次核验来源，过期和无引用前缀不饿死后续任务',integration,async t=>{
+ const f=await fixture(t,{indexBatch:32}),expired=await f.request('过期前缀',1);f.advance(2);
+ const prototype=await f.store.get('SELECT o.* FROM harbor.recording_context_objects o JOIN harbor.recording_context_references ref ON ref.object_id=o.id WHERE ref.request_id=$1',expired);
+ // Model pending objects left after their references expired. They must never
+ // enter an index job, and the batch limit must be applied after live checks.
+ await f.store.run(`INSERT INTO harbor.recording_context_objects(id,scope_digest,fingerprint,key_version,kind,state,bytes,parts,created)
+  SELECT 'unreferenced-'||n,$1,decode(md5(n::text),'hex'),$2,'history','writing',0,1,$3 FROM generate_series(1,125000) n`,prototype.scope_digest,prototype.key_version,f.clock()-1);
+ await f.store.run("UPDATE harbor.recording_context_objects SET state='complete' WHERE id LIKE 'unreferenced-%'");
+ const liveRequests=[];for(let n=0;n<40;n++){f.advance(1);liveRequests.push(await f.request('应正常入队的真实密文'+n,60000));}
+ const expected=(await f.store.all(`SELECT w.object_id FROM harbor.recording_context_work w JOIN harbor.recording_context_references ref ON ref.object_id=w.object_id WHERE ref.request_id=ANY($1::text[]) ORDER BY w.changed,w.object_id LIMIT 32`,liveRequests)).map(r=>r.object_id);
+ await f.store.query('ANALYZE harbor.recording_context_work');await f.store.query('ANALYZE harbor.recording_context_objects');
+ let sourceSql;const original=f.store.all.bind(f.store);f.store.all=async(sql,...args)=>{if(sql.startsWith('SELECT w.object_id,w.revision'))sourceSql={sql,args};return original(sql,...args);};
+ const began=performance.now();await f.backend.refill();const elapsedMs=performance.now()-began;f.store.all=original;
+ const targets=(await f.store.all('SELECT target FROM harbor.background_jobs WHERE kind=$1 ORDER BY target',kind)).map(r=>r.target);assert.deepEqual(targets,[...expected].sort());assert.equal(targets.length,32);assert.ok(!targets.some(id=>id.startsWith('unreferenced-')));
+ const plan=(await f.store.all('EXPLAIN (ANALYZE,FORMAT JSON) '+sourceSql.sql,...sourceSql.args))[0]['QUERY PLAN'][0];const nodes=[];const visit=node=>{nodes.push(node);for(const child of node.Plans??[])visit(child);};visit(plan.Plan);
+ assert.ok(nodes.some(node=>node['Index Name']==='recording_context_work_pending'),'ordered pending index must bound candidate discovery');assert.ok(nodes.some(node=>node['Index Name']==='recording_context_reference_object'),'live checks must use object references');
+ t.diagnostic(JSON.stringify({pendingObjects:125041,scheduled:32,elapsedMs,executionMs:plan['Execution Time'],planNodes:nodes.map(n=>({type:n['Node Type'],relation:n['Relation Name'],actualRows:n['Actual Rows']}))}));
+ await f.run();assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_documents')).n,32);
+ for(const id of liveRequests)await f.store.run("UPDATE harbor.requests SET recording_state='expired' WHERE id=$1",id);
+ await f.backend.refill();assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind=$1',kind)).n,32,'no live sources must produce no new tasks');
+});
+
+test('真实PG：共享多引用短路核验仍拒绝跨员工和会话不匹配来源',integration,async t=>{
+ const f=await fixture(t),shared=await f.request('共享来源'),second=await f.request('共享来源'),mismatchMember=await f.request('员工不匹配'),mismatchSession=await f.request('会话不匹配');
+ const other=randomUUID();await f.store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',other,'另一合成员工',f.clock());await f.store.run('UPDATE harbor.recording_context_snapshots SET member_id=$1 WHERE request_id=$2',other,mismatchMember);await f.store.run('UPDATE harbor.recording_context_snapshots SET session_id=$1 WHERE request_id=$2',randomUUID(),mismatchSession);
+ await f.backend.refill();assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind=$1',kind)).n,1);await f.run();assert.match((await f.document()).text,/共享来源/);
+ await f.store.run("UPDATE harbor.requests SET recording_state='expired' WHERE id=$1",shared);await f.backend.rebuild({request_id:second});await f.backend.refill();await f.run();assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_context_documents')).n,1,'the second live reference keeps the shared object eligible');
+ await f.store.run("UPDATE harbor.requests SET recording_state='expired' WHERE id=$1",second);await f.backend.rebuild({request_id:second});await f.backend.refill();assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind=$1 AND status='pending'",kind)).n,0);
+});
+
 test('真实PG：共享对象只索引一次，代码引号可检索，重建不改采集与计量',integration,async t=>{
  const f=await fixture(t),content={role:'user',text:'排查中文故障 await readFile("业务.json")'},a=await f.request(content),b=await f.request(content);
  await f.backend.schedule();await f.run();const result=await f.document();assert.match(result.text,/readFile\("业务.json"\)/);assert.ok(result.parts.every(p=>p.search_terms.length>0&&!p.payload_cipher.includes(Buffer.from('业务.json'))));
