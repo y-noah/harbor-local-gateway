@@ -53,9 +53,16 @@ test('真实PG：大积压按有界批次核验来源，过期和无引用前缀
  const prototype=await f.store.get('SELECT o.* FROM harbor.recording_context_objects o JOIN harbor.recording_context_references ref ON ref.object_id=o.id WHERE ref.request_id=$1',expired);
  // Model pending objects left after their references expired. They must never
  // enter an index job, and the batch limit must be applied after live checks.
- await f.store.run(`INSERT INTO harbor.recording_context_objects(id,scope_digest,fingerprint,key_version,kind,state,bytes,parts,created)
-  SELECT 'unreferenced-'||n,$1,decode(md5(n::text),'hex'),$2,'history','writing',0,1,$3 FROM generate_series(1,125000) n`,prototype.scope_digest,prototype.key_version,f.clock()-1);
- await f.store.run("UPDATE harbor.recording_context_objects SET state='complete' WHERE id LIKE 'unreferenced-%'");
+ // Keep the full backlog while bounding each trigger-bearing seed statement
+ // under the same timeout used by the production query on shared CI runners.
+ const backlogSize=125000,seedBatch=1000;
+ for(let first=1;first<=backlogSize;first+=seedBatch){
+  const last=Math.min(first+seedBatch-1,backlogSize);
+  await f.store.run(`INSERT INTO harbor.recording_context_objects(id,scope_digest,fingerprint,key_version,kind,state,bytes,parts,created)
+   SELECT 'unreferenced-'||n,$1,decode(md5(n::text),'hex'),$2,'history','writing',0,1,$3 FROM generate_series($4::integer,$5::integer) n`,prototype.scope_digest,prototype.key_version,f.clock()-1,first,last);
+  await f.store.run("UPDATE harbor.recording_context_objects SET state='complete' WHERE id IN (SELECT 'unreferenced-'||n FROM generate_series($1::integer,$2::integer) n)",first,last);
+ }
+ assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.recording_context_work WHERE object_id LIKE 'unreferenced-%' AND indexed_revision<revision")).n,backlogSize);
  const liveRequests=[];for(let n=0;n<40;n++){f.advance(1);liveRequests.push(await f.request('应正常入队的真实密文'+n,60000));}
  const expected=(await f.store.all(`SELECT w.object_id FROM harbor.recording_context_work w JOIN harbor.recording_context_references ref ON ref.object_id=w.object_id WHERE ref.request_id=ANY($1::text[]) ORDER BY w.changed,w.object_id LIMIT 32`,liveRequests)).map(r=>r.object_id);
  await f.store.query('ANALYZE harbor.recording_context_work');await f.store.query('ANALYZE harbor.recording_context_objects');
