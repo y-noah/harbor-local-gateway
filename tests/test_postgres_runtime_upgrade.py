@@ -30,7 +30,7 @@ class RuntimeUpgradeTests(unittest.TestCase):
    with self.subTest(value=value),patch.object(upgrade,'load',return_value=pg),self.assertRaises(ValueError):upgrade.run_upgrade(IMAGE,{**CONFIG,'postgres_preflight_timeout_seconds':value},{},ticket(),entry)
    entry.active_record.assert_not_called();entry.entry_state.assert_not_called()
  def test_source_preflight_failure_happens_before_entry_hold_or_composition(self):
-  t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']};composition.prepare_source_image_preflights.side_effect=pg.ShutdownUnconfirmed('source proof failed')
+  t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest'],'consumption_policy_contract':'v1'};composition.prepare_source_image_preflights.side_effect=pg.ShutdownUnconfirmed('source proof failed')
   with patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),self.assertRaises(pg.ShutdownUnconfirmed):upgrade.run_upgrade(IMAGE,CONFIG,{'NAME':NAME,'inspect_container':Mock(),'inspect_image':Mock()},t,entry)
   entry.entry_state.assert_not_called();composition.deploy.assert_not_called()
  def test_upgrade_runner_retains_private_success_and_failure_evidence(self):
@@ -141,7 +141,7 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
   with patch.object(wrapper.os.path,'lexists',return_value=True),patch.object(wrapper.Path,'lstat',return_value=Mock(st_uid=0,st_mode=stat.S_IFREG|0o600)),patch.object(wrapper.importlib.util,'spec_from_file_location',return_value=Mock(loader=Mock())) as spec,patch.object(wrapper.importlib.util,'module_from_spec',return_value=helper):
    self.assertEqual(wrapper.deploy_entry_postgres(IMAGE,CONFIG),{'sameDatabase':True});self.assertEqual(str(spec.call_args.args[1]),'/usr/local/lib/harbor/postgres-upgrade-deploy.py')
  def test_one_time_release_directory_prevents_second_dispatch_before_hold(self):
-  t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());proof={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']};composition=Mock();composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.SourcePreflightRejected=pg.SourcePreflightRejected;composition.configuration.return_value=([],{});composition.image_proof.return_value=proof
+  t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());proof={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest'],'consumption_policy_contract':'v1'};composition=Mock();composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.SourcePreflightRejected=pg.SourcePreflightRejected;composition.configuration.return_value=([],{});composition.image_proof.return_value=proof
   with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'private_json',return_value=t),patch.object(upgrade,'load',side_effect=[entry,composition]),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot'),patch.object(upgrade,'controller_lock',return_value=nullcontext()),patch.object(upgrade,'supervised_upgrade',side_effect=lambda entry,ticket,operation:operation()),patch.object(upgrade,'verify_installed_tools'):
    (Path(directory)/t['deploymentId']).mkdir()
    with self.assertRaises(FileExistsError):upgrade.deploy(IMAGE,CONFIG,None,{'NAME':NAME,'ENTRY_HELPER':'fixed','inspect_container':Mock(),'inspect_image':Mock()})
@@ -183,9 +183,9 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
   for outcome in ['success','busy-source','idle-timeout','hold-race','bad-inflight','bad-inflight-unhealthy','drain-nonzero','drain-timeout','drain-timeout-unhealthy','pg-rollback','preflight-rejected','preflight-rejected-stale-worker','preflight-rejected-core-unready','preflight-rejected-source-changed','preflight-rejected-source-stopped','preflight-rejected-network-changed','unknown-stop','unknown-stop-healthy','commit-unknown']:
    with self.subTest(outcome=outcome),tempfile.TemporaryDirectory() as directory:
     t=ticket();old=active();old_gateway=target(t);old_gateway.update(Id=t['from']['containerId'],Image=t['from']['imageId']);old_gateway['Config'].update(Image=OLD);old_worker=copy.deepcopy(old_gateway);old_worker['Id']=t['from']['workerId'];old_worker['Config']['Cmd']=['node','/app/postgres-worker.mjs'];rows={NAME:old_gateway,NAME+'-worker':old_worker};docker_calls=[]
-    entry=Mock();entry.ACTIVE=Path(directory)/'active.json';entry.STATE=Path(directory)/'controller.json';entry.CANDIDATE_PROFILE=Path(directory)/'candidate.json';data={str(entry.ACTIVE):old,str(entry.STATE):{'phase':'activated','candidate':old['candidate'],'activeRuntimeConfig':{'bridge':{'address':'192.0.2.1'}}},str(entry.CANDIDATE_PROFILE):{'socketPath':'/run/harbor-entry/candidate.sock'}};entry.active_record.return_value=(copy.deepcopy(old),{},old_gateway);entry.private_json.side_effect=lambda p:copy.deepcopy(data[str(p)]);entry.save_json.side_effect=lambda p,v:data.__setitem__(str(p),copy.deepcopy(v));entry.fingerprint=upgrade.digest
+    entry=Mock();entry.ACTIVE=Path(directory)/'active.json';entry.STATE=Path(directory)/'controller.json';entry.CANDIDATE_PROFILE=Path(directory)/'candidate.json';entry.ENTRY_CONFIG=Path(directory)/'entry.json';data={str(entry.ACTIVE):old,str(entry.STATE):{'phase':'activated','candidate':old['candidate'],'activeRuntimeConfig':{'bridge':{'address':'192.0.2.1'}}},str(entry.CANDIDATE_PROFILE):{'socketPath':'/run/harbor-entry/candidate.sock'},str(entry.ENTRY_CONFIG):{'drainTimeoutMs':500}};entry.active_record.return_value=(copy.deepcopy(old),{},old_gateway);entry.private_json.side_effect=lambda p:copy.deepcopy(data[str(p)]);entry.save_json.side_effect=lambda p,v:data.__setitem__(str(p),copy.deepcopy(v));entry.fingerprint=upgrade.digest
     control={'slot':'candidate','phase':'active','inflight':9 if outcome in ['busy-source','idle-timeout'] else -1 if outcome.startswith('bad-inflight') else 0,'epoch':0}
-    def entry_state(command=None,epoch=None,slot=None):
+    def entry_state(command=None,epoch=None,slot=None,**kwargs):
      if command:
       self.assertEqual(epoch,control['epoch']);control['epoch']+=1
       if command=='hold':
@@ -200,6 +200,7 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
        if outcome.startswith('preflight-rejected'):remove_gate.assert_called_once()
        control['phase']='active'
       elif command=='activate':self.assertEqual(control['phase'],'drained');control['phase']='active';self.assertEqual(slot,'candidate')
+     elif control['phase']=='holding' and control['inflight']>0 and outcome!='idle-timeout':control['inflight']=0
      return dict(control)
     entry.entry_state.side_effect=entry_state
     def wait_idle():
@@ -212,7 +213,7 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
     entry.wait_entry_idle.side_effect=wait_idle
     entry.candidate_slot_ready.return_value=not outcome.endswith('unhealthy')
     if outcome=='commit-unknown':entry.restore_active.side_effect=RuntimeError('publication outcome unknown')
-    composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.SourcePreflightRejected=pg.SourcePreflightRejected;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest']}
+    composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.ShutdownUnconfirmed=pg.ShutdownUnconfirmed;composition.SourcePreflightRejected=pg.SourcePreflightRejected;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest'],'consumption_policy_contract':'v1'}
     def deploy(*args):
      self.assertEqual(control['phase'],'drained');self.assertEqual(control['inflight'],0)
      self.assertEqual(args[-1]['postgres_preflight_timeout_seconds'],300)
@@ -233,7 +234,7 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
      docker_calls.append(args);self.assertEqual(args[0],'rename');key=next(k for k,v in rows.items() if v['Id']==args[1]);rows[args[2]]=rows.pop(key)
     api={'NAME':NAME,'inspect_container':rows.get,'inspect_image':Mock(),'docker':docker,'postgres_preflight_timeout_seconds':999};config={**CONFIG,'postgres_preflight_timeout_seconds':300}
     with patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot',return_value={'candidateNetworkIdentity':{'id':'6'*64}}),patch.object(upgrade,'gate_install',return_value={'owned':True}) as install_gate,patch.object(upgrade,'gate_remove') as remove_gate,patch.object(upgrade,'probe',return_value=503 if outcome=='preflight-rejected-core-unready' else 200) as core_probe,patch.object(upgrade,'verify_installed_tools'):
-     if outcome in ['success','busy-source']:
+     if outcome in ['success','busy-source','hold-race']:
       result=upgrade.run_upgrade(IMAGE,config,api,t,entry);self.assertEqual(result['contract'],upgrade.CONTRACT);self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64);self.assertEqual(control['phase'],'active');self.assertEqual(len(docker_calls),2);remove_gate.assert_called_once()
      else:
       with self.assertRaisesRegex(RuntimeError,'entry drain failed' if outcome=='drain-nonzero' else ''):upgrade.run_upgrade(IMAGE,config,api,t,entry)
@@ -250,18 +251,18 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
        self.assertEqual(control['phase'],'holding' if outcome.endswith('unhealthy') else 'active')
        self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
        entry.candidate_slot_ready.assert_called_once_with('192.0.2.1',8092)
-      if outcome in ['idle-timeout','hold-race']:
+      if outcome=='idle-timeout':
        install_gate.assert_not_called();composition.deploy.assert_not_called();composition.verify_started_composition.assert_not_called();entry.refresh_active.assert_not_called();remove_gate.assert_not_called()
        self.assertEqual(control['phase'],'active');self.assertFalse(any(c.args and c.args[0]=='drain' for c in entry.entry_state.call_args_list))
-       if outcome=='idle-timeout':self.assertFalse(any(c.args and c.args[0]=='hold' for c in entry.entry_state.call_args_list))
+       self.assertTrue(any(c.args and c.args[0]=='hold' for c in entry.entry_state.call_args_list))
        self.assertEqual(rows[NAME]['Id'],t['from']['containerId']);self.assertTrue(rows[NAME]['State']['Running']);self.assertTrue(rows[NAME+'-worker']['State']['Running'])
       if outcome.startswith('bad-inflight'):
        install_gate.assert_not_called();composition.deploy.assert_not_called();composition.verify_started_composition.assert_not_called();entry.refresh_active.assert_not_called();remove_gate.assert_not_called()
-       self.assertEqual(control['phase'],'active');self.assertFalse(any(call.args and call.args[0] in ['hold','drain'] for call in entry.entry_state.call_args_list))
+       self.assertEqual(control['phase'],'holding' if outcome.endswith('unhealthy') else 'active');self.assertTrue(any(call.args and call.args[0]=='hold' for call in entry.entry_state.call_args_list));self.assertFalse(any(call.args and call.args[0]=='drain' for call in entry.entry_state.call_args_list))
        self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
       if outcome=='unknown-stop-healthy':self.assertTrue(old_gateway['State']['Running']);self.assertTrue(old_worker['State']['Running']);composition.verify_started_composition.assert_not_called();self.assertEqual(data[str(upgrade.release_path(t['deploymentId'])/'release.json')]['phase'],'stop-unknown')
       if outcome=='commit-unknown':self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64)
-     entry.wait_entry_idle.assert_called_once()
+     entry.wait_entry_idle.assert_not_called()
      self.assertEqual(composition.image_proof.call_args.args[0]['postgres_preflight_timeout_seconds'],300)
      self.assertTrue(all(call[0]=='rename' for call in docker_calls));self.assertFalse(any('sqlite' in str(call) for call in docker_calls))
 

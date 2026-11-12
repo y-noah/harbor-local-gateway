@@ -60,6 +60,7 @@ def active_identity(active):
 
 def validate_ticket(ticket,image,config):
  need(isinstance(ticket,dict) and ticket.get('version')==1 and ticket.get('contract')==CONTRACT and ticket.get('approved') is True,'one-time root approval required')
+ need(type(ticket.get('interruptEntryClients',False)) is bool,'entry interruption approval must be boolean')
  need(re.fullmatch(UUID,ticket.get('deploymentId','')) and re.fullmatch('[a-f0-9]{40}',ticket.get('hostToolsRevision','')),'release identity')
  target=ticket.get('to',{});source=ticket.get('from',{});network=ticket.get('network',{});database=ticket.get('database',{})
  need(config.get('port')==8092 and config.get('storage_engine')=='postgres' and config.get('local_assurance_release') is True and config.get('entry_installed_release') is True,'installed preserved PostgreSQL entry required')
@@ -248,17 +249,142 @@ def deploy(image,config,archive,api):
  need(archive is None,'installed CI image required');ticket=validate_ticket(private_json(TICKET),image,config);verify_installed_tools(ticket);entry=load(api['ENTRY_HELPER'],'runtime_upgrade_entry')
  with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry))
 
-def drain_active_entry(entry):
- # Keep admission active while long requests finish. A busy source must not
- # turn a failed release into a long queue for unrelated clients.
- control=entry.wait_entry_idle()
- need(control.get('slot')=='candidate' and control.get('phase')=='active' and control.get('inflight')==0,'current entry is not idle PG')
- control=entry.entry_state('hold',control['epoch'])
- # New traffic can win the observation/hold race. Fail immediately so the
- # unchanged-source recovery resumes forwarding instead of waiting behind it.
- need(control.get('slot')=='candidate' and control.get('phase')=='holding' and control.get('inflight')==0,'entry became busy before hold')
- control=entry.entry_state('drain',control['epoch']);need(control.get('phase')=='drained' and control.get('inflight')==0,'entry drain failed')
+def interrupt_entry_clients(entry,ticket,api,active,deadline,held_epoch):
+ # Root ticket approval authorizes dropping only this entry's TCP clients.
+ # The private Unix control socket and listening socket stay open.
+ import subprocess
+ need(ticket.get('interruptEntryClients') is True,'entry interruption not approved')
+ runtime=load(Path(__file__).with_name('entry-runtime.py'),'upgrade_entry_interrupt_identity')
+ profile=entry.validate(entry.private_json(entry.PROFILE));process_config=entry.private_json(entry.ENTRY_CONFIG);port=process_config.get('listenPort')
+ need(type(port) is int and 1024<=port<=65535 and port==profile['entryPort'] and port!=8092,'entry interrupt listener configuration')
+ row=runtime.inspect_entry(entry);pid=row.get('State',{}).get('Pid')
+ need(type(pid) is int and pid>1 and row['State'].get('Running') is True and not any(row['State'].get(k) for k in ['Paused','Restarting','Dead']),'entry interrupt process state')
+ ticks=entry.process_ticks(pid);namespace=Path('/proc',str(pid),'ns/net').stat();host_namespace=Path('/proc/self/ns/net').stat()
+ need((namespace.st_dev,namespace.st_ino)==(host_namespace.st_dev,host_namespace.st_ino),'entry interrupt host namespace')
+ def identity():
+  need(entry.socket_owner(Path(entry.CONTROL))==pid and entry.process_ticks(pid)==ticks and entry.process_cgroup(pid)==profile['entryCgroup'],'entry interrupt process changed')
+  current=runtime.inspect_entry(entry)
+  need(current['Id']==row['Id'] and current['State'].get('Pid')==pid and current['State'].get('Running') is True and not any(current['State'].get(k) for k in ['Paused','Restarting','Dead']),'entry interrupt container changed')
+  ns=Path('/proc',str(pid),'ns/net').stat();need((ns.st_dev,ns.st_ino)==(namespace.st_dev,namespace.st_ino),'entry interrupt namespace changed')
+ def command(kill=False,listening=False):
+  remaining=deadline-time.monotonic();need(remaining>0,'entry drain timeout')
+  args=['/usr/bin/nsenter','-t',str(pid),'-n','/usr/bin/ss','-H','-O','-n','-t','-e','-p']
+  if kill:args.append('-K')
+  args+=['state','listening' if listening else 'established','( sport = :'+str(port)+' )']
+  # ss can return zero with a SOCK_DESTROY error on stderr. Never interpret
+  # unsupported/partial destruction as success, and never log endpoint output.
+  value=subprocess.run(args,stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=min(15,remaining),env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C'})
+  need(value.returncode==0 and not value.stderr.strip() and len(value.stdout)<=1048576,'entry TCP destroy unsupported or unconfirmed' if kill else 'entry TCP inventory unavailable')
+  return value.stdout.splitlines()
+ for tool in ['/usr/bin/nsenter','/usr/bin/ss']:trusted_code_bytes(tool)
+ identity()
+ current_active=entry.private_json(entry.ACTIVE);verify_source(ticket,current_active,api['inspect_container'](api['NAME']),api['inspect_container'](api['NAME']+'-worker'))
+ state=entry.private_json(entry.STATE);view=state.get('activeRuntimeConfig')
+ need(state.get('phase')=='activated' and view and state.get('candidate')==active.get('candidate'),'entry interrupt active runtime changed')
+ entry.verify_resources(state,view);network_snapshot(ticket,entry,api['inspect_container'](api['NAME']),api['inspect_container'](api['NAME']+'-worker'))
+ def owned(lines):
+  inodes=set()
+  for fd in Path('/proc',str(pid),'fd').iterdir():
+   try:target=os.readlink(fd)
+   except FileNotFoundError:continue
+   match=re.fullmatch(r'socket:\[([0-9]+)\]',target)
+   if match:inodes.add(match[1])
+  for line in lines:
+   inode=re.findall(r'\bino:([0-9]+)\b',line);owners=re.findall(r'\bpid=([0-9]+),',line)
+   need(len(inode)==1 and inode[0] in inodes and owners and set(owners)=={str(pid)},'entry TCP socket ownership unknown')
+ listeners=command(listening=True);need(listeners,'entry TCP listener absent');owned(listeners)
+ established=command();owned(established);identity()
+ control=entry.entry_state(timeout=min(125,max(0.001,deadline-time.monotonic())))
+ need(control.get('slot')=='candidate' and control.get('phase')=='holding' and control.get('epoch')==held_epoch,'entry interrupt hold changed')
+ if not established:return {'tcpResetRequested':False,'observedClients':0}
+ reported=command(kill=True);identity()
+ return {'tcpResetRequested':True,'observedClients':len(established),'reportedSockets':len(reported)}
+
+def drain_active_entry(entry,ticket=None,api=None,active=None):
+ # Freeze new admission before observing inflight: continuous traffic cannot
+ # prevent progress. Existing requests keep their original connections.
+ config=entry.private_json(entry.ENTRY_CONFIG);budget=config.get('drainTimeoutMs',config.get('shutdownTimeoutMs'))
+ need(type(budget) is int and 1<=budget<=2147483647,'entry drain budget')
+ deadline=time.monotonic()+budget/1000
+ def current(command=None,epoch=None):
+  remaining=deadline-time.monotonic();need(remaining>0,'entry drain timeout')
+  value=entry.entry_state(command,epoch,timeout=min(125,remaining))
+  need(time.monotonic()<deadline,'entry drain timeout')
+  return value
+ control=current()
+ need(control.get('slot')=='candidate' and control.get('phase')=='active' and type(control.get('epoch')) is int and control['epoch']>=0,'current entry is not active PG')
+ epoch=control['epoch']+1;control=current('hold',control['epoch'])
+ if ticket is not None and ticket.get('interruptEntryClients') is True:
+  need(control.get('phase')=='holding' and control.get('slot')=='candidate' and control.get('epoch')==epoch,'entry interrupt hold CAS')
+  interrupt_entry_clients(entry,ticket,api,active,deadline,epoch);control=current()
+ while True:
+  need(control.get('slot')=='candidate' and control.get('phase')=='holding' and control.get('epoch')==epoch,'held entry generation changed')
+  count=control.get('inflight');need(type(count) is int and count>=0,'entry drain count')
+  if count==0:break
+  time.sleep(min(0.1,max(0,deadline-time.monotonic())))
+  control=current()
+ # Only issue drain once idle, so its long-running operation cannot lock the
+ # control socket against a guarded resume while requests are still running.
+ control=current('drain',epoch)
+ need(control.get('slot')=='candidate' and control.get('phase')=='drained' and control.get('epoch')==epoch+1 and control.get('inflight')==0,'entry drain failed')
  return control
+
+CONSUMPTION_POLICY_CONTRACT='v1'
+SOURCE_CONSUMPTION_QUERY="""
+WITH fields AS (
+ SELECT a.attname,format_type(a.atttypid,a.atttypmod) kind,a.attnotnull,pg_get_expr(d.adbin,d.adrelid) default_value
+ FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+ WHERE a.attrelid='harbor.keys'::regclass AND a.attname IN ('consumption_policy','consumption_policy_version') AND a.attnum>0 AND NOT a.attisdropped
+), shape AS (
+ SELECT count(*) total,count(*) FILTER(WHERE attnotnull AND (attname='consumption_policy' AND kind='text' AND default_value='''inherit''::text' OR attname='consumption_policy_version' AND kind='bigint' AND default_value='0')) valid FROM fields
+), current_keys AS MATERIALIZED (SELECT to_jsonb(k) value FROM harbor.keys k WHERE k.removed_at IS NULL)
+SELECT COALESCE(bool_or(value->>'consumption_policy' IN ('api_only','subscription_only','api_first')),false) explicit,
+ (SELECT total NOT IN (0,2) OR total=2 AND valid<>2 FROM shape) OR COALESCE(bool_or(CASE
+ WHEN NOT(value?'consumption_policy') AND NOT(value?'consumption_policy_version') THEN false
+ WHEN jsonb_typeof(value->'consumption_policy') IS DISTINCT FROM 'string' OR jsonb_typeof(value->'consumption_policy_version') IS DISTINCT FROM 'number' THEN true
+ WHEN value->>'consumption_policy' NOT IN ('inherit','api_only','subscription_only','api_first') THEN true
+ WHEN value->>'consumption_policy_version' !~ '^(0|[1-9][0-9]*)$' THEN true
+ ELSE (value->>'consumption_policy_version')::numeric>9007199254740991 END),false) invalid
+FROM current_keys
+"""
+
+def consumption_contract(proof):
+ need(type(proof) is dict,'consumption_policy_proof_unknown')
+ if 'consumption_policy_contract' not in proof:return None
+ need(type(proof['consumption_policy_contract']) is str and proof['consumption_policy_contract']==CONSUMPTION_POLICY_CONTRACT,'consumption_policy_contract_unknown')
+ return CONSUMPTION_POLICY_CONTRACT
+
+def source_consumption_snapshot(api,ticket,entry,instance):
+ verify_source(ticket,entry.private_json(entry.ACTIVE),api['inspect_container'](api['NAME']),api['inspect_container'](api['NAME']+'-worker'))
+ need(instance.get('Id')==ticket['from']['containerId'] and instance.get('Image')==ticket['from']['imageId'],'consumption_policy_source_identity_changed')
+ timeout=int(api['postgres_preflight_timeout_seconds'])
+ program="import {createHash} from 'node:crypto';import {createRecordingProbeStore} from '/app/postgres-recording-storage.mjs';import {recordingDatabaseIdentity} from '/app/postgres-storage-report.mjs';const store=createRecordingProbeStore({connectionString:process.env.HARBOR_DATABASE_URL});const deadline=setTimeout(()=>{console.error('Source consumption query timed out');process.exit(1);},"+str(timeout*1000)+");try{const value=await store.transaction(async()=>{const identity=await recordingDatabaseIdentity(store);const row=await store.get("+json.dumps(SOURCE_CONSUMPTION_QUERY)+");return {contract:'harbor-consumption-legacy-key-snapshot-v1',database_digest:createHash('sha256').update(identity.cluster+'\\0'+identity.database).digest('hex'),...row};},{level:'REPEATABLE READ',readOnly:true});console.log(JSON.stringify(value));}catch{console.error('Source consumption query unavailable');process.exitCode=1;}finally{clearTimeout(deadline);await store.close();}"
+ try:
+  result=api['docker']('exec',instance['Id'],'node','--input-type=module','-e',program,timeout=timeout)
+  need(len(result.stdout)<=4096,'consumption_policy_query_budget');value=json.loads(result.stdout)
+ except Exception as error:raise RuntimeError('PostgreSQL runtime upgrade: consumption_policy_query_unavailable') from error
+ need(type(value) is dict and set(value)=={'contract','database_digest','explicit','invalid'} and value['contract']=='harbor-consumption-legacy-key-snapshot-v1' and value['database_digest']==ticket['databaseDigest'] and type(value['explicit']) is bool and type(value['invalid']) is bool,'consumption_policy_query_unknown')
+ need(value['invalid'] is False,'consumption_policy_metadata_unknown')
+ need(value['explicit'] is False,'consumption_policy_explicit_keys_require_v1_target')
+ return value
+
+def consumption_upgrade_guard(pg,api,ticket,entry,gateway,common,target_proof):
+ if consumption_contract(target_proof)==CONSUMPTION_POLICY_CONTRACT:return
+ original=api['source_image_preflight']
+ def guarded(instance,requested):
+  try:
+   proof=original(instance,requested)
+   # Holding 8092 does not freeze TLS keepalive/loopback management writes.
+   # Refuse a contract downgrade independently of the current Key snapshot.
+   need(consumption_contract(proof) is None,'consumption_policy_target_unsupported: 旧目标不支持来源策略，不能回退来源策略版本（全inherit也不例外）')
+   if instance.get('Id')==ticket['from']['containerId']:source_consumption_snapshot(api,ticket,entry,instance)
+   return proof
+  except pg.SourcePreflightRejected:raise
+  except Exception as error:raise pg.SourcePreflightRejected(str(error)) from error
+ api['source_image_preflight']=guarded
+ values=pg.container_shutdown(api,gateway,'gateway');need(type(values) is dict,'consumption_policy_source_shutdown_unknown')
+ requested=[next((label+'='+str(values[key]) for key,label in pg.SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
+ guarded(gateway,requested)  # Reject before hold; the existing stop path repeats this proof.
 
 def run_upgrade(image,config,api,ticket,entry):
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
@@ -268,6 +394,7 @@ def run_upgrade(image,config,api,ticket,entry):
  need(all(proof[k]==ticket[v] for k,v in [('database_digest','databaseDigest'),('schema_digest','schemaDigest'),('device_ca_digest','deviceCaDigest')]),'new image changed database/schema/device identity')
  pg.container_shutdown(pg_api,gateway,'gateway');pg.container_shutdown(pg_api,worker,'worker')
  pg_api['source_image_preflight']=pg.prepare_source_image_preflights(pg_api,[(gateway,'gateway'),(worker,'worker')],common)
+ consumption_upgrade_guard(pg,pg_api,ticket,entry,gateway,common,proof)
  network_snapshot(ticket,entry,gateway,worker)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
  context=SimpleNamespace(config=original,state=entry.private_json(entry.STATE));entry.EntryDeployment.enter_probe_worker(context);entry.EntryDeployment.allow_probe_worker(context)
@@ -285,8 +412,8 @@ def run_upgrade(image,config,api,ticket,entry):
   return probe(entry,ticket,row,port,path,headers)
  verify_installed_tools(ticket)
  try:
-  record['phase']='waiting-idle';entry.save_json(path/'release.json',record)
-  control=drain_active_entry(entry)
+  record['phase']='draining-entry';entry.save_json(path/'release.json',record)
+  control=drain_active_entry(entry,ticket,api,active)
   gate_attempted=True;gate=gate_install(entry,ticket,config);record.update(phase='holding',gate=gate);entry.save_json(path/'release.json',record);record['retiredSqlite']=retire_sqlite(api,ticket);entry.save_json(path/'release.json',record)
   pg_api.update(runtime_upgrade=True,retain_previous=True,activation=activation,http_code=http_code)
   result=pg.deploy(image,config,None,pg_api);new_gateway=api['inspect_container'](api['NAME']);new_worker=api['inspect_container'](api['NAME']+'-worker')
