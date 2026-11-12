@@ -3,13 +3,15 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {randomUUID} from 'node:crypto';
 import {createPrivatePostgres} from '../tools/capacity/owned-runtime.mjs';
 import {createPostgresGateway} from '../postgres-gateway.mjs';
 import {createGateway} from '../server.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
 import {passwordHash} from '../auth.mjs';
 
-const integration={skip:!process.env.HARBOR_CAPACITY_PG_BIN?'需自有隔离PG，不访问现网':false,timeout:30000};
+const testUrl=process.env.HARBOR_TEST_DATABASE_URL;
+const integration={skip:!testUrl&&!process.env.HARBOR_CAPACITY_PG_BIN?'需独立PG测试库或自有隔离PG':false,timeout:30000};
 const password='synthetic-overview-login',at=Date.parse('2026-11-13T03:00:00+08:00');
 test('SQLite旧入口忽略可选首屏字段，继续返回原登录协议',async()=>{
  const directory=await mkdtemp(join(tmpdir(),'harbor-legacy-login-overview-'));let app;
@@ -21,16 +23,21 @@ test('SQLite旧入口忽略可选首屏字段，继续返回原登录协议',asy
  }finally{await app?.close();await rm(directory,{recursive:true,force:true});}
 });
 async function fixture(run){
- let lab,setup,app;const directory=await mkdtemp(join(tmpdir(),'harbor-login-overview-'));
+ let lab,admin,databaseName,databaseCreated=false,database,setup,app;const directory=await mkdtemp(join(tmpdir(),'harbor-login-overview-'));
  try{
-  lab=await createPrivatePostgres({binDirectory:process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory:process.env.HARBOR_CAPACITY_PG_LIB});
-  setup=new PostgresStore({connection:lab.connection});await setup.migrate();
+  if(testUrl){
+   admin=new PostgresStore({connectionString:testUrl,allowPlaintextLocalNetwork:true});databaseName='harbor_login_'+randomUUID().replaceAll('-','');await admin.query('CREATE DATABASE '+databaseName);databaseCreated=true;
+   const target=new URL(testUrl);target.pathname='/'+databaseName;database={connectionString:target.href,allowPlaintextLocalNetwork:true};
+  }else{
+   lab=await createPrivatePostgres({binDirectory:process.env.HARBOR_CAPACITY_PG_BIN,libraryDirectory:process.env.HARBOR_CAPACITY_PG_LIB});database={connection:lab.connection};
+  }
+  setup=new PostgresStore(database);await setup.migrate();
   await setup.query("INSERT INTO harbor.members(id,name,created) VALUES('synthetic-private-member','不能出现在首屏的员工',0)");
-  app=await createPostgresGateway({env:{},database:{connection:lab.connection},dataDir:join(directory,'data'),runtimeDir:join(directory,'runtime'),clock:()=>at,config:{port:43127,codexBinary:process.execPath,adminPasswordHash:passwordHash(password),reserveTokens:100},recording:{enabled:false}});
+  app=await createPostgresGateway({env:{},database,dataDir:join(directory,'data'),runtimeDir:join(directory,'runtime'),clock:()=>at,config:{port:43127,codexBinary:process.execPath,adminPasswordHash:passwordHash(password),reserveTokens:100},recording:{enabled:false}});
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+app.server.address().port;
   const call=async(path,{body,cookie}={})=>{const response=await fetch(origin+path,{method:body===undefined?'GET':'POST',headers:{...(cookie?{cookie}:{}),...(body===undefined?{}:{'content-type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});return {response,value:await response.json()};};
   await run({app,call});
- }finally{await app?.close();await setup?.close();await lab?.close();await rm(directory,{recursive:true,force:true});}
+ }finally{await app?.close();await setup?.close();if(admin){if(databaseCreated)await admin.query('DROP DATABASE '+databaseName);await admin.close();}await lab?.close();await rm(directory,{recursive:true,force:true});}
 }
 
 test('成功登录可复用同份轻量总览，默认和关闭选项保持旧响应',integration,()=>fixture(async({call})=>{
