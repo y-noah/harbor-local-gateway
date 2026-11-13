@@ -246,6 +246,7 @@ def run_with_metadata_residency(image,config,api,ticket,entry):
  with metadata_residency(config):return run_upgrade(image,config,api,ticket,entry)
 
 def deploy(image,config,archive,api):
+ need(retained_service_pairs(config)==0,'backup_pair_restore_unqualified')
  need(archive is None,'installed CI image required');ticket=validate_ticket(private_json(TICKET),image,config);verify_installed_tools(ticket);entry=load(api['ENTRY_HELPER'],'runtime_upgrade_entry')
  with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry))
 
@@ -386,10 +387,99 @@ def consumption_upgrade_guard(pg,api,ticket,entry,gateway,common,target_proof):
  requested=[next((label+'='+str(values[key]) for key,label in pg.SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
  guarded(gateway,requested)  # Reject before hold; the existing stop path repeats this proof.
 
+def retained_service_pairs(config):
+ value=config.get('postgres_retained_service_pairs',0)
+ need(type(value) is int and value in (0,1),'postgres_retained_service_pairs must be 0 or 1')
+ return value
+
+def retired_container(api,identifier):
+ result=api['docker']('container','inspect',identifier,check=False,timeout=10)
+ if result.returncode==0:
+  rows=json.loads(result.stdout);need(type(rows) is list and len(rows)==1 and type(rows[0]) is dict and rows[0].get('Id')==identifier,'retired container inspect invalid');return rows[0]
+ inventory=api['docker']('container','ls','--all','--no-trunc','--filter','id='+identifier,'--format','{{.ID}}',check=False,timeout=10)
+ need(inventory.returncode==0 and not inventory.stdout.strip(),'retired container absence unconfirmed')
+ return None
+
+def retired_pair(record,api):
+ ticket=record.get('ticket',{});source=ticket.get('from',{})
+ need(record.get('contract')==CONTRACT and record.get('phase')=='complete' and record.get('ticketDigest')==digest(ticket) and re.fullmatch(UUID,ticket.get('deploymentId','')),'retired release is not a completed publication')
+ need(all(re.fullmatch('[a-f0-9]{64}',source.get(key,'')) for key in ['containerId','workerId']) and source['containerId']!=source['workerId'] and re.fullmatch(DIGEST,source.get('imageId','')),'retired source identity invalid')
+ return {'release':ticket['deploymentId'],'members':[{'id':source[field],'image':source['imageId'],'previous':name+'-previous','retired':name+'-retired-pg-'+source[field][:12],'role':role} for name,field,role in [(api['NAME'],'containerId','gateway'),(api['NAME']+'-worker','workerId','worker')]]}
+
+def retired_cleanup(config,api,entry,record=None):
+ """Retry exact committed code pairs; never removes volumes or images."""
+ need(retained_service_pairs(config)==0,'backup_pair_restore_unqualified');ledger_path=RELEASES/'retired-services.json'
+ ledger=entry.private_json(ledger_path) if ledger_path.exists() else {'version':1,'pairs':[]}
+ need(type(ledger) is dict and set(ledger)=={'version','pairs'} and type(ledger['version']) is int and ledger['version']==1 and type(ledger['pairs']) is list,'retired service ledger invalid')
+ records={}
+ # A release is the fallback intent if the first ledger write was interrupted.
+ for directory in RELEASES.iterdir():
+  if not re.fullmatch(UUID,directory.name):continue
+  candidate=directory/'release.json'
+  if candidate.exists():
+   saved=entry.private_json(candidate)
+   if saved.get('phase')=='committed':
+    # Both post-publication writes may have failed. Do not mistake the absence
+    # of a pending flag for successful retirement; require explicit completion
+    # recovery after checking the live entry, before another deployment holds it.
+    source=saved.get('ticket',{}).get('from',{})
+    for name,field in [(api['NAME']+'-previous','containerId'),(api['NAME']+'-worker-previous','workerId')]:
+     row=api['inspect_container'](name)
+     need(not row or row.get('Id')!=source.get(field),'retired_cleanup_commit_confirmation_required')
+   if saved.get('cleanup',{}).get('state')=='pending':records[directory.name]=saved
+ if record is not None:records[record['ticket']['deploymentId']]=record
+ for release,saved in records.items():
+  pair=retired_pair(saved,api);need(pair['release']==release,'retired release path differs')
+  existing=next((item for item in ledger['pairs'] if item.get('release')==release),None)
+  need(existing is None or existing==pair,'retired pair changed')
+  if existing is None:ledger['pairs'].append(pair)
+ for pair in ledger['pairs']:
+  need(type(pair) is dict and re.fullmatch(UUID,pair.get('release','')),'retired pair invalid')
+  saved=records.get(pair['release']) or entry.private_json(release_path(pair['release'])/'release.json')
+  need(pair==retired_pair(saved,api),'retired ledger differs from completed release');records[pair['release']]=saved
+ if ledger['pairs']:entry.save_json(ledger_path,ledger) # Intent precedes deletion.
+ status={'state':'complete','retainedPairs':0,'pendingPairs':0,'sameDatabase':True}
+ def locate(member):
+  active=entry.private_json(entry.ACTIVE);active_ids={active.get('candidate',{}).get('containerId'),*active.get('networkSnapshot',{}).get('candidateNetworkContainerIds',[])}
+  need(re.fullmatch('[a-f0-9]{64}',active.get('candidate',{}).get('containerId','')) and member['id'] not in active_ids,'active reference cannot be retired')
+  need(all((api['inspect_container'](name) or {}).get('Id')!=member['id'] for name in [api['NAME'],api['NAME']+'-worker']),'active service cannot be retired')
+  row=retired_container(api,member['id'])
+  if row is None:return None
+  need(row.get('Image')==member['image'] and row.get('State',{}).get('Running') is False and not any(row.get('State',{}).get(key) for key in ['Paused','Restarting','Dead']),'retired service identity or state changed')
+  need(row.get('Config',{}).get('Labels',{}).get('com.aistrong.project')==api['NAME'] and row['Config'].get('Cmd')==['node','/app/postgres-'+member['role']+'.mjs'],'retired service ownership changed')
+  matches=[name for name in [member['previous'],member['retired']] if (api['inspect_container'](name) or {}).get('Id')==member['id']]
+  need(len(matches)==1,'retired service name changed');return matches[0]
+ remaining=[]
+ for pair in ledger['pairs']:
+  try:
+   located=[locate(member) for member in pair['members']]
+   for member,name in zip(pair['members'],located):
+    if name is not None:
+     locate(member);api['docker']('rm',member['id']);need(retired_container(api,member['id']) is None,'retired deletion unconfirmed')
+   saved=records[pair['release']];saved['cleanup']={'state':'complete','retainedPairs':0,'pendingPairs':0,'sameDatabase':True};entry.save_json(release_path(pair['release'])/'release.json',saved)
+   ledger['pairs']=[item for item in ledger['pairs'] if item is not pair];entry.save_json(ledger_path,ledger)
+  except Exception:
+   remaining.append(pair);status.update(state='pending',errorCategory='retired_service_cleanup_pending');status['pendingPairs']+=1
+ ledger['pairs']=remaining;entry.save_json(ledger_path,ledger)
+ return status
+
+def finish_retired_cleanup(config,api,entry,record,path):
+ # Publication is already durable. Cleanup failure must not roll back live code.
+ record.update(phase='complete',cleanup={'state':'pending','errorCategory':'retired_service_cleanup_pending'})
+ try:
+  entry.save_json(path/'release.json',record)
+  record['cleanup']=retired_cleanup(config,api,entry,record)
+ except Exception:record['cleanup']={'state':'pending','errorCategory':'retired_service_cleanup_pending'}
+ try:entry.save_json(path/'release.json',record)
+ except Exception:record['cleanup']={'state':'pending','errorCategory':'retired_service_cleanup_record_failed'}
+ return record['cleanup']
+
 def run_upgrade(image,config,api,ticket,entry):
+ need(retained_service_pairs(config)==0,'backup_pair_restore_unqualified: retained pair restore is not qualified')
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
  preflight_timeout=pg.preflight_timeout_seconds(config.get('postgres_preflight_timeout_seconds',30))
  active,original,gateway=entry.active_record();worker=api['inspect_container'](api['NAME']+'-worker');verify_source(ticket,active,gateway,worker);check_storage(ticket)
+ if RELEASES.exists():need(retired_cleanup(config,api,entry)['state']=='complete','retired_service_cleanup_pending: retry before starting another upgrade')
  pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout};common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);proof=pg.image_proof(pg_api,image,common)
  need(all(proof[k]==ticket[v] for k,v in [('database_digest','databaseDigest'),('schema_digest','schemaDigest'),('device_ca_digest','deviceCaDigest')]),'new image changed database/schema/device identity')
  pg.container_shutdown(pg_api,gateway,'gateway');pg.container_shutdown(pg_api,worker,'worker')
@@ -421,11 +511,8 @@ def run_upgrade(image,config,api,ticket,entry):
   pg_api.update(runtime_upgrade=True,retain_previous=True,activation=activation,http_code=http_code)
   result=pg.deploy(image,config,None,pg_api);new_gateway=api['inspect_container'](api['NAME']);new_worker=api['inspect_container'](api['NAME']+'-worker')
   commit_started=True;publish(entry,ticket,record,new_gateway,new_worker,active);gate_remove(entry,gate);gate=None
-  # Keep the previous PG code as stopped, explicitly retired containers, freeing
-  # the ordinary previous slots for the next independently approved upgrade.
-  for name,identifier in [(api['NAME'],ticket['from']['containerId']),(api['NAME']+'-worker',ticket['from']['workerId'])]:
-   previous=api['inspect_container'](name+'-previous');need(previous and previous['Id']==identifier and previous['State']['Running'] is False,'previous PG retirement identity');retired=name+'-retired-pg-'+identifier[:12];need(api['inspect_container'](retired) is None,'retired PG name occupied');api['docker']('rename',identifier,retired)
-  record['phase']='complete';entry.save_json(path/'release.json',record);return {'contract':CONTRACT,'state':'active','sameDatabase':True,'offhostVerified':False,'composition':result}
+  cleanup=finish_retired_cleanup(config,api,entry,record,path)
+  return {'contract':CONTRACT,'state':'active','sameDatabase':True,'offhostVerified':False,'composition':result,'cleanup':cleanup}
  except Exception as error:
   if isinstance(error,pg.ShutdownUnconfirmed):
    record.update(phase='stop-unknown',errorCategory='shutdown_unconfirmed');entry.save_json(path/'release.json',record);raise

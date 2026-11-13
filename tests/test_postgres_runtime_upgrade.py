@@ -129,7 +129,10 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
    with self.assertRaises(RuntimeError):upgrade.verify_target(t,bad,worker)
  def test_previous_sqlite_is_only_renamed_when_exactly_stopped_and_approved(self):
   t=ticket();t['sqliteRetirement']={'containerId':'7'*64,'imageId':'sha256:'+'8'*64};old={'Id':'7'*64,'Image':'sha256:'+'8'*64,'Config':{'Cmd':['node','server.mjs'],'Labels':{'com.aistrong.project':NAME}},'State':{'Running':False,'Pid':0,'Status':'exited'},'HostConfig':{'RestartPolicy':{'Name':'no'}}};state={NAME+'-previous':old};calls=[]
-  def docker(*args):
+  def docker(*args,**kwargs):
+   if args[:2]==('container','inspect'):
+    row=inspect(args[2]);return SimpleNamespace(returncode=0 if row else 1,stdout=json.dumps([row]) if row else '')
+   if args[:2]==('container','ls'):return SimpleNamespace(returncode=0,stdout='')
    calls.append(args);self.assertEqual(args[0],'rename');row=state.pop(NAME+'-previous');state[args[2]]=row
   api={'NAME':NAME,'inspect_container':state.get,'docker':docker};name=upgrade.retire_sqlite(api,t);self.assertEqual(state[name]['Id'],old['Id']);self.assertEqual(len(calls),1)
   for field,value in [('Running',True),('Pid',123),('OOMKilled',True)]:
@@ -230,12 +233,15 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
     if outcome=='preflight-rejected-network-changed':entry.verify_resources.side_effect=RuntimeError('approved network changed')
     composition.deploy.side_effect=deploy
     if outcome.startswith('preflight-rejected'):composition.verify_started_composition.side_effect=RuntimeError('the same expired report cannot satisfy fresh Worker proof')
-    def docker(*args):
-     docker_calls.append(args);self.assertEqual(args[0],'rename');key=next(k for k,v in rows.items() if v['Id']==args[1]);rows[args[2]]=rows.pop(key)
-    api={'NAME':NAME,'inspect_container':rows.get,'inspect_image':Mock(),'docker':docker,'postgres_preflight_timeout_seconds':999};config={**CONFIG,'postgres_preflight_timeout_seconds':300}
+    def docker(*args,**kwargs):
+     if args[:2]==('container','inspect'):
+      row=next((row for row in rows.values() if row['Id']==args[2]),None);return SimpleNamespace(returncode=0 if row else 1,stdout=json.dumps([row]) if row else '')
+     if args[:2]==('container','ls'):return SimpleNamespace(returncode=0,stdout='')
+     docker_calls.append(args);self.assertEqual(args[0],'rm');key=next(k for k,v in rows.items() if v['Id']==args[1]);rows.pop(key)
+    api={'NAME':NAME,'inspect_container':lambda name:rows.get(name) or next((row for row in rows.values() if row['Id']==name),None),'inspect_image':Mock(),'docker':docker,'postgres_preflight_timeout_seconds':999};config={**CONFIG,'postgres_preflight_timeout_seconds':300}
     with patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot',return_value={'candidateNetworkIdentity':{'id':'6'*64}}),patch.object(upgrade,'gate_install',return_value={'owned':True}) as install_gate,patch.object(upgrade,'gate_remove') as remove_gate,patch.object(upgrade,'probe',return_value=503 if outcome=='preflight-rejected-core-unready' else 200) as core_probe,patch.object(upgrade,'verify_installed_tools'):
      if outcome in ['success','busy-source','hold-race']:
-      result=upgrade.run_upgrade(IMAGE,config,api,t,entry);self.assertEqual(result['contract'],upgrade.CONTRACT);self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64);self.assertEqual(control['phase'],'active');self.assertEqual(len(docker_calls),2);remove_gate.assert_called_once()
+      result=upgrade.run_upgrade(IMAGE,config,api,t,entry);self.assertEqual(result['contract'],upgrade.CONTRACT);self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64);self.assertEqual(control['phase'],'active');self.assertEqual(len(docker_calls),2);self.assertEqual(result['cleanup']['state'],'complete');remove_gate.assert_called_once()
      else:
       with self.assertRaisesRegex(RuntimeError,'entry drain failed' if outcome=='drain-nonzero' else ''):upgrade.run_upgrade(IMAGE,config,api,t,entry)
       if outcome=='pg-rollback':entry.refresh_active.assert_called_once();remove_gate.assert_called_once();self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],t['from']['containerId'])
@@ -264,11 +270,106 @@ u.supervised_upgrade(e,{'deploymentId':'owned-test'},operation)
       if outcome=='commit-unknown':self.assertEqual(data[str(entry.ACTIVE)]['candidate']['containerId'],'c'*64)
      entry.wait_entry_idle.assert_not_called()
      self.assertEqual(composition.image_proof.call_args.args[0]['postgres_preflight_timeout_seconds'],300)
-     self.assertTrue(all(call[0]=='rename' for call in docker_calls));self.assertFalse(any('sqlite' in str(call) for call in docker_calls))
+     self.assertTrue(all(call[0]=='rm' and len(call)==2 for call in docker_calls));self.assertFalse(any('sqlite' in str(call) for call in docker_calls))
 
  def test_publish_commits_real_candidate_then_rebuilds_current_network_and_activates(self):
   t=ticket();gateway,worker=target(t),target(t,'worker');record={'ticket':t};saved={};entry=Mock();entry.CANDIDATE_PROFILE=Path('/synthetic/profile');entry.ACTIVE=Path('/synthetic/active');entry.private_json.return_value={'socketPath':'/run/harbor-entry/candidate.sock'};entry.fingerprint=upgrade.digest;entry.save_json.side_effect=lambda p,v:saved.__setitem__(str(p),copy.deepcopy(v));entry.entry_state.side_effect=[{'slot':'candidate','phase':'drained','inflight':0,'epoch':10},{'slot':'candidate','phase':'active'}]
   with patch.object(upgrade,'network_snapshot',return_value={'candidateNetworkIdentity':{'id':'6'*64}}),patch.object(upgrade,'check_storage'):upgrade.publish(entry,t,record,gateway,worker,active())
   self.assertEqual(saved[str(entry.ACTIVE)]['candidate']['containerId'],gateway['Id']);self.assertEqual(saved[str(entry.ACTIVE)]['approval']['contract'],upgrade.CONTRACT);self.assertEqual(record['phase'],'committed');entry.entry_state.assert_any_call('activate',10,'candidate');entry.prepare_active_network.assert_called_once();entry.restore_active.assert_called_once()
+
+
+class RetiredServiceCleanupTests(unittest.TestCase):
+ def fixture(self,directory):
+  t=ticket();rows={};calls=[]
+  for index,(name,field,role) in enumerate([(NAME,'containerId','gateway'),(NAME+'-worker','workerId','worker')]):
+   row=target(t,role);row.update(Id=t['from'][field],Image=t['from']['imageId']);row['State']['Running']=False;rows[name+'-previous']=row
+  entry=Mock();entry.save_json.side_effect=lambda path,value:Path(path).write_text(json.dumps(value));entry.private_json.side_effect=lambda path:json.loads(Path(path).read_text())
+  def inspect(name):return rows.get(name) or next((row for row in rows.values() if row['Id']==name),None)
+  def docker(*args,**kwargs):
+   if args[:2]==('container','inspect'):
+    row=inspect(args[2]);return SimpleNamespace(returncode=0 if row else 1,stdout=json.dumps([row]) if row else '')
+   if args[:2]==('container','ls'):return SimpleNamespace(returncode=0,stdout='')
+   calls.append(args);self.assertEqual(args[0],'rm');self.assertEqual(len(args),2);key=next(name for name,row in rows.items() if row['Id']==args[1]);rows.pop(key)
+  api={'NAME':NAME,'inspect_container':inspect,'docker':docker};record={'contract':upgrade.CONTRACT,'ticket':t,'ticketDigest':upgrade.digest(t),'phase':'committed'};entry.ACTIVE=Path(directory)/'active.json';entry.save_json(entry.ACTIVE,{'candidate':{'containerId':'c'*64},'networkSnapshot':{'candidateNetworkContainerIds':['c'*64,'d'*64]}});(Path(directory)/t['deploymentId']).mkdir(exist_ok=True)
+  return rows,calls,entry,api,record
+ def test_default_removes_exact_stopped_pair_without_volumes_or_images(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+   rows,calls,entry,api,record=self.fixture(directory);rows['unrelated']=target(ticket());rows['unrelated']['Id']='f'*64
+   value=upgrade.finish_retired_cleanup({},api,entry,record,Path(directory)/record['ticket']['deploymentId']);self.assertEqual(value['state'],'complete');self.assertEqual(set(rows),{'unrelated'});self.assertEqual(calls,[('rm','a'*64),('rm','b'*64)]);self.assertEqual(entry.private_json(Path(directory)/'retired-services.json')['pairs'],[])
+ def test_partial_deletion_failure_is_pending_and_retry_only_removes_remaining_member(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+   rows,calls,entry,api,record=self.fixture(directory);original=api['docker']
+   def fail(*args,**kwargs):
+    if args[0]=='rm' and args[1]=='b'*64:raise RuntimeError('synthetic unavailable')
+    return original(*args,**kwargs)
+   api['docker']=fail;result=upgrade.finish_retired_cleanup({},api,entry,record,Path(directory)/record['ticket']['deploymentId']);self.assertEqual(result['state'],'pending');self.assertEqual(record['phase'],'complete');self.assertEqual(set(rows),{NAME+'-worker-previous'});self.assertEqual(len(entry.private_json(Path(directory)/'retired-services.json')['pairs']),1)
+   api['docker']=original;self.assertEqual(upgrade.retired_cleanup({},api,entry)['state'],'complete');self.assertEqual(calls,[('rm','a'*64),('rm','b'*64)]);self.assertFalse(rows)
+ def test_foreign_running_active_and_changed_identity_refuse_entire_pair(self):
+  mutations=[lambda rows:rows[NAME+'-previous']['State'].update(Running=True),lambda rows:rows[NAME+'-previous']['Config']['Labels'].update({'com.aistrong.project':'other'}),lambda rows:rows[NAME+'-previous'].update(Image='sha256:'+'9'*64),lambda rows:rows.update({NAME:rows[NAME+'-previous']}),lambda rows:rows[NAME+'-worker-previous']['Config'].update(Cmd=['other'])]
+  for mutation in mutations:
+   with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+    rows,calls,entry,api,record=self.fixture(directory);mutation(rows);result=upgrade.finish_retired_cleanup({},api,entry,record,Path(directory)/record['ticket']['deploymentId']);self.assertEqual(result['state'],'pending');self.assertEqual(calls,[])
+ def test_intent_write_failure_never_deletes_and_reports_pending(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+   rows,calls,entry,api,record=self.fixture(directory);entry.save_json.side_effect=OSError('synthetic disk full');result=upgrade.finish_retired_cleanup({},api,entry,record,Path(directory)/record['ticket']['deploymentId']);self.assertEqual(result['state'],'pending');self.assertEqual(result['errorCategory'],'retired_service_cleanup_record_failed');self.assertEqual(calls,[])
+ def test_unqualified_backup_and_bad_policy_reject_before_any_deployment_effect(self):
+  for value in [1,True,False,None,-1,2,'0',0.0]:
+   with self.subTest(value=value),patch.object(upgrade,'load') as loader,self.assertRaises(RuntimeError):upgrade.run_upgrade(IMAGE,{**CONFIG,'postgres_retained_service_pairs':value},{},ticket(),Mock())
+   loader.assert_not_called()
+
+ def test_process_interruption_keeps_intent_and_retry_updates_original_release(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+   rows,calls,entry,api,record=self.fixture(directory);path=Path(directory)/record['ticket']['deploymentId'];path.mkdir(exist_ok=True);original=api['docker']
+   def interrupt(*args,**kwargs):
+    value=original(*args,**kwargs)
+    if args[0]=='rm':raise KeyboardInterrupt()
+    return value
+   api['docker']=interrupt
+   with self.assertRaises(KeyboardInterrupt):upgrade.finish_retired_cleanup({},api,entry,record,path)
+   self.assertEqual(entry.private_json(path/'release.json')['cleanup']['state'],'pending');self.assertEqual(len(entry.private_json(Path(directory)/'retired-services.json')['pairs']),1)
+   api['docker']=original;self.assertEqual(upgrade.retired_cleanup({},api,entry)['state'],'complete');self.assertEqual(entry.private_json(path/'release.json')['cleanup']['state'],'complete');self.assertFalse(rows)
+
+ def test_first_ledger_write_failure_recovers_from_committed_pending_release(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+   rows,calls,entry,api,record=self.fixture(directory);save=entry.save_json.side_effect
+   def fail(path,value):
+    if Path(path).name=='retired-services.json':raise OSError('ledger unavailable')
+    save(path,value)
+   entry.save_json.side_effect=fail;path=Path(directory)/record['ticket']['deploymentId'];self.assertEqual(upgrade.finish_retired_cleanup({},api,entry,record,path)['state'],'pending');self.assertEqual(calls,[])
+   entry.save_json.side_effect=save;self.assertEqual(upgrade.retired_cleanup({},api,entry)['state'],'complete');self.assertFalse(rows);self.assertEqual(entry.private_json(path/'release.json')['cleanup']['state'],'complete')
+ def test_failed_inspect_with_matching_full_id_keeps_pending(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+   rows,calls,entry,api,record=self.fixture(directory);original=api['docker'];queries=[]
+   def fail(*args,**kwargs):
+    if args[:2]==('container','inspect'):return SimpleNamespace(returncode=1,stdout='')
+    if args[:2]==('container','ls'):queries.append(args);return SimpleNamespace(returncode=0,stdout='a'*64+'\n')
+    return original(*args,**kwargs)
+   api['docker']=fail;self.assertEqual(upgrade.finish_retired_cleanup({},api,entry,record,Path(directory)/record['ticket']['deploymentId'])['state'],'pending');self.assertEqual(calls,[]);self.assertTrue(all('--no-trunc' in args and 'id='+'a'*64 in args for args in queries));self.assertEqual(len(entry.private_json(Path(directory)/'retired-services.json')['pairs']),1)
+ def test_deploy_rejects_unqualified_policy_before_supervisor_or_ticket_access(self):
+  for value in [1,None,True,2,'0']:
+   with self.subTest(value=value),patch.object(upgrade,'private_json') as read,patch.object(upgrade,'supervised_upgrade') as supervise,patch.object(upgrade,'load') as loader,self.assertRaises(RuntimeError):upgrade.deploy(IMAGE,{**CONFIG,'postgres_retained_service_pairs':value},None,{})
+   read.assert_not_called();supervise.assert_not_called();loader.assert_not_called()
+ def test_rollback_record_and_active_reference_prevent_cleanup_before_rm(self):
+  for reason in ['rollback','ticket','active_gateway','active_worker']:
+   with self.subTest(reason=reason),tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+    rows,calls,entry,api,record=self.fixture(directory);path=Path(directory)/record['ticket']['deploymentId'];record['phase']='complete';record['cleanup']={'state':'pending'};pair=upgrade.retired_pair(record,api);entry.save_json(Path(directory)/'retired-services.json',{'version':1,'pairs':[pair]})
+    if reason=='rollback':record['phase']='rolled-back-pg'
+    if reason=='ticket':record['ticket']['from']['workerId']='f'*64
+    if reason=='active_gateway':entry.save_json(entry.ACTIVE,{'candidate':{'containerId':'a'*64}})
+    if reason=='active_worker':entry.save_json(entry.ACTIVE,{'candidate':{'containerId':'c'*64},'networkSnapshot':{'candidateNetworkContainerIds':['b'*64]}})
+    entry.save_json(path/'release.json',record)
+    if reason in ['rollback','ticket']:
+     with self.assertRaises(RuntimeError):upgrade.retired_cleanup({},api,entry)
+    else:self.assertEqual(upgrade.retired_cleanup({},api,entry)['state'],'pending')
+    self.assertEqual(calls,[])
+
+ def test_both_release_writes_failed_recovery_refuses_before_claiming_complete(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)):
+   rows,calls,entry,api,record=self.fixture(directory);path=Path(directory)/record['ticket']['deploymentId'];save=entry.save_json.side_effect;save(path/'release.json',record)
+   entry.save_json.side_effect=OSError('persistent disk failure');self.assertEqual(upgrade.finish_retired_cleanup({},api,entry,record,path)['errorCategory'],'retired_service_cleanup_record_failed');entry.save_json.side_effect=save
+   with self.assertRaisesRegex(RuntimeError,'retired_cleanup_commit_confirmation_required'):upgrade.retired_cleanup({},api,entry)
+   self.assertEqual(calls,[]);self.assertEqual(entry.private_json(path/'release.json')['phase'],'committed')
+   # An operator-confirmed completion retries the same exact record and pair.
+   self.assertEqual(upgrade.finish_retired_cleanup({},api,entry,record,path)['state'],'complete');self.assertFalse(rows)
 
 if __name__=='__main__':unittest.main()
