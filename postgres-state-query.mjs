@@ -10,7 +10,7 @@ import {verifyUsageRollupAvailability,usageRollupsReady,usageRollupMoneySql} fro
 
 export function stateQuery(params){
   const value={sessionPage:1,sessionPageSize:25};
-  if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview','accounts','sessions'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
+  if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview','overview-cost','accounts','sessions'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
   if(params.has('people')){if(params.getAll('people').length!==1||!['all','none'].includes(params.get('people')))throw new AppError(400,'员工加载模式无效');value.people=params.get('people');}
   for(const [name,field] of [['session_page','sessionPage'],['session_page_size','sessionPageSize']]){
     const entries=params.getAll(name);
@@ -49,11 +49,24 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
   }
   async function execute({sessionPage=1,sessionPageSize=25,people='all',view='full',sessionQ='',sessionType='',sessionAccount='',sessionStatus=''}={}){
     validateSessionFilters({sessionQ,sessionType,sessionAccount,sessionStatus});sessionQ=sessionQ.trim();
-    if(!['full','overview','accounts','sessions'].includes(view))throw new AppError(400,'状态视图无效');
+    if(!['full','overview','overview-cost','accounts','sessions'].includes(view))throw new AppError(400,'状态视图无效');
     if(!['all','none'].includes(people))throw new AppError(400,'员工加载模式无效');
     if(!Number.isSafeInteger(sessionPage)||sessionPage<1||!Number.isSafeInteger(sessionPageSize)||sessionPageSize<1||sessionPageSize>100)throw new AppError(400,'会话分页参数无效');
     const at=clock(),window=usageWindow(at),recentUsageWindow={start:at-12*3600000,end:at,hours:12};
     return store.transaction(async()=>{
+      if(view==='overview-cost'){
+        const rows=await store.all(`WITH source AS (
+          SELECT to_char(to_timestamp(r.usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
+            CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
+            CASE WHEN ${validPrice} THEN p.revision END revision,
+            ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
+          FROM harbor.requests r${joins} WHERE r.usage_at>=$1 AND r.usage_at<$2
+        ), partial AS MATERIALIZED (
+          SELECT day,revision,${referencePartialAggregateSql({standardOnly:true})} FROM source GROUP BY day,revision
+        ) SELECT day,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY day ORDER BY day`,window.start,window.end);
+        return {view:'overview-cost',usageMetric:referenceMetric,usageWindow:window,observedAt:at,
+          daily:rows.map(row=>({day:row.day,requests:row.requests,standard:aggregate(row).standard}))};
+      }
       if(view==='overview'){
         const counts=await store.get('SELECT COUNT(*) member_count FROM harbor.members WHERE removed_at IS NULL');
         const accounts=await store.all('SELECT id,name,kind,auth_mode,enabled,state,platform_models FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id');

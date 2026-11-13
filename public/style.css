@@ -213,3 +213,23 @@ body{font-size:17.6px}
 .data-refresh-region[aria-busy=true]{min-height:0}.data-refresh-region>.loading-region-content[inert]{opacity:1;user-select:text}.data-refresh-region>.loading-mask{display:none}
 
 .pricing-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:16px 0}.pricing-toolbar>.actions{margin:0;gap:8px}.pricing-status{min-width:0;max-width:100%}.pricing-status>summary,.pricing-aliases>summary{cursor:pointer;font-size:13.2px}.pricing-status-content{padding:12px 0;max-width:640px;overflow-wrap:anywhere}.pricing-status-content p{font-size:13.2px;margin:8px 0}.pricing-aliases{border-top:1px solid var(--line);padding-top:16px;margin-top:16px}
+
+/* 正文筛选：首行六个条件，第二行内容、员工与操作。 */
+.recording-query-form .recording-filter-row{grid-template-columns:repeat(6,minmax(0,1fr))}
+.recording-filter-row>.recording-source-filter,.recording-filter-row>.recording-owner-filter{grid-row:2}
+.recording-filter-row>.query-actions{grid-row:2;grid-column:3/-1;align-self:end;padding:0;flex-wrap:nowrap}
+.recording-filter-row .query-device{grid-row:3}
+.recording-member-dropdown{position:relative;min-width:0}
+.panel:has(> .panel-body > .recording-query-form){overflow:visible}
+.recording-member-dropdown>summary{display:flex;justify-content:space-between;align-items:center;gap:10px;list-style:none;min-height:44px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:10px 14px;cursor:pointer;font-size:14.3px}
+.recording-member-dropdown>summary::-webkit-details-marker{display:none}
+.recording-member-dropdown>summary span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.recording-member-options{position:absolute;top:calc(100% + 6px);left:0;width:340px;max-width:calc(100vw - 48px);max-height:360px;overflow:auto;padding:12px;background:#fff;border:1px solid var(--line);border-radius:9px;box-shadow:0 8px 24px #17352718;z-index:5}
+.recording-member-search{display:flex;gap:8px;align-items:center}.recording-filter-row .recording-member-search input{margin:0;min-width:0}
+.recording-member-option{display:block;width:100%;border:0;background:transparent;text-align:left;border-radius:5px;padding:9px 10px;white-space:normal!important;overflow-wrap:anywhere}
+.recording-member-option:hover,.recording-member-option:focus-visible{background:#eff5f0}
+.recording-member-options .pager{padding:8px 0;gap:8px;flex-wrap:wrap}
+@media(max-width:1050px){.recording-query-form .recording-filter-row{grid-template-columns:repeat(3,minmax(0,1fr))}.recording-filter-row>.recording-source-filter,.recording-filter-row>.recording-owner-filter{grid-row:3}.recording-filter-row>.query-actions{grid-row:3;grid-column:3}}
+@media(max-width:760px){.recording-query-form .recording-filter-row{grid-template-columns:repeat(2,minmax(0,1fr))}.recording-filter-row>.recording-source-filter,.recording-filter-row>.recording-owner-filter,.recording-filter-row>.query-actions,.recording-filter-row .query-device{grid-row:auto}.recording-filter-row>.query-actions{grid-column:1/-1}.recording-member-options{width:min(340px,calc(100vw - 48px))}}
+
+.overview-page .two-col{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-unavailable{display:grid;place-items:center;color:var(--muted);font-size:14.3px}.cost-chart .chart-label{white-space:nowrap;font-variant-numeric:tabular-nums}.cost-chart .bar{background:#447b69}@media(max-width:1100px){.overview-page .two-col{grid-template-columns:1fr}}

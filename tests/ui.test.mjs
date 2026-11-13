@@ -1146,10 +1146,10 @@ test('概览已在途类型目录进入正文后只更新筛选，不自动读�
  let release;const paths=[],page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({types:[{id:'type-a',code:'A',name:'研发'}]})));});prepareRecordingAdmin(page);page.run('tab="overview"');const pending=page.run('loadTypeCatalog()');page.run('tab="requests";recordView="recordings";recordingAdminFilters.q="保留草稿";');const select={value:'type-a',innerHTML:''};page.node('#recording-query-form').querySelector=()=>select;page.run('bindRecordingAdmin()');select.onfocus({target:{name:'type',tagName:'SELECT'}});assert.equal(paths.length,1);release();await pending;assert.match(select.innerHTML,/A · 研发/);assert.equal(page.run('recordingAdminFilters.q'),'保留草稿');assert.deepEqual(paths,['/api/admin/member-types']);
 });
 
-test('运行总览只显示请求趋势和运行状态，金额只在使用数据展示',async()=>{
+test('运行总览保留运行状态与请求趋势，并以USD图替换上游连接',async()=>{
  const data={...snapshot(),usageWindow:{start:Date.UTC(2026,10,1)},daily:[{day:'2026-11-01',requests:7,standard:{total:123.45}}]};
  const page=await ui(()=>response(data));page.run('admin=true;state='+JSON.stringify(data)+';tab="overview";render();');
- const html=page.node('#content').innerHTML;assert.match(html,/最近 7 天请求/);assert.match(html,/处理中 \/ 排队/);assert.match(html,/<span class="chart-label">7<\/span>/);assert.doesNotMatch(html,/参考消耗|Standard|USD|\$123\.45/);
+ const html=page.node('#content').innerHTML;assert.match(html,/最近 7 天请求/);assert.match(html,/处理中 \/ 排队/);assert.match(html,/<span class="chart-label">7<\/span>/);assert.match(html,/最近 7 天消耗|Standard · USD/);assert.doesNotMatch(html,/上游连接/);
 });
 
 
@@ -1748,4 +1748,30 @@ test('设备摘要仅展示登记和使用数量，不将IP或认证计数当作
  assert.match(page.run('deviceSummary({registered_devices:3},{pending:true})'),/使用统计加载中/);
  assert.match(page.run('deviceSummary({registered_devices:3},{error:true})'),/使用统计未加载/);
  assert.equal(page.run('deviceSummary({})'),'设备信息未加载');
+});
+
+
+test('首页USD趋势独立读取并保留两位小数和未知覆盖，不读取上游凭据',async()=>{
+ const start=Date.UTC(2026,10,6,16),data={...snapshot(),usageWindow:{start,end:start+7*86400000},capabilities:{overviewCost:true}};
+ const paths=[],page=await ui(path=>{paths.push(path);return response({view:'overview-cost',usageWindow:data.usageWindow,daily:[{day:'2026-11-07',standard:{total:12.345,unmetered:1}}]});});
+ page.run('admin=true;state='+JSON.stringify(data)+';tab="overview";render();');await new Promise(setImmediate);
+ assert.deepEqual(paths,['/api/admin/state?view=overview-cost&people=none']);const chart=page.node('#overview-cost-chart').innerHTML;
+ assert.match(chart,/\$12\.35/);assert.match(chart,/含待核对记录/);assert.equal((chart.match(/class="bar-col"/g)||[]).length,7);assert.doesNotMatch(page.node('#content').innerHTML,/上游连接/);
+});
+
+test('正文员工筛选展开才读员工，使用行内分页且员工名称转义',async()=>{
+ const paths=[],page=await ui(path=>{paths.push(path);return response({rows:[{id:'employee-a',name:'<img src=x>'}],pagination:{page:1,totalPages:1}});});prepareRecordingAdmin(page);
+ page.run('render();');assert.equal(paths.length,0);assert.match(page.node('#content').innerHTML,/recording-member-dropdown/);assert.doesNotMatch(page.node('#content').innerHTML,/选择员工/);
+ page.node('#recording-member-dropdown').open=true;await page.run('openRecordingMemberPicker()');assert.equal(paths.length,1);assert.match(page.node('#recording-member-picker').innerHTML,/&lt;img src=x&gt;/);assert.equal(page.node('#modal').open,false);
+ await page.click('recording-member-select','employee-a');assert.equal(page.run('recordingAdminFilters.member'),'employee-a');assert.equal(page.run('recordingAdminFilters.memberLabel'),'<img src=x>');assert.equal(page.node('#modal').open,false);
+});
+
+
+test('总览刷新在请求数不变时重新读取结算及人工核对金额，柱高重绘单位一致',async()=>{
+ const start=Date.UTC(2026,10,6,16),data={...snapshot(),usageWindow:{start,end:start+7*86400000},capabilities:{overviewCost:true}};let reads=0;
+ const page=await ui(path=>path.includes('view=overview-cost')?response({view:'overview-cost',usageWindow:data.usageWindow,daily:[{day:'2026-11-07',standard:{total:++reads===1?null:reads===2?2:3,unmetered:reads===1?1:0}}]}):response(data));
+ page.run('admin=true;state='+JSON.stringify(data)+';tab="overview";render();');await new Promise(setImmediate);assert.equal(reads,1);assert.match(page.node('#overview-cost-chart').innerHTML,/含待核对记录/);
+ await page.run('refresh()');await new Promise(setImmediate);assert.equal(reads,2);assert.match(page.node('#overview-cost-chart').innerHTML,/\$2\.00/);
+ await page.run('refresh(true,"state:overview")');await new Promise(setImmediate);assert.equal(reads,3);assert.match(page.node('#overview-cost-chart').innerHTML,/\$3\.00/);
+ assert.match(source,/bar\.style\.height=bar\.dataset\.height\+'px'/);assert.doesNotMatch(source,/bar\.style\.height=bar\.dataset\.height\+'%'/);
 });

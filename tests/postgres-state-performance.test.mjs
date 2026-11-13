@@ -67,6 +67,8 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
         for(const entry of [sessionView,light])assert.equal(entry.accounts.find(row=>row.id===accounts[1]).platform_models,JSON.stringify(['synthetic-model']));
         assert.deepEqual(light.totals,{requests:compact.totals.requests,success:compact.totals.success});
         assert.deepEqual(light.daily,compact.daily.map(({day,requests})=>({day,requests})));
+        const costs=await reader.read({view:'overview-cost'});assert.deepEqual(costs.daily,compact.daily);assert.deepEqual(costs.usageWindow,light.usageWindow);
+        for(const field of ['accounts','members','keys','requests','sessions','audit'])assert.equal(Object.hasOwn(costs,field),false);
         if(observedAt===at)assert.deepEqual(light,withoutIndex);
 
         if(observedAt===at){
