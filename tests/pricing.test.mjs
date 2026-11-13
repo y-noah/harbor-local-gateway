@@ -26,6 +26,18 @@ test('missing usage, unavailable cache price and unknown aliases are not priced 
  assert.equal(quoteReference({...completed('gpt-6.1-sol',0),usage_unknown:1}).state,'unmetered');assert.equal(quoteReference(completed('gpt-5.5-pro',100,1,1)).state,'unpriced');
  assert.equal(quoteReference(completed('gpt-6.1-sol',0)).totalAtoms,0n);assert.equal(quoteReference(completed('gpt-6.1-sol',1,0,2)).state,'unmetered');
 });
+test('official specialized context rows retain Standard short prices without long-context collisions',()=>{
+ const text=readFileSync(new URL('./fixtures/pricing-specialized-context.md',import.meta.url),'utf8'),rates=parseOfficialPrices(text);
+ assert.deepEqual(rates['gpt-6-cyber'],{input:'20.00',cached:'2.00',output:'100.00'});
+ assert.deepEqual(rates['gpt-6-rosalind'],{input:'15.00',cached:'1.50',output:'75.00'});
+ assert.deepEqual(rates['gpt-6.1-sol'],{input:'2.00',cached:'0.10',output:'10.00'});
+ const longOnly=text.split('\n').filter(line=>!line.includes('gpt-6-cyber (short context)')).join('\n');
+ assert.equal(Object.hasOwn(parseOfficialPrices(longOnly),'gpt-6-cyber'),false);
+ const lines=text.split('\n'),short=lines.findIndex(line=>line.includes('gpt-6-cyber (short context)')),long=lines.findIndex(line=>line.includes('gpt-6-cyber (long context)'));
+ [lines[short],lines[long]]=[lines[long],lines[short]];assert.deepEqual(parseOfficialPrices(lines.join('\n')),rates);
+ const duplicate=lines.find(line=>line.includes('gpt-6-cyber (short context)'));
+ lines.splice(long+1,0,duplicate.replace('$20.00','$21.00'));assert.throws(()=>parseOfficialPrices(lines.join('\n')),/冲突/);
+});
 test('specialized Standard text models are discovered without ingesting Fast, training or mixed-modality prices',()=>{
  const text=official+'\nStandard\n### Grouped Pricing Table data\n| Category | Model | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| Codex | gpt-5.3-codex | $1.75 | $14.00 | $0.175 |\n\nFast\n### Grouped Pricing Table data\n| Category | Model | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| Codex | gpt-5.3-codex | $3.50 | $28.00 | $0.35 |\n\nStandard\n| Model | Training | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| gpt-5.3-codex | $1 | $99 | $99 | $99 |\n\n| Model | Modality | Input | Output | Cached input |\n| --- | --- | --- | --- | --- |\n| mixed-image | Image | $8 | $30 | $2 |\n';
  const parsed=parseOfficialPrices(text);assert.deepEqual(parsed['gpt-5.3-codex'],{input:'1.75',cached:'0.175',output:'14.00'});assert.ok(!Object.hasOwn(parsed,'mixed-image'));assert.equal(Object.keys(parsed).length,38);

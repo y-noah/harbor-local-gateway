@@ -39,7 +39,11 @@ export function parseOfficialPrices(text){
     // Per-minute, image/audio modalities, tools, training and rows without text output cannot share this token reference.
     if(fields.some(f=>!header.includes(f)))continue;if(cells.length!==header.length)fail('官方费率表不完整');
     if(cells[header.indexOf(fields[0])]==='-'||cells[header.indexOf(fields[2])]==='-')continue;
-    const name=cells[header.indexOf('Model')].split(' (')[0];if(!modelName(name))fail('官方模型标识无法识别');
+    const modelCell=cells[header.indexOf('Model')],context=modelCell.match(/ \((short|long) context\)$/);
+    // Grouped tables may put the context tier in the model cell instead of
+    // separate columns. The reference continues to use only short context.
+    if(context?.[1]==='long')continue;
+    const name=modelCell.split(' (')[0];if(!modelName(name))fail('官方模型标识无法识别');
     const [input,cached,output]=fields.map(f=>money(cells[header.indexOf(f)]));if(input===null||output===null)fail('官方输入或输出费率缺失');
     const rate=validateRate({input,cached,output});if(result[name]&&JSON.stringify(result[name])!==JSON.stringify(rate))fail('官方模型费率冲突');result[name]=rate;
   }

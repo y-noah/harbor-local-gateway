@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {Readable} from 'node:stream';
+import {readFileSync} from 'node:fs';
 import {PostgresStore} from '../postgres-store.mjs';
 import {usageWindow} from '../store.mjs';
 import {createPostgresPricingRuntime} from '../postgres-pricing-runtime.mjs';
@@ -11,6 +12,15 @@ import {modelReleaseSource,modelReleaseSetting} from '../model-release-dates.mjs
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需独立PG测试库':false},at=Date.parse('2026-11-09T12:00:00+08:00');
 const rate={input:'3',cached:'0.3',output:'15',source:'synthetic official fixture'};
 const page=model=>`# Pricing\n### Standard pricing data\n| Model | Input | Cached input | Output |\n| --- | --- | --- | --- |\n| ${model} | $3 | $0.3 | $15 |\n### Batch pricing data\n`;
+test('PG官方分行上下文费率刷新发布短上下文价格且不为评审别名猜价',integration,()=>fixture(async({store,runtime})=>{
+ await runtime.refresh({force:true});
+ const state=JSON.parse((await store.get("SELECT value FROM harbor.gateway_settings WHERE name='pricing.state'")).value),book=await store.pricingBook(state.active);
+ assert.equal(state.error,null);assert.equal(state.lastSuccess,at);
+ for(const [model,input,output,cached] of [['gpt-6-cyber','20.00','100.00','2.00'],['gpt-6-rosalind','15.00','75.00','1.50']]){
+  assert.equal(book.rates[model].input,input);assert.equal(book.rates[model].output,output);assert.equal(book.rates[model].cached,cached);
+ }
+ assert.equal(Object.hasOwn(book.rates,'codex-auto-review'),false);
+},{fetchImpl:async()=>new Response(readFileSync(new URL('./fixtures/pricing-specialized-context.md',import.meta.url),'utf8'))}));
 function options(name='postgres'){const u=new URL(url);u.pathname='/'+name;return {connectionString:u.href,allowPlaintextLocalNetwork:true};}
 async function fixture(run,optionsRuntime={}){
  const admin=new PostgresStore(options()),name='harbor_price_'+randomUUID().replaceAll('-','');let store,runtime;
