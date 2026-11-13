@@ -13,7 +13,7 @@ test('B-shaped package leaves native overlay empty and its verified host project
  const root=await mkdtemp(join(tmpdir(),'harbor-activation-b-closure-')),old=process.env.HARBOR_IMAGE_REVISION;try{
   for(const directory of ['ci','ci/storage-operator-tools','public','clients','migrations'])await mkdir(join(root,directory),{recursive:true});
   for(const name of await readdir(source))if(name.endsWith('.mjs')||['package.json','package-lock.json','storage-receiver-candidate-signal.py'].includes(name))await copyFile(join(source,name),join(root,name));
-  for(const name of await readdir(join(source,'ci')))if(/^postgres-.+\.mjs$/.test(name)||['postgres-deploy.py','postgres-usage-cascade.py','deploy-wrapper.py'].includes(name))await copyFile(join(source,'ci',name),join(root,'ci',name));
+  for(const name of await readdir(join(source,'ci')))if(/^postgres-.+\.mjs$/.test(name)||['postgres-deploy.py','postgres-usage-cascade.py','postgres-department-release.py','harbor-material-storage.py','deploy-wrapper.py'].includes(name))await copyFile(join(source,'ci',name),join(root,'ci',name));
   for(const name of await readdir(join(source,'migrations')))if(name.endsWith('.sql'))await copyFile(join(source,'migrations',name),join(root,'migrations',name));
   for(const name of ['public/index.html','public/app.js','public/style.css','clients/image-mcp.mjs','clients/harbor.example.toml'])await copyFile(join(source,name),join(root,name));
   for(const name of await readdir(join(source,'tools/capacity')))if(/\.(mjs|py|c)$/.test(name))await copyFile(join(source,'tools/capacity',name),join(root,'ci/storage-operator-tools',name));

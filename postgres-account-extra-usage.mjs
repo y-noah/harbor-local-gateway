@@ -119,8 +119,9 @@ export function createPostgresAccountExtraUsage(store,{clock=Date.now,readEntitl
  const dispatchPermits=new WeakMap();
  // Own the outer transaction so identity locks precede account/budget locks,
  // and no permission is exposed before COMMIT has actually returned.
+ const validateDispatchConfiguration=(requestId,{prepare,assess}={})=>{if(!identifier(requestId)||typeof prepare!=='function'||typeof assess!=='function')fail(503,'extra_dispatch_configuration');};
  async function authorizeRequestDispatch(requestId,{prepare,assess,candidateAccountIds,allowExtraLedger=true}={}){
-  if(!identifier(requestId)||typeof prepare!=='function'||typeof assess!=='function')fail(503,'extra_dispatch_configuration');let callbackCompleted=false;
+  validateDispatchConfiguration(requestId,{prepare,assess});let callbackCompleted=false;
   try{
    const grant=await top(async()=>{
     let request=await store.get('SELECT * FROM harbor.requests WHERE id=$1 FOR UPDATE',requestId);if(!request||request.ended!==null||request.status!=='queued')fail(409,'extra_request_no_longer_dispatchable');
@@ -191,7 +192,7 @@ export function createPostgresAccountExtraUsage(store,{clock=Date.now,readEntitl
   evaluateAccounts:(accounts,options={})=>departments.run(options.scope,()=>evaluateAccounts(accounts,options)),
   reserve:(requestId,options={})=>departments.run(options.scope,async()=>{await departments.request(requestId);return reserve(requestId,options);}),
   authorizeDispatch:(requestId,{scope}={})=>departments.run(scope,()=>authorizeDispatch(requestId)),
-  authorizeRequestDispatch:(requestId,options={})=>departments.run(options.scope,async()=>{await departments.request(requestId);return authorizeRequestDispatch(requestId,options);}),
+  authorizeRequestDispatch:async(requestId,options={})=>{validateDispatchConfiguration(requestId,options);return departments.run(options.scope,async()=>{await departments.request(requestId);return authorizeRequestDispatch(requestId,options);});},
   markRequestDispatched,confirmRequestNotDispatched,
   releaseUndispatched:(requestId,options)=>departments.recovery(requestId,()=>releaseUndispatched(requestId,options)),
   settle:requestId=>departments.recovery(requestId,()=>settle(requestId)),recover
