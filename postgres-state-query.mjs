@@ -29,6 +29,44 @@ function validateSessionFilters({sessionQ='',sessionType='',sessionAccount='',se
   if(typeof sessionQ!=='string'||sessionQ.length>100||sessionQ.includes('\0')||typeof sessionType!=='string'||sessionType&&!/^[a-zA-Z0-9-]{1,100}$/.test(sessionType)||typeof sessionAccount!=='string'||sessionAccount&&!/^[a-zA-Z0-9-]{1,100}$/.test(sessionAccount)||!['','enabled','disabled'].includes(sessionStatus))throw new AppError(400,'会话筛选参数无效');
 }
 
+// Account buckets include historical owners. Requests without an account and
+// partial boundary hours stay on the original facts in the same read snapshot.
+const overviewCostRollupSql=`WITH bounds AS (
+  SELECT ceil($1::bigint::numeric/3600000)::bigint*3600000 first_hour,floor($2::bigint::numeric/3600000)::bigint*3600000 last_hour
+), edges AS (
+  SELECT e.from_at,e.to_at FROM bounds w CROSS JOIN LATERAL
+    (VALUES($1::bigint,LEAST($2::bigint,w.first_hour)),(GREATEST($1::bigint,w.first_hour,w.last_hour),$2::bigint)) e(from_at,to_at)
+  WHERE e.from_at<e.to_at
+), raw_requests AS (
+  SELECT r.id,r.usage_at,r.price_version FROM harbor.requests r
+  WHERE r.account_id IS NULL AND r.usage_at>=$1::bigint AND r.usage_at<$2::bigint
+  UNION ALL
+  -- Keep this range-parameterized: an aligned window has no boundary scan.
+  SELECT r.id,r.usage_at,r.price_version FROM edges w CROSS JOIN LATERAL (
+    SELECT r.id,r.usage_at,r.price_version FROM harbor.requests r
+    WHERE r.account_id IS NOT NULL AND r.usage_at>=w.from_at AND r.usage_at<w.to_at OFFSET 0
+  ) r
+), source AS (
+  SELECT to_char(to_timestamp(r.usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
+    CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
+    CASE WHEN ${validPrice} THEN p.revision END revision,
+    ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
+  FROM raw_requests r${joins}
+), partial AS (
+  SELECT day,revision,${referencePartialAggregateSql({standardOnly:true})} FROM source GROUP BY day,revision
+  UNION ALL
+  SELECT to_char(to_timestamp(b.hour_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
+    CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.revision END revision,b.requests,
+    CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.known ELSE 0 END known,
+    CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.pending ELSE 0 END pending,
+    CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.unpriced ELSE b.requests END unpriced,
+    CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.expired ELSE 0 END expired,
+    CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.unmetered ELSE 0 END unmetered,
+    ${fields.map(field=>`CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.${field} END ${field}`).join(',')}
+  FROM bounds w JOIN harbor.usage_hour_buckets b ON b.scope='account' AND b.hour_at>=w.first_hour AND b.hour_at<w.last_hour
+  LEFT JOIN harbor.pricing_versions v ON v.id=b.revision
+) SELECT day,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY day ORDER BY day`;
+
 // The page identities and every usage dimension share one read snapshot. Only
 // aggregates and this page's request/session metadata leave PostgreSQL.
 export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,queryQueue,balancingReader,maxPeople=1000}={}){
@@ -55,7 +93,8 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
     const at=clock(),window=usageWindow(at),recentUsageWindow={start:at-12*3600000,end:at,hours:12};
     return store.transaction(async()=>{
       if(view==='overview-cost'){
-        const rows=await store.all(`WITH source AS (
+        const useRollups=await usageRollupsReady(store);
+        const rows=await store.all(useRollups?overviewCostRollupSql:`WITH source AS (
           SELECT to_char(to_timestamp(r.usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
             CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
             CASE WHEN ${validPrice} THEN p.revision END revision,
@@ -196,5 +235,5 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         requests:requests.map(row=>decorate(row,window.start)),totals:totals||{requests:0,success:0,standard:empty},daily:daily.sort((a,b)=>a.day.localeCompare(b.day)),audit};
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {read:(query,{signal}={})=>{const input={...query};return queue.run(async()=>{if(input.view==='accounts'){const initializationError=await (rollupInitialization??=verifyUsageRollupAvailability(store).then(()=>null,error=>error));if(initializationError)throw initializationError;}return execute(input);},{signal});},close:()=>queue.close(),status:()=>queue.status()};
+  return {read:(query,{signal}={})=>{const input={...query};return queue.run(async()=>{if(['accounts','overview-cost'].includes(input.view)){const initializationError=await (rollupInitialization??=verifyUsageRollupAvailability(store).then(()=>null,error=>error));if(initializationError)throw initializationError;}return execute(input);},{signal});},close:()=>queue.close(),status:()=>queue.status()};
 }
