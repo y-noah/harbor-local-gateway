@@ -1,3 +1,4 @@
+import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {codexQuotaDenials} from './codex-entitlements.mjs';
 import {annotateExtraPlanning} from './postgres-extra-planning.mjs';
 import {AppError,storedModelAllowlist,checkAllowedModel} from './store.mjs';
@@ -8,13 +9,13 @@ import {validPrice,joins} from './postgres-reference-query.mjs';
 // Only per-session totals and bounded account/version metadata leave SQL. Raw
 // samples are repriced in SQL at each estimator's dispatch revision, not at the
 // current rate, and manual reconciliations never become raw usage samples.
-const workloadSql=`WITH source AS MATERIALIZED (
+const workloadSql=scope=>`WITH source AS MATERIALIZED (
   SELECT r.session_id,r.route_version,r.query_sequence,r.handoff_context,r.handoff_input,r.started,r.ended,r.status,r.price_version,r.billing_model,r.model,r.input,r.output,r.cached,r.usage_unknown,
     CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
     CASE WHEN ${validPrice} THEN p.total_atoms END total,
     COALESCE(NULLIF(CASE WHEN ${validPrice} THEN p.model END,''),NULLIF(r.billing_model,''),r.model,'') model_key,
     COALESCE(NULLIF(r.billing_model,''),r.model) chosen
-  FROM harbor.requests r${joins} WHERE r.usage_at>=$1 OR r.status IN ('queued','running')
+  FROM harbor.requests r${joins} WHERE ${scope?'r.department_id=$5 AND ':''}(r.usage_at>=$1 OR r.status IN ('queued','running'))
 ), included AS MATERIALIZED (
   SELECT *,ended IS NOT NULL AND ended<>0 AND total IS NOT NULL measured
   FROM source WHERE session_id IS NOT NULL AND ((started<$2 AND COALESCE(ended,$3)>=$1) OR status IN ('queued','running'))
@@ -66,22 +67,23 @@ ORDER BY s.created,s.id LIMIT $4`;
 
 export function createPostgresPlanningInput(store,{clock=Date.now,maxSessions=20000,maxAccounts=1000,maxVersions=1000}={}){
   if(!store||typeof clock!=='function'||!Number.isInteger(maxSessions)||maxSessions<1||maxSessions>100000||!Number.isInteger(maxAccounts)||maxAccounts<1||maxAccounts>100000||!Number.isInteger(maxVersions)||maxVersions<1||maxVersions>10000)throw new AppError(503,'夜间规划资源配置无效','planning_configuration');
-  const packages=createPostgresAccountPackages(store,{clock,maxAccounts});
+  const packages=createPostgresAccountPackages(store,{clock,maxAccounts}),departments=createRoutingDepartments(store,{clock});
   const capacity=()=>{throw new AppError(503,'夜间规划数据超出配置容量，未生成部分计划','planning_capacity');};
-  async function read({at=clock(),window=nightlyWindow(at),requestBoundary=false,quotaBoundary}={}){
+  async function read({at=clock(),window=nightlyWindow(at),requestBoundary=false,quotaBoundary,scope}={}){
     if(quotaBoundary!==undefined&&(!Number.isSafeInteger(quotaBoundary)||quotaBoundary<0))throw new AppError(400,'规划额度边界无效','planning_configuration');
     if(!Number.isSafeInteger(at)||at<0||!window||!Number.isSafeInteger(window.start)||!Number.isSafeInteger(window.end)||window.start>=window.end)throw new AppError(400,'规划时间无效');
     return store.transaction(async()=>{
-      let accounts=await store.all("SELECT id,name,kind,auth_mode,enabled,removed_at,state,last_used,quota_json,quota_error,route_block,route_epoch FROM harbor.accounts WHERE kind='codex' AND auth_mode<>'openai_api' AND enabled=1 AND removed_at IS NULL AND state IN ('ready','degraded') AND (route_block IS NULL OR route_block='quota_exhausted') ORDER BY id LIMIT $1",maxAccounts+1);if(accounts.length>maxAccounts)capacity();accounts=await packages.decorate(accounts);if(quotaBoundary!==undefined)accounts=accounts.map(account=>{let quota;try{quota=JSON.parse(account.quota_json);}catch{}return quota?.checked>=quotaBoundary&&!account.quota_error?account:{...account,quota_json:null,planningQuotaDenials:codexQuotaDenials(quota)};});
-      const versions=await store.all("SELECT DISTINCT price_version FROM harbor.requests WHERE (usage_at>=$1 OR status IN ('queued','running')) AND price_version IS NOT NULL ORDER BY price_version LIMIT $2",window.start,maxVersions+1);if(versions.length>maxVersions)capacity();
-      const rows=await store.all(workloadSql,window.start,window.end,at,maxSessions+1);if(rows.length>maxSessions)capacity();
+      scope=await departments.resolve(scope);
+      let accounts=await store.all(`SELECT ${scope?'department_id,':''}id,name,kind,auth_mode,enabled,removed_at,state,last_used,quota_json,quota_error,route_block,route_epoch FROM harbor.accounts WHERE kind='codex' AND auth_mode<>'openai_api' AND enabled=1 AND removed_at IS NULL AND state IN ('ready','degraded') AND (route_block IS NULL OR route_block='quota_exhausted') ${scope?'AND department_id=$2':''} ORDER BY id LIMIT $1`,maxAccounts+1,...(scope?[scope.department_id]:[]));if(accounts.length>maxAccounts)capacity();accounts=await packages.decorate(accounts);if(quotaBoundary!==undefined)accounts=accounts.map(account=>{let quota;try{quota=JSON.parse(account.quota_json);}catch{}return quota?.checked>=quotaBoundary&&!account.quota_error?account:{...account,quota_json:null,planningQuotaDenials:codexQuotaDenials(quota)};});
+      const versions=await store.all("SELECT DISTINCT price_version FROM harbor.requests WHERE (usage_at>=$1 OR status IN ('queued','running')) AND price_version IS NOT NULL"+(scope?" AND department_id=$3":"")+" ORDER BY price_version LIMIT $2",window.start,maxVersions+1,...(scope?[scope.department_id]:[]));if(versions.length>maxVersions)capacity();
+      const rows=await store.all(workloadSql(scope),window.start,window.end,at,maxSessions+1,...(scope?[scope.department_id]:[]));if(rows.length>maxSessions)capacity();
       const fixed=requestBoundary?await store.all("WITH facts AS (SELECT h.session_id,h.origin='manual' AND h.status='waiting' manual,h.origin='automatic' AND h.status='completed' AND g.slot=$1 transferred FROM harbor.session_handoffs h LEFT JOIN harbor.automatic_handoff_groups g ON g.id=h.automatic_group_id WHERE h.session_id=ANY($2::text[]) AND (h.origin='manual' AND h.status='waiting' OR h.origin='automatic' AND h.status='completed' AND g.slot=$1) UNION ALL SELECT m.payload->>'session_id',false,true FROM harbor.nightly_plan_applications a JOIN harbor.nightly_plan_group_results result ON result.plan_id=a.plan_id AND result.status='applied' AND result.moved>0 JOIN harbor.routing_plan_items group_item ON group_item.plan_id=a.plan_id AND group_item.section='groups' AND group_item.ordinal=result.group_ordinal JOIN harbor.routing_plan_items m ON m.plan_id=a.plan_id AND m.section='moves' AND group_item.payload->'accounts' ? (m.payload->>'from') WHERE a.slot=$1 AND m.payload->>'session_id'=ANY($2::text[])) SELECT session_id,BOOL_OR(manual) manual,BOOL_OR(transferred) transferred FROM facts GROUP BY session_id",window.key,rows.map(row=>row.id)):[],fixedById=new Map(fixed.map(row=>[row.session_id,row]));
       const workloads=rows.map(({measured_atoms,estimated_atoms,after_boundary,context_replayable,context_sequence,context_model,context_channel,context_key_id,context_key_enabled,context_key_expires,context_key_removed,context_allowed_models,...row})=>{
         let sourcePermissionAvailable=true;
         if(context_sequence!==null){sourcePermissionAvailable=!!context_key_id&&!!context_key_enabled&&context_key_removed===null&&(context_key_expires===null||context_key_expires>at);if(sourcePermissionAvailable)try{checkAllowedModel(storedModelAllowlist(context_allowed_models),context_model);}catch{sourcePermissionAvailable=false;}}
         return {...row,contextModel:context_model,contextProtocol:context_channel==='responses'||context_channel==='legacy'&&context_replayable===true?'responses':['images/generations','images/edits'].includes(context_channel)?'images':null,measuredAtoms:BigInt(measured_atoms),estimatedAtoms:estimated_atoms,afterBoundary:after_boundary,contextReplayable:context_replayable!==false,sourcePermissionAvailable,...(fixedById.get(row.id)?{pendingManual:fixedById.get(row.id).manual,transferredInSlot:fixedById.get(row.id).transferred}:{})};
       });
-      const packagePolicy=await packages.policy();accounts=await annotateExtraPlanning(store,{accounts,workloads,at,packagePolicy,requestBoundary});return {accounts,workloads,at,window,packagePolicy,priceRevisions:versions.map(row=>row.price_version)};
+      const packagePolicy=scope?(await departments.setting(scope,'account_package_policy')??{enabled:false,smoothing_hours:24,version:0}):await packages.policy();accounts=await annotateExtraPlanning(store,{accounts,workloads,at,packagePolicy,requestBoundary});return {accounts,workloads,at,window,packagePolicy,priceRevisions:versions.map(row=>row.price_version)};
     },{level:'REPEATABLE READ',readOnly:true});
   }
   return {read,plan:async(options={})=>planBalanceWorkloads({...await read(options),quietMinutes:options.quietMinutes,preparing:options.preparing,weighted:options.weighted,requestBoundary:options.requestBoundary})};

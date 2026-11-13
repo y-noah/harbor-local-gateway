@@ -194,8 +194,8 @@ test('真实PG：有限GC轮询跳过活作用域，清除较后作用域及删�
 
 test('真实PG：大量不同组件的分页验证只需固定数量查询，空尾页不逐对象查询',integration,()=>fixture(async({store,context,request})=>{
  const id=await request();await context.writeSnapshot(id,Array.from({length:200},(_,index)=>({kind:'history',content:{text:'合成不同消息'+index}})));
- const query=store.query.bind(store);let calls=0;store.query=(...args)=>{calls++;return query(...args);};
- try{assert.equal((await context.read(id,{limit:2})).parts.length,2);assert.ok(calls<=5,'分页查询次数必须固定有界');calls=0;assert.equal((await context.read(id,{after:{component:1000,part:0},limit:2})).parts.length,0);assert.ok(calls<=5,'空尾页不能逐对象验证');}finally{store.query=query;}
+ const query=store.query.bind(store);let calls=0,authorityCalls=0;store.query=(...args)=>{const sql=args[0],readiness=sql.includes("to_regclass('harbor.gateway_settings')")||sql==='SELECT value FROM harbor.gateway_settings WHERE name=$1'&&args[1]?.[0]==='schema.department-isolation';if(readiness)authorityCalls++;else calls++;return query(...args);};
+ try{assert.equal((await context.read(id,{limit:2})).parts.length,2);assert.ok(calls<=5,'分页业务查询次数必须固定有界');assert.ok(authorityCalls<=4,'部门核验不能逐对象执行');calls=0;authorityCalls=0;assert.equal((await context.read(id,{after:{component:1000,part:0},limit:2})).parts.length,0);assert.ok(calls<=5,'空尾页不能逐对象验证');assert.ok(authorityCalls<=4,'空尾页部门核验次数仍须固定有界');}finally{store.query=query;}
 }));
 
 test('真实PG：大组件分页仅提取预算内密文，不预读全部正文再截取',integration,()=>fixture(async({store,context,request,read})=>{

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {withLegacyDepartmentSchema} from './department-legacy-query-fixture.mjs';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {randomBytes,randomUUID} from 'node:crypto';
@@ -61,7 +62,7 @@ test('type version budget avoids redundant request scans without rejecting unuse
 }));
 
 test('query admission is bounded and shared queue remains available when the type reader closes',async()=>{
-  let release;const gate=new Promise(resolve=>{release=resolve;}),queue=createPostgresQueryQueue({maxConcurrent:1,maxQueued:0}),store={get:async()=>{},all:async()=>{},transaction:async()=>{await gate;throw new AppError(503,'synthetic','fixture_stop');}},reader=createPostgresTypeStatistics(store,{queryQueue:queue});
+  let release;const gate=new Promise(resolve=>{release=resolve;}),queue=createPostgresQueryQueue({maxConcurrent:1,maxQueued:0}),store={get:async()=>{},all:async()=>{},transaction:async()=>{await gate;throw new AppError(503,'synthetic','fixture_stop');}},reader=createPostgresTypeStatistics(withLegacyDepartmentSchema(store),{queryQueue:queue});
   const first=assert.rejects(reader.read(),{code:'fixture_stop'});await assert.rejects(reader.read(),{code:'query_queue_full'});const closing=reader.close();await assert.rejects(reader.read(),{code:'query_closed'});release();await Promise.all([first,closing]);assert.equal(queue.status().closed,false);assert.equal(await queue.run(async()=>7),7);await queue.close();
 });
 
@@ -113,7 +114,7 @@ test('company total and paged groups retain the same PostgreSQL snapshot while a
 }));
 
 test('database timeout uses the shared actionable error and releases the query slot',async()=>{
-  const reader=createPostgresTypeStatistics({get:async()=>{},all:async()=>{},transaction:async()=>{throw Object.assign(new Error('synthetic'),{code:'57014'});}});await assert.rejects(reader.read(),{code:'query_timeout'});await reader.close();assert.equal(reader.status().active,0);
+  const reader=createPostgresTypeStatistics(withLegacyDepartmentSchema({get:async()=>{},all:async()=>{},transaction:async()=>{throw Object.assign(new Error('synthetic'),{code:'57014'});}}));await assert.rejects(reader.read(),{code:'query_timeout'});await reader.close();assert.equal(reader.status().active,0);
 });
 
 

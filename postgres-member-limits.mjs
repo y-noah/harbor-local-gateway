@@ -1,9 +1,9 @@
-import {randomUUID} from 'node:crypto';
 import {AppError} from './store.mjs';
 import {exactUsd,referenceModel} from './pricing.mjs';
-import {memberLimitAtoms,normalizeMemberLimitRules} from './member-limits.mjs';
+import {memberLimitAtoms,normalizeMemberLimitRules,memberLimitWindow,memberLimitExceededMessage} from './member-limits.mjs';
+import {createPostgresAudit} from './postgres-audit.mjs';
+import {createAdminDepartments} from './postgres-admin-departments.mjs';
 
-const hour=3600000;
 const fail=(status,message,code='invalid_member_limits')=>{throw new AppError(status,message,code);};
 
 export function postgresMemberLimitConfiguration(row){
@@ -18,6 +18,7 @@ export function postgresMemberLimitConfiguration(row){
 // Amounts are exact NUMERIC/BigInt. Only one aggregate per configured rule
 // crosses the database boundary; completed request histories stay in SQL.
 export function createPostgresMemberLimits(store,{clock=Date.now}={}){
+  const departments=createAdminDepartments(store);
   async function configuration(memberId,{lock=false}={}){
     const row=await store.get('SELECT usage_limits,usage_limits_version FROM harbor.members WHERE id=$1 AND removed_at IS NULL'+(lock?' FOR UPDATE':''),memberId);
     if(!row)fail(404,'员工不存在或已移除');
@@ -34,30 +35,33 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
     return next;
   }
   const effective=(rule,at,book)=>{const model=referenceModel(rule.model,at,book);return {...rule,effective_model:model,invalid_model:model===null};};
-  async function save(memberId,payload,{source={kind:'custom'}}={}){
+  async function save(memberId,payload,{source={kind:'custom'},scope}={}){
     if(!payload||typeof payload!=='object'||Array.isArray(payload)||Object.keys(payload).some(k=>!['enabled','rules','expected_version'].includes(k))||!Number.isSafeInteger(payload.expected_version)||payload.expected_version<0||payload.enabled===undefined&&payload.rules===undefined)fail(400,'员工限额配置字段无效');
+    const authorization=await departments.resolve(scope,{write:true});
     return store.transaction(async()=>{
+      await departments.current(authorization,{lock:true});
+      if(authorization){const owner=await store.get('SELECT department_id FROM harbor.members WHERE id=$1',memberId);departments.same(authorization,owner);}
       const previous=await configuration(memberId,{lock:true});
       if(payload.expected_version!==previous.version)fail(409,'限额设置已变化，请重新打开','member_limits_conflict');
       const next={enabled:payload.enabled===undefined?previous.enabled:payload.enabled,rules:payload.rules===undefined?previous.rules:normalizeMemberLimitRules(payload.rules)};
       if(typeof next.enabled!=='boolean'||next.enabled&&!next.rules.length)fail(400,'开启限额后至少配置一条模型规则');
       if(next.enabled||payload.rules!==undefined){const book=await currentBook(),at=clock();for(const rule of next.rules){const target=effective(rule,at,book).effective_model;if(target!==rule.model)fail(400,target?'请使用规范模型ID '+target+'，不能把别名保存为限额模型':'请先为模型配置明确费率，再设置限额');}}
       await store.run("UPDATE harbor.members SET usage_limits=$1,usage_limits_version=usage_limits_version+1,configuration_source=jsonb_set(configuration_source,'{limits}',$3::jsonb),defaults_version=defaults_version+1 WHERE id=$2",JSON.stringify(next),memberId,JSON.stringify(source));
-      await store.run('INSERT INTO harbor.audit(id,at,action,detail) VALUES($1,$2,$3,$4)',randomUUID(),clock(),'member.limits',JSON.stringify({member:memberId,before:{enabled:previous.enabled,rules:previous.rules},after:next,version:previous.version+1}));
+      await createPostgresAudit(store,{clock}).write(authorization,{action:'member.limits',detail:{member:memberId,before:{enabled:previous.enabled,rules:previous.rules},after:next,version:previous.version+1},subject:{kind:'member',id:memberId}});
       return {...next,version:previous.version+1};
     });
   }
   async function calculate(memberId,at,config,book){
     const targets=config.rules.map(rule=>effective(rule,at,book));
     if(!targets.length)return {...config,currency:'USD',observed_at:at,usage:[]};
-    const maximum=Math.max(...targets.map(rule=>rule.hours));
+    const start=Math.min(...targets.map(rule=>memberLimitWindow(rule.hours,at).start));
     const rows=await store.all(`WITH rules AS (
-      SELECT * FROM jsonb_to_recordset($4::jsonb) AS x(position INTEGER,model TEXT,hours INTEGER)
+      SELECT * FROM jsonb_to_recordset($4::jsonb) AS x(position INTEGER,model TEXT,start_at BIGINT,inclusive BOOLEAN)
     ), source AS MATERIALIZED (
       SELECT r.ended,r.started,r.status,r.usage_unknown,r.input,r.output,r.cached,r.manual_cost_atoms,r.price_version,
         COALESCE(r.billing_model,r.model) chosen,p.total_atoms,p.revision,p.request_id projected
       FROM harbor.requests r LEFT JOIN harbor.request_prices p ON p.request_id=r.id
-      WHERE r.member_id=$1 AND ((r.ended>$2 AND r.ended<=$3) OR (r.ended IS NULL AND r.status IN ('queued','running')))
+      WHERE r.member_id=$1 AND ((r.ended>=$2 AND r.ended<=$3) OR (r.ended IS NULL AND r.status IN ('queued','running')))
     ), books AS MATERIALIZED (
       SELECT id,book::jsonb book FROM harbor.pricing_versions WHERE id IN (SELECT DISTINCT price_version FROM source)
     ), measured AS MATERIALIZED (
@@ -78,16 +82,16 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
           AND b.book->'rates' ? (alias->>'target') LIMIT 1
       ) a ON TRUE
     ) SELECT x.position,
-      COALESCE(SUM(m.atoms) FILTER(WHERE m.ended>$3-x.hours::bigint*3600000 AND m.model=x.model),0)::text used,
-      COUNT(*) FILTER(WHERE m.ended>$3-x.hours::bigint*3600000 AND
+      COALESCE(SUM(m.atoms) FILTER(WHERE (m.ended>x.start_at OR (x.inclusive AND m.ended=x.start_at)) AND m.model=x.model),0)::text used,
+      COUNT(*) FILTER(WHERE (m.ended>x.start_at OR (x.inclusive AND m.ended=x.start_at)) AND
         ((m.model=x.model AND m.atoms IS NULL) OR (m.model IS NULL AND m.atoms IS DISTINCT FROM 0::numeric))) unresolved,
       COUNT(*) FILTER(WHERE m.ended IS NULL AND m.model=x.model AND m.status IN ('queued','running')) in_flight
       FROM rules x LEFT JOIN measured m ON (m.model=x.model OR m.model IS NULL)
-      GROUP BY x.position ORDER BY x.position`,memberId,at-maximum*hour,at,
-      JSON.stringify(targets.map((r,position)=>({position,model:r.effective_model||r.model,hours:r.hours}))),JSON.stringify(book));
+      GROUP BY x.position ORDER BY x.position`,memberId,start,at,
+      JSON.stringify(targets.map((r,position)=>({position,model:r.effective_model||r.model,start_at:memberLimitWindow(r.hours,at).start,inclusive:r.hours===24}))),JSON.stringify(book));
     const usage=targets.map((rule,i)=>{
       const row=rows[i],used=BigInt(row.used),ceiling=memberLimitAtoms(rule.limit_usd),exceeded=used>=ceiling;
-      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved:row.unresolved,in_flight:row.in_flight,exceeded,blocked:config.enabled&&(exceeded||row.unresolved>0||rule.invalid_model),window:{start:at-rule.hours*hour,end:at}};
+      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved:row.unresolved,in_flight:row.in_flight,exceeded,blocked:config.enabled&&(exceeded||row.unresolved>0||rule.invalid_model),window:{start:memberLimitWindow(rule.hours,at).start,end:at}};
     });
     return {...config,currency:'USD',observed_at:at,usage};
   }
@@ -114,7 +118,7 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
       if(!config.rules.some(rule=>requested.has(effective(rule,at,current).effective_model)))return;
       for(const row of (await calculate(memberId,at,config,current)).usage){
         if(!requested.has(row.effective_model))continue;
-        if(row.exceeded)fail(429,row.model+'已达到近'+row.hours+'小时参考USD上限'+row.limit_usd+'，请等待用量滚出窗口或联系管理员','member_model_limit_exceeded');
+        if(row.exceeded)fail(429,memberLimitExceededMessage(row),'member_model_limit_exceeded');
         if(row.unresolved)fail(409,row.model+'窗口内存在无法计价的记录，请管理员核对后重试','member_model_usage_unknown');
       }
     },{level:'REPEATABLE READ',readOnly:true});

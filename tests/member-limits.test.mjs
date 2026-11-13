@@ -87,3 +87,19 @@ test('unattributed manual amounts pause configured model limits without charging
  const status=a.store.memberLimits.status(a.member.memberId);assert.ok(status.usage.every(row=>row.used_usd==='0'&&row.unresolved===1&&row.blocked));assert.equal((await a.send(sol)).status,409);assert.equal((await a.send(astra)).status,409);
  a.store.run("UPDATE requests SET manual_cost_atoms='0' WHERE id=?",id);assert.ok(a.store.memberLimits.status(a.member.memberId).usage.every(row=>row.unresolved===0));
 });
+
+test('Beijing midnight resets daily limits without deleting history and charges overnight completions to the new day',{timeout:10000},async t=>{
+ const a=await setup(t),midnight=Date.parse('2026-11-14T00:00:00+08:00');a.advance(midnight-1-a.now());await a.configure([rule(sol,24,'2'),rule(sol,168,'20'),rule(astra,24,'20')]);
+ const previous=a.seed(sol,a.now());assert.equal((await a.send()).status,429);
+ let release;const held=new Promise(r=>release=r);a.hold(()=>held);
+ // Already admitted work is not a USD reservation and is counted by completion time.
+ await a.configure([rule(sol,24,'10'),rule(sol,168,'20'),rule(astra,24,'20')]);
+ const first=a.send(),second=a.send(sol,a.key2),until=performance.now()+3000;
+ while(a.calls.length<2){assert.ok(performance.now()<until);await new Promise(r=>setTimeout(r,5));}
+ a.advance(1);let status=a.store.memberLimits.status(a.member.memberId);
+ assert.equal(status.usage[0].window.start,midnight);assert.equal(status.usage[0].used_usd,'0');assert.equal(status.usage[0].in_flight,2);assert.equal(status.usage[1].used_usd,'2');
+ await a.configure([rule(sol,24,'2'),rule(sol,168,'20'),rule(astra,24,'20')]);release();assert.equal((await first).status,200);assert.equal((await second).status,200);
+ status=a.store.memberLimits.status(a.member.memberId);assert.equal(status.usage[0].used_usd,'4');assert.equal(status.usage[0].in_flight,0);assert.equal(status.usage[1].used_usd,'6');assert.equal(status.usage[2].used_usd,'0');assert.equal((await a.send()).status,429);
+ assert.ok(a.store.get('SELECT ended FROM requests WHERE id=?',previous));
+ a.advance(86400000);assert.equal(a.store.memberLimits.status(a.member.memberId).usage[0].used_usd,'0');assert.equal(a.store.memberLimits.status(a.member.memberId).usage[1].used_usd,'6');assert.equal((await a.send()).status,200);
+});

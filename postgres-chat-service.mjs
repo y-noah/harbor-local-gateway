@@ -26,7 +26,7 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
         if(activity.isStopping()){reject(job,fail(503,'服务排空，取消尚未派发的请求','service_stopping'));continue;}
         let release,processLease;job.selecting=true;
         try{
-          const dispatched=await state.dispatch(job.secret,job.id,{followDisabled:true,deferAuthorization:true,isCancelled:()=>!!job.failure||job.signal.aborted||activity.isStopping(),authorizeDevice:person=>deviceAccess?.authorize(person,job.request,{phase:'dispatch'}),acquireAccount:account=>{
+          const dispatched=await state.dispatch(job.secret,job.id,{followDisabled:true,deferAuthorization:true,isCancelled:()=>!!job.failure||job.signal.aborted||activity.isStopping(),scope:job.scope,authorizeDevice:person=>deviceAccess?.authorize(person,job.request,{phase:'dispatch'}),acquireAccount:account=>{
             if(activity.accounts.has(account.id)||cliProcesses&&!cliProcesses.available(account.home,{kind:'model'}))return false;const permit=execution?.acquire({memberId:job.memberId,accountId:account.id,cli:true,requireIdle:true});if(execution&&!permit)return false;try{processLease=cliProcesses?.reserve(account.home,{kind:'model',signal:job.signal});}catch(error){permit?.();throw error;}activity.accounts.set(account.id,1);let released=false;release=()=>{if(!released){released=true;releaseAccount(account.id);permit?.();processLease?.release();}};return true;
           }});
           if(job.failure||job.signal.aborted||activity.isStopping())throw job.failure||fail(503,'文本请求已取消或服务停止','service_stopping');
@@ -35,12 +35,12 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
       }
     }while(again);})().finally(()=>{pumping=null;if(again){again=false;void wake();}});return pumping;
   }
-  function enqueue(secret,id,signal,memberId,request){
+  function enqueue(secret,id,signal,memberId,request,scope){
     if(queue.length>=maxQueued)throw fail(429,'文本请求等待队列已满','chat_queue_full');
-    return new Promise((resolve,rejectPromise)=>{const job={secret,id,signal,memberId,request,resolve,reject:rejectPromise,selecting:false};job.abort=()=>reject(job,fail(499,'排队期间已取消','request_cancelled'));job.timer=setTimeout(()=>reject(job,fail(503,'文本请求排队超时','chat_queue_timeout')),waitMs);job.timer.unref();queue.push(job);signal.addEventListener('abort',job.abort,{once:true});if(signal.aborted)job.abort();else void wake();});
+    return new Promise((resolve,rejectPromise)=>{const job={secret,id,signal,memberId,request,scope,resolve,reject:rejectPromise,selecting:false};job.abort=()=>reject(job,fail(499,'排队期间已取消','request_cancelled'));job.timer=setTimeout(()=>reject(job,fail(503,'文本请求排队超时','chat_queue_timeout')),waitMs);job.timer.unref();queue.push(job);signal.addEventListener('abort',job.abort,{once:true});if(signal.aborted)job.abort();else void wake();});
   }
   async function handle(req,res){
-    const secret=String(req.headers.authorization||'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at:clock()});
+    const secret=String(req.headers.authorization||'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at:clock()}),scope=store.departmentScope(member);
     await deviceAccess?.authorize(member,req);
     await consumption.check(member);
     if(activity.isStopping())throw fail(503,'服务正在排空','service_stopping');
@@ -67,15 +67,15 @@ export function createPostgresChatService({store,buffer,meteringRecovery,checkLi
       await refreshQuotas().catch(()=>{});alive();if(activity.isStopping())throw fail(503,'服务正在排空','service_stopping');
       admission=await store.transaction(async()=>{
         let snapshot;
-        const admitted=await state.admit(secret,original,{headers:req.headers,ip:req.socket.remoteAddress||'unknown',agent:String(req.headers['user-agent']||'').slice(0,200),recordingEnabled:captureEnabled,authorizeDevice:async person=>{snapshot=await consumption.check(person,{lock:true});return deviceAccess?.authorize(person,req,{phase:'admission'});}});
+        const admitted=await state.admit(secret,original,{scope,headers:req.headers,ip:req.socket.remoteAddress||'unknown',agent:String(req.headers['user-agent']||'').slice(0,200),recordingEnabled:captureEnabled,authorizeDevice:async person=>{snapshot=await consumption.check(person,{lock:true});return deviceAccess?.authorize(person,req,{phase:'admission'});}});
         await consumption.record(admitted.requestId,admitted.person,snapshot);return admitted;
-      });extraBoundary=extraRuntime?.boundary({requestId:admission.requestId,protocol:'chat',admittedExtra:admission.extraAdmission.extraReserved});releasePreparation();releasePreparation=null;
+      });extraBoundary=extraRuntime?.boundary({requestId:admission.requestId,protocol:'chat',scope:admission.scope??undefined,admittedExtra:admission.extraAdmission.extraReserved});releasePreparation();releasePreparation=null;
       if(!captureEnabled)await store.run('UPDATE harbor.requests SET recording_reason=$1 WHERE id=$2 AND recording_state=\'disabled\'',captureDecision.reason,admission.requestId).catch(()=>{});
       if(captureEnabled){const input=record(()=>currentInput({input:admission.delta}));recordStarted=!!input&&!!writeRecording('start',admission.requestId,input.state);if(!recordStarted)recordFailed=true;
         if(recordStarted)requestContext=await observeRequestContextAsync(captureContext,admission.requestId,received,{signal:controller.signal});
         if(recordStarted){capture=record(()=>new ConversationCapture({emit:event=>{const size=Buffer.byteLength(JSON.stringify(event));if(batch.length>=128||bytes+size>65536)flush();batch.push(event);bytes+=size;return !recordFailed;}}));record(()=>capture?.input({input:admission.delta},input));flush();flushTimer=setInterval(flush,250);flushTimer.unref();}}
       received=undefined;
-      const ready=await enqueue(secret,admission.requestId,controller.signal,member.id,req);releaseSlot=ready.release;admission={...admission,account:ready.account,session:ready.session};alive();
+      const ready=await enqueue(secret,admission.requestId,controller.signal,member.id,req,admission.scope??undefined);releaseSlot=ready.release;admission={...admission,account:ready.account,session:ready.session};alive();
       if(ready.contextReset)record(()=>capture?.send('boundary',{reason:'context_reset'},'gateway'));
       extraBoundary=state.dispatchBoundary(secret,admission,{isCancelled:()=>controller.signal.aborted||res.destroyed||activity.isStopping(),authorizeDevice:person=>deviceAccess?.authorize(person,req,{phase:'dispatch'})});const result=await extraBoundary.run(async()=>{alive();dispatched=true;return runChat({account:admission.account,processLease:ready.processLease,output,session:admission.session,messages:admission.delta,model:original.model,signal:controller.signal,timeoutMs,onText:text=>record(()=>capture?.delta('chat-output','assistant',{},text))});});
       const facts=chatSettlementFacts(admission,result);if(result.usageKnown!==true||!['input','output','cached'].every(name=>Number.isSafeInteger(result[name])&&result[name]>=0)||result.cached>result.input||!facts.cursor||admission.session.upstream_id&&facts.upstreamId!==admission.session.upstream_id)throw Object.assign(fail(502,'CLI未返回可核对的会话和用量，请新建会话','chat_result_invalid'),result,{status:502});

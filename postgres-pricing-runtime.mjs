@@ -1,8 +1,8 @@
-import {randomUUID} from 'node:crypto';
 import {AppError,usageWindow} from './store.mjs';
 import seed from './pricing-data.mjs';
 import {fetchOfficialPricing,nextPricingSettings,pricingPublication,quoteReference} from './pricing.mjs';
 import {postgresPricingStatus} from './postgres-observability.mjs';
+import {createPostgresAudit} from './postgres-audit.mjs';
 import {fetchModelReleaseDates,mergeModelReleaseDates,modelReleaseRegistry,modelReleaseSetting} from './model-release-dates.mjs';
 
 const defaults=()=>({enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[]});
@@ -34,11 +34,11 @@ export function createPostgresPricingRuntime(store,{clock=Date.now,fetchImpl=fet
  // bounded admin query queue. The caller retains ownership of both resources.
  const readStatus=({signal}={})=>queryQueue?queryQueue.run(()=>postgresPricingStatus(readStore,clock()),{signal}):postgresPricingStatus(readStore,clock());
  const status=options=>track(()=>readStatus(options));
- function configure(value){return track(async()=>{
+ function configure(value,{scope}={}){return track(async()=>{
   await locked(async current=>{
    const settings=nextPricingSettings(current.settings,current.official,value,clock);
    await set('pricing.settings',settings);const revision=await publish({...current,settings});
-   await store.run('INSERT INTO harbor.audit(id,at,action,detail) VALUES($1,$2,$3,$4)',randomUUID(),clock(),'pricing.configure',JSON.stringify({version:settings.version,revision}));
+   await createPostgresAudit(store,{clock}).write(scope,{action:'pricing.configure',detail:{version:settings.version,revision}});
   });return readStatus();
  });}
  function refresh({force=false}={}){

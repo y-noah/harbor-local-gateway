@@ -1,5 +1,12 @@
 import {exactUsd,referenceModel} from './pricing.mjs';
 const hour=3600000,scale=1000000000000n;
+// Daily limits follow Beijing civil days; rolling seven-day limits keep an open lower bound.
+export function memberLimitWindow(hours,at){
+  return {start:hours===24?Math.floor((at+8*hour)/(24*hour))*24*hour-8*hour:at-hours*hour,end:at,inclusive:hours===24};
+}
+export function memberLimitExceededMessage(row){
+  return row.model+'已达到'+(row.hours===24?'北京时间当日':'近168小时')+'参考USD上限'+row.limit_usd+'，'+(row.hours===24?'请等待北京时间次日00:00重置或联系管理员':'请等待用量滚出窗口或联系管理员');
+}
 const failure=(status,message,code='invalid_member_limits')=>{throw Object.assign(new Error(message),{status,code});};
 const modelId=value=>typeof value==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(value)&&!['codex','claude'].includes(value);
 function amount(value){
@@ -42,8 +49,8 @@ export function createMemberLimits(store,{clock=Date.now}={}){
     }catch(error){store.db.exec('ROLLBACK');throw error;}
   }
   function status(memberId,at=clock()){
-    const config=configuration(memberId),maximum=Math.max(0,...config.rules.map(r=>r.hours)),models=new Set(config.rules.map(r=>effective(r,at).effective_model||r.model));
-    const rows=maximum?store.all('SELECT * FROM requests WHERE member_id=? AND ended>? AND ended<=?',memberId,at-maximum*hour,at):[];
+    const config=configuration(memberId),start=Math.min(at,...config.rules.map(r=>memberLimitWindow(r.hours,at).start)),models=new Set(config.rules.map(r=>effective(r,at).effective_model||r.model));
+    const rows=config.rules.length?store.all('SELECT * FROM requests WHERE member_id=? AND ended>=? AND ended<=?',memberId,start,at):[];
     const current=store.pricing.book(store.pricing.current());
     const measured=rows.map(row=>{
       const book=row.price_version?store.pricing.book(row.price_version):null,chosen=row.billing_model||row.model;
@@ -52,14 +59,15 @@ export function createMemberLimits(store,{clock=Date.now}={}){
       const quoted=book?store.pricing.quoteAt(row):null;
       return {ended:row.ended,model,atoms:zero?0n:typeof row.manual_cost_atoms==='string'&&/^\d+$/.test(row.manual_cost_atoms)?BigInt(row.manual_cost_atoms):quoted?.totalAtoms??null};
     });
-    const pending=maximum?store.all("SELECT model,billing_model,started,price_version FROM requests WHERE member_id=? AND ended IS NULL AND status IN ('queued','running')",memberId):[];
+    const pending=config.rules.length?store.all("SELECT model,billing_model,started,price_version FROM requests WHERE member_id=? AND ended IS NULL AND status IN ('queued','running')",memberId):[];
     const usage=config.rules.map(saved=>{
       const rule=effective(saved,at),model=rule.effective_model||rule.model;
+      const window=memberLimitWindow(rule.hours,at);
       let used=0n,unresolved=0;
-      for(const row of measured){if(row.ended<=at-rule.hours*hour||row.model!==model&&row.model!==null)continue;if(row.model===null){if(row.atoms!==0n)unresolved++;continue;}if(row.atoms===null)unresolved++;else used+=row.atoms;}
+      for(const row of measured){if(row.ended<window.start||!window.inclusive&&row.ended===window.start||row.model!==model&&row.model!==null)continue;if(row.model===null){if(row.atoms!==0n)unresolved++;continue;}if(row.atoms===null)unresolved++;else used+=row.atoms;}
       const ceiling=amount(rule.limit_usd),exceeded=used>=ceiling;
       const inFlight=pending.filter(row=>(referenceModel(row.billing_model||row.model,row.started,store.pricing.book(row.price_version))||row.billing_model||row.model)===model).length;
-      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved,in_flight:inFlight,exceeded,blocked:config.enabled&&(exceeded||unresolved>0||rule.invalid_model),window:{start:at-rule.hours*hour,end:at}};
+      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved,in_flight:inFlight,exceeded,blocked:config.enabled&&(exceeded||unresolved>0||rule.invalid_model),window:{start:window.start,end:window.end}};
     });
     return {...config,currency:'USD',observed_at:at,usage};
   }
@@ -80,7 +88,7 @@ export function createMemberLimits(store,{clock=Date.now}={}){
     if(!config.rules.some(rule=>requested.has(effective(rule,at).effective_model)))return;
     for(const row of status(memberId,at).usage){
       if(!requested.has(row.effective_model))continue;
-      if(row.exceeded)failure(429,row.model+'已达到近'+row.hours+'小时参考USD上限'+row.limit_usd+'，请等待用量滚出窗口或联系管理员','member_model_limit_exceeded');
+      if(row.exceeded)failure(429,memberLimitExceededMessage(row),'member_model_limit_exceeded');
       if(row.unresolved)failure(409,row.model+'窗口内存在无法计价的记录，请管理员核对后重试','member_model_usage_unknown');
     }
   }

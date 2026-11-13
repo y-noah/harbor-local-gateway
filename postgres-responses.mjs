@@ -1,4 +1,5 @@
 import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
+import {requireDepartmentScope} from './department-access.mjs';
 import {beginAdminRequestTiming,finishAdminRequestTiming,registerAdminRequestTimingSignal,wrapAdminQueryTimingQueue} from './admin-request-timing.mjs';
 import {createAdminJsonCompression} from './admin-json-compression.mjs';
 import {createPostgresConsumptionPolicy} from './postgres-consumption-policy.mjs';
@@ -57,11 +58,27 @@ async function sse(res,event,signal,sessionId,output,timing,contentToken){
 // Composable asynchronous endpoint. Routing and shared-limit adapters are
 // mandatory: this must never silently replace an existing policy with LRU or
 // an unlimited default while the PostgreSQL migration is being developed.
-export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,consumptionRouting,sourceAccounts,consumptionPolicyReady,checkLimits,transportForAccount,adminAuthenticated,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},pricingOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,captureContext,contextReader,contextIndexEnabled=false,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
+export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,consumptionRouting,sourceAccounts,consumptionPolicyReady,checkLimits,transportForAccount,adminAuthenticated,adminContext,revalidateAdminScope,departmentActors,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},pricingOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,captureContext,contextReader,contextIndexEnabled=false,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
   if(consumptionRouting!==undefined&&(!consumptionRouting||['read','resolve','fallback'].some(name=>typeof consumptionRouting[name]!=='function'))||sourceAccounts!==undefined&&typeof sourceAccounts!=='function'||consumptionPolicyReady!==undefined&&typeof consumptionPolicyReady!=='function')throw new AppError(503,'消耗来源请求依赖无效','postgres_configuration');
   if(typeof contextIndexEnabled!=='boolean'||captureContext!==undefined&&typeof captureContext!=='function'||contextReader!==undefined&&typeof contextReader?.read!=='function')throw new AppError(503,'上下文采集依赖无效','recording_configuration');
   if(!store||!recordings||!buffer||!meteringRecovery||['settle','flush','status','close'].some(name=>typeof meteringRecovery[name]!=='function')||[resolveRoute,checkLimits,transportForAccount,adminAuthenticated].some(fn=>typeof fn!=='function')||onRouteFailure!==undefined&&typeof onRouteFailure!=='function'||requestQueries!==undefined&&(!requestQueries||['read','close','status'].some(name=>typeof requestQueries[name]!=='function')||!requestQueries.queue||['run','close','status'].some(name=>typeof requestQueries.queue[name]!=='function'))||adminStateContext!==undefined&&typeof adminStateContext!=='function'||typeof recordingEnabled!=='boolean'||![maxConcurrent,maxPerMember].every(n=>Number.isInteger(n)&&n>=1))throw new AppError(503,'PostgreSQL请求处理依赖尚未配置完整','postgres_configuration');
   if(!meteringRecovery.directory||!buffer.directory||realpathSync(meteringRecovery.directory)===realpathSync(buffer.directory))throw new AppError(503,'计量与正文须使用独立恢复目录','metering_configuration');
+  if(adminContext!==undefined&&typeof adminContext!=='function'||revalidateAdminScope!==undefined&&typeof revalidateAdminScope!=='function')throw new AppError(503,'部门请求鉴权未配置完整','postgres_configuration');
+  const authorizeAdmin=async req=>{
+    if(adminContext){const scope=await adminContext(req);if(scope!==undefined)requireDepartmentScope(scope,{allowGlobal:true});return scope;}
+    if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
+    return undefined;
+  };
+  const refreshAdmin=async(req,scope)=>{
+    if(scope===undefined)return scope;
+    if(typeof revalidateAdminScope!=='function')throw new AppError(503,'部门管理会话复验未配置','postgres_configuration');
+    const current=await revalidateAdminScope(req,scope);requireDepartmentScope(current,{allowGlobal:true});return current;
+  };
+  const authorizeLegacyAdmin=async req=>{
+    let scope=await authorizeAdmin(req);
+    if(scope!==undefined)throw new AppError(503,'此入口尚未完成部门隔离适配','department_operation_unavailable');
+    return true;
+  };
   const consumptionPolicies=createPostgresConsumptionPolicy(store,{clock});
   const stages=createStreamingStageObserver(stageObserver);
   const timingPersistence={queued:0,rejected:0};
@@ -72,21 +89,21 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const queryQueue=requestQueries?.queue||wrapAdminQueryTimingQueue(createPostgresQueryQueue());
   const adminJsonCompression=createAdminJsonCompression();
   const usageJson=async(req,res,value,signal)=>adminJsonCompression.send(req,res,JSON.stringify(value),{authenticated:true,signal,beforeHeaders:()=>finishAdminRequestTiming(res,200,{authenticated:true})});
-  const handoffAdmin=createPostgresSessionHandoffs(store,{gate:sessionHandoffs,readStore:queryStore,queryQueue,clock,isStopping:()=>stopping,validateTarget:async(account,model,signal)=>{if(!model)return true;const transport=await transportForAccount(account);if(typeof transport.models!=='function')return false;const models=await transport.models({binary:codexBinary,home:account.auth_mode==='openai_api'?account.id:account.home,signal});return models.some(item=>item.slug===model);}});
-  const queries=requestQueries||createPostgresRequestQueries(queryStore,{clock,queryQueue,businessOutcomes:true,readInputPreviews:typeof recordingReader?.previews==='function'?ids=>recordingReader.previews(ids):undefined});
+  const handoffAdmin=createPostgresSessionHandoffs(store,{departmentActors,gate:sessionHandoffs,readStore:queryStore,queryQueue,clock,isStopping:()=>stopping,validateTarget:async(account,model,signal)=>{if(!model)return true;const transport=await transportForAccount(account);if(typeof transport.models!=='function')return false;const models=await transport.models({binary:codexBinary,home:account.auth_mode==='openai_api'?account.id:account.home,signal});return models.some(item=>item.slug===model);}});
+  const queries=requestQueries||createPostgresRequestQueries(queryStore,{clock,queryQueue,businessOutcomes:true,readInputPreviews:typeof recordingReader?.previews==='function'?(ids,options)=>recordingReader.previews(ids,options):undefined});
   const adminRouter=createPostgresRouter(store,{clock,isStopping:()=>stopping,extraRuntime}),readRouter=createPostgresRouter(queryStore,{clock});
-  const states=createPostgresStateQueries(queryStore,{clock,encryptionKey:keyEncryptionKey,queryQueue,balancingReader:at=>readRouter.readView({at})});
-  const readAdminState=async(query,{signal}={})=>({...await states.read(query,{signal}),...(adminStateContext?await adminStateContext():{}),busy:active.size,queue:chat?.status().queued??0,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0)});
+  const states=createPostgresStateQueries(queryStore,{clock,encryptionKey:keyEncryptionKey,queryQueue,balancingReader:(at,options)=>readRouter.readView({at,...options})});
+  const readAdminState=async(query,{signal,scope}={})=>({...await states.read(query,{signal,scope}),...(adminStateContext?await adminStateContext({scope}):{}),...(scope?.view==='department'?{}:{busy:active.size,queue:chat?.status().queued??0,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0)})});
   const sessionAdmin=createPostgresSessionAdmin(store,{clock,preparation,isPreparing:memberId=>preparing.has(memberId),isStopping:()=>stopping});
-  const planning=createPostgresPlanningJobs(store,{jobs:createPostgresJobs(store),clock}),planningReader=createPostgresPlanningJobs(queryStore,{jobs:createPostgresJobs(queryStore),clock});
+  const planning=createPostgresPlanningJobs(store,{jobs:createPostgresJobs(store,{departmentActors,scopedKinds:['routing.preview']}),clock}),planningReader=createPostgresPlanningJobs(queryStore,{jobs:createPostgresJobs(queryStore),clock});
   const history=createPostgresHistoryQueries(queryStore,{clock});
-  const pricingAdmin=createPostgresPricingAdmin(store,{...pricingOptions,clock,adminAuthenticated,readStore:queryStore,queryQueue,readBody:(req,{signal}={})=>requestBodies.read(req,{owner:'admin',maxBytes:65536,signal})});
-  const memberAdmin=createPostgresMemberAdmin(store,{clock,readStore:queryStore,encryptionKey:keyEncryptionKey,queryQueue,isBusy:memberId=>members.has(memberId),consumptionReady:consumptionPolicyReady});
+  const pricingAdmin=createPostgresPricingAdmin(store,{...pricingOptions,clock,adminAuthenticated,adminContext:authorizeAdmin,readStore:queryStore,queryQueue,readBody:(req,{signal}={})=>requestBodies.read(req,{owner:'admin',maxBytes:65536,signal})});
+  const memberAdmin=createPostgresMemberAdmin(store,{clock,readStore:queryStore,encryptionKey:keyEncryptionKey,queryQueue,isBusy:memberId=>members.has(memberId),consumptionReady:consumptionPolicyReady,departmentActors});
   const deviceAccess=createPostgresDeviceAccess(store,{issuer:deviceIssuer,clock,readStore:queryStore,queryQueue});
   const clientCatalog=createPostgresClientCatalog(store,{deviceAccess,transportForAccount,sourceAccounts,codexBinary,clock});
-  const typeStatisticsAdmin=createPostgresTypeStatisticsAdmin(queryStore,{clock,queryQueue,adminAuthenticated});
-  const recordingJobs=recordingBackend??(recordingKey?createPostgresRecordingJobs(store,{...recordingBackendOptions,contextIndex:contextIndexEnabled,contextStorage:!!contextReader,recordingKey,clock,readStore:queryStore,queryQueue,storagePolicy:recordingStoragePolicy,devices:true}):null);
-  const recordingAdmin=recordingJobs?createPostgresRecordingAdmin(recordingJobs,{...recordingAdminOptions,adminAuthenticated,requestBodies}):null;
+  const typeStatisticsAdmin=createPostgresTypeStatisticsAdmin(queryStore,{clock,queryQueue,adminAuthenticated,adminContext});
+  const recordingJobs=recordingBackend??(recordingKey?createPostgresRecordingJobs(store,{...recordingBackendOptions,departmentActors,contextIndex:contextIndexEnabled,contextStorage:!!contextReader,recordingKey,clock,readStore:queryStore,queryQueue,storagePolicy:recordingStoragePolicy,devices:true}):null);
+  const recordingAdmin=recordingJobs?createPostgresRecordingAdmin(recordingJobs,{...recordingAdminOptions,adminAuthenticated,adminContext,revalidateAdminScope,requestBodies}):null;
   const selfQuery=createPostgresSelfQuery(queryStore,{clock,queryQueue});
   const chat=runChat?createPostgresChatService({...chatOptions,extraRuntime,execution,cliProcesses,outputBudget,readBody:requestBodies.read,store,buffer,meteringRecovery,checkLimits,runChat,deviceAccess,recordingEnabled,captureContext,recordingPolicy,clock,maxConcurrent,maxPerMember,refreshQuotas:()=>accountAdmin?.refreshQuotas?.()||Promise.resolve(),activity:{active,members,preparing,preparation,accounts,isStopping:()=>stopping}}):null;
   const platform=platformTransport?createPostgresPlatformService({extraRuntime,execution,outputBudget,readBody:requestBodies.read,store,queryStore,queryQueue,buffer,meteringRecovery,checkLimits,transport:platformTransport,credential:(row,signal)=>accountAdmin.platformCredential(row,signal),deviceAccess,recordingEnabled,captureContext,recordingPolicy,clock,maxConcurrent,maxPerMember,activity:{active,members,preparing,preparation,accounts,isStopping:()=>stopping,wake:()=>void chat?.wake()}}):null;
@@ -100,24 +117,26 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       const result=await deviceAccess.publicHandle(path,req.method,payload,req);if(result){json(res,result.status,result.value);return true;}
     }
     if(/^\/api\/admin\/(devices|device-invitations)(?:\/|$)/.test(path)){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
+      let scope=await authorizeAdmin(req);
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',maxBytes:65536,signal:bodySignal}):{};
-      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){json(res,result.status,result.value);return true;}
+      if(['POST','PATCH'].includes(req.method))scope=await refreshAdmin(req,scope);
+      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,{scope,...(scope!==undefined?{revalidateScope:original=>refreshAdmin(req,original)}:{}),...(req.method==='GET'?{signal:bodySignal}:{})});if(result){json(res,result.status,result.value);return true;}
     }
-    if(path==='/api/me'&&req.method==='GET'){const secret=String(req.headers.authorization||'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at:clock()});await deviceAccess.authorize(member,req);json(res,200,await selfQuery(secret));return true;}
+    if(path==='/api/me'&&req.method==='GET'){const secret=String(req.headers.authorization||'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at:clock()});await deviceAccess.authorize(member,req);json(res,200,await selfQuery(secret,{scope:store.departmentScope?.(member)}));return true;}
     if(await clientCatalog.handle(req,res))return true;
     if(platform&&['/v1/platform/models','/v1/platform/chat/completions'].includes(path))return platform.handle(req,res);
     if(path==='/v1/chat/completions'&&req.method==='POST'&&chat)return chat.handle(req,res);
     if(/^\/api\/admin\/(sessions|balancing)(?:\/|$)/.test(path)){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
+      let scope=await authorizeAdmin(req);
       if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
+      if(['POST','PATCH'].includes(req.method))scope=await refreshAdmin(req,scope);
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
       if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');
-      const handoff=await handoffAdmin.handle(path,req.method,payload,req.method==='GET'?{signal:bodySignal}:{});if(handoff){json(res,handoff.status,handoff.value);return true;}
+      const handoff=await handoffAdmin.handle(path,req.method,payload,{scope,...(scope!==undefined?{revalidateScope:original=>refreshAdmin(req,original)}:{}),...(req.method==='GET'?{signal:bodySignal}:{})});if(handoff){json(res,handoff.status,handoff.value);return true;}
       if(path==='/api/admin/balancing/plans'&&req.method==='POST'){
         if(Object.keys(payload).length)throw new AppError(400,'规划预览无需额外参数');
-        const result=await store.transaction(async()=>{if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');const result=await planning.enqueue();if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');return result;});
+        const result=await store.transaction(async()=>{if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');const result=await planning.enqueue({scope});if(stopping)throw new AppError(503,'会话管理正在关闭','service_stopping');return result;});
         json(res,202,result);return true;
       }
       const planPath=path.match(/^\/api\/admin\/balancing\/plans\/([a-zA-Z0-9-]+)(\/items)?$/);
@@ -125,72 +144,83 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         let result;
         if(planPath[2]){
           const params=url.searchParams;if([...params.keys()].some(key=>!['section','after','limit'].includes(key))||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))throw new AppError(400,'规划分页参数无效','planning_query_invalid');
-          result=await queryQueue.run(()=>planningReader.page(planPath[1],{section:params.get('section')??'moves',after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)}),{signal:bodySignal});
-        }else result=await queryQueue.run(()=>planningReader.status(planPath[1]),{signal:bodySignal});
+          result=await queryQueue.run(()=>planningReader.page(planPath[1],{scope,section:params.get('section')??'moves',after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)}),{signal:bodySignal});
+        }else result=await queryQueue.run(()=>planningReader.status(planPath[1],{scope}),{signal:bodySignal});
         json(res,200,result);return true;
       }
-      if(path==='/api/admin/balancing/explanation'&&req.method==='GET'){json(res,200,await queryQueue.run(()=>readRouter.readView({explanation:true}),{signal:bodySignal}));return true;}
-      if(path==='/api/admin/balancing'&&req.method==='PATCH'){json(res,200,await adminRouter.saveSettings(payload));return true;}
-      if(path==='/api/admin/balancing/schedule'&&req.method==='PATCH'){json(res,200,await adminRouter.saveTransferSchedule(payload));return true;}
-      if(path==='/api/admin/balancing/weights'&&req.method==='PATCH'){const result=await adminRouter.saveWeights(payload);await handoffAdmin.reconcileAutomatic();json(res,200,result);return true;}
-      const result=await sessionAdmin.handle(path,req.method,payload);if(result){json(res,result.status,result.value);return true;}
+      if(path==='/api/admin/balancing/explanation'&&req.method==='GET'){json(res,200,await queryQueue.run(()=>readRouter.readView({explanation:true,scope}),{signal:bodySignal}));return true;}
+      if(path==='/api/admin/balancing'&&req.method==='PATCH'){json(res,200,await adminRouter.saveSettings(payload,{scope}));return true;}
+      if(path==='/api/admin/balancing/schedule'&&req.method==='PATCH'){json(res,200,await adminRouter.saveTransferSchedule(payload,{scope}));return true;}
+      if(path==='/api/admin/balancing/weights'&&req.method==='PATCH'){const result=await adminRouter.saveWeights(payload,{scope});if(scope===undefined)await handoffAdmin.reconcileAutomatic();json(res,200,result);return true;}
+      const result=await sessionAdmin.handle(path,req.method,payload,{scope});if(result){json(res,result.status,result.value);return true;}
     }
     if(accountAdmin&&/^\/api\/admin\/(accounts|account-packages|quotas|platform)(?:\/|$)/.test(path)){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
+      let scope=await authorizeAdmin(req);
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
+      if(['POST','PATCH'].includes(req.method))scope=await refreshAdmin(req,scope);
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
-      const result=await accountAdmin.handle(path,req.method,payload,req.method==='GET'?{signal:bodySignal}:{});if(result){void chat?.wake();json(res,result.status,result.value);return true;}
+      const result=await accountAdmin.handle(path,req.method,payload,{scope,...(scope!==undefined&&revalidateAdminScope?{revalidateScope:original=>revalidateAdminScope(req,original)}:{}),...(req.method==='GET'?{signal:bodySignal}:{})});if(result){void chat?.wake();json(res,result.status,result.value);return true;}
     }
     if(/^\/api\/admin\/(members|keys|member-types|member-config-batches|member-action-batches)(?:\/|$)/.test(path)){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
+      let scope=await authorizeAdmin(req);
       const payload=['POST','PATCH'].includes(req.method)?await requestBodies.read(req,{owner:'admin',signal:bodySignal}):{};
+      if(['POST','PATCH'].includes(req.method))scope=await refreshAdmin(req,scope);
       if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new AppError(400,'管理参数须为对象');
-      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{})||await memberAdmin.handle(path,req.method,payload,url.searchParams,req.method==='GET'?{signal:bodySignal}:{});if(result){if(path==='/api/admin/members'&&req.method==='GET'&&result.status===200)await usageJson(req,res,result.value,bodySignal);else json(res,result.status,result.value);return true;}
+      const result=await deviceAccess.handle(path,req.method,payload,url.searchParams,{scope,...(scope!==undefined?{revalidateScope:original=>refreshAdmin(req,original)}:{}),...(req.method==='GET'?{signal:bodySignal}:{})})||await memberAdmin.handle(path,req.method,payload,url.searchParams,{scope,...(req.method==='GET'?{signal:bodySignal}:{})});if(result){if(path==='/api/admin/members'&&req.method==='GET'&&result.status===200)await usageJson(req,res,result.value,bodySignal);else json(res,result.status,result.value);return true;}
     }
     if((path==='/api/admin/history'||path.startsWith('/api/admin/history/'))&&req.method==='GET'){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      if(path==='/api/admin/history'){json(res,200,await queryQueue.run(()=>history.list(historyQuery(url.searchParams)),{signal:bodySignal}));return true;}
+      let scope=await authorizeAdmin(req);
+      if(path==='/api/admin/history'){json(res,200,await queryQueue.run(()=>history.list(historyQuery(url.searchParams),{scope}),{signal:bodySignal}));return true;}
       const match=path.match(/^\/api\/admin\/history\/nightly\/(\d{4}-\d{2}-\d{2}(?:-\d{4})?)(\/(?:items|revisions))?$/);if(!match)throw new AppError(404,'历史查询入口不存在');
       const params=url.searchParams;
       const allowed=match[2]==='/items'?['section','after','limit','revision']:match[2]==='/revisions'?['after','limit']:['revision'];
       for(const name of params.keys())if(!allowed.includes(name)||params.getAll(name).length!==1)throw new AppError(400,'夜间历史查询参数无效');
       for(const name of ['after','limit','revision'])if(params.has(name)&&!/^\d+$/.test(params.get(name)))throw new AppError(400,'夜间历史分页无效');
-      const revision=params.has('revision')?Number(params.get('revision')):undefined,paging={after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)};
-      const result=await queryQueue.run(()=>match[2]==='/revisions'?history.revisions(match[1],paging):match[2]?history.page(match[1],{...paging,revision,section:params.get('section')??'moves'}):history.nightly(match[1],{revision}),{signal:bodySignal});json(res,200,result);return true;
+      const revision=params.has('revision')?Number(params.get('revision')):undefined,paging={after:Number(params.get('after')??0),limit:Number(params.get('limit')??20),scope};
+      const result=await queryQueue.run(()=>match[2]==='/revisions'?history.revisions(match[1],paging):match[2]?history.page(match[1],{...paging,revision,section:params.get('section')??'moves'}):history.nightly(match[1],{revision,scope}),{signal:bodySignal});json(res,200,result);return true;
     }
     if(await pricingAdmin.handle(req,res,{signal:bodySignal}))return true;
     if(path==='/api/admin/state'&&req.method==='GET'){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      json(res,200,await readAdminState(stateQuery(url.searchParams),{signal:bodySignal}));return true;
+      let scope=await authorizeAdmin(req);
+      json(res,200,await readAdminState(stateQuery(url.searchParams),{signal:bodySignal,scope}));return true;
     }
     if(path==='/api/admin/requests'&&req.method==='GET'){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      await usageJson(req,res,await queries.read(requestsQuery(url.searchParams,{usageTypes:true}),{signal:bodySignal}),bodySignal);return true;
+      let scope=await authorizeAdmin(req);
+      await usageJson(req,res,await queries.read(requestsQuery(url.searchParams,{usageTypes:true}),{signal:bodySignal,scope}),bodySignal);return true;
     }
     const contextDetail=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]{1,80})\/context$/);
     if(contextDetail&&req.method==='GET'){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
+      let scope=await authorizeAdmin(req);
       for(const key of url.searchParams.keys())if(!['after_component','after_part','limit'].includes(key)||url.searchParams.getAll(key).length!==1)throw new AppError(400,'上下文分页无效');
       const numeric=(name,fallback)=>url.searchParams.has(name)&&/^\d+$/.test(url.searchParams.get(name))?Number(url.searchParams.get(name)):url.searchParams.has(name)?NaN:fallback;
-      const options={after:{component:numeric('after_component',0),part:numeric('after_part',0)},limit:numeric('limit',32)};
+      const options={after:{component:numeric('after_component',0),part:numeric('after_part',0)},limit:numeric('limit',32),scope};
       if(!Object.values(options.after).every(value=>Number.isSafeInteger(value)&&value>=0)||!Number.isInteger(options.limit)||options.limit<1||options.limit>100)throw new AppError(400,'上下文分页无效');
       json(res,200,await queryQueue.run(async()=>{
         if(contextReader)return contextReader.read(contextDetail[1],options);
-        if(!await queryStore.get('SELECT id FROM harbor.requests WHERE id=$1',contextDetail[1]))throw new AppError(404,'请求不存在');
+        await postgresRequestObservation(queryStore,contextDetail[1],clock(),{scope});
         return {state:'unavailable',parts:[],next:{component:0,part:0},hasMore:false};
       },{signal:bodySignal}));return true;
     }
     const detail=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]{1,80})(\/recording)?$/);
     if(detail&&req.method==='GET'){
-      if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
-      if(!detail[2]){json(res,200,await queryQueue.run(()=>postgresRequestObservation(queryStore,detail[1],clock()),{signal:bodySignal}));return true;}
+      let scope=await authorizeAdmin(req);
+      if(!detail[2]){json(res,200,await queryQueue.run(()=>postgresRequestObservation(queryStore,detail[1],clock(),{scope}),{signal:bodySignal}));return true;}
       for(const key of url.searchParams.keys())if(!['after','limit'].includes(key)||url.searchParams.getAll(key).length!==1)throw new AppError(400,'正文分页无效');
       const numeric=(name,fallback)=>url.searchParams.has(name)&&/^\d+$/.test(url.searchParams.get(name))?Number(url.searchParams.get(name)):url.searchParams.has(name)?NaN:fallback;
-      json(res,200,await queryQueue.run(()=>recordingReader.read(detail[1],{after:numeric('after',0),limit:numeric('limit',32)}),{signal:bodySignal}));return true;
+      json(res,200,await queryQueue.run(()=>recordingReader.read(detail[1],{after:numeric('after',0),limit:numeric('limit',32),scope}),{signal:bodySignal}));return true;
     }
     const jsonPath=path.startsWith('/v1/')&&codexJsonRoutes.has(path.slice(3))?path.slice(3):null;
     if((path!=='/v1/responses'&&!jsonPath)||req.method!=='POST')return false;
     const secret=String(req.headers.authorization||'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at:clock()});
+    const requestScope=store.departmentScope?.(member);
+    const authenticatedScope=current=>{
+      const scope=store.departmentScope?.(current);
+      if(requestScope!==undefined){
+        requireDepartmentScope(scope,{roles:['employee']});
+        if(['department_id','member_id','member_version','credential_id','credential_version','department_version'].some(field=>scope[field]!==requestScope[field]))throw new AppError(403,'请求访问身份已变化','request_identity_changed');
+      }else if(scope!==undefined)throw new AppError(503,'请求受理期间部门结构已变化','department_migration_conflict');
+      return scope;
+    };
     await deviceAccess.authorize(member,req);
     const captureDecision=await recordingCaptureDecision(recordingEnabled,recordingPolicy),captureEnabled=captureDecision.enabled;
     if(stopping)throw new AppError(503,'服务正在排空，请稍后重试','service_stopping');
@@ -258,7 +288,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       contextReplayable=!jsonPath&&replayableResponsesInput(payload);
       // Never wait with a database transaction or routing lock held. Arrival
       // already covers uploads whose client identity only appears in the body.
-      const identified=await findPostgresResponseSession(store,member,payload,req.headers);
+      const identified=await findPostgresResponseSession(store,member,payload,req.headers,{scope:requestScope});
       if(identified.session)await ticket.bind(identified.session.id);
       receipt.timing?.preDispatch('sessionReady');
       // This request already owned admission/upload capacity before drain.
@@ -269,29 +299,30 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       // This receipt changes observation only; routing and settlement stay intact.
       try{receipt.nested=!!store.context?.getStore?.();}catch{receipt.nested=true;}
       let route=await store.transaction(async()=>{
-        const current=await store.authenticate(secret,{at:clock(),lock:true}),device=await deviceAccess.authorize(current,req,{phase:'admission'});await store.checkModel(current,payload.model,payload.tools);
+        const current=await store.authenticate(secret,{at:clock(),lock:true}),scope=authenticatedScope(current),device=await deviceAccess.authorize(current,req,{phase:'admission'});await store.checkModel(current,payload.model,payload.tools);
         await checkLimits(current,payload,{at:clock()});
-        const route=await (consumptionRouting?consumptionRouting.resolve(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses'}):resolveRoute(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses'}));
+        const route=await (consumptionRouting?consumptionRouting.resolve(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope}):resolveRoute(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope}));
         if(!route?.session?.id||!route?.account?.id)throw new AppError(503,'会话路由未准备好','session_account_unavailable');
         if(identified.session&&identified.session.id!==route.session.id)throw new AppError(409,'会话关联已变化，请稍后重试','session_route_conflict');
         // Recheck trusted ownership/state, even when an adapter returns stale data.
         const session=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND protocol='responses' AND enabled=1 FOR SHARE",route.session.id,current.id);
         const account=session&&await store.get("SELECT * FROM harbor.accounts WHERE id=$1 AND enabled=1 AND removed_at IS NULL AND state IN ('ready','degraded') FOR SHARE",session.account_id);
         if(!account||account.id!==route.account.id)throw new AppError(503,'会话路由已变化或不可用','session_route_conflict');
+        if(scope&&(session.department_id!==scope.department_id||account.department_id!==scope.department_id))throw new AppError(403,'会话和账号不属于当前部门','department_forbidden');
         if(session.handoff_requires_replay&&!contextReplayable)throw new AppError(409,'此会话已跨账号转移，当前上下文不支持重放；请提交可重放的完整上下文','session_context_unsupported');
         if(jsonPath&&account.auth_mode==='openai_api')throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');
         stage.emit('admission-attempt');releaseExecution=execution.acquire({memberId:current.id,accountId:account.id});if(releaseExecution){stage.emit('lease',{lease:'execution',action:'acquire'});stage.emit('admission-granted');}if(!releaseExecution)throw new AppError(503,'账号执行容量已满，请稍后重试','inference_capacity_busy');
-        const requestId=await store.observe(current,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model,{at:clock(),channel:jsonPath?jsonPath.slice(1):'responses',device,parameters:payload});
+        const requestId=await store.observe(current,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model,{at:clock(),channel:jsonPath?jsonPath.slice(1):'responses',device,parameters:payload,scope});
         await store.run('UPDATE harbor.requests SET account_id=$1,session_id=$2,route_version=$3,recording_state=$4,handoff_input=$5,recording_reason=$7 WHERE id=$6',account.id,session.id,session.route_version,captureEnabled?'pending':'disabled',contextReplayable?'replayable':'opaque',requestId,captureDecision.reason);
         if(route.consumption?.schemaAvailable)await consumptionPolicies.recordAdmission(requestId,current.key_id,route.consumption);
         await store.run('UPDATE harbor.accounts SET last_used=$1 WHERE id=$2',clock(),account.id);
-        const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:jsonPath?'images':'responses'}),fixed:!!identified.fixed};
-        receipt.callbackCompleted=true;return {requestId,account,session,extraAdmission,...(route.consumption?{consumption:route.consumption}:{})};
+        const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:jsonPath?'images':'responses',scope}),fixed:!!identified.fixed};
+        receipt.callbackCompleted=true;return {requestId,account,session,extraAdmission,scope,...(route.consumption?{consumption:route.consumption}:{})};
       });
       receipt.timing?.preDispatch('admissionEnd');
       requestId=route.requestId;consumption=route.consumption;if(consumption?.schemaAvailable)sourceHeaders();if(receipt.nested)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:true,recordingExpected:captureEnabled});routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
-      const createBoundary=()=>extraRuntime.boundary({requestId,protocol:jsonPath?'images':'responses',admittedExtra:route.extraAdmission.extraReserved,fixed:route.extraAdmission.fixed,packagePreference:adminRouter.dispatchPreference,
-        prepare:async request=>{ensureConnected();const current=await store.authenticate(secret,{at:clock(),lock:true});if(current.id!==request.member_id||current.key_id!==request.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});await lockPostgresRouting(store);return ensureConnected;},
+      const createBoundary=()=>extraRuntime.boundary({requestId,scope:route.scope,protocol:jsonPath?'images':'responses',admittedExtra:route.extraAdmission.extraReserved,fixed:route.extraAdmission.fixed,packagePreference:route.scope?adminRouter.dispatchPreferenceFor(route.scope):adminRouter.dispatchPreference,
+        prepare:async request=>{ensureConnected();const current=await store.authenticate(secret,{at:clock(),lock:true});authenticatedScope(current);if(current.id!==request.member_id||current.key_id!==request.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});await lockPostgresRouting(store);return ensureConnected;},
         validate:async(account,request)=>{const current=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 FOR SHARE",request.session_id);if(account.id!==route.account.id||account.route_epoch!==route.account.route_epoch||!current||current.id!==route.session.id||current.member_id!==member.id||!current.enabled||current.protocol!=='responses'||current.account_id!==account.id||current.route_version!==request.route_version)throw new AppError(409,'会话或账号身份已变化，请重新请求','session_route_conflict');if(jsonPath&&account.auth_mode==='openai_api')throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');ensureConnected();}
       });
       extraBoundary=createBoundary();
@@ -335,16 +366,17 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         ensureConnected();let nextRelease,preparedRoute,preparedAt;const previousRoute=route;
         try{
           const next=await store.transaction(async()=>{
-            const current=await store.authenticate(secret,{at:clock(),lock:true});if(current.id!==member.id||current.key_id!==member.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');
+            const current=await store.authenticate(secret,{at:clock(),lock:true}),scope=authenticatedScope(current);if(current.id!==member.id||current.key_id!==member.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');
             await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});ensureConnected();
-            const selected=await consumptionRouting.fallback({member:current,payload,headers:req.headers,options:{preparing,protocol:'responses'},requestId,route,error,attempts:0,outputStarted:false,contextReplayable});
+            const selected=await consumptionRouting.fallback({member:current,payload,headers:req.headers,options:{preparing,protocol:'responses',scope},requestId,route,error,attempts:0,outputStarted:false,contextReplayable});
             const session=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND enabled=1 FOR SHARE",selected.session.id,current.id),account=session&&await store.get("SELECT * FROM harbor.accounts WHERE id=$1 AND enabled=1 AND removed_at IS NULL AND state IN ('ready','degraded') FOR SHARE",session.account_id);
             if(!account||account.id!==selected.account.id||session.route_version!==selected.session.route_version||account.id===previous.id||session.route_version!==previousRoute.session.route_version+1||account.auth_mode!=='subscription')throw new AppError(409,'备用会话或账号已变化','session_route_conflict');
+            if(scope&&(session.department_id!==scope.department_id||account.department_id!==scope.department_id))throw new AppError(403,'备用会话和账号不属于当前部门','department_forbidden');
             nextRelease=execution.acquire({memberId:current.id,accountId:account.id});if(!nextRelease)throw new AppError(503,'备用账号执行容量已满','inference_capacity_busy');stage.emit('lease',{lease:'execution',action:'acquire'});
             const updated=await store.run("UPDATE harbor.requests SET account_id=$1,session_id=$2,route_version=$3,status='queued',business_status='running' WHERE id=$4 AND key_id=$5 AND account_id=$6 AND route_version=$7 AND status IN ('queued','running') AND ended IS NULL",account.id,session.id,session.route_version,requestId,current.key_id,previous.id,route.session.route_version);if(updated.changes!==1)throw new AppError(409,'备用派发的原请求已变化','consumption_fallback_conflict');
             await store.run('UPDATE harbor.accounts SET last_used=$1 WHERE id=$2',clock(),account.id);
-            const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:'responses'}),fixed:false};ensureConnected();
-            preparedAt=clock();preparedRoute={...selected,requestId,account,session,extraAdmission};return preparedRoute;
+            const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:'responses',scope}),fixed:false};ensureConnected();
+            preparedAt=clock();preparedRoute={...selected,requestId,account,session,extraAdmission,scope};return preparedRoute;
           });
           route=next;consumption=next.consumption;releaseExecution=nextRelease;nextRelease=null;attemptIndex=-1;
           if(accountTracked){const count=accounts.get(previous.id)-1;if(count)accounts.set(previous.id,count);else accounts.delete(previous.id);}routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
@@ -366,7 +398,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
           }
           throw fallbackError;
         }
-        finally{if(onRouteFailure)try{await onRouteFailure(previous,error.routeFailure);}catch{}}
+        finally{if(onRouteFailure)try{await onRouteFailure(previous,error.routeFailure,{scope:requestScope});}catch{}}
         extraBoundary=createBoundary();ensureConnected();result=await dispatch();
       }
       finishAttempt(result);if(consumption?.schemaAvailable){actualConsumptionSource=consumptionSource(route.account);actualFallback=consumptionAttempts.length===2;}sourceHeaders();
@@ -385,7 +417,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(attemptIndex>=0&&['dispatched','unknown'].includes(consumptionAttempts[attemptIndex]?.state))finishAttempt(error,{failed:true});sourceHeaders();
       dispatched||=extraBoundary?.status().dispatched===true;
       if(requestId){
-        if(onRouteFailure&&routedAccount&&error.routeFailure){try{await onRouteFailure(routedAccount,error.routeFailure);}catch{}}
+        if(onRouteFailure&&routedAccount&&error.routeFailure){try{await onRouteFailure(routedAccount,error.routeFailure,{scope:requestScope});}catch{}}
         finishCapture();
         if(recordStarted&&!writeRecording('finish',requestId,{state:'partial',...recordingFinishReason(recordFailed?recordFailureReason??'capture_failed':controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted')}))recordFailed=true;
         if(!settlementAttempted)await settle({...error,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':controller.signal.aborted?'cancelled':error.status&&error.status<500?'rejected':'failed',usageKnown:consumption?.schemaAvailable?!extraBoundary?.status().uncertain&&(!currentDispatched||error.usageKnown===true):!dispatched||!extraBoundary?.status().uncertain&&error.usageKnown===true}).catch(()=>{});
@@ -430,5 +462,5 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       requestBodies.release(req);
     }
   };
-  return {handle,initialOverview:({signal}={})=>readAdminState(stateQuery(new URLSearchParams('view=overview&people=none')),{signal}),stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({consumptionRouting:{configured:!!consumptionRouting,sourceAccounts:typeof sourceAccounts==='function'},streamTiming:{...timingPersistence},clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),tickPricing:()=>pricingAdmin.tick(),closeQueries:async()=>{await pricingAdmin.close();return Promise.all([adminJsonCompression.close(),typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]);},drain:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
+  return {handle,initialOverview:({signal,scope}={})=>readAdminState(stateQuery(new URLSearchParams('view=overview&people=none')),{signal,scope}),stageObserverStatus:()=>({handler:stages.status(),requestBodies:requestBodies.stageObserverStatus?.()??{enabled:false},preparation:preparation.stageObserverStatus(),handoff:sessionHandoffs.stageObserverStatus()}),recordingBackend:recordingJobs,preparation,sessionHandoffs,handoffAdmin,deviceAccess,recoverHandoffs:handoffAdmin.recover,status:()=>({consumptionRouting:{configured:!!consumptionRouting,sourceAccounts:typeof sourceAccounts==='function'},streamTiming:{...timingPersistence},clientCatalog:clientCatalog.status(),recordingAdmin:recordingAdmin?.status()??null,typeStatistics:typeStatisticsAdmin.status(),handoffAdmin:handoffAdmin.status(),sessionHandoffs:sessionHandoffs.status(),outputBuffers:outputBudget.status(),execution:execution.status(),requestBodies:requestBodies.status(),active:active.size,preparing:[...preparing.values()].reduce((sum,n)=>sum+n,0),routingPreparation:preparation.status(),queries:queries.status(),chat:chat?.status()??null,meteringRecovery:meteringRecovery.status(),stopping}),closeRecording:options=>recordingAdmin?.close(options),tickPricing:()=>pricingAdmin.tick(),closeQueries:async()=>{await pricingAdmin.close();return Promise.all([adminJsonCompression.close(),typeStatisticsAdmin.close(),recordingAdmin?.close(),clientCatalog.close(),handoffAdmin.close(),queries.close(),states.close()]);},drain:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});clientCatalog.stop();handoffAdmin.stop();chat?.drain();},abort:()=>{stopping=true;void pricingAdmin.close().catch(()=>{});void recordingAdmin?.close({force:true,timeoutMs:0});clientCatalog.stop();handoffAdmin.stop();chat?.drain();for(const controller of active)controller.abort(new AppError(503,'服务排空超时或实例失去所有权','service_shutdown'));}};
 }

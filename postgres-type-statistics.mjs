@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {AppError,usageWindow} from './store.mjs';
 import {fields,validPrice,joins,aggregate,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
+import {createQueryDepartments,departmentPredicate,queryDepartmentIdentity} from './postgres-query-departments.mjs';
 
 const states=new Set(['queued','running','ok','failed','unknown','interrupted','cancelled','rejected']);
 const invalid=(message='使用类型统计筛选无效')=>{throw new AppError(400,message,'type_statistics_invalid');};
@@ -26,7 +27,7 @@ export function typeStatisticsQuery(params){
 }
 // Uses request-time identity only. Callers can reuse these exact conditions for
 // list/export drill-down; current employee classification never enters SQL.
-export function typeStatisticsConditions(value,{at=Date.now(),alias='r',start=1}={}){
+export function typeStatisticsConditions(value,{at=Date.now(),alias='r',start=1,departmentScope=null}={}){
   const query=normalize(value);if(!Number.isSafeInteger(at)||at<0||!Number.isSafeInteger(start)||start<1||start>1000||!/^[a-z][a-z0-9_]{0,20}$/.test(alias))invalid();
   const visible=usageWindow(at),window={start:query.from??visible.start,end:query.to??visible.end};
   if(window.start<visible.start||window.end>visible.end||window.start>=window.end)invalid('统计仅支持近7个北京时间自然日');
@@ -37,6 +38,7 @@ export function typeStatisticsConditions(value,{at=Date.now(),alias='r',start=1}
   if(query.memberMissing)where.push(`${alias}.member_id IS NULL`);else if(query.member)add(`${alias}.member_id=`,query.member);
   if(query.modelMissing)where.push(`COALESCE(NULLIF(${alias}.billing_model,''),NULLIF(${alias}.model,'')) IS NULL`);else if(query.model)add(`COALESCE(NULLIF(${alias}.billing_model,''),NULLIF(${alias}.model,''))=`,query.model);
   if(query.status==='unknown')where.push(`${alias}.business_status NOT IN ('ok','failed','queued','running','cancelled','rejected','interrupted')`);else if(query.status)add(`${alias}.business_status=`,query.status);
+  if(departmentScope!==null)where.push(departmentPredicate(departmentScope,alias,values,start-1));
   return {where:where.join(' AND '),values,window,filters:{...query,from:window.start,to:window.end}};
 }
 const counters=`COUNT(*) FILTER(WHERE status='failed') failed,COUNT(*) FILTER(WHERE status='queued') queued,COUNT(*) FILTER(WHERE status='running') running,
@@ -52,8 +54,9 @@ function usage(row){
 export function createPostgresTypeStatistics(store,{clock=Date.now,queryQueue,pageBytes=524288,maxVersions=1000,maxConcurrent=2,maxQueued=8,queueTimeoutMs=15000}={}){
   if(!store||['get','all','transaction'].some(key=>typeof store[key]!=='function')||typeof clock!=='function'||!Number.isSafeInteger(pageBytes)||pageBytes<1024||pageBytes>2097152||!Number.isSafeInteger(maxVersions)||maxVersions<1||maxVersions>10000||queryQueue&&['run','close','status'].some(key=>typeof queryQueue[key]!=='function'))throw new AppError(503,'类型统计资源配置无效','type_statistics_configuration');
   const ownQueue=createPostgresQueryQueue({maxConcurrent,maxQueued,queueTimeoutMs}),queue=queryQueue??ownQueue,operations=new Set();let closed=false;
-  async function execute(query){
-    const at=clock(),scope=typeStatisticsConditions(query,{at}),args=scope.values,key=groupKeys[query.groupBy];
+  const departments=createQueryDepartments(store);
+  async function execute(query,authorization){
+    const at=clock(),scope=typeStatisticsConditions(query,{at,departmentScope:authorization}),args=scope.values,key=groupKeys[query.groupBy];
     return store.transaction(async()=>{
       const visibility=(await store.get('SELECT pg_current_snapshot()::text visibility')).visibility;
       // Valid projections reference an existing catalogue row in this same
@@ -92,9 +95,9 @@ export function createPostgresTypeStatistics(store,{clock=Date.now,queryQueue,pa
         else{identity={memberId:row.member_id,name:row.member_name??'历史员工未知'};drilldown={...filters,member:row.member_id??'',memberMissing:row.member_id===null};}
         return {id:row.group_key,...identity,...usage(row),filters:drilldown,requestFilters:{type:drilldown.type,member:drilldown.member,model:drilldown.model,outcome:drilldown.status,from:drilldown.from,to:drilldown.to,member_missing:drilldown.memberMissing,model_missing:drilldown.modelMissing}};
       });
-      const result={window:scope.window,observedAt:at,watermark:createHash('sha256').update(visibility).digest('hex').slice(0,24),watermarkKind:'postgres_visibility',classificationSource:'request_snapshot',filters:scope.filters,summary:usage(total),rows:items,pagination:{page,pageSize:query.pageSize,total:total.group_count,totalPages}};
+      const result={window:scope.window,observedAt:at,watermark:createHash('sha256').update(queryDepartmentIdentity(authorization)+'\0'+visibility).digest('hex').slice(0,24),watermarkKind:'postgres_visibility',classificationSource:'request_snapshot',filters:scope.filters,summary:usage(total),rows:items,pagination:{page,pageSize:query.pageSize,total:total.group_count,totalPages}};
       if(Buffer.byteLength(JSON.stringify(result))>pageBytes)capacity();return result;
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {read:(value,{signal}={})=>{if(closed)return Promise.reject(new AppError(503,'类型统计查询已关闭','query_closed'));const query=normalize(value),operation=queue.run(()=>execute(query),{signal});operations.add(operation);operation.then(()=>operations.delete(operation),()=>operations.delete(operation));return operation;},close:async()=>{closed=true;if(!queryQueue)await queue.close();await Promise.allSettled([...operations]);},status:()=>({...queue.status(),closed:closed||queue.status().closed}),queue};
+  return {read:(value,{signal,scope}={})=>{if(closed)return Promise.reject(new AppError(503,'类型统计查询已关闭','query_closed'));const query=normalize(value),operation=queue.run(async()=>execute(query,await departments.resolve(scope)),{signal});operations.add(operation);operation.then(()=>operations.delete(operation),()=>operations.delete(operation));return operation;},close:async()=>{closed=true;if(!queryQueue)await queue.close();await Promise.allSettled([...operations]);},status:()=>({...queue.status(),closed:closed||queue.status().closed}),queue};
 }

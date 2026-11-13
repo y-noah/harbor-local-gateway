@@ -1,29 +1,40 @@
+import {requireDepartmentScope} from './department-access.mjs';
+import {verifyDepartmentIsolationAvailability,assertDepartmentIsolationReadiness,departmentJobFields,departmentJobKinds,isPostgresDepartmentActorService} from './postgres-departments.mjs';
 import {randomUUID} from 'node:crypto';
 import {AppError} from './store.mjs';
 
 const validKind=value=>typeof value==='string'&&/^[a-z][a-z0-9_.-]{0,79}$/.test(value);
 const encoded=value=>{let text;try{text=JSON.stringify(value);}catch{}if(!text||Buffer.byteLength(text)>65536)throw new AppError(400,'后台任务数据超过限制','job_payload_invalid');return text;};
 const lost=()=>new AppError(409,'后台任务租约已失效','job_lease_lost');
-export function createPostgresJobs(store,{clock,leaseMs=30000,maxPending=1000,reservedKinds=[]}={}){
+export function createPostgresJobs(store,{clock,leaseMs=30000,maxPending=1000,reservedKinds=[],departmentActors,scopedKinds=['worker.startup']}={}){
   if(!store||clock!==undefined&&typeof clock!=='function'||!Number.isInteger(leaseMs)||leaseMs<1000||leaseMs>300000||!Number.isInteger(maxPending)||maxPending<1||maxPending>100000||!Array.isArray(reservedKinds)||reservedKinds.length>8||new Set(reservedKinds).size!==reservedKinds.length||reservedKinds.some(kind=>!validKind(kind)))throw new AppError(503,'后台任务资源配置无效','job_configuration');
+  if(!Array.isArray(scopedKinds)||new Set(scopedKinds).size!==scopedKinds.length||scopedKinds.some(kind=>!departmentJobKinds.includes(kind)))throw new AppError(503,'部门后台任务类型配置无效','job_configuration');
+  const supported=new Set(scopedKinds);let initialization;
+  async function installed(){const first=initialization===undefined,pending=initialization??=verifyDepartmentIsolationAvailability(store);let available;try{available=await pending;}catch(error){if(initialization===pending)initialization=undefined;throw error;}if(!first)await assertDepartmentIsolationReadiness(store,available);return available;}
+  const unavailable=()=>{throw new AppError(503,'后台任务处理器尚未完成部门隔离适配','department_job_kind_unavailable');};
+  function actors(){if(!isPostgresDepartmentActorService(departmentActors,store))throw new AppError(503,'后台任务部门授权依赖未配置或数据库不匹配','department_job_authorization_unavailable');return departmentActors;}
+  async function verifyReadiness({handlers}={}){const available=await installed();if(!available)return {installed:false,scopedKinds:[]};actors();if(handlers!==undefined){if(!handlers||typeof handlers!=='object'||Array.isArray(handlers)||Object.keys(handlers).length===0||Object.keys(handlers).length>32||Object.values(handlers).some(handler=>typeof handler!=='function'))throw new AppError(503,'后台任务处理器配置无效','worker_configuration');if(Object.keys(handlers).some(kind=>!supported.has(kind)))unavailable();}return {installed:true,scopedKinds:[...supported]};}
+  async function authorizePersistedActor(job,options){if(!await installed())return null;actors();const row=await store.get('SELECT kind FROM harbor.background_jobs WHERE id=$1',job?.id);if(!row)throw new AppError(404,'后台任务不存在','job_not_found');if(!supported.has(row.kind))unavailable();return departmentActors.authorizePersistedActor(job,options);}
   const now=async()=>{const at=clock?clock():(await store.get('SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint at')).at;if(!Number.isSafeInteger(at)||at<0)throw new AppError(503,'后台任务时钟无效','job_configuration');return at;};
-  async function enqueue(kind,{id=randomUUID(),target=null,payload={},availableAt,maxAttempts=5,dependencyId=null}={}){
+  async function enqueue(kind,{id=randomUUID(),target=null,payload={},availableAt,maxAttempts=5,dependencyId=null,scope}={}){
     if(!validKind(kind)||typeof id!=='string'||!id.length||id.length>200||target!==null&&(typeof target!=='string'||target.length>200)||!payload||typeof payload!=='object'||Array.isArray(payload)||!Number.isInteger(maxAttempts)||maxAttempts<1||maxAttempts>20||availableAt!==undefined&&(!Number.isSafeInteger(availableAt)||availableAt<0))throw new AppError(400,'后台任务参数无效','job_payload_invalid');
     if(dependencyId!==null&&(typeof dependencyId!=='string'||!dependencyId.length||dependencyId.length>200||dependencyId===id))throw new AppError(400,'后台任务依赖无效','job_dependency_invalid');
-    const body=encoded(payload);
+    const body=encoded(payload),scoped=await installed();if(scoped&&!supported.has(kind))unavailable();if(!scoped&&scope!==undefined){const trusted=requireDepartmentScope(scope,{allowGlobal:true,allowSystem:true,roles:['super_admin','system']});if(trusted.view!=='global')throw new AppError(503,'部门隔离尚未启用','department_unavailable');}
     return store.transaction(async()=>{
+      const authorization=scoped?await actors().authorizeJobEnqueue(scope,kind):null;
       await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-background-admission',0))");
-      const existing=await store.get('SELECT id,kind,target,payload,max_attempts,dependency_id FROM harbor.background_jobs WHERE id=$1',id);
-      if(existing){if(existing.kind!==kind||existing.target!==target||existing.max_attempts!==maxAttempts||existing.dependency_id!==dependencyId||!(await store.get('SELECT $1::jsonb=$2::jsonb equal',body,JSON.stringify(existing.payload))).equal)throw new AppError(409,'任务标识已用于其他内容','job_identity_conflict');return {id,created:false};}
-      if(dependencyId!==null&&!await store.get('SELECT id FROM harbor.background_jobs WHERE id=$1',dependencyId))throw new AppError(400,'后台任务前置依赖不存在','job_dependency_invalid');
+      const existing=await store.get('SELECT id,kind,target,payload,max_attempts,dependency_id'+(scoped?','+departmentJobFields.join(','):'')+' FROM harbor.background_jobs WHERE id=$1',id);
+      if(existing){if(scoped&&departmentJobFields.some(field=>existing[field]!==authorization[field]))throw new AppError(409,'任务标识已用于其他部门或身份','job_identity_conflict');if(existing.kind!==kind||existing.target!==target||existing.max_attempts!==maxAttempts||existing.dependency_id!==dependencyId||!(await store.get('SELECT $1::jsonb=$2::jsonb equal',body,JSON.stringify(existing.payload))).equal)throw new AppError(409,'任务标识已用于其他内容','job_identity_conflict');return {id,created:false};}
+      if(dependencyId!==null&&!await store.get('SELECT id FROM harbor.background_jobs WHERE id=$1'+(scoped?' AND scope_identity=$2':''),dependencyId,...(scoped?[authorization.scope_identity]:[])))throw new AppError(400,'后台任务前置依赖不存在','job_dependency_invalid');
       const pending=(await store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE status IN ('pending','running')")).n;
       const reserved=reservedKinds.includes(kind);
-      if(pending>=maxPending+(reserved?reservedKinds.length:0)||reserved&&(await store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind=$1 AND status IN ('pending','running')",kind)).n>=1)throw new AppError(503,'后台任务队列已满','job_queue_full');
-      const at=await now();await store.run("INSERT INTO harbor.background_jobs(id,kind,target,payload,available_at,created,updated,max_attempts,dependency_id) VALUES($1,$2,$3,$4::jsonb,$5,$6,$6,$7,$8)",id,kind,target,body,availableAt??at,at,maxAttempts,dependencyId);return {id,created:true};
+      if(pending>=maxPending+(reserved?reservedKinds.length:0)||reserved&&(await store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind=$1 AND status IN ('pending','running')"+(scoped?' AND scope_identity=$2':''),kind,...(scoped?[authorization.scope_identity]:[]))).n>=1)throw new AppError(503,'后台任务队列已满','job_queue_full');
+      const at=await now();await store.run("INSERT INTO harbor.background_jobs(id,kind,target,payload,available_at,created,updated,max_attempts,dependency_id"+(scoped?','+departmentJobFields.join(','):'')+") VALUES($1,$2,$3,$4::jsonb,$5,$6,$6,$7,$8"+(scoped?departmentJobFields.map((_,index)=>',$'+(9+index)).join(''):'')+")",id,kind,target,body,availableAt??at,at,maxAttempts,dependencyId,...(scoped?departmentJobFields.map(field=>authorization[field]):[]));return {id,created:true};
     });
   }
   async function claim(kinds){
     if(!Array.isArray(kinds)||!kinds.length||kinds.length>32||kinds.some(kind=>!validKind(kind)))throw new AppError(503,'后台任务类型配置无效','job_configuration');
+    const scoped=await installed();if(scoped){actors();if(kinds.some(kind=>!supported.has(kind)))unavailable();}
     return store.transaction(async()=>{
       const at=await now();
       await store.run("WITH exhausted AS (SELECT id FROM harbor.background_jobs WHERE kind=ANY($2::text[]) AND attempts>=max_attempts AND (status='pending' OR status='running' AND lease_until<=$1) ORDER BY id LIMIT 256 FOR UPDATE SKIP LOCKED) UPDATE harbor.background_jobs j SET status=CASE WHEN j.result IS NULL THEN 'failed' ELSE 'completed' END,error_code=CASE WHEN j.result IS NULL THEN 'job_attempts_exhausted' ELSE NULL END,claim_token=NULL,lease_until=NULL,updated=$1 FROM exhausted e WHERE j.id=e.id",at,kinds);
@@ -32,7 +43,7 @@ export function createPostgresJobs(store,{clock,leaseMs=30000,maxPending=1000,re
         AND ((status='pending' AND available_at<=$2) OR (status='running' AND lease_until<=$2))
         AND (result IS NOT NULL OR dependency_id IS NULL OR EXISTS(SELECT 1 FROM harbor.background_jobs d WHERE d.id=j.dependency_id AND d.status='completed'))
         ORDER BY available_at,created,id LIMIT 1 FOR UPDATE SKIP LOCKED`,kinds,at);if(!row)return null;
-      return store.get("UPDATE harbor.background_jobs SET status='running',attempts=attempts+1,claimed_at=$1,lease_until=$2,claim_token=$3,updated=$1,error_code=NULL WHERE id=$4 RETURNING id,kind,target,payload,attempts,max_attempts,lease_until,claim_token,result,dependency_id",at,at+leaseMs,randomUUID(),row.id);
+      return store.get("UPDATE harbor.background_jobs SET status='running',attempts=attempts+1,claimed_at=$1,lease_until=$2,claim_token=$3,updated=$1,error_code=NULL WHERE id=$4 RETURNING id,kind,target,payload,attempts,max_attempts,lease_until,claim_token,result,dependency_id"+(scoped?','+departmentJobFields.join(','):''),at,at+leaseMs,randomUUID(),row.id);
     });
   }
   async function heartbeat(job){return store.transaction(async()=>{
@@ -70,5 +81,5 @@ export function createPostgresJobs(store,{clock,leaseMs=30000,maxPending=1000,re
     return owned(job,async()=>{const at=await now();return (await store.get("UPDATE harbor.background_jobs SET status=CASE WHEN result IS NOT NULL THEN 'completed' WHEN $1 AND attempts<max_attempts THEN 'pending' ELSE 'failed' END,available_at=$2,lease_until=NULL,claim_token=CASE WHEN result IS NOT NULL THEN claim_token ELSE NULL END,error_code=CASE WHEN result IS NOT NULL THEN NULL ELSE $3 END,updated=$4 WHERE id=$5 RETURNING status",retry,at+retryDelayMs,errorCode,at,job.id)).status;});
   }
   async function cancel(id){return (await store.run("UPDATE harbor.background_jobs SET status='cancelled',claim_token=NULL,lease_until=NULL,updated=$1 WHERE id=$2 AND status IN ('pending','running') AND result IS NULL",await now(),id)).changes===1;}
-  return {enqueue,claim,heartbeat,owned,commitEffect,complete,fail,cancel,now,leaseMs};
+  return {supportsScopedKind:kind=>supported.has(kind)&&isPostgresDepartmentActorService(departmentActors,store),verifyReadiness,authorizePersistedActor,enqueue,claim,heartbeat,owned,commitEffect,complete,fail,cancel,now,leaseMs};
 }

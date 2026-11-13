@@ -1,4 +1,8 @@
+import {createPostgresJobs} from './postgres-jobs.mjs';
 import {recordingContextConfiguration} from './recording-context-configuration.mjs';
+import {createDepartmentScopeIssuer,requireDepartmentScope} from './department-access.mjs';
+import {createPostgresDepartments,verifyDepartmentIsolationAvailability} from './postgres-departments.mjs';
+import {createPostgresDepartmentHttp} from './postgres-department-http.mjs';
 import {beginAdminRequestTiming,finishAdminRequestTiming} from './admin-request-timing.mjs';
 import {postgresShutdownConfiguration,installPostgresGatewayShutdown} from './postgres-shutdown.mjs';
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
@@ -144,6 +148,8 @@ export async function createPostgresGateway(options={}){
     try{await store.verifySchema();}catch(e){if(e.code==='42P01')throw new AppError(503,'数据库尚未迁移，请先运行db:migrate','database_migration_required');throw e;}
     const consumptionSchemaAvailable=await verifyConsumptionPolicyAvailability(store),consumptionReadSchemaAvailable=await verifyConsumptionPolicyAvailability(queryStore);
     if(consumptionSchemaAvailable!==consumptionReadSchemaAvailable)throw new AppError(503,'读写连接的消耗来源结构不一致','database_migration_conflict');
+    const departmentInstalled=await verifyDepartmentIsolationAvailability(store);
+    if(departmentInstalled!==await verifyDepartmentIsolationAvailability(queryStore))throw new AppError(503,'读写连接的部门结构不一致','database_migration_conflict');
     const contextSchemaVersion=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,{available:contextAvailable}=recordingContextConfiguration({env,enabled:options.recording?.contextEnabled,schemaVersion:contextSchemaVersion});
     await store.initializePricing();
     const configPath=join(data,'settings.json');
@@ -186,7 +192,12 @@ export async function createPostgresGateway(options={}){
     }
     if(lostOwnership)throw new AppError(503,'数据库单实例锁已丢失','gateway_ownership_lost');
     const extraUsage=createPostgresAccountExtraUsage(store,{...options.extraUsage,clock}),extraRuntime=createPostgresExtraRuntime(store,{clock,service:extraUsage});await extraUsage.recover({limit:100});requireOwnership();
-    const auth=createAdminAuth(config,{clock}),router=createPostgresRouter(store,{clock,extraRuntime}),limits=createPostgresMemberLimits(store,{clock}),readRouter=createPostgresRouter(queryStore,{clock});
+    const scopeIssuer=createDepartmentScopeIssuer();let auth;
+    const departments=createPostgresDepartments(store,{issuer:scopeIssuer,clock,authorizeSuperAdmin:credential=>auth.authorizeSuperAdmin(credential)});
+    auth=createAdminAuth(config,{clock,scopeIssuer,...(departmentInstalled?{departmentKeys:{authenticate:departments.authenticateManagementKey,validate:departments.validateManagementSession}}:{})});
+    const departmentHttp=createPostgresDepartmentHttp({auth,departments,issuer:scopeIssuer,installed:departmentInstalled,readBody:requestBodies.read});
+    const publicIdentity=async identity=>({role:identity.role,view:identity.view,department_id:identity.department_id,department_name:identity.view==='department'?(await departments.getDepartment(identity,identity.department_id)).name:null});
+    const router=createPostgresRouter(store,{clock,extraRuntime}),limits=createPostgresMemberLimits(store,{clock}),readRouter=createPostgresRouter(queryStore,{clock});
     const consumptionRouting=createPostgresConsumptionRouting(store,{router,clock,schemaAvailable:consumptionSchemaAvailable}),readConsumptionRouting=createPostgresConsumptionRouting(queryStore,{router:readRouter,clock,schemaAvailable:consumptionReadSchemaAvailable});
     const consumptionFeatureReady=()=>{if(!consumptionSchemaAvailable||!consumptionReadSchemaAvailable)return false;const readiness=handler?.status().consumptionRouting;return readiness?.configured===true&&readiness?.sourceAccounts===true;};
     const responses=options.responsesTransport||createResponsesTransport({outputBudget,stageObserver:options.stageObserver,fetchImpl:options.responsesFetch,credentials:(binary,home)=>accountCredentials(binary,home,{refresh:(binary,home)=>refreshCredentials(binary,home,{spawnProcess:spawnFor(home)})}),version:binary=>installedVersion(binary,{spawnProcess:spawnFor('internal:cli-version')})}),apiResponses=options.apiResponsesTransport||createResponsesTransport({outputBudget,stageObserver:options.stageObserver,apiKeyMode:true,credentials:async(_binary,accountId)=>{
@@ -201,15 +212,17 @@ export async function createPostgresGateway(options={}){
       checkApi:(account,{signal})=>apiResponses.models({binary:config.codexBinary,home:account.id,signal,force:true}),
       checkSubscription:(account,{signal})=>account.kind==='claude'?(options.claudeChecker||checkClaudeLogin)(config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe'),account.home,{signal,spawnProcess:spawnFor(account.home,{signal})}):(options.checker||checkLogin)(config.codexBinary,account.home,{signal,spawnProcess:spawnFor(account.home,{signal})})});
     await accountAdmin.recover();requireOwnership();
-    const extraReader=createPostgresAccountExtraUsage(queryStore,{clock}),extraBatches=createPostgresExtraUsageBatches(store,{readStore:queryStore,service:extraUsage,clock});extraUsageAdmin=createPostgresExtraUsageAdmin({service:extraUsage,reader:extraReader,policyPreviews:extraBatches.policyPreviews,batches:extraBatches,refreshSubscriptionQuota:(id,options)=>accountAdmin.refreshQuota(id,options),adminAuthenticated:auth.authenticated,adminSession:auth.sessionReference,acceptsAdminRequest:req=>acceptsRequest(req.headers,network),requestBodies,clock,refreshSupported:typeof options.extraUsage?.readEntitlement==='function'});
+    const extraReader=createPostgresAccountExtraUsage(queryStore,{clock}),extraBatches=createPostgresExtraUsageBatches(store,{readStore:queryStore,service:extraUsage,jobs:createPostgresJobs(store,{departmentActors:departments,scopedKinds:['account.extra.configure']}),clock});extraUsageAdmin=createPostgresExtraUsageAdmin({service:extraUsage,reader:extraReader,policyPreviews:extraBatches.policyPreviews,batches:extraBatches,refreshSubscriptionQuota:(id,options)=>accountAdmin.refreshQuota(id,options),adminAuthenticated:auth.authenticated,adminSession:departmentInstalled?auth.managementSessionReference:auth.sessionReference,...(departmentInstalled?{adminContext:departmentHttp.context,revalidateAdminScope:departmentHttp.revalidate}:{}),acceptsAdminRequest:req=>acceptsRequest(req.headers,network),requestBodies,clock,refreshSupported:typeof options.extraUsage?.readEntitlement==='function'});
     const files=new Map(await Promise.all(['index.html','app.js','style.css'].map(async name=>[name,await readFile(join(root,'public',name))])));
     handler=createPostgresResponsesHandler({extraRuntime,runChat:({account,processLease,output,session,messages,model,signal,timeoutMs,onText})=>(account.kind==='claude'?(options.claudeExecutor||runClaude):(options.executor||runCodex))({binary:account.kind==='claude'?(config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe')):config.codexBinary,home:account.home,workspace:join(runtime,'jobs',session.id),messages,model,sessionId:session.upstream_id,previousUsage:{input:session.cum_input,output:session.cum_output,cached:session.cum_cached},signal,timeoutMs,onText,output,spawnProcess:processLease?.spawn||spawnFor(account.home,{kind:'model',signal})}),cliProcesses,outputBudget,requestBodies,stageObserver:options.stageObserver,executionOptions:options.execution,pricingOptions:options.pricing,chatOptions:{reserveTokens:config.reserveTokens??32000,...options.chat},store,queryStore,recordings,recordingReader,buffer:captureBuffer,meteringRecovery,accountAdmin,deviceIssuer:deviceSettings?.issuer,platformTransport,keyEncryptionKey:key,clock,codexBinary:config.codexBinary,
       maxPendingHandoffs:options.handoffs?.maxPending,recordingEnabled,captureContext,contextReader,contextIndexEnabled:contextSchemaVersion===postgresContextSchemaVersions.index,recordingPolicy:recordingMonitor.snapshot,recordingKey:recordKey,recordingStoragePolicy:recordingMonitor.policy,recordingBackendOptions:options.recording?.backend,recordingAdminOptions:options.recording?.http,maxConcurrent:options.maxConcurrent??120,maxPerMember:options.maxPerMember??8,
-      resolveRoute:consumptionRouting.resolve,consumptionRouting,consumptionPolicyReady:consumptionFeatureReady,sourceAccounts:options=>readConsumptionRouting.catalogCandidates(options),onRouteFailure:router.block,checkLimits:(m,p,o)=>limits.check(m.id,p.model,{...o,tools:p.tools}),adminAuthenticated:auth.authenticated,
+      resolveRoute:consumptionRouting.resolve,consumptionRouting,consumptionPolicyReady:consumptionFeatureReady,sourceAccounts:options=>readConsumptionRouting.catalogCandidates(options),onRouteFailure:router.block,checkLimits:(m,p,o)=>limits.check(m.id,p.model,{...o,tools:p.tools}),adminAuthenticated:auth.authenticated,adminContext:departmentInstalled?departmentHttp.context:undefined,revalidateAdminScope:departmentInstalled?departmentHttp.revalidate:undefined,departmentActors:departments,
       transportForAccount:async account=>{if(account.kind!=='codex')throw new AppError(503,'此开发入口尚未接通该平台通道','platform_unavailable');return account.auth_mode==='openai_api'?apiResponses:responses;},
       adminStateContext:()=>({endpoint:(network.origins[0]||'http://'+(network.listenHost==='::1'?'[::1]':network.listenHost)+':'+(server?.address()?.port||network.port||config.port))+'/v1',mode:'PostgreSQL · 开发验证',capabilities:{overviewCost:true,accountStateView:true,extraUsage:true,accountPackages:true,asyncPlanning:true,pagedHistory:true,sessionHandoffs:true,memberTypes:true,pagedMembers:true,memberListMetadata:true,requestPageSummary:true,sessionFilters:true,sessionStateView:true,deviceAccess:true,memberActions:true,typeStatistics:true,recordingHistory:true,consumptionPolicy:consumptionFeatureReady(),recordingContext:contextAvailable,recordingContextSearch:contextSchemaVersion===postgresContextSchemaVersions.index}})});
     await handler.recoverHandoffs();requireOwnership();
-    nightly=createPostgresNightly(store,{preparation:handler.preparation,sessionHandoffs:handler.sessionHandoffs,handoffAdmin:handler.handoffAdmin,refreshQuotas:options=>accountAdmin.refreshQuotas(options),clock,isStopping:()=>closing||lostOwnership});
+    nightly=createPostgresNightly(store,{preparation:handler.preparation,sessionHandoffs:handler.sessionHandoffs,handoffAdmin:handler.handoffAdmin,departmentActors:departments,
+      departmentScopes:async({includeDisabled=false}={})=>(await store.all('SELECT id FROM harbor.departments'+(includeDisabled?'':' WHERE enabled')+' ORDER BY id')).map(row=>scopeIssuer.system({purpose:'routing.nightly',departmentId:row.id})),
+      refreshQuotas:options=>{if(!departmentInstalled)return accountAdmin.refreshQuotas(options);const actor=requireDepartmentScope(options?.scope,{allowSystem:true,roles:['system']});if(actor.purpose!=='routing.nightly'||actor.view!=='department')throw new AppError(403,'额度刷新缺少夜间部门身份','department_forbidden');return accountAdmin.refreshQuotas({...options,scope:scopeIssuer.system({purpose:'account.quota.refresh',departmentId:actor.department_id})});},clock,isStopping:()=>closing||lostOwnership});
     await nightly.recover();requireOwnership();
     const status=()=>({...handler.status(),jsonParsing:jsonParser.status(),cliProcesses:cliProcesses.status(),nightly:nightly.status(),ownership:!lostOwnership,interruptedOnStartup:interrupted,accountChecks:accountAdmin.status(),pools:{core:store.status(),query:queryStore.status(),recording:recordingStore.status()},recording:buffer.status(),recordingStorage:recordingMonitor.status(),recordingCapture:{enabled:recordingEnabled,effective:recordingEnabled&&recordingMonitor.captureAllowed(),reason:!recordingEnabled?'capture_disabled':recordingMonitor.snapshot().status==='low'?'storage_low':recordingMonitor.captureAllowed()?null:'storage_unknown'},devices:{...handler.deviceAccess.status(),tls:deviceTls?.status()??null},eventLoop:{meanMs:Number.isFinite(loop.mean)?loop.mean/1e6:0,maxMs:loop.max/1e6}});
     async function handle(req,res){
@@ -229,17 +242,21 @@ export async function createPostgresGateway(options={}){
           const input=await requestBodies.read(req,{owner:'login',signal:body.signal});
           if(!input||typeof input!=='object'||Array.isArray(input))throw new AppError(400,'登录内容无效');
           if(input.includeOverview!==undefined&&typeof input.includeOverview!=='boolean')throw new AppError(400,'登录首屏选项无效');
-          await auth.loginAsync(input.password,res);
+          const identity=await auth.loginAsync(input.password,res);
           let initialState;
           if(input.includeOverview){
-            try{initialState=await handler.initialOverview({signal:body.signal});}
+            try{initialState=await handler.initialOverview({signal:body.signal,scope:departmentInstalled?identity:undefined});}
             catch(error){if(body.signal.aborted)throw error;}
           }
-          return json(res,200,{ok:true,...(initialState?{initialState}:{})});
+          return json(res,200,{ok:true,...(departmentInstalled?{identity:await publicIdentity(identity)}:{}),...(initialState?{initialState}:{})});
         }
         if(path==='/api/auth/logout'&&req.method==='POST'){auth.logout(req,res);return json(res,200,{ok:true});}
-        if(path==='/api/auth/session'&&req.method==='GET')return json(res,200,{authenticated:auth.authenticated(req)});
+        if(path==='/api/auth/session'&&req.method==='GET'){
+          if(!departmentInstalled)return json(res,200,{authenticated:auth.authenticated(req)});
+          const identity=await auth.context(req);return json(res,200,{authenticated:!!identity,...(identity?{identity:await publicIdentity(identity)}:{})});
+        }
         if(path==='/api/admin/status'&&req.method==='GET'){if(!auth.authenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');return json(res,200,status(),true);}
+        if(await departmentHttp.handle(req,res,{signal:body.signal}))return;
         if(await handler.handle(req,res))return;
         throw new AppError(404,'此入口尚未接入PostgreSQL开发服务','not_found');
       }catch(error){

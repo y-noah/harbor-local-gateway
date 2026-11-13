@@ -2,6 +2,7 @@ import {createCipheriv,createDecipheriv,randomBytes} from 'node:crypto';
 import {AppError} from './store.mjs';
 import {sanitizeRecord,restoreAuthenticatedRecord} from './record-redaction.mjs';
 import {isRecordingRetentionDays,unlimitedRecordingExpiry} from './recording-retention.mjs';
+import {createQueryDepartments,departmentPredicate} from './postgres-query-departments.mjs';
 
 const kinds=new Set(['user','assistant','tool_call','tool_result','attachment','boundary']);
 const origins=new Set(['client','upstream','gateway']);
@@ -13,11 +14,13 @@ const previewCipherBytes=previewCharacters*6+Buffer.byteLength('{"text":""}')+12
 export function consumeRecordingAtomicCommit(receipt,commands,repository){const saved=receipt&&atomicCommits.get(receipt);if(!saved||saved.commands!==commands||saved.repository!==repository)return false;atomicCommits.delete(receipt);return true;}
 const validateTurnState=value=>{if(!['known','uncertain'].includes(value))throw new AppError(400,'本轮识别状态无效');};
 export class RecordingStore{
+  #departments;
   constructor(store,{encryptionKey,retentionDays=30,maxBytes=2*1024*1024,maxEventBytes=128*1024,maxPageBytes=128*1024,clock=Date.now,contextRepository}={}){
     if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32)throw new AppError(503,'正文加密材料未配置','recording_configuration');
     if(!isRecordingRetentionDays(retentionDays)||!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxEventBytes)||maxEventBytes<256||maxEventBytes>maxBytes||!Number.isSafeInteger(maxPageBytes)||maxPageBytes<256||maxPageBytes>2*1024*1024)throw new AppError(503,'正文保留与容量配置无效','recording_configuration');
     if(contextRepository!==undefined&&(!contextRepository||contextRepository.store!==store||typeof contextRepository.writeSnapshot!=='function'))throw new AppError(503,'上下文仓储须共用正文事务','recording_configuration');
     this.store=store;this.key=Buffer.from(encryptionKey);this.retentionDays=retentionDays;this.maxBytes=maxBytes;this.maxEventBytes=maxEventBytes;this.maxPageBytes=maxPageBytes;this.clock=clock;this.contextRepository=contextRepository;
+    this.#departments=createQueryDepartments(store);
   }
   seal(value,aad){
     const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.key,iv);cipher.setAAD(Buffer.from(aad));
@@ -114,13 +117,14 @@ export class RecordingStore{
     if(!states.has(state)||reason!==null&&!['upstream_interrupted','capture_failed','queue_limit','size_limit','process_interrupted'].includes(reason)||storageReason!==undefined&&(reason!=='capture_failed'||state!=='partial'||!['storage_low','storage_unknown'].includes(storageReason)))throw new AppError(400,'正文完成状态无效');
     await this.store.run(`UPDATE harbor.requests SET recording_state=CASE WHEN recording_reason IS NOT NULL AND $1='complete' THEN 'partial' ELSE $1 END,recording_reason=COALESCE($2,recording_reason) WHERE id=$3 AND recording_state='pending'`,state,storageReason??reason,requestId);
   }
-  async previews(requestIds){
+  async previews(requestIds,{scope}={}){
     if(!Array.isArray(requestIds)||requestIds.length>100||requestIds.some(id=>typeof id!=='string'||!id.length||id.length>100))throw new AppError(400,'输入摘要分页无效');
-    const result=new Map(requestIds.map(id=>[id,{input_preview:null,input_preview_state:'unavailable'}]));if(!requestIds.length)return result;
-    const at=this.clock(),rows=await this.store.all(`SELECT r.id request_id,c.turn_state,c.expires_at,r.recording_state,
+    const authorization=await this.#departments.resolve(scope),result=new Map(requestIds.map(id=>[id,{input_preview:null,input_preview_state:'unavailable'}]));if(!requestIds.length)return result;
+    const at=this.clock(),args=[requestIds,at,previewCipherBytes],predicate=departmentPredicate(authorization,'r',args),relationship=authorization===null?'TRUE':'(r.session_id IS NULL OR (s.member_id=r.member_id AND s.department_id=r.department_id))';
+    const rows=await this.store.all(`SELECT r.id request_id,c.turn_state,c.expires_at,r.recording_state,
       octet_length(c.preview_cipher) preview_bytes,
       CASE WHEN c.expires_at>$2 AND r.recording_state<>'expired' AND octet_length(c.preview_cipher)<=$3 THEN c.preview_cipher END preview_cipher
-      FROM harbor.requests r LEFT JOIN harbor.recordings c ON c.request_id=r.id WHERE r.id=ANY($1::text[])`,requestIds,at,previewCipherBytes);
+      FROM harbor.requests r LEFT JOIN harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.sessions s ON s.id=r.session_id WHERE r.id=ANY($1::text[]) AND ${predicate} AND ${relationship}`,...args);
     for(const row of rows){
       let text=null,state='unavailable';
       if(row.recording_state==='expired'||row.expires_at!==null&&row.expires_at<=at)state='expired';
@@ -132,10 +136,11 @@ export class RecordingStore{
     }
     return result;
   }
-  async read(requestId,{after=0,limit=32}={}){
+  async read(requestId,{after=0,limit=32,scope}={}){
     if(!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>100)throw new AppError(400,'正文分页无效');
     return this.store.transaction(async()=>{
-      const row=await this.store.get('SELECT r.recording_state,r.recording_reason,c.expires_at,c.turn_state,c.persisted_sequence FROM harbor.requests r LEFT JOIN harbor.recordings c ON c.request_id=r.id WHERE r.id=$1',requestId);
+      const authorization=await this.#departments.resolve(scope),args=[requestId],predicate=departmentPredicate(authorization,'r',args),relationship=authorization===null?'TRUE':'(r.session_id IS NULL OR (s.member_id=r.member_id AND s.department_id=r.department_id))';
+      const row=await this.store.get('SELECT r.recording_state,r.recording_reason,c.expires_at,c.turn_state,c.persisted_sequence FROM harbor.requests r LEFT JOIN harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.sessions s ON s.id=r.session_id WHERE r.id=$1 AND '+predicate+' AND '+relationship,...args);
       if(!row)throw new AppError(404,'请求不存在');
       const expired=row.expires_at!==null&&row.expires_at<=this.clock();
       if(!row.expires_at||expired||row.recording_state==='expired')return {state:expired?'expired':row.recording_state,reason:row.recording_reason,events:[],next:after,hasMore:false};

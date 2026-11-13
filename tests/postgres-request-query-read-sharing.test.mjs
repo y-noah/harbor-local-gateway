@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createPostgresRequestQueries} from '../postgres-request-query.mjs';
 import {usageWindow} from '../store.mjs';
+import {withLegacyDepartmentSchema} from './department-legacy-query-fixture.mjs';
 
 const at=Date.parse('2026-11-12T12:00:00+08:00'),snapshot='00000000-0000-4000-8000-000000000001',window=usageWindow(at);
 function fixture({total=21}={}){
  const statements=[],previews=[];
  const store={transaction:operation=>operation(),run:async()=>assert.fail('有效查询快照不得写入'),get:async(sql,...args)=>{statements.push({sql,args});if(sql.includes('pg_current_snapshot()'))return {visibility:'1:1:'};if(sql.includes('FROM harbor.request_query_snapshots'))return {visibility:'1:1:',window_start:window.start,window_end:window.end,filters:'["","",""]'};if(sql.startsWith('SELECT COUNT(*) n'))return {n:total};assert.fail('非预期读取');},all:async(sql,...args)=>{statements.push({sql,args});if(sql.startsWith('WITH data AS'))return [{g_model:1,g_member:1,requests:total,success:total,active:0,average_ms:100,known:0,unmetered:0,unpriced:total,pending:0,expired:0,input:'0',output:'0',cached:'0',adjustment:'0',total:'0',revisions:[]}];if(sql.startsWith('SELECT r.*')){const offset=sql.includes(' OFFSET ')?args.at(-1):0,limit=sql.includes(' OFFSET ')?args.at(-2):args.at(-1);return Array.from({length:total},(_,i)=>({id:'synthetic-request-'+i,started:at-i,ended:at-i+1,status:'ok',model:'synthetic-model',price_version:null,projected_revision:null,book_exists:false})).slice(offset,offset+limit);}return [];} };
- const reader=createPostgresRequestQueries(store,{clock:()=>at,readInputPreviews:async ids=>{previews.push(ids);return new Map(ids.map(id=>[id,{input_preview:'合成问题',input_preview_state:'available'}]));}});
+ const reader=createPostgresRequestQueries(withLegacyDepartmentSchema(store),{clock:()=>at,readInputPreviews:async ids=>{previews.push(ids);return new Map(ids.map(id=>[id,{input_preview:'合成问题',input_preview_state:'available'}]));}});
  return {reader,statements,previews};
 }
 const input=(view='all',extra={})=>({view,page:1,pageSize:20,snapshot,...extra});

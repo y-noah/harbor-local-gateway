@@ -2,6 +2,7 @@ import {createCipheriv,createDecipheriv,createHash,createHmac,hkdfSync,randomByt
 import {AppError} from './store.mjs';
 import {sanitizeRecord,restoreAuthenticatedRecord,validRecordRedaction} from './record-redaction.mjs';
 import {requestContextReasons} from './recording-request-context.mjs';
+import {createQueryDepartments,departmentPredicate} from './postgres-query-departments.mjs';
 
 const minimumPartBytes=256;
 const kinds=new Set(['instruction','history','tool_schema','context']);
@@ -19,27 +20,36 @@ function normalizedCoverage(coverage){
 // this repository is already filtered; this second boundary remains defensive.
 function chunks(bytes,limit){const result=[];for(let start=0;start<bytes.length;){let end=Math.min(start+limit,bytes.length);if(end<bytes.length)while(end>start&&(bytes[end]&0xc0)===0x80)end--;result.push(bytes.subarray(start,end));start=end;}return result;}
 export class RecordingContextStore{
+ #departments;
+ #workerDepartments;
  constructor(store,{encryptionKey,clock=Date.now,maxSnapshotBytes=2097152,maxComponents=4096,partBytes=65536,maxReadBytes=131072}={}){
   if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32||typeof clock!=='function'||!Number.isSafeInteger(maxSnapshotBytes)||maxSnapshotBytes<256||maxSnapshotBytes>8388608||!Number.isInteger(maxComponents)||maxComponents<1||maxComponents>16384||!Number.isInteger(partBytes)||partBytes<minimumPartBytes||partBytes>131072||partBytes>maxSnapshotBytes||!Number.isInteger(maxReadBytes)||maxReadBytes<partBytes+28||maxReadBytes>2097152)fail(503,'上下文仓储配置无效','recording_context_configuration');
   this.store=store;this.clock=clock;this.maxSnapshotBytes=maxSnapshotBytes;this.maxComponents=maxComponents;this.partBytes=partBytes;this.maxReadBytes=maxReadBytes;this.gcScope=null;
+  this.#departments=createQueryDepartments(store);
+  this.#workerDepartments=createQueryDepartments(store,{systemReadPurposes:['recording.context.index']});
   this.key=Buffer.from(hkdfSync('sha256',encryptionKey,Buffer.alloc(0),'harbor-recording-context-encryption-v1',32));
   this.fingerprintKey=Buffer.from(hkdfSync('sha256',encryptionKey,Buffer.alloc(0),'harbor-recording-context-fingerprint-v1',32));
   this.keyVersion=createHash('sha256').update(this.key).digest('hex');
  }
  #digest(domain,value){return createHmac('sha256',this.fingerprintKey).update(domain+'\0').update(value).digest();}
+ scopeDigestForSource({requestId,memberId,sessionId}){
+  if(typeof requestId!=='string'||!requestId||requestId.length>200||typeof memberId!=='string'||!memberId||memberId.length>200||sessionId!==null&&sessionId!==undefined&&(typeof sessionId!=='string'||!sessionId||sessionId.length>200))fail(503,'请求上下文归属不一致','recording_context_scope');
+  return this.#digest('scope',JSON.stringify([memberId,sessionId?['session',sessionId]:['request',requestId]]));
+ }
  attachmentFingerprint(requestId,bytes){
   if(typeof requestId!=='string'||!requestId||requestId.length>200||!Buffer.isBuffer(bytes)||bytes.length>this.maxSnapshotBytes)fail(400,'附件指纹输入无效');
   return this.#digest('attachment-request:'+requestId,bytes).toString('hex');
  }
  #seal(bytes,id,ordinal,scope){const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.key,iv);cipher.setAAD(Buffer.from(`context:v1:${this.keyVersion}:${scope.toString('hex')}:${id}:${ordinal}`));return Buffer.concat([iv,cipher.update(bytes),cipher.final(),cipher.getAuthTag()]);}
  #open(bytes,id,ordinal,scope){try{const decipher=createDecipheriv('aes-256-gcm',this.key,bytes.subarray(0,12));decipher.setAAD(Buffer.from(`context:v1:${this.keyVersion}:${scope.toString('hex')}:${id}:${ordinal}`));decipher.setAuthTag(bytes.subarray(-16));return Buffer.concat([decipher.update(bytes.subarray(12,-16)),decipher.final()]);}catch{fail(503,'上下文密文无法验证','recording_context_unreadable');}}
- async #authority(requestId,{lock=false,allowMissing=false}={}){
+ async #authority(requestId,{lock=false,allowMissing=false,departmentScope=null,workerRead=false}={}){
   if(typeof requestId!=='string'||!requestId||requestId.length>200)fail(400,'上下文请求标识无效');
-  const row=await this.store.get(`SELECT r.id,r.member_id,r.session_id,r.recording_state,r.recording_reason,c.expires_at,s.member_id session_member FROM harbor.requests r ${allowMissing?'LEFT JOIN':'JOIN'} harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.sessions s ON s.id=r.session_id WHERE r.id=$1${lock?' FOR SHARE OF r,c':''}`,requestId);
+  const args=[requestId],predicate=(workerRead?this.#workerDepartments.predicate:departmentPredicate)(departmentScope,'r',args),relationship=departmentScope===null?'TRUE':'(r.session_id IS NULL OR (s.member_id=r.member_id AND s.department_id=r.department_id))';
+  const row=await this.store.get(`SELECT r.id,r.member_id,r.session_id,r.recording_state,r.recording_reason,c.expires_at,s.member_id session_member FROM harbor.requests r ${allowMissing?'LEFT JOIN':'JOIN'} harbor.recordings c ON c.request_id=r.id LEFT JOIN harbor.sessions s ON s.id=r.session_id WHERE r.id=$1 AND ${predicate} AND ${relationship}${lock?' FOR SHARE OF r,c':''}`,...args);
   if(!row)fail(404,'请求正文尚不存在','recording_context_missing');
   if(allowMissing&&row.expires_at===null)return {...row,scope:null};
   if(!row.member_id||row.session_id&&row.session_member!==row.member_id)fail(503,'请求上下文归属不一致','recording_context_scope');
-  const scope=this.#digest('scope',JSON.stringify([row.member_id,row.session_id?['session',row.session_id]:['request',row.id]]));
+  const scope=this.scopeDigestForSource({requestId:row.id,memberId:row.member_id,sessionId:row.session_id});
   return {...row,scope};
  }
  async #lock(scope){await this.store.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",['harbor-recording-context:'+scope.toString('hex')]);}
@@ -178,10 +188,10 @@ export class RecordingContextStore{
   if(!shape.scope_valid)fail(503,'上下文对象归属不一致','recording_context_scope');
   if(shape.components!==snapshot.components||shape.last!==snapshot.components||Number(shape.bytes)!==snapshot.bytes||!shape.complete)fail(503,'上下文对象或引用不完整','recording_context_incomplete');
  }
- async read(requestId,{after={component:0,part:0},limit=32}={}){
+ async read(requestId,{after={component:0,part:0},limit=32,scope}={}){
   if(!after||Object.keys(after).some(key=>!['component','part'].includes(key))||![after.component,after.part].every(value=>Number.isSafeInteger(value)&&value>=0)||!Number.isInteger(limit)||limit<1||limit>100)fail(400,'上下文分页无效');
   return this.store.transaction(async()=>{
-   const authority=await this.#authority(requestId,{allowMissing:true});
+   const departmentScope=await this.#departments.resolve(scope),authority=await this.#authority(requestId,{allowMissing:true,departmentScope});
    if(authority.expires_at===null){const known=['disabled','historical','expired','pending'].includes(authority.recording_state);return {state:known?authority.recording_state:'unavailable',reason:known?authority.recording_reason:'recording_missing',parts:[],next:after,hasMore:false};}
    const snapshot=await this.store.get('SELECT * FROM harbor.recording_context_snapshots WHERE request_id=$1',requestId);
    if(!snapshot)return {state:authority.expires_at<=this.clock()||authority.recording_state==='expired'?'expired':'unavailable',parts:[],next:after,hasMore:false};
@@ -200,10 +210,10 @@ export class RecordingContextStore{
  }
  // Internal export manifest, without fetching shared ciphertext repeatedly.
  // The exporter locks source recording rows first, then scopes in sorted order.
- async describeSnapshot(requestId,{lockScope=false}={}){
+ async describeSnapshot(requestId,{lockScope=false,scope}={}){
   if(typeof lockScope!=='boolean')fail(400,'上下文导出锁选项无效');
   return this.store.transaction(async()=>{
-   const authority=await this.#authority(requestId,{allowMissing:true});
+   const departmentScope=await this.#departments.resolve(scope),authority=await this.#authority(requestId,{allowMissing:true,departmentScope});
    if(authority.expires_at===null)return {requestId,state:['disabled','historical','expired','pending'].includes(authority.recording_state)?authority.recording_state:'unavailable',references:[]};
    if(lockScope)await this.#lock(authority.scope);
    const snapshot=await this.store.get('SELECT * FROM harbor.recording_context_snapshots WHERE request_id=$1',requestId);
@@ -220,7 +230,8 @@ export class RecordingContextStore{
  // Internal derived-data reader. It is not exposed as an employee endpoint.
  // A live source authorizes the scope; ciphertext is fetched only after its
  // full size is checked. Workers must recheck source liveness when committing.
- async #liveSource(object){
+ async #liveSource(object,{departmentScope=null,workerRead=false}={}){
+   const args=[object.id,object.scope_digest,object.key_version,this.clock()],predicate=(workerRead?this.#workerDepartments.predicate:departmentPredicate)(departmentScope,'r',args),relationship=departmentScope===null?'TRUE':'(r.session_id IS NULL OR session.department_id=r.department_id)';
    return this.store.get(`SELECT r.id,r.member_id,r.session_id FROM harbor.recording_context_references ref
     JOIN harbor.recording_context_snapshots s ON s.request_id=ref.request_id
     JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id
@@ -228,32 +239,38 @@ export class RecordingContextStore{
     WHERE ref.object_id=$1 AND s.scope_digest=$2 AND s.key_version=$3 AND s.member_id=r.member_id
      AND s.session_id IS NOT DISTINCT FROM r.session_id AND r.recording_state<>'expired'
      AND LEAST(s.expires_at,c.expires_at)>$4 AND (r.session_id IS NULL OR session.member_id=r.member_id)
-    ORDER BY r.id LIMIT 1`,object.id,object.scope_digest,object.key_version,this.clock());
+     AND ${predicate} AND ${relationship}
+    ORDER BY r.id LIMIT 1`,...args);
  }
- async withLiveObject(objectId,expected,operation){
+ async withLiveObject(objectId,expected,operation,{scope}={}){
   if(typeof operation!=='function'||!expected||expected.objectId!==objectId||expected.keyVersion!==this.keyVersion||!Buffer.isBuffer(expected.fingerprint)||!Buffer.isBuffer(expected.scopeDigest))fail(503,'上下文派生提交依赖无效','recording_context_configuration');
   return this.store.transaction(async()=>{
-   let object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1',objectId);
+   const departmentScope=await this.#workerDepartments.resolve(scope),readScope={departmentScope,workerRead:true};
+   const args=[objectId],predicate=this.#workerDepartments.predicate(departmentScope,'r',args),eligible=departmentScope?.view==='department'?'EXISTS(SELECT 1 FROM harbor.recording_context_references ref JOIN harbor.requests r ON r.id=ref.request_id WHERE ref.object_id=o.id AND '+predicate+')':'TRUE';
+   let object=await this.store.get('SELECT o.* FROM harbor.recording_context_objects o WHERE o.id=$1 AND '+eligible,...args);
+   if(!object&&departmentScope?.view==='department')fail(404,'上下文对象不存在','recording_context_missing');
    if(!object)return {object_id:objectId,expired:true};
-   const source=await this.#liveSource(object);if(!source)return {object_id:objectId,expired:true};
+   const source=await this.#liveSource(object,readScope);if(!source)return {object_id:objectId,expired:true};
    // Match capture's source -> scope -> object/work lock order. In particular,
    // never wait on a recording row while holding the scope GC lock.
-   let authority;try{authority=await this.#authority(source.id,{lock:true});}catch(error){if(error.code==='recording_context_missing')return {object_id:objectId,expired:true};throw error;}await this.#lock(authority.scope);
+   let authority;try{authority=await this.#authority(source.id,{lock:true,...readScope});}catch(error){if(error.code==='recording_context_missing')return {object_id:objectId,expired:true};throw error;}await this.#lock(authority.scope);
    object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1 FOR SHARE',objectId);
-   if(!object||authority.expires_at<=this.clock()||authority.recording_state==='expired'||!await this.#liveSource(object))return {object_id:objectId,expired:true};
+   if(!object||authority.expires_at<=this.clock()||authority.recording_state==='expired'||!await this.#liveSource(object,readScope))return {object_id:objectId,expired:true};
    if(object.state!=='complete'||object.key_version!==expected.keyVersion||!equal(object.scope_digest,expected.scopeDigest)||!equal(authority.scope,expected.scopeDigest)||!equal(object.fingerprint,expected.fingerprint))fail(503,'上下文派生来源已变化','recording_context_scope');
    return operation(object);
   });
  }
- async readObject(objectId){
+ async readObject(objectId,{scope}={}){
   if(typeof objectId!=='string'||!objectId||objectId.length>200)fail(400,'上下文对象标识无效');
   const {object,rows}=await this.store.transaction(async()=>{
-   const object=await this.store.get('SELECT * FROM harbor.recording_context_objects WHERE id=$1',objectId);
+   const departmentScope=await this.#workerDepartments.resolve(scope),args=[objectId],predicate=this.#workerDepartments.predicate(departmentScope,'r',args);
+   const eligible=departmentScope?.view==='department'?'EXISTS(SELECT 1 FROM harbor.recording_context_references ref JOIN harbor.requests r ON r.id=ref.request_id WHERE ref.object_id=o.id AND '+predicate+')':'TRUE';
+   const object=await this.store.get('SELECT o.* FROM harbor.recording_context_objects o WHERE o.id=$1 AND '+eligible,...args);
    if(!object)fail(404,'上下文对象不存在','recording_context_missing');
-   const source=await this.#liveSource(object);
-   if(!source)fail(410,'上下文对象已无有效来源','recording_context_expired');
-   const scope=this.#digest('scope',JSON.stringify([source.member_id,source.session_id?['session',source.session_id]:['request',source.id]]));
-   if(!equal(scope,object.scope_digest)||object.key_version!==this.keyVersion)fail(503,'上下文对象归属或密钥不一致','recording_context_scope');
+   const source=await this.#liveSource(object,{departmentScope,workerRead:true});
+   if(!source)fail(departmentScope?.view==='department'?404:410,departmentScope?.view==='department'?'上下文对象不存在':'上下文对象已无有效来源',departmentScope?.view==='department'?'recording_context_missing':'recording_context_expired');
+   const expected=this.scopeDigestForSource({requestId:source.id,memberId:source.member_id,sessionId:source.session_id});
+   if(!equal(expected,object.scope_digest)||object.key_version!==this.keyVersion)fail(503,'上下文对象归属或密钥不一致','recording_context_scope');
    const rows=await this.#objectRows(object);
    return {object,rows};
   },{level:'REPEATABLE READ',readOnly:true});

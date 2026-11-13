@@ -1,3 +1,4 @@
+import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {AppError,hash} from './store.mjs';
 import {readConsumptionPolicy,consumptionSource,assertConsumptionSource,subscriptionFallbackDecision} from './consumption-policy.mjs';
 import {createPostgresConsumptionPolicy,verifyConsumptionPolicyAvailability} from './postgres-consumption-policy.mjs';
@@ -9,15 +10,15 @@ const fail=(code,message,status=409)=>{throw new AppError(status,message,code);}
 // It chooses a route, never invokes a model or releases an execution lease.
 export function createPostgresConsumptionRouting(store,{router,clock=Date.now,schemaAvailable}={}){
   if(typeof router?.resolve!=='function'||typeof router?.catalogCandidates!=='function'||schemaAvailable!==undefined&&typeof schemaAvailable!=='boolean'&&typeof schemaAvailable!=='function')throw new TypeError('consumption_routing_configuration');
-  const policies=createPostgresConsumptionPolicy(store,{clock}),tokens=new WeakMap(),used=new WeakSet();let availability;
+  const access=createRoutingDepartments(store,{clock}),policies=createPostgresConsumptionPolicy(store,{clock}),tokens=new WeakMap(),used=new WeakSet();let availability;
   const available=async()=>{
     if(typeof schemaAvailable==='function'){const value=await schemaAvailable();if(typeof value!=='boolean')throw new TypeError('consumption_schema_availability_invalid');return value;}
     if(typeof schemaAvailable==='boolean')return schemaAvailable;
     availability??=verifyConsumptionPolicyAvailability(store).catch(error=>{availability=undefined;throw error;});return availability;
   };
   const transaction=()=>{if(!store.context.getStore())fail('database_transaction_required','来源路由必须位于请求受理事务',503);};
-  async function read(member){
-    transaction();if(!member?.id||!member.key_id)fail('invalid_api_key','缺少已认证的Key身份',401);
+  async function read(member,{scope}={}){
+    transaction();await access.resolve(scope,{member,write:true,employeeOnly:true});if(!member?.id||!member.key_id)fail('invalid_api_key','缺少已认证的Key身份',401);
     const schema=await available();
     if(!schema)return Object.freeze({...readConsumptionPolicy({}),schemaAvailable:false});
     return Object.freeze({...await policies.read(member.key_id,{memberId:member.id,lock:true}),schemaAvailable:true});
@@ -34,9 +35,10 @@ export function createPostgresConsumptionRouting(store,{router,clock=Date.now,sc
     }
   }
   async function scoped(member,payload,headers,options,snapshot,{excludeRequestId=null,sourceOverride=null,expectedSession=null}={}){
-    await lockPostgresRouting(store);
-    const identity=await findPostgresResponseSession(store,member,payload,headers,{lock:true}),session=identity.session??(expectedSession&&!identity.fixed?await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND protocol='responses' FOR UPDATE",expectedSession.id,member.id):null);
-    const view=await router.catalogCandidates({at:clock(),policy:snapshot.consumption_policy,model:payload.model,protocol:options.protocol??'responses'});
+    const department=await access.resolve(options.scope,{member,write:true,employeeOnly:true});await lockPostgresRouting(store);
+    const identity=await findPostgresResponseSession(store,member,payload,headers,{lock:true,scope:options.scope}),session=identity.session??(expectedSession&&!identity.fixed?await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND protocol='responses' FOR UPDATE",expectedSession.id,member.id):null);
+    const view=await router.catalogCandidates({at:clock(),policy:snapshot.consumption_policy,model:payload.model,protocol:options.protocol??'responses',scope:options.scope});
+    if(session)access.same(department,session);
     let source=sourceOverride;
     if(!source){
       if(snapshot.consumption_policy==='api_only')source='api';
@@ -59,21 +61,23 @@ export function createPostgresConsumptionRouting(store,{router,clock=Date.now,sc
     if(consumptionSource(route.account)!==source)fail('consumption_source_conflict','返回账号不符合已选消耗来源');return route;
   }
   async function resolve(member,payload,headers={},options={}){
-    const snapshot=await read(member);
+    const snapshot=await read(member,{scope:options.scope});
     const route=snapshot.consumption_policy==='inherit'?await router.resolve(member,payload,headers,options):await scoped(member,payload,headers,options,snapshot);
-    const consumption=Object.freeze({...snapshot,consumption_source:consumptionSource(route.account),fallback:false});
-    tokens.set(consumption,{memberId:member.id,keyId:member.key_id,sessionId:route.session.id,accountId:route.account.id,routeVersion:route.session.route_version,snapshot,account:Object.freeze({kind:route.account.kind,auth_mode:route.account.auth_mode}),payloadDigest:hash(JSON.stringify(payload)),protocol:options.protocol??'responses'});
+    const consumption=Object.freeze({...snapshot,consumption_source:consumptionSource(route.account),fallback:false}),department=await access.resolve(options.scope,{member,write:true,employeeOnly:true});
+    tokens.set(consumption,{memberId:member.id,keyId:member.key_id,sessionId:route.session.id,accountId:route.account.id,routeVersion:route.session.route_version,snapshot,account:Object.freeze({kind:route.account.kind,auth_mode:route.account.auth_mode}),payloadDigest:hash(JSON.stringify(payload)),protocol:options.protocol??'responses',departmentIdentity:access.identity(department),departmentScope:department});
     return {...route,consumption};
   }
   async function fallback({member,payload,headers={},options={},requestId,route,snapshot=route?.consumption,error,attempts,outputStarted,contextReplayable}={}){
-    transaction();const token=snapshot&&tokens.get(snapshot);
-    if(!token||used.has(snapshot)||token.memberId!==member?.id||token.keyId!==member?.key_id||token.payloadDigest!==hash(JSON.stringify(payload))||token.protocol!==(options.protocol??'responses')||!token.snapshot.schemaAvailable)fail('consumption_fallback_conflict','备用来源缺少原受理身份');
+    transaction();const department=await access.resolve(options.scope,{member,write:true,employeeOnly:true}),token=snapshot&&tokens.get(snapshot);
+    if(!token||token.departmentIdentity!==access.identity(department)||department&&['credential_id','credential_version','member_id','member_version','department_version'].some(field=>token.departmentScope?.[field]!==department[field])||used.has(snapshot)||token.memberId!==member?.id||token.keyId!==member?.key_id||token.payloadDigest!==hash(JSON.stringify(payload))||token.protocol!==(options.protocol??'responses')||!token.snapshot.schemaAvailable)fail('consumption_fallback_conflict','备用来源缺少原受理身份');
     const decision=subscriptionFallbackDecision({policy:token.snapshot.consumption_policy,account:token.account,error,payload,attempts,outputStarted,contextReplayable});if(!decision.allowed)fail(decision.reason,'当前请求不满足安全备用条件');
     await lockPostgresRouting(store);
-    const identity=await findPostgresResponseSession(store,member,payload,headers,{lock:true}),session=identity.session??await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND protocol='responses' FOR UPDATE",token.sessionId,member.id);
+    const identity=await findPostgresResponseSession(store,member,payload,headers,{lock:true,scope:options.scope}),session=identity.session??await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND protocol='responses' FOR UPDATE",token.sessionId,member.id);
+    if(session)access.same(department,session);
     if(identity.fixed)fail('consumption_source_conflict','固定会话不能自动改变消耗来源');
     if(!session||session.id!==token.sessionId||session.account_id!==token.accountId||session.route_version!==token.routeVersion)fail('session_route_conflict','会话绑定已变化');
     const request=await store.get('SELECT * FROM harbor.requests WHERE id=$1 AND member_id=$2 AND key_id=$3 FOR UPDATE',requestId,member.id,member.key_id);
+    if(request)access.same(department,request);
     const previous=request?.consumption_attempts,attempt=Array.isArray(previous)&&previous[0];
     if(!request||!['queued','running'].includes(request.status)||request.session_id!==token.sessionId||request.account_id!==token.accountId||request.route_version!==token.routeVersion||request.consumption_policy!==token.snapshot.consumption_policy||request.consumption_policy_version!==token.snapshot.consumption_policy_version||request.consumption_fallback!==false||!Array.isArray(previous)||previous.length!==1||attempt.source!=='api'||attempt.account_id!==token.accountId||attempt.state!=='rejected'||attempt.usage_known!==true||attempt.error_code!=='upstream_quota_exhausted'||['input','output','cached'].some(field=>attempt[field]!==0)||request.handoff_input!=='replayable')fail('consumption_fallback_conflict','备用来源与原请求派发证据不一致');
     const next=await scoped(member,payload,headers,options,token.snapshot,{excludeRequestId:requestId,sourceOverride:'subscription',expectedSession:session});

@@ -1,3 +1,5 @@
+import {createAdminDepartments} from './postgres-admin-departments.mjs';
+import {createPostgresAudit} from './postgres-audit.mjs';
 import {AppError,id,token,hash,modelAllowlist,storedModelAllowlist,encryptStoredKey} from './store.mjs';
 import {integer,name,expiry,bool} from './admin-input.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
@@ -21,10 +23,11 @@ function consumptionInput(payload,{create=false}={}){
 
 // All permission mutations lock member before Key, matching admission and
 // settlement. No lock crosses request-body reading or upstream execution.
-export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,clock=Date.now,isBusy=()=>false,queryQueue=createPostgresQueryQueue(),consumptionReady}={}){
+export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,clock=Date.now,isBusy=()=>false,queryQueue=createPostgresQueryQueue(),consumptionReady,departmentActors}={}){
+  const departments=createAdminDepartments(store);
   const types=createPostgresMemberTypes(store,{readStore,clock,queryQueue});
-  const batches=createPostgresMemberBatches(store,{readStore,clock,queryQueue});
-  const actions=createPostgresMemberActions(store,{readStore,clock,queryQueue});
+  const batches=createPostgresMemberBatches(store,{readStore,clock,queryQueue,departmentActors});
+  const actions=createPostgresMemberActions(store,{readStore,clock,queryQueue,departmentActors});
   const queries=createPostgresMemberQueries(readStore,{clock,encryptionKey,queryQueue});
   const limits=createPostgresMemberLimits(store,{clock}),readLimits=createPostgresMemberLimits(readStore,{clock});
   if(consumptionReady!==undefined&&typeof consumptionReady!=='function')throw new AppError(503,'消耗来源运行就绪依赖无效','consumption_runtime_not_ready');
@@ -34,94 +37,100 @@ export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,c
     if(!(available??await verifyConsumptionPolicyAvailability(store)))throw new AppError(503,'请先安装Key消耗来源迁移','database_migration_required');
     throw new AppError(503,'消耗来源扩展已安装，当前网关尚未启用；请受控重启后重试','consumption_runtime_not_ready');
   };
-  const audit=(action,detail)=>store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),clock(),action,typeof detail==='string'?detail:JSON.stringify(detail));
-  const activeMember=async memberId=>{
+  const auditWriter=createPostgresAudit(store,{clock});
+  const audit=(scope,action,detail,subject)=>auditWriter.write(scope,{action,detail,subject});
+  const activeMember=async(memberId,scope=null,{write=true}={})=>{
+    await departments.current(scope,{lock:true,write});
     const row=await store.get('SELECT * FROM harbor.members WHERE id=$1 AND removed_at IS NULL FOR UPDATE',memberId);
-    if(!row)throw new AppError(404,'员工不存在或已移除');return row;
+    if(!row)throw new AppError(404,'员工不存在或已移除');departments.same(scope,row);return row;
   };
-  const keyMember=async keyId=>{
-    const owner=await store.get('SELECT member_id FROM harbor.keys WHERE id=$1 AND removed_at IS NULL',keyId);if(!owner)throw new AppError(404,'Key 不存在或已删除');
-    await activeMember(owner.member_id);
+  const keyMember=async(keyId,scope)=>{
+    const owner=await store.get('SELECT * FROM harbor.keys WHERE id=$1 AND removed_at IS NULL',keyId);if(!owner)throw new AppError(404,'Key 不存在或已删除');
+    departments.same(scope,owner);await activeMember(owner.member_id,scope);
     const key=await store.get('SELECT * FROM harbor.keys WHERE id=$1 AND removed_at IS NULL FOR UPDATE',keyId);if(!key)throw new AppError(404,'Key 不存在或已删除');return key;
   };
-  async function createKey(memberId,expires,quota,allowedModels,expectedDefaults,source){
+  async function createKey(memberId,expires,quota,allowedModels,expectedDefaults,source,scope){
     if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32)throw new AppError(503,'员工凭据加密材料尚未配置','key_configuration');
     const consumptionAvailable=await verifyConsumptionPolicyAvailability(store);
     if(source&&!consumptionAvailable)throw new AppError(503,'请先安装Key消耗来源迁移','database_migration_required');
     await requireConsumptionReady(source,consumptionAvailable);
-    const owner=await activeMember(memberId),inherited=allowedModels===undefined&&!!owner.default_models_set;
+    const owner=await activeMember(memberId,scope),inherited=allowedModels===undefined&&!!owner.default_models_set;
     if(expectedDefaults!==undefined){if(!Number.isSafeInteger(expectedDefaults)||expectedDefaults<0)throw new AppError(400,'员工默认版本无效');if(expectedDefaults!==owner.defaults_version)throw new AppError(409,'员工默认已变化，请重新打开新增Key并核对','employee_defaults_conflict');}
     if(allowedModels===undefined)allowedModels=inherited?storedModelAllowlist(owner.default_models):null;
     const modelSource=inherited?{...owner.configuration_source.models,kind:'employee',defaults_version:owner.defaults_version}:{kind:owner.default_models_set?'custom':'legacy'},keyId=id(),secret=token();
     const policy=source?.consumption_policy??'inherit';
-    await store.run('INSERT INTO harbor.keys(id,member_id,digest,prefix,expires,created,quota,secret_cipher,allowed_models,model_source'+(consumptionAvailable?',consumption_policy,consumption_policy_version':'')+') VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb'+(consumptionAvailable?',$11,0':'')+')',
-      keyId,memberId,hash(secret),secret.slice(0,11),expires,clock(),quota,encryptStoredKey(encryptionKey,secret,keyId),allowedModels===null?null:JSON.stringify(allowedModels),JSON.stringify(modelSource),...(consumptionAvailable?[policy]:[]));
-    await audit('key.create',keyId);if(allowedModels!==null)await audit('key.models',{key:keyId,allowed_models:allowedModels});
-    if(source)await audit('key.consumption_policy',{key:keyId,member:memberId,previous:null,consumption_policy:policy,consumption_policy_version:0});
+    await store.run('INSERT INTO harbor.keys(id,member_id,digest,prefix,expires,created,quota,secret_cipher,allowed_models,model_source'+(scope?',department_id':'')+(consumptionAvailable?',consumption_policy,consumption_policy_version':'')+') VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb'+(scope?',$11':'')+(consumptionAvailable?', $'+(scope?12:11)+',0':'')+')',
+      keyId,memberId,hash(secret),secret.slice(0,11),expires,clock(),quota,encryptStoredKey(encryptionKey,secret,keyId),allowedModels===null?null:JSON.stringify(allowedModels),JSON.stringify(modelSource),...(scope?[scope.department_id]:[]),...(consumptionAvailable?[policy]:[]));
+    await audit(scope,'key.create',keyId,{kind:'key',id:keyId});if(allowedModels!==null)await audit(scope,'key.models',{key:keyId,allowed_models:allowedModels},{kind:'key',id:keyId});
+    if(source)await audit(scope,'key.consumption_policy',{key:keyId,member:memberId,previous:null,consumption_policy:policy,consumption_policy_version:0},{kind:'key',id:keyId});
     return {keyId,secret,...(consumptionAvailable?{consumption_policy:policy,consumption_policy_version:0}:{})};
   }
-  async function handle(path,method,payload,params,{signal}={}){
+  async function handle(path,method,payload,params,{signal,scope}={}){
+    if(!/^\/api\/admin\/(?:members|keys|member-types|member-config-batches|member-action-batches)(?:\/|$)/.test(path))return null;
+    if(method==='GET')signal?.throwIfAborted();
+    let trusted=method==='GET'?scope:await departments.resolve(scope,{write:true,payload});
     if(method==='GET'){
       params??=new URLSearchParams();
-      if(path==='/api/admin/members')return {status:200,value:await queries.list(memberQuery(params),{signal})};
-      if(path==='/api/admin/members/selection'){if(params.has('view'))throw new AppError(400,'筛选选择不接受视图参数');return {status:200,value:await queries.selection(memberQuery(params),{signal})};}
-      if(path==='/api/admin/keys')return {status:200,value:await queries.keys(memberQuery(params,{keys:true}),{signal})};
+      if(path==='/api/admin/members')return {status:200,value:await queries.list(memberQuery(params),{signal,scope:trusted??undefined})};
+      if(path==='/api/admin/members/selection'){if(params.has('view'))throw new AppError(400,'筛选选择不接受视图参数');return {status:200,value:await queries.selection(memberQuery(params),{signal,scope:trusted??undefined})};}
+      if(path==='/api/admin/keys')return {status:200,value:await queries.keys(memberQuery(params,{keys:true}),{signal,scope:trusted??undefined})};
       const copyPolicy=path.match(/^\/api\/admin\/keys\/([a-f0-9-]{36})\/policy$/);
-      if(copyPolicy){if([...params.keys()].length)throw new AppError(400,'Key权限摘要不接受查询参数');return {status:200,value:await queries.keyPolicy(copyPolicy[1],{signal})};}
+      if(copyPolicy){if([...params.keys()].length)throw new AppError(400,'Key权限摘要不接受查询参数');return {status:200,value:await queries.keyPolicy(copyPolicy[1],{signal,scope:trusted??undefined})};}
       const detail=path.match(/^\/api\/admin\/members\/([a-f0-9-]{36})(\/keys)?$/);
-      if(detail){if(!detail[2]&&[...params.keys()].length)throw new AppError(400,'员工详情不接受查询参数');return {status:200,value:detail[2]?await queries.keys(memberQuery(params,{keys:true}),{memberId:detail[1],reveal:true,signal}):await queries.detail(detail[1],{signal})};}
+      if(detail){if(!detail[2]&&[...params.keys()].length)throw new AppError(400,'员工详情不接受查询参数');return {status:200,value:detail[2]?await queries.keys(memberQuery(params,{keys:true}),{memberId:detail[1],reveal:true,signal,scope:trusted??undefined}):await queries.detail(detail[1],{signal,scope:trusted??undefined})};}
     }
-    const actionResult=await actions.handle(path,method,payload,params,method==='GET'?{signal}:{});if(actionResult)return actionResult;
-    const batchResult=await batches.handle(path,method,payload,params,method==='GET'?{signal}:{});if(batchResult)return batchResult;
-    const typeResult=await types.handle(path,method,payload,params,method==='GET'?{signal}:{});if(typeResult)return typeResult;
+    if(method==='GET'){trusted=await queryQueue.run(()=>departments.resolve(scope),{signal});}
+    const actionResult=await actions.handle(path,method,payload,params,{scope:trusted??undefined,...(method==='GET'?{signal}:{})});if(actionResult)return actionResult;
+    const batchResult=await batches.handle(path,method,payload,params,{scope:trusted??undefined,...(method==='GET'?{signal}:{})});if(batchResult)return batchResult;
+    const typeResult=await types.handle(path,method,payload,params,{...(method==='GET'?{signal}:{}),scope:trusted??undefined});if(typeResult)return typeResult;
     if(path==='/api/admin/members'&&method==='POST'){
       const b=payload,source=consumptionInput(b,{create:true}),memberName=name(b.name),quota=integer(b.quota,'额度',{nullable:true}),expires=expiry(b.expires),allowed=b.type_id===undefined?modelAllowlist(b.allowed_models===undefined?null:b.allowed_models):undefined;
       return {status:201,value:await store.transaction(async()=>{
-        const configuration=await types.creation(b),memberId=id();
-        await store.run('INSERT INTO harbor.members(id,name,quota,created,usage_type_id,usage_type_version,default_models,default_models_set,defaults_version,configuration_source) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)',memberId,memberName,quota,clock(),configuration?.type.id??null,configuration?1:0,configuration?.allowed===undefined||configuration.allowed===null?null:JSON.stringify(configuration.allowed),configuration?1:0,configuration?1:0,JSON.stringify(configuration?.sources||{models:{kind:'legacy'},limits:{kind:'legacy'}}));
-        if(configuration)await limits.save(memberId,{...configuration.limits,expected_version:0},{source:configuration.sources.limits});
-        const key=await createKey(memberId,expires,null,allowed,undefined,source);await audit('member.create',memberName);return {memberId,...key};
+        await departments.current(trusted,{lock:true});const configuration=await types.creation(b,{scope:trusted??undefined}),memberId=id();
+        await store.run('INSERT INTO harbor.members(id,name,quota,created,usage_type_id,usage_type_version,default_models,default_models_set,defaults_version,configuration_source'+(trusted?',department_id':'')+') VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb'+(trusted?',$11':'')+')',memberId,memberName,quota,clock(),configuration?.type?.id??null,configuration?.type?1:0,configuration?.allowed===undefined||configuration.allowed===null?null:JSON.stringify(configuration.allowed),configuration?1:0,configuration?1:0,JSON.stringify(configuration?.sources||{models:{kind:'legacy'},limits:{kind:'legacy'}}),...(trusted?[trusted.department_id]:[]));
+        if(configuration)await limits.save(memberId,{...configuration.limits,expected_version:0},{source:configuration.sources.limits,scope:trusted??undefined});
+        const key=await createKey(memberId,expires,null,allowed,undefined,source,trusted);await audit(trusted,'member.create',memberName,{kind:'member',id:memberId});return {memberId,...key};
       })};
     }
     const typeMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/type$/);
-    if(typeMatch&&method==='PATCH')return {status:200,value:await store.transaction(async()=>types.changeType(await activeMember(typeMatch[1]),payload))};
+    if(typeMatch&&method==='PATCH')return {status:200,value:await store.transaction(async()=>types.changeType(await activeMember(typeMatch[1],trusted),payload,{scope:trusted??undefined}))};
     const limitMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/usage-limits$/);
     if(limitMatch&&['GET','PATCH'].includes(method)){
-      return {status:200,value:await queryQueue.run(async()=>{if(method==='PATCH')await limits.save(limitMatch[1],payload);return readLimits.status(limitMatch[1]);},method==='GET'?{signal}:{})};
+      return {status:200,value:await queryQueue.run(async()=>{await store.transaction(async()=>{await activeMember(limitMatch[1],trusted??null,{write:method!=='GET'});if(method==='PATCH')await limits.save(limitMatch[1],payload,{scope:trusted??undefined});});return readLimits.status(limitMatch[1]);},method==='GET'?{signal}:{})};
     }
     const memberMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
     if(memberMatch&&['PATCH','DELETE'].includes(method))return {status:200,value:await store.transaction(async()=>{
-      const member=await activeMember(memberMatch[1]),b=payload;
+      const member=await activeMember(memberMatch[1],trusted),b=payload;
       if(b&&['consumption_policy','consumption_policy_version','expected_consumption_policy_version'].some(field=>Object.hasOwn(b,field)))throw new AppError(400,'请在对应Key中设置消耗来源','consumption_policy_invalid');
       if(method==='DELETE'){
         if(isBusy(member.id)||await store.get("SELECT id FROM harbor.requests WHERE member_id=$1 AND status IN ('queued','running') LIMIT 1",member.id))throw new AppError(409,'该员工仍有请求正在准备、排队或处理，请完成后再移除');
         const at=clock();await store.run('UPDATE harbor.members SET enabled=0,removed_at=$1 WHERE id=$2',at,member.id);
         await store.run("UPDATE harbor.keys SET enabled=0,secret_cipher=NULL,removed_at=COALESCE(removed_at,$1),digest='removed:'||id WHERE member_id=$2",at,member.id);
-        await store.run("UPDATE harbor.sessions SET state='uncertain',updated=$1 WHERE member_id=$2",at,member.id);await audit('member.remove',member.id);
+        await store.run("UPDATE harbor.sessions SET state='uncertain',updated=$1 WHERE member_id=$2",at,member.id);await audit(trusted,'member.remove',member.id,{kind:'member',id:member.id});
       }else{
-        await store.run('UPDATE harbor.members SET name=$1,quota=$2,enabled=$3 WHERE id=$4',b.name===undefined?member.name:name(b.name),b.quota===undefined?member.quota:integer(b.quota,'额度',{nullable:true}),b.enabled===undefined?member.enabled:bool(b.enabled),member.id);await audit('member.update',member.id);
+        await store.run('UPDATE harbor.members SET name=$1,quota=$2,enabled=$3 WHERE id=$4',b.name===undefined?member.name:name(b.name),b.quota===undefined?member.quota:integer(b.quota,'额度',{nullable:true}),b.enabled===undefined?member.enabled:bool(b.enabled),member.id);await audit(trusted,'member.update',member.id,{kind:'member',id:member.id});
       }
       return {ok:true};
     })};
     if(path==='/api/admin/keys'&&method==='POST'){
       const source=consumptionInput(payload,{create:true});
-      return {status:201,value:await store.transaction(()=>createKey(payload.memberId,expiry(payload.expires),payload.quota===undefined?null:integer(payload.quota,'Key 额度',{nullable:true}),payload.allowed_models===undefined?undefined:modelAllowlist(payload.allowed_models),payload.expected_defaults_version,source))};
+      return {status:201,value:await store.transaction(()=>createKey(payload.memberId,expiry(payload.expires),payload.quota===undefined?null:integer(payload.quota,'Key 额度',{nullable:true}),payload.allowed_models===undefined?undefined:modelAllowlist(payload.allowed_models),payload.expected_defaults_version,source,trusted))};
     }
     const keyMatch=path.match(/^\/api\/admin\/keys\/([a-f0-9-]+)$/);
     if(keyMatch&&['PATCH','DELETE'].includes(method))return {status:200,value:await store.transaction(async()=>{
-      const key=await keyMember(keyMatch[1]),b=payload,source=consumptionInput(b);
+      const key=await keyMember(keyMatch[1],trusted),b=payload,source=consumptionInput(b);
       if(method==='DELETE'){
         if(source)throw new AppError(400,'删除Key不接受消耗来源设置','consumption_policy_invalid');
         if(isBusy(key.member_id)||await store.get("SELECT id FROM harbor.requests WHERE key_id=$1 AND status IN ('queued','running') LIMIT 1",key.id))throw new AppError(409,'该员工仍有请求正在准备、排队或处理，请完成后再删除');
-        await store.run('UPDATE harbor.keys SET enabled=0,secret_cipher=NULL,removed_at=$1,digest=$2 WHERE id=$3',clock(),'removed:'+key.id,key.id);await audit('key.remove',key.id);
+        await store.run('UPDATE harbor.keys SET enabled=0,secret_cipher=NULL,removed_at=$1,digest=$2 WHERE id=$3',clock(),'removed:'+key.id,key.id);await audit(trusted,'key.remove',key.id,{kind:'key',id:key.id});
       }else{
         const changesModels=b.allowed_models!==undefined;
         if(changesModels&&b.expected_model_policy_version!==key.model_policy_version)throw new AppError(409,'模型权限已变化，请重新打开设置','model_policy_conflict');
         const allowed=changesModels?(b.allowed_models===null?null:JSON.stringify(modelAllowlist(b.allowed_models))):key.allowed_models;
         await requireConsumptionReady(source);
-        const sourceResult=source?await consumption.set(key.id,source):undefined;
+        const sourceResult=source?await consumption.set(key.id,source,{scope:trusted??undefined}):undefined;
         await store.run('UPDATE harbor.keys SET enabled=$1,expires=$2,quota=$3,allowed_models=$4,model_policy_version=$5,model_source=$6::jsonb WHERE id=$7',b.enabled===undefined?key.enabled:bool(b.enabled),b.expires===undefined?key.expires:expiry(b.expires),b.quota===undefined?key.quota:integer(b.quota,'Key 额度',{nullable:true}),allowed,key.model_policy_version+(changesModels?1:0),JSON.stringify(changesModels?{kind:'custom'}:key.model_source),key.id);
-        await audit('key.update',key.id);if(changesModels)await audit('key.models',{key:key.id,allowed_models:b.allowed_models});
+        await audit(trusted,'key.update',key.id,{kind:'key',id:key.id});if(changesModels)await audit(trusted,'key.models',{key:key.id,allowed_models:b.allowed_models},{kind:'key',id:key.id});
         if(sourceResult)return {ok:true,...sourceResult};
       }
       return {ok:true};

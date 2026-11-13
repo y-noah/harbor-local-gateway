@@ -1,3 +1,5 @@
+import {createDepartmentScopeIssuer,requireDepartmentScope} from './department-access.mjs';
+import {verifyDepartmentIsolationAvailability,assertDepartmentIsolationReadiness} from './postgres-departments.mjs';
 import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
 import {migrateUsageRollups} from './postgres-usage-rollups.mjs';
 import {migrateRecordingRetention} from './recording-retention.mjs';
@@ -45,6 +47,33 @@ function databaseTransport(connectionString,connection,allowPlaintextLocalNetwor
 }
 export class PostgresStore{
   #connections=new WeakMap();
+  #departmentIssuer=createDepartmentScopeIssuer();
+  #authenticatedDepartments=new WeakMap();
+  #departmentInitialization;
+  #departmentAvailable;
+  async #departmentReadiness(){
+    const first=this.#departmentInitialization===undefined,pending=this.#departmentInitialization??=verifyDepartmentIsolationAvailability(this);let available;
+    try{available=await pending;}catch(error){if(this.#departmentInitialization===pending)this.#departmentInitialization=undefined;throw error;}
+    if(!first)await assertDepartmentIsolationReadiness(this,available);this.#departmentAvailable=available;return available;
+  }
+  departmentScope(member){
+    const saved=this.#authenticatedDepartments.get(member);
+    if(!saved){if(this.#departmentAvailable===false)return undefined;throw new AppError(403,'员工身份不是本次数据库认证结果','department_scope_required');}
+    if(saved.scope===undefined)return undefined;
+    if(Object.entries(saved.identity).some(([field,value])=>member[field]!==value))throw new AppError(403,'员工认证身份已变化','department_forbidden');
+    return saved.scope;
+  }
+  async #departmentIdentity({departmentId,memberId,keyId,at,lock=false,exclusive=false,expected,digest}){
+    const department=await this.get('SELECT id,version,enabled FROM harbor.departments WHERE id=$1'+(lock?' FOR SHARE':''),departmentId);
+    if(!department?.enabled)throw new AppError(403,'部门已停用或不存在','department_forbidden');
+    const owner=await this.get('SELECT * FROM harbor.members WHERE id=$1 AND department_id=$2 AND removed_at IS NULL'+(lock?exclusive?' FOR UPDATE':' FOR SHARE':''),memberId,departmentId);
+    if(!owner?.enabled)throw new AppError(403,'Key 或员工已停用','key_disabled');
+    const key=await this.get('SELECT id,enabled,expires,allowed_models,model_policy_version,access_version FROM harbor.keys WHERE id=$1 AND member_id=$2 AND department_id=$3 AND removed_at IS NULL'+(digest?' AND digest=$4':'')+(lock?' FOR SHARE':''),keyId,memberId,departmentId,...(digest?[digest]:[]));
+    if(!key?.enabled)throw new AppError(403,'Key 或员工已停用','key_disabled');
+    if(key.expires!==null&&key.expires<=at)throw new AppError(403,'Key 已到期','key_expired');
+    if(expected&&(department.version!==expected.department_version||owner.access_version!==expected.member_version||key.access_version!==expected.credential_version))throw new AppError(403,'员工或部门授权版本已变化','department_forbidden');
+    return {department,owner,key};
+  }
   constructor({connectionString,connection,poolSize=12,connectionTimeoutMs=3000,statementTimeoutMs=10000,allowPlaintextLocalNetwork=false,maxParallelWorkersPerGather,Client}={}){
     if(!connectionString&&!connection)throw new AppError(503,'请配置PostgreSQL连接','database_configuration');
     if(!Number.isInteger(poolSize)||poolSize<1||poolSize>64||!Number.isInteger(connectionTimeoutMs)||connectionTimeoutMs<100||connectionTimeoutMs>30000||!Number.isInteger(statementTimeoutMs)||statementTimeoutMs<100||statementTimeoutMs>600000)throw new AppError(503,'数据库资源配置无效','database_configuration');
@@ -141,6 +170,14 @@ export class PostgresStore{
   async authenticate(secret,{at=Date.now(),lock=false,exclusive=false}={}){
     if(typeof secret!=='string'||!secret||secret.length>4096)throw new AppError(401,'Key 无效','invalid_api_key');
     if(typeof lock!=='boolean'||typeof exclusive!=='boolean'||(lock||exclusive)&&!this.context.getStore())throw new AppError(503,'受理鉴权锁必须位于请求事务内','database_transaction_required');
+    if(await this.#departmentReadiness()){
+      const lookup=await this.get('SELECT k.id,k.member_id,k.department_id,m.department_id member_department_id FROM harbor.keys k JOIN harbor.members m ON m.id=k.member_id WHERE k.digest=$1 AND k.removed_at IS NULL AND m.removed_at IS NULL',hash(secret));
+      if(!lookup)throw new AppError(401,'Key 无效','invalid_api_key');
+      if(lookup.department_id!==lookup.member_department_id)throw new AppError(403,'员工和Key归属不一致','department_forbidden');
+      const {department,owner,key}=await this.#departmentIdentity({departmentId:lookup.department_id,memberId:lookup.member_id,keyId:lookup.id,at,lock:lock||exclusive,exclusive,digest:hash(secret)});
+      const row={...owner,key_id:key.id,key_enabled:key.enabled,expires:key.expires,allowed_models:key.allowed_models,model_policy_version:key.model_policy_version,key_access_version:key.access_version,department_version:department.version},scope=this.#departmentIssuer.employee({departmentId:department.id,memberId:owner.id,credentialId:key.id,credentialVersion:key.access_version,memberVersion:owner.access_version,departmentVersion:department.version});
+      const identity=Object.fromEntries(['id','key_id','department_id','access_version','key_access_version','department_version'].map(field=>[field,row[field]]));this.#authenticatedDepartments.set(row,{scope,identity});return row;
+    }
     // Settlement updates the member before the Key. Acquire the same order
     // explicitly; a joined row-lock query can otherwise retain a Key lock while
     // waiting for the member and deadlock with a concurrent settlement.
@@ -152,7 +189,7 @@ export class PostgresStore{
     if(!row)throw new AppError(401,'Key 无效','invalid_api_key');
     if(!row.enabled||!row.key_enabled)throw new AppError(403,'Key 或员工已停用','key_disabled');
     if(row.expires!==null&&row.expires<=at)throw new AppError(403,'Key 已到期','key_expired');
-    return row;
+    this.#authenticatedDepartments.set(row,{scope:undefined});return row;
   }
   async initializePricing(){
     const value={rates:seed.rates,aliases:[]},book=JSON.stringify(value),revision=createHash('sha256').update(book).digest('hex');
@@ -183,20 +220,26 @@ export class PostgresStore{
     const book=revision?await this.#operationBook(revision,books):null;
     return book?quoteReference(row,book,revision):emptyReferenceQuote('unpriced',row.billing_model||row.model,revision);
   }
-  async observe(member,ip,agent,model,{at=Date.now(),channel='responses',device,parameters}={}){
+  async observe(member,ip,agent,model,{at=Date.now(),channel='responses',device,parameters,scope}={}){
+    const installed=await this.#departmentReadiness();
+    let department=null;if(installed){department=requireDepartmentScope(scope===undefined?this.departmentScope(member):scope,{roles:['employee']});if(department.member_id!==member?.id||department.credential_id!==member?.key_id||department.department_id!==member?.department_id)throw new AppError(403,'请求身份与部门范围不一致','department_forbidden');}
+    else if(scope!==undefined)throw new AppError(503,'部门隔离尚未启用','department_unavailable');
+    const memberId=department?.member_id??member.id,keyId=department?.credential_id??member.key_id,observedDevice=device?{...device}:undefined;
     return this.transaction(async()=>{
-      const currentMember=await this.get('SELECT id,usage_type_id,usage_type_version FROM harbor.members WHERE id=$1 FOR SHARE',member.id);
+      if(department)await this.#departmentIdentity({departmentId:department.department_id,memberId:department.member_id,keyId:department.credential_id,at,lock:true,expected:department});
+      if(department&&observedDevice?.deviceId&&!await this.get('SELECT id FROM harbor.employee_devices WHERE id=$1 AND member_id=$2',observedDevice.deviceId,memberId))throw new AppError(403,'设备不属于当前员工','department_forbidden');
+      const currentMember=await this.get('SELECT id,usage_type_id,usage_type_version FROM harbor.members WHERE id=$1 FOR SHARE',memberId);
       const type=currentMember?.usage_type_id?await this.get('SELECT id,code,name FROM harbor.member_types WHERE id=$1 FOR SHARE',currentMember.usage_type_id):null;
       const owner=await this.get(`SELECT k.id FROM harbor.keys k JOIN harbor.members m ON m.id=k.member_id
         WHERE k.id=$1 AND m.id=$2 AND k.removed_at IS NULL AND m.removed_at IS NULL
-        AND k.enabled=1 AND m.enabled=1 AND (k.expires IS NULL OR k.expires>$3) FOR SHARE OF k,m`,member.key_id,member.id,at);
+        AND k.enabled=1 AND m.enabled=1 AND (k.expires IS NULL OR k.expires>$3) FOR SHARE OF k,m`,keyId,memberId,at);
       if(!owner)throw new AppError(403,'Key或员工已停用或到期','key_disabled');
       const revision=JSON.parse((await this.get("SELECT value FROM harbor.gateway_settings WHERE name='pricing.state'"))?.value||'{}').active;
       const books=new Map();
       if(!revision||!await this.#operationBook(revision,books))throw new AppError(503,'计价版本尚未准备好','pricing_unavailable');
       const request=randomUUID(),observedParameters=requestParameters(parameters);
-      const row=await this.get(`INSERT INTO harbor.requests(id,member_id,key_id,started,received_at,status,business_status,ip,agent,model,price_version,tracking_only,predicted,source_channel,recording_state,phase,phase_at,phase_history,usage_type_id,usage_type_code,usage_type_name,usage_type_version,device_id,device_name,device_system,device_generation,device_auth_state,effort,service_tier)
-        VALUES($1,$2,$3,$4,$4,'queued','queued',$5,$6,$7,$8,1,0,$9,'disabled','queued',$4,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,request,member.id,member.key_id,at,ip,agent,model,revision,channel,JSON.stringify([{phase:'queued',at}]),type?.id??null,type?.code??null,type?.name??null,currentMember?.usage_type_version??null,device?.deviceId??null,device?.deviceName??null,device?.deviceSystem??null,device?.generation??null,device?.authState??'historical_unknown',observedParameters.effort,observedParameters.service_tier);
+      const row=await this.get(`INSERT INTO harbor.requests(id,member_id,key_id,started,received_at,status,business_status,ip,agent,model,price_version,tracking_only,predicted,source_channel,recording_state,phase,phase_at,phase_history,usage_type_id,usage_type_code,usage_type_name,usage_type_version,device_id,device_name,device_system,device_generation,device_auth_state,effort,service_tier${department?',department_id':''})
+        VALUES($1,$2,$3,$4,$4,'queued','queued',$5,$6,$7,$8,1,0,$9,'disabled','queued',$4,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21${department?',$22':''}) RETURNING *`,request,memberId,keyId,at,ip,agent,model,revision,channel,JSON.stringify([{phase:'queued',at}]),type?.id??null,type?.code??null,type?.name??null,currentMember?.usage_type_version??null,observedDevice?.deviceId??null,observedDevice?.deviceName??null,observedDevice?.deviceSystem??null,observedDevice?.generation??null,observedDevice?.authState??'historical_unknown',observedParameters.effort,observedParameters.service_tier,...(department?[department.department_id]:[]));
       await this.#projectLockedPrice(row,at,books);return request;
     });
   }

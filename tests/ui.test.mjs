@@ -737,7 +737,7 @@ test('Key model selection preserves exact names, saved versions and ignores stal
 test('member model limits use an employee-scoped endpoint, retain disabled rules and guard stale dialogs',async()=>{
  const limits={enabled:false,version:2,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'20.00'}],usage:[]},calls=[];
  const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?pricingState():path.endsWith('usage-limits')?limits:snapshot());});
- page.run('admin=true;globalThis.FormData=class{get(k){return values[k]??null;}getAll(k){return values[k]||[];}};');await page.click('member-limits','member-id');assert.match(page.node('#modal-content').innerHTML,/滚动24小时/);assert.match(page.node('#modal-content').innerHTML,/20.00/);
+ page.run('admin=true;globalThis.FormData=class{get(k){return values[k]??null;}getAll(k){return values[k]||[];}};');await page.click('member-limits','member-id');assert.match(page.node('#modal-content').innerHTML,/北京时间00:00重置/);assert.match(page.node('#modal-content').innerHTML,/20.00/);
  page.node('#member-limit-enabled').onchange({target:{value:'on'}});assert.equal(page.run('memberLimitEditor.enabled'),true);
  page.run('globalThis.values={limits_enabled:"on",limit_model:["gpt-6.1-sol"],limit_hours:["168"],limit_usd:["30.00"]};');await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
  const saved=calls.find(([p,o])=>p==='/api/admin/members/member-id/usage-limits'&&o.method==='PATCH');assert.deepEqual(JSON.parse(saved[1].body),{expected_version:2,enabled:true,rules:[{model:'gpt-6.1-sol',hours:168,limit_usd:'30.00'}]});
@@ -1087,7 +1087,7 @@ test('套餐开启时负载设置不能把disabled的旧weighted误保存成fals
  let sent;const state=packageSnapshot();state.balancing.settings.weighted=true;const page=await ui((path,options)=>options.method==='PATCH'?(sent=JSON.parse(options.body),response({})):response(state));page.run('admin=true;state='+JSON.stringify(state));await page.click('balancing-settings');assert.match(page.node('#modal-content').innerHTML,/select name="weighted" disabled/);assert.match(page.node('#modal-content').innerHTML,/当前由既有容量策略管理，此项只读/);useSyntheticForm(page,{failover:'false',nightly:'false',quietMinutes:'30'});await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});assert.equal(Object.hasOwn(sent,'weighted'),false);
 });
 test('添加按量API不发送订阅字段，Codex只填写月费且不猜测容量',async()=>{
- const writes=[];const snapshot=packageSnapshot(),page=await ui((path,options)=>{if(options.method==='POST'){writes.push(JSON.parse(options.body));return response({id:'new-account'});}return response(path.includes('account-packages')?packageCatalogFixture():snapshot);});page.run('admin=true;state='+JSON.stringify(snapshot)+';tab="accounts";');await page.click('create-account');useSyntheticForm(page,{auth_mode:'openai_api',name:'合成API账户',api_key:'sk-proj-synthetic-test-only',api_weight:'12',package_choice:'pkg-one@1'});await page.node('#package-create-account-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});assert.equal(writes[0].auth_mode,'openai_api');assert.equal(writes[0].api_weight,0);assert.equal(Object.hasOwn(writes[0],'package'),false);await page.click('close');await page.click('create-account');useSyntheticForm(page,{auth_mode:'subscription',kind:'codex',name:'未知合成订阅',subscription_monthly_usd:'200',package_choice:''});await page.node('#package-create-account-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});assert.deepEqual(writes[1].package,{template_id:null});assert.equal(writes[1].subscription_monthly_usd,200);assert.equal(Object.hasOwn(writes[0],'subscription_monthly_usd'),false);assert.match(page.node('#modal-content').innerHTML,/\$200\.00\/月/);
+ const writes=[];const snapshot=packageSnapshot(),page=await ui((path,options)=>{if(options.method==='POST'){writes.push(JSON.parse(options.body));return response({id:'new-account'});}return response(path.includes('account-packages')?packageCatalogFixture():snapshot);});page.run('admin=true;state='+JSON.stringify(snapshot)+';tab="accounts";');await page.click('create-account');useSyntheticForm(page,{auth_mode:'openai_api',name:'合成API账户',api_key:'sk-proj-synthetic-test-only',api_weight:'12',package_choice:'pkg-one@1'});await page.node('#package-create-account-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});assert.equal(writes[0].auth_mode,'openai_api');assert.equal(writes[0].api_weight,0);assert.equal(Object.hasOwn(writes[0],'package'),false);await page.click('close');await page.click('create-account');useSyntheticForm(page,{auth_mode:'subscription',kind:'codex',name:'未知合成订阅',subscription_monthly_usd:'200',package_choice:''});await page.node('#package-create-account-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});assert.equal(Object.hasOwn(writes[1],'package'),false);assert.equal(writes[1].subscription_monthly_usd,200);assert.equal(Object.hasOwn(writes[0],'subscription_monthly_usd'),false);assert.match(page.node('#modal-content').innerHTML,/\$200\.00\/月/);
 });
 test('套餐创建目录迟到和保存后的刷新迟到都不能替换用户新打开的弹窗',async()=>{
  let release;const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response(packageCatalogFixture()));}));page.run('admin=true;state='+JSON.stringify(packageSnapshot())+';tab="accounts";');const pending=page.click('create-account');await new Promise(setImmediate);await page.click('close');page.run('modal("另一个对话框")');release();await pending;assert.equal(page.node('#modal-content').innerHTML,'另一个对话框');
@@ -1463,7 +1463,7 @@ test('员工到期列显示北京时间，混合Key注明最近到期、永久�
 test('创建员工和新增类型各自打开正确表单，不复用同一个创建模式',async()=>{
  const type={id:'usage-a',code:'A',name:'合成类型',description:'',enabled:1,configured:true,version:1,default_version:1,defaults:{allowed_models:null,usage_limits:{enabled:false,rules:[]}}};
  const page=await ui(path=>response(path==='/api/admin/pricing'?{rates:[]}:{types:[type]}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot()));
- await page.click('create-member');assert.match(page.node('#modal-content').innerHTML,/<h2>创建员工 Key<\/h2>/);assert.match(page.node('#modal-content').innerHTML,/name="type_id"/);assert.match(page.node('#modal-content').innerHTML,/<details><summary>自定义权限与限额<\/summary>/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/name="type_name"/);
+ await page.click('create-member');assert.match(page.node('#modal-content').innerHTML,/<h2>创建员工 Key<\/h2>/);assert.match(page.node('#modal-content').innerHTML,/name="type_id"/);assert.match(page.node('#modal-content').innerHTML,/<details id="typed-member-custom"><summary>自定义权限与限额<\/summary>/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/name="type_name"/);
  await page.click('close');await page.click('create-member-type');assert.match(page.node('#modal-content').innerHTML,/<h2>新增使用类型<\/h2>/);assert.match(page.node('#modal-content').innerHTML,/name="type_name"/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/name="type_id"/);
  await page.click('close');await page.click('create-member');assert.match(page.node('#modal-content').innerHTML,/<h2>创建员工 Key<\/h2>/);
 });
@@ -1478,7 +1478,7 @@ test('员工管理单Key不重复设备与批量信息，总览不提供创建Ke
 
 test('复制Key附加当前模型与共享限额，无限制不列举，设备指纹复制保持原样',async()=>{
  const page=await ui(()=>response({})),policy={allowed_models:['gpt-6.1-sol'],usage_limits:{enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'20'}]}};
- assert.equal(page.run('employeeKeyClipboard("synthetic",'+JSON.stringify(policy)+')'),'synthetic\n可用模型：gpt-6.1-sol\n模型限额（员工全部 Key 共享，参考 USD）：\ngpt-6.1-sol：$20.00／滚动24小时');
+ assert.equal(page.run('employeeKeyClipboard("synthetic",'+JSON.stringify(policy)+')'),'synthetic\n可用模型：gpt-6.1-sol\n模型限额（员工全部 Key 共享，参考 USD）：\ngpt-6.1-sol：$20.00／每日（北京时间00:00重置）');
  policy.allowed_models=null;policy.usage_limits.rules[0].hours=168;const text=page.run('employeeKeyClipboard("synthetic",'+JSON.stringify(policy)+')');assert.match(text,/可用模型：无限制/);assert.match(text,/滚动7天/);assert.match(text,/其余可用模型：无限制/);
  policy.allowed_models=[];policy.usage_limits.enabled=false;assert.match(page.run('employeeKeyClipboard("synthetic",'+JSON.stringify(policy)+')'),/无可用模型/);
  assert.throws(()=>page.run('employeeKeyClipboard("synthetic",{allowed_models:null})'),/未加载/);
@@ -1569,7 +1569,7 @@ test('统计Tab仅显示相应筛选，切换时清除不可见条件并重新�
 });
 
 test('平台文档从统计口径下载，规则说明移出设置且文档不包含实际Key',async()=>{
- const page=await ui(()=>response({})),state={...snapshot(),endpoint:'http://example.test/v1',keys:[{full_key:'hg_synthetic_do_not_export_actual_key'}],balancing:{settings:{quietMinutes:30},lastRun:{day:'2026-11-11-1300',status:'completed'}}};page.run('admin=true;state='+JSON.stringify(state));await page.click('download-platform-guide');assert.equal(page.node('#modal').open,false);assert.equal(page.downloads.at(-1),'Harbor-平台说明.html');const doc=page.run('platformGuideDocument(state.endpoint)');assert.ok(doc.indexOf('使用前告知')<doc.indexOf('用量统计口径'));for(const text of ['模型共享限额','滚动24小时','员工全部Key共享','已经计价','物理设备身份','模型权限'])assert.ok(doc.includes(text),text);assert.ok(!doc.includes(state.keys[0].full_key));assert.doesNotMatch(doc,/<script/);
+ const page=await ui(()=>response({})),state={...snapshot(),endpoint:'http://example.test/v1',keys:[{full_key:'hg_synthetic_do_not_export_actual_key'}],balancing:{settings:{quietMinutes:30},lastRun:{day:'2026-11-11-1300',status:'completed'}}};page.run('admin=true;state='+JSON.stringify(state));await page.click('download-platform-guide');assert.equal(page.node('#modal').open,false);assert.equal(page.downloads.at(-1),'Harbor-平台说明.html');const doc=page.run('platformGuideDocument(state.endpoint)');assert.ok(doc.indexOf('使用前告知')<doc.indexOf('用量统计口径'));for(const text of ['模型共享限额','北京时间00:00','员工全部Key共享','已经计价','物理设备身份','模型权限'])assert.ok(doc.includes(text),text);assert.ok(!doc.includes(state.keys[0].full_key));assert.doesNotMatch(doc,/<script/);
  await page.click('balancing-settings');const html=page.node('#modal-content').innerHTML;assert.match(html,/最近执行：2026-11-11-1300 · 已完成/);assert.doesNotMatch(html,/自动参考权重在每日|统计过去16小时活跃会话|重会话，再优先/);
 });
 
@@ -1774,4 +1774,45 @@ test('总览刷新在请求数不变时重新读取结算及人工核对金额�
  await page.run('refresh()');await new Promise(setImmediate);assert.equal(reads,2);assert.match(page.node('#overview-cost-chart').innerHTML,/\$2\.00/);
  await page.run('refresh(true,"state:overview")');await new Promise(setImmediate);assert.equal(reads,3);assert.match(page.node('#overview-cost-chart').innerHTML,/\$3\.00/);
  assert.match(source,/bar\.style\.height=bar\.dataset\.height\+'px'/);assert.doesNotMatch(source,/bar\.style\.height=bar\.dataset\.height\+'%'/);
+});
+
+
+test('创建未分类员工使用明确自定义规则，模型目录不读取全局费率配置',async()=>{
+ let sent;const calls=[],catalog={types:[],models:['gpt-6.1-sol','gpt-6.1-luna']},page=await ui((path,options)=>{calls.push(path);if(path==='/api/admin/members'&&options.method==='POST'){sent=JSON.parse(options.body);return response({error:{message:'合成保留表单'}},409);}return response(catalog);});
+ page.run('admin=true;state='+JSON.stringify(pagedSnapshot()));await page.click('create-member');assert.match(page.node('#modal-content').innerHTML,/<option value="unclassified">未分类<\/option>/);page.node('[name="type_id"]').value='unclassified';page.node('[name="type_id"]').onchange({target:{value:'unclassified'}});assert.equal(page.node('[name="models_mode"]').value,'custom');assert.equal(page.node('[name="limits_mode"]').value,'custom');assert.equal(page.node('#typed-member-custom').open,true);assert.equal(page.node('#type-model-config').disabled,false);
+ page.run('globalThis.FormData=class{get(key){return {name:"未分类合成员工",type_id:"unclassified",days:"0",models_mode:"custom",limits_mode:"custom",model_policy_mode:"limited",allowed_models:"gpt-6.1-sol",type_limits_enabled:"true"}[key]??null;}getAll(key){return {limit_model:["gpt-6.1-sol"],limit_hours:["24"],limit_usd:["20"]}[key]||[];}}');await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
+ assert.equal(sent.type_id,null);assert.equal(Object.hasOwn(sent,'expected_type_version'),false);assert.deepEqual(sent.allowed_models,['gpt-6.1-sol']);assert.deepEqual(sent.usage_limits,{enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'20'}]});assert.equal(calls.includes('/api/admin/pricing'),false);
+});
+test('类型限额使用模型下拉并保留现值，删除类型只显示一个入口',async()=>{
+ const page=await ui(()=>response({})),type={id:'type-one',code:'A',name:'合成类型',enabled:1,version:1,configured:true,default_version:1,defaults:{allowed_models:null,usage_limits:{enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'20'}]}}};page.run('admin=true;showTypeEditor('+JSON.stringify(type)+',[],["gpt-6.1-sol","gpt-6.1-luna"])');const html=page.run('typeLimitRowsHtml(typeEditor.type.defaults.usage_limits.rules)');assert.match(html,/<select name="limit_model" required>/);assert.match(html,/<option value="gpt-6.1-sol" selected>/);assert.match(html,/value="gpt-6.1-luna"/);assert.doesNotMatch(html,/<input name="limit_model"/);assert.equal((page.node('#modal-content').innerHTML.match(/删除类型/g)||[]).length,1);
+});
+
+test('删除员工需确认，成功移除员工与Key缓存并清除批量选择',async()=>{
+ const member={id:'delete-member',name:'合成删除员工',enabled:1,usage_limits:{enabled:false,rules:[]}},key={id:'delete-key',member_id:member.id,prefix:'synthetic',enabled:1},before={...snapshot(),members:[member],keys:[key]},writes=[];
+ const page=await ui((path,options)=>{if(options.method==='DELETE'){writes.push(path);return response({ok:true});}return response({...snapshot(),keys:[]});});page.run('admin=true;state='+JSON.stringify(before)+';memberSelection.set("delete-member",{id:"delete-member"});renderMemberDetail("delete-member")');assert.match(page.node('#modal-content').innerHTML,/data-action="remove-member"/);
+ await page.click('remove-member',member.id);assert.equal(writes.length,0);assert.match(page.node('#modal-content').innerHTML,/历史使用记录保留/);await page.click('confirm-remove-member',member.id);assert.deepEqual(writes,['/api/admin/members/'+member.id]);assert.equal(page.run('memberSelection.has("delete-member")'),false);assert.equal(page.run('state.members.length'),0);assert.equal(page.run('state.keys.length'),0);assert.equal(page.node('#modal').open,false);
+});
+test('员工有在途请求删除失败时保留员工与确认界面',async()=>{
+ const member={id:'busy-member',name:'合成在途员工',enabled:1},page=await ui(()=>response({error:{message:'该员工仍有请求正在处理'}},409));page.run('admin=true;state='+JSON.stringify({...snapshot(),members:[member],keys:[]}));await page.click('remove-member',member.id);await page.click('confirm-remove-member',member.id);assert.equal(page.run('state.members.length'),1);assert.equal(page.node('#modal').open,true);assert.match(page.node('#modal-content').innerHTML,/确认删除/);assert.match(page.node('#toast').textContent,/仍有请求/);
+});
+
+test('员工详情应用类型默认覆盖例外，批量仍保留，并且仅生成预览不执行',async()=>{
+ for(const single of [true,false]){
+  const writes=[],page=await ui((path,options)=>{
+   if(options.method==='POST'){writes.push({path,body:JSON.parse(options.body)});return response({id:'synthetic-batch'});}
+   return response(path==='/api/admin/member-types'?typeCatalog():batchRecord());
+  });
+  page.node('#dialog-form').querySelector=()=>({textContent:''});
+  page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{memberTypes:true},members:[{id:'synthetic-member',usage_type_id:'usage-a'}]}));
+  if(single)await page.click('member-batch-settings','synthetic-member');
+  else await page.run('configureMemberBatch({member_ids:["synthetic-member"]},"usage-a")');
+  const html=page.node('#modal-content').innerHTML;
+  assert.match(html,single?/<option value="overwrite" selected>/ : /<option value="keep" selected>保留个人/);
+  assert.equal(writes.length,0);
+  useSyntheticForm(page,{batch_type:'usage-a',batch_models:'apply',batch_limits:'apply',batch_classify:'keep',batch_overwrite:single?'overwrite':'keep'});
+  await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
+  assert.equal(writes.length,1);assert.equal(writes[0].path,'/api/admin/member-config-batches/preview');
+  assert.equal(writes[0].body.overwrite_exceptions,single);assert.equal(writes[0].body.models,true);assert.equal(writes[0].body.limits,true);assert.equal(writes[0].body.classify,false);
+  assert.deepEqual(writes[0].body.scope,{member_ids:['synthetic-member']});
+ }
 });

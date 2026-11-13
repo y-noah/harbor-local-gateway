@@ -1,4 +1,6 @@
 import {randomBytes} from 'node:crypto';
+import {createDeviceDepartments} from './postgres-device-departments.mjs';
+import {createPostgresAudit} from './postgres-audit.mjs';
 import {AppError,id,usageWindow} from './store.mjs';
 import {deviceTransportProof} from './device-transport.mjs';
 import {deviceDigest,deviceEnrollmentMessage,verifyDeviceEnrollment} from './device-proof.mjs';
@@ -17,9 +19,9 @@ const dto=row=>({id:row.id,member_id:row.member_id,name:row.name,system:row.syst
 export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQueue,readStore=store,invitationMs=3600000,maxInvitationMs=86400000,challengeMs=300000,maxChallenges=10,maxDevices=1000}={}){
   const issuerConfigured=!!issuer;if(issuer!==undefined&&(!issuer||typeof issuer.inspect!=='function'||typeof issuer.issue!=='function')||typeof clock!=='function'||![invitationMs,maxInvitationMs,challengeMs,maxChallenges,maxDevices].every(Number.isSafeInteger)||invitationMs<60000||maxInvitationMs>86400000||maxInvitationMs<invitationMs||challengeMs<10000||challengeMs>600000||maxChallenges<1||maxChallenges>100||maxDevices<1||maxDevices>10000)fail(503,'设备接入配置无效','device_configuration');
   issuer??={inspect:()=>fail(503,'设备CA尚未配置，已有强制策略仍执行','device_ca_unavailable'),issue:()=>fail(503,'设备CA尚未配置，已有强制策略仍执行','device_ca_unavailable')};
-  const read=(op,{signal}={})=>queryQueue?queryQueue.run(()=>readStore.transaction(op,{level:'REPEATABLE READ',readOnly:true}),{signal}):readStore.transaction(op,{level:'REPEATABLE READ',readOnly:true});
-  const audit=(action,value)=>store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),clock(),action,JSON.stringify(value));
-  async function member(memberId,{lock=false,target=store}={}){const value=await target.get('SELECT id,enabled,device_mode,device_policy_version FROM harbor.members WHERE id=$1 AND removed_at IS NULL'+(lock?' FOR UPDATE':''),memberId);if(!value)fail(404,'员工不存在','device_member_not_found');return value;}
+  const read=(op,{signal}={})=>{const run=departments.bind(()=>readStore.transaction(op,{level:'REPEATABLE READ',readOnly:true}));return queryQueue?queryQueue.run(run,{signal}):run();};
+  const audit=async(action,value)=>createPostgresAudit(store,{clock}).write(await departments.auditScope(value.member),{action,detail:value,subject:{kind:'member',id:value.member}});
+  const departments=createDeviceDepartments(store,{clock}),member=departments.member;
   async function scope(){return store.transaction(async()=>{let row=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='device.instance_scope'");if(!row){await store.run("INSERT INTO harbor.gateway_settings(name,value) VALUES('device.instance_scope',$1) ON CONFLICT(name) DO NOTHING",randomBytes(32).toString('hex'));row=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='device.instance_scope'");}if(!hex(row.value))fail(503,'设备实例作用域损坏','device_configuration');return row.value;});}
   async function keyIds(memberId,values){
     if(values===null)return null;if(!Array.isArray(values)||values.length>maxDevices||values.some(value=>!identityIdentifier(value))||new Set(values).size!==values.length)fail(400,'设备可用Key范围无效');
@@ -39,6 +41,7 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
   async function challenge(payload){
     if(!object(payload,['invitation'])||typeof payload.invitation!=='string'||payload.invitation.length>200)fail(400,'设备邀请无效');
     return store.transaction(async()=>{
+      const initial=await store.get('SELECT member_id FROM harbor.device_invitations WHERE digest=$1',deviceDigest(payload.invitation));if(!initial)fail(403,'邀请不存在、已使用或已失效','device_invitation_invalid');await member(initial.member_id,{lock:true});
       const invitation=await store.get('SELECT * FROM harbor.device_invitations WHERE digest=$1 FOR UPDATE',deviceDigest(payload.invitation));
       if(!invitation||invitation.consumed!==null||invitation.revoked!==null||invitation.expires<=clock())fail(403,'邀请不存在、已使用或已失效','device_invitation_invalid');if(invitation.challenge_count>=maxChallenges)fail(429,'邀请核验次数达到上限，请重新创建邀请','device_invitation_attempts');
       const challenge=id(),nonce=secret(),expires=Math.min(clock()+challengeMs,invitation.expires);await store.run('UPDATE harbor.device_invitations SET challenge_id=$1,challenge_digest=$2,challenge_expires=$3,challenge_count=challenge_count+1 WHERE id=$4',challenge,deviceDigest(nonce),expires,invitation.id);
@@ -50,7 +53,7 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
     const name=text(payload.name,80),system=text(payload.system,160),source=payload.fingerprint_source;
     if(!['smbios_uuid','unavailable'].includes(source)||source==='smbios_uuid'&&!hex(payload.fingerprint)||source==='unavailable'&&payload.fingerprint!==null||payload.installation_fingerprint!==null&&payload.installation_fingerprint!==undefined&&!hex(payload.installation_fingerprint))fail(400,'设备指纹摘要无效');
     const initial=await store.get('SELECT member_id,consumed,revoked,expires,challenge_id,challenge_digest,challenge_expires FROM harbor.device_invitations WHERE digest=$1',deviceDigest(payload.invitation));if(!initial||initial.consumed!==null||initial.revoked!==null||initial.expires<=clock()||initial.challenge_id!==payload.challenge||initial.challenge_digest!==deviceDigest(payload.nonce)||initial.challenge_expires<=clock())fail(403,'设备邀请或挑战已失效','device_invitation_invalid');
-    const inspected=await issuer.inspect(payload.csr);if(!verifyDeviceEnrollment(inspected.publicKey,deviceEnrollmentMessage({...payload,name,system}),payload.signature))fail(403,'设备私钥持有证明无效','device_possession_invalid');
+    await member(initial.member_id);const inspected=await issuer.inspect(payload.csr);if(!verifyDeviceEnrollment(inspected.publicKey,deviceEnrollmentMessage({...payload,name,system}),payload.signature))fail(403,'设备私钥持有证明无效','device_possession_invalid');
     return store.transaction(async()=>{
       await member(initial.member_id,{lock:true});const invitation=await store.get('SELECT * FROM harbor.device_invitations WHERE digest=$1 FOR UPDATE',deviceDigest(payload.invitation));
       if(!invitation||invitation.member_id!==initial.member_id||invitation.consumed!==null||invitation.revoked!==null||invitation.expires<=clock()||invitation.challenge_id!==payload.challenge||invitation.challenge_digest!==deviceDigest(payload.nonce)||invitation.challenge_expires<=clock())fail(403,'设备邀请或挑战已失效','device_invitation_invalid');
@@ -67,8 +70,8 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
   }
   async function enrollmentStatus(payload){
     if(!object(payload,['enrollment_token'])||typeof payload.enrollment_token!=='string'||payload.enrollment_token.length>200)fail(400,'设备登记凭据无效');
-    const row=await store.get(`SELECT d.id,d.state,d.pending_renewal,d.enrollment_expires,c.certificate,c.expires FROM harbor.employee_devices d LEFT JOIN harbor.device_credentials c ON c.device_id=d.id AND c.generation=d.credential_generation AND c.revoked IS NULL WHERE d.enrollment_digest=$1`,deviceDigest(payload.enrollment_token));
-    if(!row||row.enrollment_expires<=clock())fail(403,'设备登记凭据无效或已失效','device_enrollment_invalid');return {device_id:row.id,state:row.pending_renewal?'renewal_pending':row.state,...(row.state==='approved'&&!row.pending_renewal&&row.certificate?{certificate:row.certificate,certificate_expires:row.expires}:{})};
+    const row=await store.get(`SELECT d.id,d.member_id,d.state,d.pending_renewal,d.enrollment_expires,c.certificate,c.expires FROM harbor.employee_devices d LEFT JOIN harbor.device_credentials c ON c.device_id=d.id AND c.generation=d.credential_generation AND c.revoked IS NULL WHERE d.enrollment_digest=$1`,deviceDigest(payload.enrollment_token));
+    if(!row||row.enrollment_expires<=clock())fail(403,'设备登记凭据无效或已失效','device_enrollment_invalid');await member(row.member_id);return {device_id:row.id,state:row.pending_renewal?'renewal_pending':row.state,...(row.state==='approved'&&!row.pending_renewal&&row.certificate?{certificate:row.certificate,certificate_expires:row.expires}:{})};
   }
   async function approve(deviceId,payload){
     if(!object(payload,['expected_version','credentials_only'])||!version(payload.expected_version)||typeof payload.credentials_only!=='boolean')fail(400,'设备批准参数无效');
@@ -96,8 +99,10 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
       await member(initial.member_id,{lock:true});const current=await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1 FOR UPDATE',deviceId);if(current.version!==payload.expected_version||!current.pending_renewal)fail(409,'设备没有待续期或状态已变化','device_conflict');await store.run('UPDATE harbor.employee_devices SET pending_renewal=FALSE,enrollment_expires=$1,version=version+1 WHERE id=$2',clock(),deviceId);await audit('device.renewal_cancel',{device:deviceId,member:current.member_id,generation:current.credential_generation});return dto(await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1',deviceId));
     });
   }
-  async function authorize(identity,request,{phase='request'}={}){
+  async function authorize(identity,request,{phase='request',scope:employeeScope}={}){
     if(!identity||!identityIdentifier(identity.id)||!identityIdentifier(identity.key_id)||!['request','admission','dispatch'].includes(phase))fail(503,'设备鉴权调用无效','device_configuration');
+    employeeScope??=store.departmentScope?.(identity);
+    return departments.employee(async()=>{
     const at=clock(),owner=await store.get('SELECT m.device_mode,k.device_ids,k.enabled,m.enabled member_enabled,k.expires FROM harbor.members m JOIN harbor.keys k ON k.member_id=m.id WHERE m.id=$1 AND k.id=$2 AND m.removed_at IS NULL AND k.removed_at IS NULL',identity.id,identity.key_id);
     if(!owner||!owner.enabled||!owner.member_enabled||owner.expires!==null&&owner.expires<=at)fail(403,'员工或Key已停用或到期','key_disabled');
     const proof=deviceTransportProof(request);if(proof?.invalidCertificate)fail(403,'设备证书未通过TLS验证','device_proof_invalid');
@@ -106,13 +111,16 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
     if(!value||value.member_id!==identity.id||value.revoked!==null||value.certificate_expires<=at||value.generation!==value.credential_generation||value.state!=='approved')fail(403,'设备未批准、已停用、归属不符或证书已失效','device_not_authorized');
     if(owner.device_ids!==null&&!owner.device_ids.includes(value.id)||value.allowed_key_ids!==null&&!value.allowed_key_ids.includes(identity.key_id))fail(403,'此Key不可在该设备使用','device_key_not_allowed');
     if(value.hardware_state!=='credentials_only'&&(!proof.hardwareFingerprint||proof.hardwareFingerprint!==value.fingerprint||value.installation_fingerprint&&proof.installationFingerprint!==value.installation_fingerprint)){
-      if(phase==='request'&&!store.context.getStore())await markHardwareReview(value.id,value.credential_generation,{fingerprint:proof.hardwareFingerprint,installationFingerprint:proof.installationFingerprint});fail(403,'硬件摘要变化或采集失败，设备待管理员核验','device_hardware_changed');
+      if(phase==='request'&&!store.context.getStore())await markHardwareReview(value.id,value.credential_generation,{fingerprint:proof.hardwareFingerprint,installationFingerprint:proof.installationFingerprint,scope:employeeScope});fail(403,'硬件摘要变化或采集失败，设备待管理员核验','device_hardware_changed');
     }
     return Object.freeze({deviceId:value.id,deviceName:value.name,deviceSystem:value.system,generation:value.generation,authState:value.hardware_state==='credentials_only'?'unverified_hardware':'authenticated'});
+    },employeeScope,identity);
   }
-  async function markHardwareReview(deviceId,generation,{fingerprint=null,installationFingerprint=null}={}){if(fingerprint!==null&&!hex(fingerprint)||installationFingerprint!==null&&!hex(installationFingerprint))fail(503,'设备复核摘要无效','device_configuration');return store.transaction(async()=>{const row=await store.get('SELECT member_id FROM harbor.employee_devices WHERE id=$1',deviceId);if(!row)return;await member(row.member_id,{lock:true});const changed=await store.run("UPDATE harbor.employee_devices SET state='needs_review',review_fingerprint=$3,review_installation_fingerprint=$4,version=version+1 WHERE id=$1 AND credential_generation=$2 AND state='approved'",deviceId,generation,fingerprint,installationFingerprint);if(changed.changes)await audit('device.hardware_review',{device:deviceId,member:row.member_id,generation});});}
+  async function markHardwareReview(deviceId,generation,{fingerprint=null,installationFingerprint=null,scope:employeeScope}={}){if(fingerprint!==null&&!hex(fingerprint)||installationFingerprint!==null&&!hex(installationFingerprint))fail(503,'设备复核摘要无效','device_configuration');return departments.employee(()=>store.transaction(async()=>{const row=await store.get('SELECT member_id FROM harbor.employee_devices WHERE id=$1',deviceId);if(!row)return;await member(row.member_id,{lock:true});const changed=await store.run("UPDATE harbor.employee_devices SET state='needs_review',review_fingerprint=$3,review_installation_fingerprint=$4,version=version+1 WHERE id=$1 AND credential_generation=$2 AND state='approved'",deviceId,generation,fingerprint,installationFingerprint);if(changed.changes)await audit('device.hardware_review',{device:deviceId,member:row.member_id,generation});}),employeeScope);}
   async function markVerified(requestId){return store.transaction(async()=>{
-    const row=await store.get("SELECT device_id,device_generation,started,ended FROM harbor.requests WHERE id=$1 AND status='ok' AND device_auth_state IN ('authenticated','unverified_hardware')",requestId);if(!row?.device_id)return false;
+    const isolated=await departments.installed();
+    const row=await store.get("SELECT device_id,device_generation,started,ended"+(isolated?",member_id,department_id":"")+" FROM harbor.requests WHERE id=$1 AND status='ok' AND device_auth_state IN ('authenticated','unverified_hardware')",requestId);if(!row?.device_id)return false;
+    if(isolated&&!await store.get('SELECT d.id FROM harbor.employee_devices d JOIN harbor.members m ON m.id=d.member_id WHERE d.id=$1 AND d.member_id=$2 AND m.department_id=$3',row.device_id,row.member_id,row.department_id))return false;
     return (await store.run("UPDATE harbor.employee_devices SET verified_request_at=COALESCE(verified_request_at,$1),last_seen=GREATEST(COALESCE(last_seen,0),$1) WHERE id=$2 AND credential_generation=$3 AND state='approved'",row.ended??row.started,row.device_id,row.device_generation)).changes===1;
   });}
   async function policy(memberId,payload){return store.transaction(async()=>{
@@ -129,22 +137,25 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
     return store.transaction(async()=>{await member(initial.member_id,{lock:true});const value=await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1 FOR UPDATE',deviceId);if(value.version!==payload.expected_version)fail(409,'设备已变化','device_conflict');let state=value.state;if(payload.enabled!==undefined){if(!['approved','disabled'].includes(state))fail(409,'此设备不能直接恢复，需重新核验','device_state_invalid');state=payload.enabled?'approved':'disabled';}await store.run('UPDATE harbor.employee_devices SET name=$1,state=$2,version=version+1 WHERE id=$3',payload.name===undefined?value.name:text(payload.name,80),state,deviceId);await audit('device.update',{device:deviceId,member:value.member_id,state});return dto(await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1',deviceId));});
   }
   async function list(params,{signal}={}){
-    if([...params.keys()].some(key=>!['member_id','key_id','state','page','page_size'].includes(key)||params.getAll(key).length!==1))fail(400,'设备查询参数无效');const page=Number(params.get('page')??1),pageSize=Number(params.get('page_size')??25),memberId=params.get('member_id'),keyId=params.get('key_id'),state=params.get('state');if(!Number.isSafeInteger(page)||page<1||!Number.isSafeInteger(pageSize)||pageSize<1||pageSize>100||memberId&&!identityIdentifier(memberId)||keyId&&!identityIdentifier(keyId)||state&&!['pending','approved','disabled','needs_review','replaced'].includes(state))fail(400,'设备查询参数无效');
+    if([...params.keys()].some(key=>!['member_id','key_id','state','page','page_size'].includes(key)||params.getAll(key).length!==1))fail(400,'设备查询参数无效');const page=Number(params.get('page')??1),pageSize=Number(params.get('page_size')??20),memberId=params.get('member_id'),keyId=params.get('key_id'),state=params.get('state');if(!Number.isSafeInteger(page)||page<1||!Number.isSafeInteger(pageSize)||![20,50,100].includes(pageSize)||memberId&&!identityIdentifier(memberId)||keyId&&!identityIdentifier(keyId)||state&&!['pending','approved','disabled','needs_review','replaced'].includes(state))fail(400,'设备查询参数无效');
     return read(async()=>{
-      const at=clock(),window=usageWindow(at),values=[],where=['m.removed_at IS NULL'];
+      await departments.revalidate({target:readStore});
+      const at=clock(),window=usageWindow(at),values=[],where=['m.removed_at IS NULL'],actor=departments.current();
+      if(actor?.view==='department'){values.push(actor.department_id);where.push('m.department_id=$'+values.length);}
       const add=(sql,value)=>{values.push(value);where.push(sql.replaceAll('?',String(values.length)));};
       const owner=memberId?await member(memberId,{target:readStore}):null;
       if(memberId)add('d.member_id=$?',memberId);
-      if(keyId){const key=await readStore.get('SELECT member_id,device_ids FROM harbor.keys WHERE id=$1 AND removed_at IS NULL',keyId);if(!key)fail(404,'Key不存在');add('d.member_id=$?',key.member_id);values.push(keyId);where.push('(d.allowed_key_ids IS NULL OR d.allowed_key_ids ? $'+values.length+')');if(key.device_ids!==null)add('d.id=ANY($?::text[])',key.device_ids);}
+      if(keyId){const key=await readStore.get('SELECT member_id,device_ids FROM harbor.keys WHERE id=$1 AND removed_at IS NULL',keyId);if(!key)fail(404,'Key不存在');await member(key.member_id,{target:readStore});add('d.member_id=$?',key.member_id);values.push(keyId);where.push('(d.allowed_key_ids IS NULL OR d.allowed_key_ids ? $'+values.length+')');if(key.device_ids!==null)add('d.id=ANY($?::text[])',key.device_ids);}
       if(state)add('d.state=$?',state);
       const from=' FROM harbor.employee_devices d JOIN harbor.members m ON m.id=d.member_id WHERE '+where.join(' AND '),total=(await readStore.get('SELECT COUNT(*) n'+from,...values)).n,totalPages=Math.max(1,Math.ceil(total/pageSize)),current=Math.min(page,totalPages),n=values.length;
       const rows=await readStore.all(`SELECT d.*,m.name member_name,c.expires certificate_expires,(c.expires>$${n+3} AND c.revoked IS NULL AND d.state='approved') certificate_valid,
-        (SELECT COUNT(*) FROM harbor.requests r WHERE r.device_id=d.id AND r.usage_at>=$${n+1} AND r.usage_at<$${n+2}${keyId?' AND r.key_id=$'+(n+4):''}) request_count
+        (SELECT COUNT(*) FROM harbor.requests r WHERE r.device_id=d.id AND r.member_id=d.member_id${actor?' AND r.department_id=m.department_id':''} AND r.usage_at>=$${n+1} AND r.usage_at<$${n+2}${keyId?' AND r.key_id=$'+(n+4):''}) request_count
         ${from.replace(' WHERE ',' LEFT JOIN harbor.device_credentials c ON c.device_id=d.id AND c.generation=d.credential_generation WHERE ')} ORDER BY d.created DESC,d.id DESC LIMIT $${n+(keyId?5:4)} OFFSET $${n+(keyId?6:5)}`,...values,window.start,window.end,at,...(keyId?[keyId]:[]),pageSize,(current-1)*pageSize);
       const requestValues=[window.start,window.end],requestWhere=['r.usage_at>=$1','r.usage_at<$2','rm.removed_at IS NULL'];
       if(memberId){requestValues.push(memberId);requestWhere.push('r.member_id=$'+requestValues.length);}
       if(keyId){requestValues.push(keyId);requestWhere.push('r.key_id=$'+requestValues.length);}
       if(state){requestValues.push(state);requestWhere.push('EXISTS(SELECT 1 FROM harbor.employee_devices sd WHERE sd.id=r.device_id AND sd.state=$'+requestValues.length+')');}
+      if(actor?.view==='department'){requestValues.push(actor.department_id);requestWhere.push('r.department_id=$'+requestValues.length);}
       const summary=await readStore.get(`SELECT COUNT(DISTINCT r.device_id) used_devices,COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests FROM harbor.requests r JOIN harbor.members rm ON rm.id=r.member_id WHERE ${requestWhere.join(' AND ')}`,...requestValues);
       return {rows:rows.map(row=>({...dto(row),fingerprint:hex(row.fingerprint)?row.fingerprint:null,member_name:row.member_name,request_count:row.request_count})),summary:{registered_devices:total,...summary},...(owner?{member:{id:owner.id,device_mode:owner.device_mode,device_policy_version:owner.device_policy_version}}:{}),pagination:{page:current,pageSize,total,totalPages},observedAt:at};
     },{signal});
@@ -162,5 +173,13 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
     if(!path.startsWith('/api/device/enroll/')||method!=='POST')return null;if(!deviceTransportProof(request)?.encrypted)fail(403,'设备登记必须通过经验证的TLS入口','device_tls_required');
     if(path==='/api/device/enroll/challenge')return {status:200,value:await challenge(payload)};if(path==='/api/device/enroll/register')return {status:201,value:await register(payload)};if(path==='/api/device/enroll/status')return {status:200,value:await enrollmentStatus(payload)};return null;
   }
-  return {handle,publicHandle,invite,challenge,register,approve,cancelRenewal,authorize,policy,saveKeyPolicy,update,list,markVerified,markHardwareReview,enrollmentStatus,scope,status:()=>({issuerConfigured,requiresTrustedTls:true})};
+  const manage=(fn,write=true)=>(...args)=>{const options=args[fn.length]||{};return departments.management(()=>fn(...args),options.scope,{write,revalidateScope:options.revalidateScope});};
+  async function managedHandle(path,method,payload,params=new URLSearchParams(),options={}){
+    if(!/^\/api\/admin\/(?:device-invitations$|devices(?:\/|$)|members\/[a-zA-Z0-9-]{1,80}\/device-policy$|keys\/[a-zA-Z0-9-]{1,80}\/devices$)/.test(path))return null;
+    if(method==='GET')options.signal?.throwIfAborted();
+    return departments.management(()=>handle(path,method,payload,params,options),options.scope,{write:method!=='GET',revalidateScope:options.revalidateScope});
+  }
+  async function managedList(params,options={}){options.signal?.throwIfAborted();return departments.management(()=>list(params,options),options.scope,{revalidateScope:options.revalidateScope});}
+  const publicCall=fn=>(...args)=>departments.publicOperation(()=>fn(...args));
+  return {handle:managedHandle,publicHandle:publicCall(publicHandle),invite:manage(invite),challenge:publicCall(challenge),register:publicCall(register),approve:manage(approve),cancelRenewal:manage(cancelRenewal),authorize,policy:(memberId,payload,options={})=>departments.management(()=>policy(memberId,payload),options.scope,{write:payload!==undefined,revalidateScope:options.revalidateScope}),saveKeyPolicy:manage(saveKeyPolicy),update:manage(update),list:managedList,markVerified,markHardwareReview,enrollmentStatus:publicCall(enrollmentStatus),scope,status:()=>({issuerConfigured,requiresTrustedTls:true})};
 }

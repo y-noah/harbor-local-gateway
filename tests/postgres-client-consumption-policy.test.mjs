@@ -99,8 +99,8 @@ test('MCP download works without model sources/reader and policy versions are re
  const response=await f.call('/v1/codex/image-mcp.mjs');assert.equal(response.status,200);assert.deepEqual(Buffer.from(await response.arrayBuffer()),readFileSync(new URL('../clients/image-mcp.mjs',import.meta.url)));assert.equal(f.seen.length,0);assert.equal(f.sourceCalls.length,0);
  const directory=await f.call();assert.equal(directory.status,503);assert.equal((await directory.json()).code,'client_catalog_configuration');
 },{policy:'api_only',reader:false}));
-test('me/catalog schema validation initializes once per lifecycle and ordinary reads never rescan schema',integration,()=>fixture(async f=>{
- const original=f.store.query.bind(f.store),calls=[];f.store.query=(sql,args)=>{calls.push({sql,marker:sql==='SELECT value FROM harbor.gateway_settings WHERE name=$1'&&args[0]==='schema.key-consumption-policy'});return original(sql,args);};
+test('me/catalog full schema validation initializes once while ordinary reads retain explicit department presence probes',integration,()=>fixture(async f=>{
+ const original=f.store.query.bind(f.store),calls=[];f.store.query=(sql,args)=>{calls.push({sql,marker:sql==='SELECT value FROM harbor.gateway_settings WHERE name=$1'&&args[0]==='schema.key-consumption-policy',departmentProbe:sql.startsWith("SELECT to_regclass('harbor.gateway_settings')")});return original(sql,args);};
  assert.equal((await f.call('/api/me')).status,200);assert.equal((await f.call('/v1/codex/image-mcp.mjs')).status,200);assert.equal(calls.filter(row=>row.marker).length,2);
- calls.length=0;assert.equal((await f.call('/api/me')).status,200);assert.equal((await f.call('/v1/codex/image-mcp.mjs')).status,200);assert.equal(calls.some(row=>row.marker||/pg_proc|pg_constraint|pg_attribute/.test(row.sql)),false);
+ calls.length=0;assert.equal((await f.call('/api/me')).status,200);assert.equal((await f.call('/v1/codex/image-mcp.mjs')).status,200);assert.equal(calls.some(row=>row.marker||/pg_proc|pg_constraint|pg_attribute/.test(row.sql)&&!row.departmentProbe),false);assert.ok(calls.some(row=>row.departmentProbe));console.log(JSON.stringify({diagnostic:'client-ordinary-read-sql',actualTotal:calls.length,departmentPresenceProbes:calls.filter(row=>row.departmentProbe).length,fullSchemaRescans:0}));
 }));

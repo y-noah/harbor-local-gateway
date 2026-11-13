@@ -1,6 +1,8 @@
 import {readFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {AppError,id} from './store.mjs';
+import {createPostgresAudit} from './postgres-audit.mjs';
+import {createAdminDepartments} from './postgres-admin-departments.mjs';
 import {readConsumptionPolicy,updateConsumptionPolicy} from './consumption-policy.mjs';
 
 const setting='schema.key-consumption-policy',migrationUrl=new URL('./migrations/key-consumption-policy.sql',import.meta.url),verified=new WeakSet();
@@ -123,16 +125,18 @@ export function createPostgresConsumptionPolicy(store,{clock=Date.now}={}){
   const key=await store.get('SELECT consumption_policy,consumption_policy_version FROM harbor.keys WHERE id=$1 AND member_id=$2 AND removed_at IS NULL'+(lock?' FOR SHARE':''),keyId,owner.member_id);if(!key)throw new AppError(404,'Key不存在或已删除','key_not_found');
   return readConsumptionPolicy(key,{allowLegacy:false});
  }
- async function set(keyId,value){
+ async function set(keyId,value,{scope}={}){
   keyIdValid(keyId);if(!object(value)||Object.keys(value).some(key=>!['consumption_policy','expected_consumption_policy_version'].includes(key)))invalid();
-  await ensure();return store.transaction(async()=>{
+  await ensure();const departments=createAdminDepartments(store),authorization=await departments.resolve(scope,{write:true});return store.transaction(async()=>{
+   await departments.current(authorization,{lock:true});
    const owner=await store.get('SELECT member_id FROM harbor.keys WHERE id=$1 AND removed_at IS NULL',keyId);if(!owner)throw new AppError(404,'Key不存在或已删除','key_not_found');
+   if(authorization)departments.same(authorization,await store.get('SELECT department_id FROM harbor.members WHERE id=$1',owner.member_id));
    const member=await store.get('SELECT id FROM harbor.members WHERE id=$1 AND removed_at IS NULL FOR UPDATE',owner.member_id);if(!member)throw new AppError(404,'员工不存在或已移除','member_not_found');
    const current=await store.get('SELECT consumption_policy,consumption_policy_version FROM harbor.keys WHERE id=$1 AND member_id=$2 AND removed_at IS NULL FOR UPDATE',keyId,owner.member_id);if(!current)throw new AppError(404,'Key不存在或已删除','key_not_found');
    const next=updateConsumptionPolicy(current,value.consumption_policy,value.expected_consumption_policy_version);
    if(next.consumption_policy_version===current.consumption_policy_version)return next;
    const result=await store.run('UPDATE harbor.keys SET consumption_policy=$1,consumption_policy_version=$2 WHERE id=$3 AND member_id=$4 AND consumption_policy_version=$5',next.consumption_policy,next.consumption_policy_version,keyId,owner.member_id,current.consumption_policy_version);if(result.changes!==1)throw new AppError(409,'消耗来源已变化，请重新读取','consumption_policy_conflict');
-   await store.run('INSERT INTO harbor.audit(id,at,action,detail) VALUES($1,$2,$3,$4)',id(),clock(),'key.consumption_policy',JSON.stringify({key:keyId,member:owner.member_id,previous:current,...next}));return next;
+   await createPostgresAudit(store,{clock}).write(authorization,{action:'key.consumption_policy',detail:{key:keyId,member:owner.member_id,previous:current,...next},subject:{kind:'key',id:keyId}});return next;
   });
  }
  // Internal admission hook only: caller supplies the authenticated snapshot,

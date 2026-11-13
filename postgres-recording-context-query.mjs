@@ -2,23 +2,30 @@ import {createHash} from 'node:crypto';
 import {AppError} from './store.mjs';
 import {recordingScope} from './postgres-recording-query.mjs';
 import {normalizeSearch} from './recording-search-index.mjs';
+import {createQueryDepartments,departmentPredicate,queryDepartmentIdentity} from './postgres-query-departments.mjs';
 
 const fail=()=>{throw new AppError(400,'上下文分页已失效，请重新查询','recording_cursor_invalid');};
-export function createPostgresRecordingContextQueries(store,{crypto,clock=Date.now,queryQueue,devices=false,maxCandidates=500,maxPageBytes=131072}={}){
- if(!crypto||!Number.isInteger(maxCandidates)||maxCandidates<1||maxCandidates>10000||!Number.isInteger(maxPageBytes)||maxPageBytes<1024||maxPageBytes>2097152)throw new AppError(503,'上下文查询预算无效','recording_query_configuration');
+export function createPostgresRecordingContextQueries(store,{crypto,clock=Date.now,queryQueue,devices=false,maxCandidates=500,maxPageBytes=131072,scopeDigestForSource}={}){
+ if(!crypto||!Number.isInteger(maxCandidates)||maxCandidates<1||maxCandidates>10000||!Number.isInteger(maxPageBytes)||maxPageBytes<1024||maxPageBytes>2097152||scopeDigestForSource!==undefined&&typeof scopeDigestForSource!=='function')throw new AppError(503,'上下文查询预算无效','recording_query_configuration');
  const read=(operation,{signal}={})=>queryQueue?queryQueue.run(operation,{signal}):operation();
- async function search(query,{signal}={}){return read(async()=>{
-  const at=clock(),key=createHash('sha256').update('context:'+JSON.stringify(Object.fromEntries(Object.entries(query).filter(([name])=>!['limit','cursor'].includes(name))))).digest('hex');let cursor;
+ const departments=createQueryDepartments(store);
+ async function search(query,{signal,scope:accessScope}={}){return read(async()=>{
+  const authorization=await departments.resolve(accessScope);
+  if(authorization!==null&&typeof scopeDigestForSource!=='function')throw new AppError(503,'上下文来源校验尚未配置','recording_context_configuration');
+  const at=clock(),key=createHash('sha256').update('context:'+(authorization===null?'':queryDepartmentIdentity(authorization)+'\0')+JSON.stringify(Object.fromEntries(Object.entries(query).filter(([name])=>!['limit','cursor'].includes(name))))).digest('hex');let cursor;
   if(query.cursor)try{cursor=JSON.parse(Buffer.from(query.cursor,'base64url').toString());if(Object.keys(cursor).sort().join(',')!=='at,id,key,ordinal,watermark'||cursor.key!==key||!Number.isSafeInteger(cursor.at)||!Number.isSafeInteger(cursor.watermark)||typeof cursor.id!=='string'||!/^[a-f0-9-]{36}$/.test(cursor.id)||!Number.isSafeInteger(cursor.ordinal)||cursor.ordinal<1)fail();}catch{fail();}
   if(query.device&&!devices)throw new AppError(400,'设备正文筛选尚未启用','recording_query_invalid');
-  for(const [field,table] of [['member','members'],['type','member_types'],['session','sessions'],...(devices?[['device','employee_devices']]:[])])if(query[field]&&!['unknown',...(field==='type'?['unclassified','historical_unknown']:[])].includes(query[field])&&!await store.get(`SELECT id FROM harbor.${table} WHERE id=$1`,query[field]))throw new AppError(400,'正文筛选对象不存在','recording_query_invalid');
-  const scope=recordingScope(query),watermark=cursor?.watermark??at,values=[...scope.values,at,watermark,crypto.keyVersion,crypto.terms(query.q)],n=scope.values.length;let seek='';
+  for(const [field,table] of [['member','members'],['type','member_types'],['session','sessions'],...(devices?[['device','employee_devices']]:[])])if(query[field]&&!['unknown',...(field==='type'?['unclassified','historical_unknown']:[])].includes(query[field])){
+   const args=[query[field]],predicate=table==='employee_devices'&&authorization?.view==='department'?'EXISTS(SELECT 1 FROM harbor.members m WHERE m.id=employee_devices.member_id AND '+departmentPredicate(authorization,'m',args)+')':departmentPredicate(authorization,table,args);
+   if(!await store.get(`SELECT id FROM harbor.${table} WHERE id=$1 AND ${predicate}`,...args))throw new AppError(400,'正文筛选对象不存在','recording_query_invalid');
+  }
+  const scope=recordingScope(query,{departmentScope:authorization}),watermark=cursor?.watermark??at,values=[...scope.values,at,watermark,crypto.keyVersion,crypto.terms(query.q)],n=scope.values.length;let seek='';
   if(cursor){values.push(cursor.at,cursor.id,cursor.ordinal);seek=` AND (d.indexed_at,o.id,p.ordinal)<($${values.length-2},$${values.length-1},$${values.length})`;}
   values.push(maxCandidates+1);
-  const rows=await store.all(`SELECT o.id object_id,o.kind context_kind,p.ordinal,p.payload_cipher,d.source_revision,d.format_version,d.indexed_at,w.revision current_revision,source.*
+  const rows=await store.all(`SELECT o.id object_id,o.scope_digest object_scope,o.kind context_kind,p.ordinal,p.payload_cipher,d.source_revision,d.format_version,d.indexed_at,w.revision current_revision,source.*
    FROM harbor.recording_context_document_parts p JOIN harbor.recording_context_documents d ON d.object_id=p.object_id
    JOIN harbor.recording_context_objects o ON o.id=d.object_id LEFT JOIN harbor.recording_context_work w ON w.object_id=o.id
-   JOIN LATERAL (SELECT r.id request_id,r.member_id,r.session_id,r.started,r.model,r.billing_model,r.usage_type_id,r.usage_type_code,r.usage_type_name,r.usage_type_version,LEAST(s.expires_at,c.expires_at) expires_at${devices?',r.device_id,r.device_name,r.device_system,r.device_auth_state':''}
+   JOIN LATERAL (SELECT r.id request_id,r.member_id,r.session_id,s.scope_digest source_scope,r.started,r.model,r.billing_model,r.usage_type_id,r.usage_type_code,r.usage_type_name,r.usage_type_version,LEAST(s.expires_at,c.expires_at) expires_at${devices?',r.device_id,r.device_name,r.device_system,r.device_auth_state':''}
     FROM harbor.recording_context_references ref JOIN harbor.recording_context_snapshots s ON s.request_id=ref.request_id
     JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id LEFT JOIN harbor.sessions session ON session.id=r.session_id
     WHERE ref.object_id=o.id AND s.scope_digest=o.scope_digest AND s.key_version=o.key_version
@@ -32,9 +39,10 @@ export function createPostgresRecordingContextQueries(store,{crypto,clock=Date.n
   const items=[];let checked=0,last=null,bytes=0;
   for(const row of rows.slice(0,maxCandidates)){
    if(items.length>=query.limit)break;
+   if(scopeDigestForSource){const expected=scopeDigestForSource({requestId:row.request_id,memberId:row.member_id,sessionId:row.session_id});if(!Buffer.isBuffer(expected)||!expected.equals(row.object_scope)||!expected.equals(row.source_scope))throw new AppError(503,'上下文来源归属不一致','recording_context_scope');}
    const value=crypto.open(row.payload_cipher,`context-document:${row.object_id}:${row.source_revision}:${row.format_version}:${row.ordinal}`),text=normalizeSearch(value.searchText);checked++;last=row;
    const location=text.indexOf(query.q);if(location<0)continue;
-   const {payload_cipher,source_revision,current_revision,...metadata}=row,item={...metadata,association:'shared_context',snippet:text.slice(Math.max(0,location-80),location+query.q.length+160),index_pending:source_revision!==current_revision},size=Buffer.byteLength(JSON.stringify(item));
+   const {payload_cipher,object_scope,source_scope,source_revision,current_revision,...metadata}=row,item={...metadata,association:'shared_context',snippet:text.slice(Math.max(0,location-80),location+query.q.length+160),index_pending:source_revision!==current_revision},size=Buffer.byteLength(JSON.stringify(item));
    if(bytes+size>maxPageBytes){if(!items.length)throw new AppError(503,'上下文查询结果超过响应预算','recording_query_capacity');checked--;last=rows[checked-1]??null;break;}bytes+=size;items.push(item);
   }
   const hasMore=Boolean(last)&&checked<rows.length,next=hasMore?Buffer.from(JSON.stringify({key,at:last.indexed_at,id:last.object_id,ordinal:last.ordinal,watermark})).toString('base64url'):null;

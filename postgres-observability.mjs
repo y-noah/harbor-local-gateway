@@ -5,12 +5,16 @@ import {modelReleaseRegistry,modelReleaseSetting} from './model-release-dates.mj
 import {joins,validPrice} from './postgres-reference-query.mjs';
 import {decorateReferenceRequest,publicUsage,referenceMetric} from './pricing.mjs';
 import {sanitizeRecord} from './record-redaction.mjs';
+import {createQueryDepartments,departmentPredicate} from './postgres-query-departments.mjs';
 
-export async function postgresRequestObservation(store,id,at=Date.now()){
+const observationDepartments=new WeakMap();
+export async function postgresRequestObservation(store,id,at=Date.now(),{scope}={}){
+  if(!observationDepartments.has(store))observationDepartments.set(store,createQueryDepartments(store));
+  const authorization=await observationDepartments.get(store).resolve(scope),args=[id],predicate=departmentPredicate(authorization,'r',args);
   return store.transaction(async()=>{
     const row=await store.get(`SELECT r.*,m.name member_name,a.name account_name,k.prefix key_prefix,k.removed_at key_removed_at
       FROM harbor.requests r LEFT JOIN harbor.members m ON m.id=r.member_id LEFT JOIN harbor.accounts a ON a.id=r.account_id
-      LEFT JOIN harbor.keys k ON k.id=r.key_id WHERE r.id=$1`,id);
+      LEFT JOIN harbor.keys k ON k.id=r.key_id WHERE r.id=$1 AND ${predicate}`,...args);
     const window=usageWindow(at),time=row?.ended??row?.started;
     if(!row||time<window.start||time>=window.end)throw new AppError(404,'请求记录不存在或超出近7天可见范围');
     let phases;try{phases=JSON.parse(row.phase_history);}catch{}

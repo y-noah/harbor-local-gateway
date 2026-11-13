@@ -4,6 +4,7 @@ import http from 'node:http';
 import {createPostgresQueryQueue} from '../postgres-query-queue.mjs';
 import {createPostgresRecordingAdmin} from '../postgres-recording-admin.mjs';
 import {createPostgresRecordingJobs} from '../postgres-recording-jobs.mjs';
+import {withLegacyDepartmentSchema} from './department-legacy-query-fixture.mjs';
 
 const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};};
 async function until(predicate){const deadline=Date.now()+3000;while(!predicate()){assert.ok(Date.now()<deadline,'等待合成正文查询状态超时');await new Promise(resolve=>setTimeout(resolve,5));}}
@@ -18,13 +19,13 @@ async function fixture(t){
   if(sql.includes('SELECT recording_state'))return {recording_state:'none'};
   return undefined;
  },all:async()=>{reads++;if(readBlocked)await gate.promise;return [];},run:async()=>{writes++;return {changes:1};}};
- const backend=createPostgresRecordingJobs(store,{recordingKey:Buffer.alloc(32,1),queryQueue:queue,contextIndex:true,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
+ const legacyStore=withLegacyDepartmentSchema(store),backend=createPostgresRecordingJobs(legacyStore,{recordingKey:Buffer.alloc(32,1),queryQueue:queue,contextIndex:true,storagePolicy:async()=>({captureAllowed:true,exportAllowed:true})});
  const admin=createPostgresRecordingAdmin(backend,{adminAuthenticated:async()=>true}),clients=new Set();
  const server=http.createServer((req,res)=>{res.once('close',()=>closed.add(req.url));void admin.handle(req,res).then(done=>{if(!done&&!res.destroyed){res.statusCode=404;res.end();}},error=>{if(!res.destroyed){res.statusCode=error.status??500;res.end('{}');}}).finally(()=>finished++);});
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
  t.after(async()=>{gate.resolve();for(const client of clients)client.destroy();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await admin.close({force:true});await queue.close();});
  const send=(path,method='GET',payload)=>{const client=http.request({host:'127.0.0.1',port:server.address().port,path,method,agent:false,headers:payload?{'Content-Type':'application/json'}:{}},response=>response.resume());clients.add(client);client.on('error',()=>{});client.once('close',()=>clients.delete(client));client.end(payload?JSON.stringify(payload):undefined);return client;};
- return {store,queue,gate,backend,admin,send,closed,reads:()=>reads,writes:()=>writes,transactions:()=>transactions,finished:()=>finished,blockRead:()=>{readBlocked=true;},blockWrite:()=>{writeBlocked=true;}};
+ return {store:legacyStore,queue,gate,backend,admin,send,closed,reads:()=>reads,writes:()=>writes,transactions:()=>transactions,finished:()=>finished,blockRead:()=>{readBlocked=true;},blockWrite:()=>{writeBlocked=true;}};
 }
 
 test('正文HTTP外层断开同时取消内层等待读取，不留下嵌套查询',async t=>{

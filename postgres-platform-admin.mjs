@@ -3,6 +3,7 @@ import {join,resolve} from 'node:path';
 import {AppError,id,hash,revealStoredKey} from './store.mjs';
 import {name} from './admin-input.mjs';
 import {platformProviders,platformConfiguration} from './platforms.mjs';
+import {createPostgresAudit} from './postgres-audit.mjs';
 
 // Uses the account administrator's bounded check queue and short mutation lock.
 // Upstream authorization and refresh never hold a database transaction open.
@@ -10,7 +11,8 @@ export function createPostgresPlatformAdmin(store,{runtime,encryptionKey,transpo
   const logins=new Map(),refreshes=new Map(),checks=new Map(),controllers=new Set(),tasks=new Set();let stopping=false;
   const fail=(status,message,code='platform_configuration_changed')=>new AppError(status,message,code);
   const running=()=>{if(stopping)throw fail(503,'平台账号管理正在关闭','service_stopping');};
-  const audit=(action,account)=>store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)',id(),clock(),action,account);
+  // This backend remains legacy-only until its account actor is propagated.
+  const audit=(action,account)=>createPostgresAudit(store,{clock}).write(undefined,{action,detail:account,subject:{kind:'account',id:account}});
   const account=async(accountId,lock=false)=>{const row=await store.get("SELECT * FROM harbor.accounts WHERE id=$1 AND auth_mode='platform' AND removed_at IS NULL"+(lock?' FOR UPDATE':''),accountId);if(!row)throw fail(404,'平台账号不存在');running();return row;};
   const valid=async(row,lock=false)=>{const current=await account(row.id,lock);if(!current.enabled||current.route_epoch!==row.route_epoch)throw fail(409,'平台账号配置已变化，请重试');return current;};
   const token=value=>{if(typeof value!=='string'||!value.trim()||value.length>4096||/\s/.test(value.trim()))throw fail(400,'请填写有效的官方Key或访问令牌','invalid_platform_credential');return {token:value.trim()};};

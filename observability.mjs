@@ -45,7 +45,8 @@ export function historyQuery(params){
     if(!/^\d+$/.test(value)||!Number.isSafeInteger(Number(value))||Number(value)>max||Number(value)<(key==='page'||key==='page_size'?1:0))throw new AppError(400,'历史查询范围无效');
     return Number(value);
   };
-  const result={kind:params.get('kind')||'audit',page:integer('page',1,1e7),pageSize:integer('page_size',25,100),start:integer('start',null,9e15),end:integer('end',null,9e15),action:params.get('action')||'',account:params.get('account')||'',session:params.get('session')||''};
+  const result={kind:params.get('kind')||'audit',page:integer('page',1,1e7),pageSize:integer('page_size',20,100),start:integer('start',null,9e15),end:integer('end',null,9e15),action:params.get('action')||'',account:params.get('account')||'',session:params.get('session')||''};
+  if(![20,50,100].includes(result.pageSize))throw new AppError(400,'历史每页条数仅支持20、50、100');
   if(!['audit','nightly'].includes(result.kind)||result.start!==null&&result.end!==null&&result.start>=result.end||result.action&&!/^[a-z.]{1,80}$/.test(result.action)||[result.account,result.session].some(x=>x&&!/^[a-zA-Z0-9-]{1,100}$/.test(x))||result.kind==='nightly'&&result.action)throw new AppError(400,'历史筛选条件无效');
   return result;
 }

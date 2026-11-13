@@ -1,3 +1,4 @@
+import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {setTimeout as delay} from 'node:timers/promises';
 import {AppError,usageWindow,nextDailyReset} from './store.mjs';
 import {balanceSettings,planBalanceWorkloads,nightlyWindow,quotaFreshnessMs} from './balancing.mjs';
@@ -5,6 +6,8 @@ import {lockPostgresRouting} from './postgres-routing.mjs';
 import {transferSchedule,transferWindow} from './transfer-schedule.mjs';
 import {createPostgresPlanningInput} from './postgres-planning-input.mjs';
 
+export const departmentPlanningJobId=(kind,target,scope)=>kind+':'+(scope?scope.department_id+':':'')+target;
+const configurationNames=['balancing','routing_strategy','routing_weights','transfer_schedule','request_handoff_policy','account_package_policy'];
 const publicSections=new Set(['moves','skipped','groups','fixed']);
 const stopped=signal=>{if(signal?.aborted)throw new AppError(503,'规划任务已停止','worker_stopping');};
 const capacity=()=>{throw new AppError(503,'完整规划超出存储容量，未保存部分计划','planning_capacity');};
@@ -13,41 +16,47 @@ const capacity=()=>{throw new AppError(503,'完整规划超出存储容量，未
 // computes immutable plans; applying bindings belongs to the active gateway.
 export function createPostgresPlanningJobs(store,{jobs,clock=Date.now,input={},ttlMs=3600000,maxPlanBytes=16777216,maxItemBytes=262144,pageBytes=131072}={}){
   if(!jobs||typeof clock!=='function'||!Number.isInteger(ttlMs)||ttlMs<60000||ttlMs>86400000||!Number.isInteger(maxPlanBytes)||maxPlanBytes<1024||maxPlanBytes>67108864||!Number.isInteger(maxItemBytes)||maxItemBytes<256||maxItemBytes>2097152||maxItemBytes>maxPlanBytes||!Number.isInteger(pageBytes)||pageBytes<256||pageBytes>2097152)throw new AppError(503,'规划存储配置无效','planning_configuration');
+  const departments=createRoutingDepartments(store,{clock});
+  const readConfiguration=async scope=>Object.fromEntries(await departments.settings(scope,configurationNames));
   const kind='routing.preview',reader=createPostgresPlanningInput(store,{...input,clock});
-  const enqueue=()=>jobs.enqueue(kind);
-  const scheduleConfig=async()=>transferSchedule(JSON.parse((await store.get("SELECT value FROM harbor.gateway_settings WHERE name='transfer_schedule'"))?.value||'{}'));
-  async function schedule(){
-    const at=await jobs.now(),window=transferWindow(at,await scheduleConfig());
-    const value=await store.get("SELECT value FROM harbor.gateway_settings WHERE name='balancing'"),enabled=balanceSettings(JSON.parse(value?.value||'{}')).nightly;
-    const obsolete=await store.all("SELECT id FROM harbor.background_jobs WHERE kind='routing.nightly' AND status IN ('pending','running') AND result IS NULL AND ($1 OR target<>$2) ORDER BY created,id LIMIT 256",!enabled||!window.due,window.key);
+  const enqueue=async({scope}={})=>{scope=await departments.resolve(scope,{management:true});return jobs.enqueue(kind,scope?{scope}:{});};
+  const scheduleConfig=async scope=>transferSchedule(await departments.setting(scope,'transfer_schedule')??{});
+  async function schedule({scope,expiryScope}={}){
+    scope=await departments.resolve(scope);if(scope&&(scope.role!=='system'||scope.purpose!=='routing.nightly'))throw new AppError(403,'夜间计划需专用系统身份','department_forbidden');
+    const at=await jobs.now(),window=transferWindow(at,await scheduleConfig(scope));
+    const enabled=balanceSettings(await departments.setting(scope,'balancing')??{}).nightly;
+    const obsolete=await store.all("SELECT id FROM harbor.background_jobs WHERE kind='routing.nightly' AND status IN ('pending','running') AND result IS NULL AND ($1 OR target<>$2)"+(scope?' AND department_id=$3':'')+" ORDER BY created,id LIMIT 256",!enabled||!window.due,window.key,...(scope?[scope.department_id]:[]));
     for(const row of obsolete)await jobs.cancel(row.id);
     if(!enabled||!window.due)return null;
-    const expiry=nextDailyReset(window.end)-86400000,dependencyId='routing.expiry:'+expiry;await jobs.enqueue('routing.expiry',{id:dependencyId,payload:{boundary:expiry}});
-    const policy=JSON.parse((await store.get("SELECT value FROM harbor.gateway_settings WHERE name='request_handoff_policy'"))?.value||'{}');
-    const revision=policy.mode==='request-boundary'?await store.get('SELECT revision,job_id FROM harbor.nightly_plan_revisions WHERE slot=$1 ORDER BY revision DESC LIMIT 1',window.key):null;
-    return jobs.enqueue('routing.nightly',{id:revision?.job_id??'routing.nightly:'+window.key,target:window.key,payload:{boundary:window.end,...(revision?{revision:revision.revision}:{})},dependencyId});
+    if(scope){expiryScope=await departments.resolve(expiryScope);if(expiryScope.department_id!==scope.department_id||expiryScope.role!=='system'||expiryScope.purpose!=='routing.expiry')throw new AppError(403,'周期恢复身份不匹配','department_forbidden');}
+    const expiry=nextDailyReset(window.end)-86400000,dependencyId=departmentPlanningJobId('routing.expiry',expiry,scope);await jobs.enqueue('routing.expiry',{id:dependencyId,payload:{boundary:expiry},...(scope?{scope:expiryScope}:{})});
+    const policy=await departments.setting(scope,'request_handoff_policy')??{};
+    const revision=policy.mode==='request-boundary'?await store.get('SELECT revision,job_id FROM harbor.nightly_plan_revisions WHERE slot=$1'+(scope?' AND department_id=$2':'')+' ORDER BY revision DESC LIMIT 1',window.key,...(scope?[scope.department_id]:[])):null;
+    return jobs.enqueue('routing.nightly',{id:revision?.job_id??departmentPlanningJobId('routing.nightly',window.key,scope),target:window.key,payload:{boundary:window.end,...(revision?{revision:revision.revision}:{})},dependencyId,...(scope?{scope}:{})});
   }
   async function execute(job,{signal}={}){
-    const nightly=job.kind==='routing.nightly',boundary=job.payload?.boundary,window=Number.isSafeInteger(boundary)?transferWindow(boundary,await scheduleConfig()):null,expiry=Number.isSafeInteger(boundary)?nextDailyReset(boundary)-86400000:null;
-    const revision=nightly&&job.payload?.revision!==undefined?await store.get('SELECT job_id FROM harbor.nightly_plan_revisions WHERE slot=$1 AND revision=$2',job.target,Number.isSafeInteger(job.payload.revision)?job.payload.revision:-1):null;
-    if(nightly?(!window||!window.due||window.end!==boundary||boundary<0||(revision?job.id!==revision.job_id:job.id!=='routing.nightly:'+window.key)||job.target!==window.key||job.dependency_id!=='routing.expiry:'+expiry||Object.keys(job.payload).length!==(revision?2:1)):job.kind!==kind||Object.keys(job.payload||{}).length)throw new AppError(400,'规划任务参数无效','job_payload_invalid');
+    const scope=await jobs.authorizePersistedActor(job);
+    const nightly=job.kind==='routing.nightly',boundary=job.payload?.boundary,window=Number.isSafeInteger(boundary)?transferWindow(boundary,await scheduleConfig(scope)):null,expiry=Number.isSafeInteger(boundary)?nextDailyReset(boundary)-86400000:null;
+    const revision=nightly&&job.payload?.revision!==undefined?await store.get('SELECT job_id FROM harbor.nightly_plan_revisions WHERE slot=$1 AND revision=$2'+(scope?' AND department_id=$3':''),job.target,Number.isSafeInteger(job.payload.revision)?job.payload.revision:-1,...(scope?[scope.department_id]:[])):null;
+    if(nightly?(!window||!window.due||window.end!==boundary||boundary<0||(revision?job.id!==revision.job_id:job.id!==departmentPlanningJobId('routing.nightly',window.key,scope))||job.target!==window.key||job.dependency_id!==departmentPlanningJobId('routing.expiry',expiry,scope)||Object.keys(job.payload).length!==(revision?2:1)):job.kind!==kind||Object.keys(job.payload||{}).length)throw new AppError(400,'规划任务参数无效','job_payload_invalid');
     stopped(signal);
     const saved=await jobs.owned(job,()=>store.get('SELECT result FROM harbor.background_jobs WHERE id=$1',job.id));
     if(saved.result!==null)return saved.result;
     if(nightly)for(;;){
-      stopped(signal);const now=await jobs.now();if(now<boundary||now>=window.until||transferWindow(now,await scheduleConfig()).key!==job.target)throw new AppError(409,'夜间规划窗口已失效','nightly_plan_expired');
-      const dependency=await store.get('SELECT status,result FROM harbor.background_jobs WHERE id=$1','routing.expiry:'+expiry);
-      if(dependency?.status==='completed'&&dependency.result!==null&&await store.get('SELECT day FROM harbor.nightly_cycle_ready WHERE day=$1 AND at>=$2',job.target,now-quotaFreshnessMs))break;
+      stopped(signal);const now=await jobs.now();if(now<boundary||now>=window.until||transferWindow(now,await scheduleConfig(scope)).key!==job.target)throw new AppError(409,'夜间规划窗口已失效','nightly_plan_expired');
+      const dependency=await store.get('SELECT status,result FROM harbor.background_jobs WHERE id=$1',departmentPlanningJobId('routing.expiry',expiry,scope));
+      if(dependency?.status==='completed'&&dependency.result!==null&&await store.get('SELECT day FROM harbor.nightly_cycle_ready WHERE day=$1 AND at>=$2'+(scope?' AND department_id=$3':''),job.target,now-quotaFreshnessMs,...(scope?[scope.department_id]:[])))break;
       if(dependency&&['failed','cancelled'].includes(dependency.status))throw new AppError(409,'周期恢复未完成，未生成夜间计划','nightly_dependency_failed');
       await delay(1000,undefined,{signal});
     }
     const at=await jobs.now();
     const captured=await store.transaction(async()=>{
-      const rows=await store.all("SELECT name,value FROM harbor.gateway_settings WHERE name IN ('balancing','routing_strategy','routing_weights','transfer_schedule','request_handoff_policy','account_package_policy') ORDER BY name"),configuration=Object.fromEntries(rows.map(row=>[row.name,JSON.parse(row.value)]));
+      await jobs.authorizePersistedActor(job);
+      const configuration=await readConfiguration(scope);
       const legacy=configuration.balancing||{},settings=balanceSettings({...legacy,weighted:configuration.routing_strategy?.weighted??legacy.weighted??false});
       const requestBoundary=configuration.request_handoff_policy?.mode==='request-boundary',currentWindow=nightly||requestBoundary?transferWindow(at,configuration.transfer_schedule):nightlyWindow(at);if(nightly&&(!settings.nightly||!currentWindow.due||currentWindow.key!==job.target||currentWindow.end!==boundary))throw new AppError(409,'定时转移配置已变化','nightly_plan_expired');
       const workloadWindow=nightly||requestBoundary?{...currentWindow,boundary:currentWindow.end,start:at-16*3600000,end:at}:currentWindow;
-      const captured=await reader.read({at,window:workloadWindow,requestBoundary,...(nightly?{quotaBoundary:boundary}:{})});
+      const captured=await reader.read({scope,at,window:workloadWindow,requestBoundary,...(nightly?{quotaBoundary:boundary}:{})});
       return {configuration,settings,requestBoundary,...captured};
     },{level:'REPEATABLE READ',readOnly:true});
     stopped(signal);
@@ -67,15 +76,15 @@ export function createPostgresPlanningJobs(store,{jobs,clock=Date.now,input={},t
     }
     stopped(signal);
     return jobs.commitEffect(job,async()=>{
-      stopped(signal);
+      stopped(signal);await jobs.authorizePersistedActor(job);await departments.resolve(scope,{write:true});
       if(nightly){
         await lockPostgresRouting(store);stopped(signal);
-        const current=Object.fromEntries((await store.all("SELECT name,value FROM harbor.gateway_settings WHERE name IN ('balancing','routing_strategy','routing_weights','transfer_schedule','request_handoff_policy','account_package_policy') ORDER BY name")).map(row=>[row.name,JSON.parse(row.value)]));
-        const replacement=captured.requestBoundary?await store.get('SELECT job_id FROM harbor.nightly_plan_revisions WHERE slot=$1 ORDER BY revision DESC LIMIT 1',job.target):null;
+        const current=await readConfiguration(scope);
+        const replacement=captured.requestBoundary?await store.get('SELECT job_id FROM harbor.nightly_plan_revisions WHERE slot=$1'+(scope?' AND department_id=$2':'')+' ORDER BY revision DESC LIMIT 1',job.target,...(scope?[scope.department_id]:[])):null;
         if(replacement&&replacement.job_id!==job.id)throw new AppError(409,'计划已被恢复修订替代','nightly_plan_expired');
         if(!(await store.get('SELECT $1::jsonb=$2::jsonb equal',JSON.stringify(current),JSON.stringify(captured.configuration))).equal||!transferWindow(await jobs.now(),current.transfer_schedule).due||transferWindow(await jobs.now(),current.transfer_schedule).key!==job.target)throw new AppError(409,'定时转移配置已变化，未保存旧计划','nightly_plan_expired');
       }
-      await store.run('INSERT INTO harbor.routing_plans VALUES($1,$2,$3,$4::jsonb,$5)',job.id,at,nightly?Math.min(at+ttlMs,window.until):at+ttlMs,encodedHeader,bytes);
+      await store.run('INSERT INTO harbor.routing_plans(id,created,expires,header,bytes'+(scope?',department_id':'')+') VALUES($1,$2,$3,$4::jsonb,$5'+(scope?',$6':'')+')',job.id,at,nightly?Math.min(at+ttlMs,window.until):at+ttlMs,encodedHeader,bytes,...(scope?[scope.department_id]:[]));
       // Bound each statement as well as total plan size; no giant JSON array is
       // passed as a single SQL parameter and no partial plan commits.
       for(let start=0;start<items.length;){
@@ -87,17 +96,18 @@ export function createPostgresPlanningJobs(store,{jobs,clock=Date.now,input={},t
       stopped(signal);return {plan_id:job.id};
     });
   }
-  async function status(id){
-    const at=clock(),row=await store.get("SELECT j.id,j.status,j.error_code,j.result,j.created,j.updated,p.created planned_at,p.expires,p.header FROM harbor.background_jobs j LEFT JOIN harbor.routing_plans p ON p.id=j.id WHERE j.id=$1 AND j.kind=$2 AND j.created>=$3 AND j.created<$4",id,kind,usageWindow(at).start,usageWindow(at).end);
+  async function status(id,{scope}={}){
+    scope=await departments.resolve(scope,{management:true});
+    const at=clock(),row=await store.get("SELECT j.id,j.status,j.error_code,j.result,j.created,j.updated,p.created planned_at,p.expires,p.header FROM harbor.background_jobs j LEFT JOIN harbor.routing_plans p ON p.id=j.id WHERE j.id=$1 AND j.kind=$2 AND j.created>=$3 AND j.created<$4"+(scope?" AND j.department_id=$5":""),id,kind,usageWindow(at).start,usageWindow(at).end,...(scope?[scope.department_id]:[]));
     if(!row)throw new AppError(404,'规划任务不存在或超出查询范围','planning_not_found');
     const {result,header,...view}=row;
     if(header&&row.expires<=at)throw new AppError(410,'规划已过期，请重新生成','planning_expired');
     return {...view,...(header?{plan:header}:{}),ready:!!header};
   }
-  async function page(id,{section='moves',after=0,limit=25}={}){
+  async function page(id,{section='moves',after=0,limit=20,scope}={}){
     if(!publicSections.has(section)||!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>100)throw new AppError(400,'规划分页参数无效','planning_query_invalid');
     return store.transaction(async()=>{
-      const view=await status(id);if(!view.ready)throw new AppError(409,'规划尚未生成','planning_pending');
+      const view=await status(id,{scope});if(!view.ready)throw new AppError(409,'规划尚未生成','planning_pending');
       const rows=await store.all('SELECT ordinal,bytes FROM harbor.routing_plan_items WHERE plan_id=$1 AND section=$2 AND ordinal>$3 ORDER BY ordinal LIMIT $4',id,section,after,limit+1);
       let size=0;const selected=[];
       for(const row of rows.slice(0,limit)){if(selected.length&&size+row.bytes>pageBytes)break;selected.push(row.ordinal);size+=row.bytes;}
