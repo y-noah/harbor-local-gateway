@@ -8,6 +8,14 @@ Worker 首次进入持续运行状态时通过原有界后台队列安排一次 
 
 ## 服务器部署（GitLab CI/CD）
 
+### PostgreSQL 大盘迁移与恢复监督
+
+迁盘工具为 `ci/harbor-pg-storage-coordinator.py` 和 `ci/harbor-pg-storage-host.py`。启用前须由管理员安装受控工具、绑定原实例与数据库身份、校验迁移计划及挂载依赖；仅有源码或镜像不代表已经迁盘。切换保留原数据，目标库开始写入后禁止直接回退旧数据副本。当前实例的实际交付状态以发布验收记录为准。
+
+root 配置 `postgres_storage_startup_guard` 缺省为 `false`，严格布尔值；开启后发布器通过已安装的迁盘工具登记计划操作并核对恢复结果，客户端不能覆盖。迁盘后的容器使用 `restart=no`，由原 storage-online 服务监督恢复，先校验持久挂载与当前实例授权，避免 Docker 在挂载未就绪时抢先启动。`postgres_storage_supervision_poll_seconds` 默认 5，仅接受 1–60 的整数，重启 storage-online 后生效；它是轮询间隔，不是恢复时限承诺，0 或 false 不表示关闭。
+
+计划停机使用 root 工具的 `pause`／`resume`；pause 先保存意图并停止自动恢复，重启后仍保持暂停。直接 `docker stop` 会被当作意外退出，监督服务会尝试恢复。`status` 只读查看状态；`reconcile` 核实实例已经恢复后清除计划操作标记，不启动服务或恢复暂停入口。恢复只选择当前 ACTIVE 的实例，不把未知发布结果写成成功。关闭启动保护不能代替迁盘回滚：须先按受控恢复流程核对当前写入位置、恢复容器启动策略与挂载依赖，再撤销配置。
+
 当前服务入口为 `http://173.208.167.168:8092/`，所有分支共用项目变量 `GATEWAY_DEPLOY_HOST` 指定的部署主机，不区分主分支。流水线先运行测试，再构建镜像并执行候选验证；保留部署作业名供既有入口使用，部署作业手动触发。本机默认端口仍为 `43127`。CI 的 `SERVICE_ORIGIN` 只用于环境链接，不决定 SSH 目标；实际监听与允许的 Origin 由服务器 root 配置决定。`gateway-93` 环境名及 `harbor-gateway-93` 串行锁保留为既有标识，不代表部署目标仍是旧主机。
 
 8092 的 `preserve-current` 策略禁止原先停再建入口。受控 PostgreSQL 切换使用 `deploy-entry-postgres`，必须通过固定 root controller 的入口排空、真实来源围栏、候选身份、材料及 activation 核验，候选健康后才切换；首次分发至 PostgreSQL 后不自动恢复 SQLite。固定 root/0600 的 `/etc/harbor-gateway-deploy.json` 可设严格布尔 `entry_installed_release:true`，仅让显式新 action 使用已安装的批准镜像，不接受附加镜像字节，仍执行全部发布门禁；缺省或关闭时沿原运输方式，客户端不能开启。此模式配合专用 CI 手动作业，避免切换窗口重复运输镜像，不等于允许使用任意本地镜像。关闭该值恢复原运输路径，既有数据及镜像不删除。

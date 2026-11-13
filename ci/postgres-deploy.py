@@ -431,7 +431,40 @@ def verify_started_composition(api,image,config,started,approval):
     else:raise RuntimeError('PostgreSQL gateway/Worker readiness or progress failed')
     if api['http_code'](port,'/api/admin/state')!=401 or api['http_code'](port,'/health',{'Host':'untrusted.invalid'})!=403 or device_http_code(stack,config,'/api/admin/state')!=401 or device_http_code(stack,config,'/health',{'Host':'untrusted.invalid'})!=403:raise RuntimeError('PostgreSQL authentication checks failed')
 
+STORAGE_STARTUP_CONTRACT='harbor-pg-storage-boot-v1'
+
+def storage_restart_policy(config):
+    enabled=config.get('postgres_storage_startup_guard',False)
+    if type(enabled) is not bool:raise ValueError('PostgreSQL storage startup guard must be a root boolean')
+    if not enabled:
+        state=Path('/sdc-disk/harbor-data/.pg-storage-state.json')
+        if os.path.lexists(state):
+            for item in [state,*state.parents]:
+                info=item.lstat()
+                if info.st_uid!=0 or info.st_mode&0o022 or stat.S_ISLNK(info.st_mode):raise ValueError('PostgreSQL storage guard state is not root controlled')
+            info=state.stat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode)!=0o600 or info.st_nlink!=1 or info.st_size>262144:raise ValueError('PostgreSQL storage guard state is not private')
+            current=json.loads(state.read_bytes())
+            if current.get('scope')!='harbor-pg-storage-move-v1':raise ValueError('PostgreSQL storage guard state is unknown')
+            if any(type(current.get(key,False)) is not bool for key in ['oldDataRollbackForbidden','targetBootAuthorized']):raise ValueError('PostgreSQL storage guard flags are invalid')
+            legacy_phases={'planned','archive-precopying','archive-prepared','holding-intent','held','gated','writers-paused','autostart-fenced','applications-stopped','pg-stop-intent','source-cold','cold-verified','bound','recovering-source','source-restored'}
+            if current.get('oldDataRollbackForbidden') is True or current.get('targetBootAuthorized') is True or current.get('phase') not in legacy_phases:raise ValueError('Migrated PostgreSQL still requires its instance startup guard')
+        return 'unless-stopped'
+    # Only the protected host configuration can request this. The fixed helper
+    # proves the completed physical move and the current instance's boot guard.
+    path=Path('/usr/local/lib/harbor/harbor-pg-storage-host.py')
+    for item in [path,*path.parents]:
+        info=item.lstat()
+        if info.st_uid!=0 or info.st_mode&0o022 or stat.S_ISLNK(info.st_mode):raise ValueError('PostgreSQL storage startup guard is not root controlled')
+    import importlib.util
+    spec=importlib.util.spec_from_file_location('harbor_storage_startup_guard',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    result=module.verify_factory_guard(config)
+    if type(result) is not dict or result!={'contract':STORAGE_STARTUP_CONTRACT,'completed':True,'samePostgres':True,'mountsVerified':True} or any(type(result.get(k)) is not bool for k in ['completed','samePostgres','mountsVerified']):raise ValueError('PostgreSQL storage startup guard is not ready')
+    return 'no'
+
 def deploy(image,config,archive,api):
+    restart_policy=storage_restart_policy(config)
     stack=api['STACK'];name=api['NAME'];worker=name+'-worker';port=config['port'];docker=api['docker'];entry_deployment=api.get('entry_deployment');shutdown_rows=[];inspect=lambda target:container_inspection(api,target,shutdown_rows)
     if not callable(api.get('activation')):raise ValueError('PostgreSQL activation consumer is required')
     approval=api['activation']('check',image)
@@ -547,7 +580,7 @@ def deploy(image,config,archive,api):
                 stop_confirmed(api,target,existing,'gateway' if target==name else 'worker',shutdown_rows,proof_verified=old_proofs[index] is not None and old_shutdown[index] is not None);docker('rename',target,target+'-previous');stopped.append(target)
         started=int(time.time()*1000)
         for target,kind,entry in [(name,'gateway','postgres-gateway.mjs'),(worker,'worker','postgres-worker.mjs')]:
-            budget=budgets[kind];shutdown=shutdown_configuration(config.get('postgres_shutdown'));stop_ms=shutdown['gateway_drain_ms']+shutdown['cleanup_grace_ms'] if kind=='gateway' else shutdown['worker_stop_ms'];args=['run','-d','--entrypoint','','--stop-signal','SIGTERM','--name',target,'--label','com.aistrong.project='+name,'--label','com.harbor.activation-deployment-id='+approval['deploymentId'],'--label','com.harbor.activation-receipt='+approval['receiptDigest'],'--label','com.harbor.shutdown-contract='+SHUTDOWN_CONTRACT,'--label','com.harbor.shutdown-role='+kind,'--stop-timeout',str((stop_ms+999)//1000),'--restart','unless-stopped','--memory',str(budget['memory_mib'])+'m','--cpus',str(budget['cpus']),'--pids-limit',str(budget['pids']),*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime']
+            budget=budgets[kind];shutdown=shutdown_configuration(config.get('postgres_shutdown'));stop_ms=shutdown['gateway_drain_ms']+shutdown['cleanup_grace_ms'] if kind=='gateway' else shutdown['worker_stop_ms'];args=['run','-d','--entrypoint','','--stop-signal','SIGTERM','--name',target,'--label','com.aistrong.project='+name,'--label','com.harbor.activation-deployment-id='+approval['deploymentId'],'--label','com.harbor.activation-receipt='+approval['receiptDigest'],'--label','com.harbor.shutdown-contract='+SHUTDOWN_CONTRACT,'--label','com.harbor.shutdown-role='+kind,'--stop-timeout',str((stop_ms+999)//1000),'--restart',restart_policy,'--memory',str(budget['memory_mib'])+'m','--cpus',str(budget['cpus']),'--pids-limit',str(budget['pids']),*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime']
             if kind=='gateway':args+=['--env','HARBOR_LISTEN_HOST=0.0.0.0','--env','HARBOR_PORT='+str(port),'--publish',str(port)+':'+str(port),'--publish',str(config['device_tls_port'])+':'+str(config['device_tls_port'])]
             else:args+=['--health-cmd','node /app/ci/postgres-preflight.mjs --worker-health','--health-interval','15s','--health-timeout','5s','--health-start-period','30s']
             created.append(target);docker(*args,image,'node','/app/'+entry)

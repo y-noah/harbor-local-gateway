@@ -309,6 +309,29 @@ def log_image_stage_error(action,error,module=None):
     except Exception:
         pass
 
+def storage_operation_helper(config):
+    enabled=config.get('postgres_storage_startup_guard',False)
+    if type(enabled) is not bool:raise ValueError('PostgreSQL storage startup guard must be a root boolean')
+    if not enabled:return None
+    path=Path('/usr/local/lib/harbor/harbor-pg-storage-host.py')
+    for item in [path,*path.parents]:
+        info=item.lstat()
+        if info.st_uid!=0 or info.st_mode&0o022 or stat.S_ISLNK(info.st_mode):raise ValueError('PostgreSQL storage operation helper is not root controlled')
+    spec=importlib.util.spec_from_file_location('harbor_storage_operation',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+
+def storage_deployment(config,image,archive,action,lock_fd):
+    helper=storage_operation_helper(config);nonce=helper.deployment_begin(config,image,lock_fd) if helper else None
+    try:result=(deploy_entry_postgres if action=='deploy-entry-postgres' else deploy)(image,config,archive)
+    except BaseException:
+        if helper:
+            try:helper.deployment_finish(config,nonce,False,lock_fd)
+            except Exception:syslog.syslog(syslog.LOG_ERR,'Harbor planned operation remains protected; inspect storage helper status')
+        raise
+    if helper and helper.deployment_finish(config,nonce,True,lock_fd).get('released') is not True:raise RuntimeError('Harbor planned operation result remains protected')
+    return result
+
 def main():
     os.umask(0o077)
     request=sys.stdin.buffer.readline(4097)
@@ -362,7 +385,7 @@ def main():
         archive=None
         try:
             archive,transport=receive_deployment_image(sys.stdin.buffer,payload,config,action)
-            result=(deploy_entry_postgres if action=='deploy-entry-postgres' else deploy)(image,config,archive)
+            result=storage_deployment(config,image,archive,action,lock.fileno())
             if action=='deploy-entry-postgres':result={**result,'wireAction':payload['action'],'effectiveAction':action,'imageTransport':transport}
             if config.get('storage_engine')=='postgres':print(json.dumps({'postgres_deployment':result},sort_keys=True))
         finally:
