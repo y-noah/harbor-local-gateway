@@ -247,6 +247,9 @@ def image_proof_content(api,image,common):
 
 def validate_image_proof(value,image,common):
     if not isinstance(value,dict) or value.get('contract')!=CONTRACT or value.get('extra_usage_dispatch_contract')!=EXTRA_USAGE_DISPATCH_CONTRACT or value.get('storage_verified') is not True or value.get('credentials_verified') is not True or value.get('device_tls_verified') is not True or value.get('revision')!=image.rsplit(':',1)[-1] or any(not isinstance(value.get(key),str) or not re.fullmatch('[a-f0-9]{64}',value[key]) for key in ['schema_digest','database_digest','source_digest','device_ca_digest']):raise ValueError('Candidate PostgreSQL preflight proof is invalid')
+    if 'department_isolation_contract' in value:
+        if value['department_isolation_contract']!='harbor-department-isolation-v1' or type(value.get('department_isolation_installed')) is not bool:raise ValueError('Candidate department proof is invalid')
+    elif 'department_isolation_installed' in value:raise ValueError('Candidate department contract is missing')
     requested={key:int(next(item.split('=',1)[1] for item in common if item.startswith(name+'='))) for key,name in SHUTDOWN_ENV.items()}
     if 'shutdown' not in value:raise ShutdownContractUnsupported('Validated legacy PostgreSQL image has no shutdown contract')
     shutdown=value['shutdown']
@@ -321,7 +324,7 @@ def prepare_source_image_preflights(api,sources,common):
             key=(instance.get('Config',{}).get('Image'),instance.get('Image'),tuple(requested))
             if bindings.get(instance.get('Id'))!=key or source_preflight_material_identity(api['STACK'])!=materials or (image_inspection(api,key[0],[]) or {}).get('Id')!=key[1]:raise ShutdownUnconfirmed('Prepared source preflight identity changed')
             fresh=running_source_image_proof(api,instance,requested)
-            if any(fresh.get(name)!=proofs[key].get(name) for name in ['contract','revision','source_digest','schema_digest','database_digest','device_ca_digest','shutdown']):raise ShutdownUnconfirmed('Source runtime proof changed')
+            if any(fresh.get(name)!=proofs[key].get(name) for name in ['contract','revision','source_digest','schema_digest','database_digest','device_ca_digest','shutdown','department_isolation_contract','department_isolation_installed']):raise ShutdownUnconfirmed('Source runtime proof changed')
             return fresh
         except Exception as error:raise SourcePreflightRejected('Source preflight rejected before composition change') from error
     return verified
@@ -583,6 +586,11 @@ def deploy(image,config,archive,api):
             except Exception as repair_error:
                 if api['usage_cascade_release'].uncertain:raise ShutdownUnconfirmed('Usage cascade repair outcome is unknown; stopped composition retained') from repair_error
                 raise
+        if api.get('department_release') is not None:
+            try:api['department_release'].install()
+            except Exception as install_error:
+                if api['department_release'].uncertain:raise ShutdownUnconfirmed('Department activation outcome is unknown; stopped composition retained') from install_error
+                raise
         started=int(time.time()*1000)
         for target,kind,entry in [(name,'gateway','postgres-gateway.mjs'),(worker,'worker','postgres-worker.mjs')]:
             budget=budgets[kind];shutdown=shutdown_configuration(config.get('postgres_shutdown'));stop_ms=shutdown['gateway_drain_ms']+shutdown['cleanup_grace_ms'] if kind=='gateway' else shutdown['worker_stop_ms'];args=['run','-d','--entrypoint','','--stop-signal','SIGTERM','--name',target,'--label','com.aistrong.project='+name,'--label','com.harbor.activation-deployment-id='+approval['deploymentId'],'--label','com.harbor.activation-receipt='+approval['receiptDigest'],'--label','com.harbor.shutdown-contract='+SHUTDOWN_CONTRACT,'--label','com.harbor.shutdown-role='+kind,'--stop-timeout',str((stop_ms+999)//1000),'--restart',restart_policy,'--memory',str(budget['memory_mib'])+'m','--cpus',str(budget['cpus']),'--pids-limit',str(budget['pids']),*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime']
@@ -601,6 +609,9 @@ def deploy(image,config,archive,api):
         # Finish candidate intake and durable cleanup before removing either member.
         # Unknown cleanup retains the whole composition and blocks automatic rollback.
         reclaimed=reclaim_candidates(created)
+        if api.get('department_release') is not None:
+            try:api['department_release'].rollback_guard()
+            except Exception as rollback_error:raise ShutdownUnconfirmed('Department rollback compatibility is unconfirmed; stopped composition retained') from rollback_error
         if api.get('usage_cascade_release') is not None:
             try:api['usage_cascade_release'].rollback()
             except Exception as rollback_error:raise ShutdownUnconfirmed('Usage cascade rollback is unconfirmed; stopped composition retained') from rollback_error

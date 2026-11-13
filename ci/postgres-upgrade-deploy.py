@@ -6,7 +6,7 @@ from contextlib import contextmanager
 CONTRACT='harbor-postgres-runtime-upgrade-v1'
 TICKET=Path('/etc/harbor-postgres-runtime-upgrade.json')
 TOOLS_MANIFEST=Path('/etc/harbor-postgres-runtime-tools.json')
-HOST_FILES=('/usr/local/bin/harbor-gateway-deploy','/usr/local/lib/harbor/postgres-deploy.py','/usr/local/lib/harbor/gateway-entry-controller.py','/usr/local/lib/harbor/postgres-upgrade-deploy.py','/usr/local/lib/harbor/postgres-usage-cascade.py')
+HOST_FILES=('/usr/local/bin/harbor-gateway-deploy','/usr/local/lib/harbor/postgres-deploy.py','/usr/local/lib/harbor/gateway-entry-controller.py','/usr/local/lib/harbor/postgres-upgrade-deploy.py','/usr/local/lib/harbor/postgres-usage-cascade.py','/usr/local/lib/harbor/postgres-department-release.py')
 RELEASES=Path('/var/lib/harbor-postgres-upgrades')
 ENTRY=Path('/usr/local/lib/harbor/gateway-entry-controller.py')
 LOCAL=Path('/usr/local/lib/harbor/local-assurance-deploy.py')
@@ -61,6 +61,7 @@ def active_identity(active):
 def validate_ticket(ticket,image,config):
  need(isinstance(ticket,dict) and ticket.get('version')==1 and ticket.get('contract')==CONTRACT and ticket.get('approved') is True,'one-time root approval required')
  need(type(ticket.get('interruptEntryClients',False)) is bool,'entry interruption approval must be boolean')
+ need(type(ticket.get('activateDepartmentIsolation',False)) is bool,'department activation approval must be boolean')
  need(re.fullmatch(UUID,ticket.get('deploymentId','')) and re.fullmatch('[a-f0-9]{40}',ticket.get('hostToolsRevision','')),'release identity')
  target=ticket.get('to',{});source=ticket.get('from',{});network=ticket.get('network',{});database=ticket.get('database',{})
  need(config.get('port')==8092 and config.get('storage_engine')=='postgres' and config.get('local_assurance_release') is True and config.get('entry_installed_release') is True,'installed preserved PostgreSQL entry required')
@@ -474,6 +475,33 @@ def finish_retired_cleanup(config,api,entry,record,path):
  except Exception:record['cleanup']={'state':'pending','errorCategory':'retired_service_cleanup_record_failed'}
  return record['cleanup']
 
+DEPARTMENT_CONTRACT='harbor-department-isolation-v1'
+def department_contract(proof):
+ need(type(proof) is dict,'department_proof_unknown')
+ value=proof.get('department_isolation_contract')
+ if value is None:
+  need('department_isolation_installed' not in proof,'department_marker_without_contract');return None
+ need(value==DEPARTMENT_CONTRACT and type(proof.get('department_isolation_installed')) is bool,'department_proof_invalid');return value
+
+def department_upgrade_guard(pg,api,ticket,gateway,worker,common,target_proof):
+ target=department_contract(target_proof);activate=ticket.get('activateDepartmentIsolation',False)
+ need(type(activate) is bool,'department_activation_flag')
+ if activate:need(target==DEPARTMENT_CONTRACT,'department_activation_target_unsupported')
+ original=api['source_image_preflight'];proofs=[]
+ def guarded(instance,requested):
+  proof=original(instance,requested);source=department_contract(proof)
+  if proof.get('department_isolation_installed',False):need(target==DEPARTMENT_CONTRACT,'department_installed_requires_compatible_target')
+  if activate:need(source==DEPARTMENT_CONTRACT,'department_bridge_release_required')
+  return proof
+ api['source_image_preflight']=guarded
+ if target==DEPARTMENT_CONTRACT:
+  for instance,role in [(gateway,'gateway'),(worker,'worker')]:
+   values=pg.container_shutdown(api,instance,role)
+   need(type(values) is dict,'department_source_shutdown_unknown')
+   requested=[next((label+'='+str(values[key]) for key,label in pg.SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
+   proofs.append(guarded(instance,requested))
+ return proofs
+
 def run_upgrade(image,config,api,ticket,entry):
  need(retained_service_pairs(config)==0,'backup_pair_restore_unqualified: retained pair restore is not qualified')
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
@@ -485,6 +513,7 @@ def run_upgrade(image,config,api,ticket,entry):
  pg.container_shutdown(pg_api,gateway,'gateway');pg.container_shutdown(pg_api,worker,'worker')
  pg_api['source_image_preflight']=pg.prepare_source_image_preflights(pg_api,[(gateway,'gateway'),(worker,'worker')],common)
  consumption_upgrade_guard(pg,pg_api,ticket,entry,gateway,common,proof)
+ department_sources=department_upgrade_guard(pg,pg_api,ticket,gateway,worker,common,proof)
  network_snapshot(ticket,entry,gateway,worker)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
  context=SimpleNamespace(config=original,state=entry.private_json(entry.STATE));entry.EntryDeployment.enter_probe_worker(context);entry.EntryDeployment.allow_probe_worker(context)
@@ -492,6 +521,9 @@ def run_upgrade(image,config,api,ticket,entry):
  if proof.get('usage_rollup_cascade_contract') is not None:
   cascade=load(Path(__file__).with_name('postgres-usage-cascade.py'),'runtime_upgrade_usage_cascade')
   pg_api['usage_cascade_release']=cascade.UsageCascadeRelease(api=api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path)
+ if department_contract(proof)==DEPARTMENT_CONTRACT:
+  department=load(Path(__file__).with_name('postgres-department-release.py'),'runtime_upgrade_department')
+  pg_api['department_release']=department.DepartmentRelease(api=api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path,source_proofs=department_sources)
  target=approval(ticket);activation_state='pending'
  def activation(action,requested):
   nonlocal activation_state

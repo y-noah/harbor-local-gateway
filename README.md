@@ -895,3 +895,5 @@ PostgreSQL与原SQLite共用费率配置校验、官方解析及不可变版本�
 超管继续用管理密码登录，在部门管理中创建部门并签发独立部门管理 Key。部门管理员用此 Key 登录原后台，只能访问本部门。超管默认全局查看，写入业务配置前需选择具体部门；`X-Harbor-Department` 只选择超管已有权限范围，员工及部门管理员不能借此换部门。部门管理接口为 `GET/POST /api/admin/departments`、`PATCH /api/admin/departments/:id`、`GET/POST /api/admin/departments/:id/management-keys` 和 `POST /api/admin/departments/:id/management-keys/:keyId/revoke`；修改、停用和撤销携带最新 `expected_version`，管理 Key 明文只在签发时返回。
 
 部门账号、模型权限、员工类型、共享限额、用量查询、正文与导出、额外额度及套餐配置均保留部门归属。订阅账号仍只需填写月费，API Key 独立添加。夜间任务按部门规划和换绑；管理 Key 撤销或部门停用后，旧任务不能启动新派发或迁移，已运行请求仍按原部门结算。停用后再启用不恢复旧管理会话或旧任务权限，员工与单个 Key 自身的启停状态保留。
+
+首次激活采用两阶段发布：普通票据省略 `activateDepartmentIsolation`（等同 `false`），仅上线兼容代码、不执行部门DDL；确认该兼容版本业务健康后，后续票据才明确设为 `true`。激活要求网关、Worker源镜像和目标都声明 `harbor-department-isolation-v1`，停源并排空运行角色连接后，由受控 owner 安装同校验和迁移。提交回执丢失须查询实际marker确认，结果未知不猜测成功；失败先回收候选并核验旧源兼容性再恢复，不通过删除部门结构回退。
