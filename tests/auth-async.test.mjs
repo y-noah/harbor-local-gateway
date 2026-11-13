@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {setImmediate as immediate} from 'node:timers/promises';
 import {createAdminAuth,passwordHash} from '../auth.mjs';
+import {requireDepartmentScope} from '../department-access.mjs';
 const response=()=>{const headers={};return {headers,setHeader:(name,value)=>{headers[name]=value;}};};
 const cookie=res=>res.headers['Set-Cookie'].split(';')[0];
 test('the real async scrypt login yields the event loop and keeps legacy synchronous sessions',async()=>{
-  const auth=createAdminAuth({adminPasswordHash:passwordHash('synthetic-async')}),legacy=response();assert.equal(auth.login('synthetic-async',legacy),undefined);assert.equal(auth.authenticated({headers:{cookie:cookie(legacy)}}),true);
-  let settled=false;const current=response(),pending=auth.loginAsync('synthetic-async',current).finally(()=>{settled=true;});await immediate();assert.equal(settled,false);await pending;assert.equal(auth.authenticated({headers:{cookie:cookie(current)}}),true);assert.notEqual(cookie(current),cookie(legacy));
+  const auth=createAdminAuth({adminPasswordHash:passwordHash('synthetic-async')}),legacy=response(),legacyScope=auth.login('synthetic-async',legacy);assert.equal(requireDepartmentScope(legacyScope,{allowGlobal:true,roles:['super_admin']}),legacyScope);assert.equal(legacyScope.view,'global');assert.equal(await auth.context({headers:{cookie:cookie(legacy)}}),legacyScope);assert.throws(()=>requireDepartmentScope({...legacyScope},{allowGlobal:true}),{code:'department_scope_required'});assert.equal(auth.authenticated({headers:{cookie:cookie(legacy)}}),true);
+  let settled=false;const current=response(),pending=auth.loginAsync('synthetic-async',current).finally(()=>{settled=true;});await immediate();assert.equal(settled,false);const currentScope=await pending;assert.equal(requireDepartmentScope(currentScope,{allowGlobal:true,roles:['super_admin']}),currentScope);assert.equal(await auth.context({headers:{cookie:cookie(current)}}),currentScope);assert.throws(()=>requireDepartmentScope({...currentScope},{allowGlobal:true}),{code:'department_scope_required'});assert.equal(auth.authenticated({headers:{cookie:cookie(current)}}),true);assert.notEqual(cookie(current),cookie(legacy));
 });
 test('concurrent accepted logins stay ordered and five failures cannot be bypassed by an already queued valid password',async()=>{
   let at=1000;const auth=createAdminAuth({adminPasswordHash:passwordHash('synthetic-correct')},{clock:()=>at}),responses=Array.from({length:6},response),outcomes=await Promise.allSettled(responses.map((res,index)=>auth.loginAsync(index===5?'synthetic-correct':'wrong',res)));
