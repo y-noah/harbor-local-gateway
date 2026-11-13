@@ -578,6 +578,11 @@ def deploy(image,config,archive,api):
         for index,(target,existing) in enumerate([(name,current),(worker,old_worker)]):
             if existing:
                 stop_confirmed(api,target,existing,'gateway' if target==name else 'worker',shutdown_rows,proof_verified=old_proofs[index] is not None and old_shutdown[index] is not None);docker('rename',target,target+'-previous');stopped.append(target)
+        if api.get('usage_cascade_release') is not None:
+            try:api['usage_cascade_release'].repair()
+            except Exception as repair_error:
+                if api['usage_cascade_release'].uncertain:raise ShutdownUnconfirmed('Usage cascade repair outcome is unknown; stopped composition retained') from repair_error
+                raise
         started=int(time.time()*1000)
         for target,kind,entry in [(name,'gateway','postgres-gateway.mjs'),(worker,'worker','postgres-worker.mjs')]:
             budget=budgets[kind];shutdown=shutdown_configuration(config.get('postgres_shutdown'));stop_ms=shutdown['gateway_drain_ms']+shutdown['cleanup_grace_ms'] if kind=='gateway' else shutdown['worker_stop_ms'];args=['run','-d','--entrypoint','','--stop-signal','SIGTERM','--name',target,'--label','com.aistrong.project='+name,'--label','com.harbor.activation-deployment-id='+approval['deploymentId'],'--label','com.harbor.activation-receipt='+approval['receiptDigest'],'--label','com.harbor.shutdown-contract='+SHUTDOWN_CONTRACT,'--label','com.harbor.shutdown-role='+kind,'--stop-timeout',str((stop_ms+999)//1000),'--restart',restart_policy,'--memory',str(budget['memory_mib'])+'m','--cpus',str(budget['cpus']),'--pids-limit',str(budget['pids']),*common,'--mount','type=bind,src='+stack+'/pg-data,dst=/app/data','--mount','type=bind,src='+stack+'/runtime,dst=/app/runtime']
@@ -596,6 +601,9 @@ def deploy(image,config,archive,api):
         # Finish candidate intake and durable cleanup before removing either member.
         # Unknown cleanup retains the whole composition and blocks automatic rollback.
         reclaimed=reclaim_candidates(created)
+        if api.get('usage_cascade_release') is not None:
+            try:api['usage_cascade_release'].rollback()
+            except Exception as rollback_error:raise ShutdownUnconfirmed('Usage cascade rollback is unconfirmed; stopped composition retained') from rollback_error
         for target,previous_image in originals.items():
             previous=inspect(target+'-previous');restored=inspect(target)
             if previous and previous.get('Config',{}).get('Image')==previous_image and previous.get('Config',{}).get('Labels',{}).get('com.aistrong.project')==name and not restored:

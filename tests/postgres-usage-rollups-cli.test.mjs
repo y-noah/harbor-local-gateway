@@ -5,7 +5,7 @@ import {randomUUID} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {PostgresStore} from '../postgres-store.mjs';
-import {usageRollupArguments,runUsageRollupsCommand} from '../postgres-usage-rollups-cli.mjs';
+import {usageRollupArguments,runUsageRollupsCommand,readUsageCascadeInput} from '../postgres-usage-rollups-cli.mjs';
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需独立PG测试库':false,timeout:30000};
 function options(name='postgres'){const u=new URL(url);u.pathname='/'+name;return {connectionString:u.href,allowPlaintextLocalNetwork:true};}
 test('小时汇总CLI默认只读且参数有界、不接受重复或跨动作写入选项',()=>{
@@ -36,4 +36,13 @@ test('真实PG CLI支持本机保障五列激活合同，缺显式角色原子�
   assert.deepEqual(await runUsageRollupsCommand(['install','--runtime-role='+role],options(name)),{action:'install',installed:true,changed:true,ready:false});
   assert.deepEqual(await runUsageRollupsCommand(['install','--runtime-role='+role],options(name)),{action:'install',installed:true,changed:false,ready:false});
  }finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+name);await admin.query('DROP ROLE IF EXISTS '+name+'_runtime');await admin.close();}
+});
+
+test('级联维护输入有界，拒绝URL/参数覆盖且必须显式校验证书',async()=>{
+ for(const action of ['cascade-plan','cascade-status','cascade-verify','cascade-repair','cascade-rollback','cascade-receipt']){assert.deepEqual(usageRollupArguments([action]),{action});assert.throws(()=>usageRollupArguments([action,'--batch-size=10']));}
+ const stream=async function*(v){yield Buffer.from(v);},valid={connection:{host:'127.0.0.1',port:5432,database:'synthetic',user:'synthetic_admin',password:'synthetic',application_name:'harbor-usage-cascade-maintenance',ssl:{rejectUnauthorized:true,servername:'synthetic-db',ca:'BEGIN CERTIFICATE'}},cascade:{}};
+ await assert.rejects(readUsageCascadeInput(stream('x'.repeat(131073))),e=>e.code==='database_configuration');
+ for(const field of ['connectionString','options','hostaddr','service']){const value=structuredClone(valid);value.connection[field]='forbidden';await assert.rejects(readUsageCascadeInput(stream(JSON.stringify(value))),e=>e.code==='database_configuration');}
+ for(const alter of [v=>v.connection.ssl.rejectUnauthorized=false,v=>v.connection.ssl.ca='no-cert',v=>v.connection.host='unbound.example',v=>v.connectionString='forbidden']){const value=structuredClone(valid);alter(value);await assert.rejects(readUsageCascadeInput(stream(JSON.stringify(value))),e=>e.code==='database_configuration');}
+ assert.deepEqual(await readUsageCascadeInput(stream(JSON.stringify(valid))),valid);
 });

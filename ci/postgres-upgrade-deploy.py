@@ -6,7 +6,7 @@ from contextlib import contextmanager
 CONTRACT='harbor-postgres-runtime-upgrade-v1'
 TICKET=Path('/etc/harbor-postgres-runtime-upgrade.json')
 TOOLS_MANIFEST=Path('/etc/harbor-postgres-runtime-tools.json')
-HOST_FILES=('/usr/local/bin/harbor-gateway-deploy','/usr/local/lib/harbor/postgres-deploy.py','/usr/local/lib/harbor/gateway-entry-controller.py','/usr/local/lib/harbor/postgres-upgrade-deploy.py')
+HOST_FILES=('/usr/local/bin/harbor-gateway-deploy','/usr/local/lib/harbor/postgres-deploy.py','/usr/local/lib/harbor/gateway-entry-controller.py','/usr/local/lib/harbor/postgres-upgrade-deploy.py','/usr/local/lib/harbor/postgres-usage-cascade.py')
 RELEASES=Path('/var/lib/harbor-postgres-upgrades')
 ENTRY=Path('/usr/local/lib/harbor/gateway-entry-controller.py')
 LOCAL=Path('/usr/local/lib/harbor/local-assurance-deploy.py')
@@ -399,6 +399,9 @@ def run_upgrade(image,config,api,ticket,entry):
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
  context=SimpleNamespace(config=original,state=entry.private_json(entry.STATE));entry.EntryDeployment.enter_probe_worker(context);entry.EntryDeployment.allow_probe_worker(context)
  active=entry.private_json(entry.ACTIVE);record['fromActive']=active;entry.save_json(path/'release.json',record);gate=None;gate_attempted=False;commit_started=False
+ if proof.get('usage_rollup_cascade_contract') is not None:
+  cascade=load(Path(__file__).with_name('postgres-usage-cascade.py'),'runtime_upgrade_usage_cascade')
+  pg_api['usage_cascade_release']=cascade.UsageCascadeRelease(api=api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path)
  target=approval(ticket);activation_state='pending'
  def activation(action,requested):
   nonlocal activation_state

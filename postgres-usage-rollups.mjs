@@ -48,7 +48,7 @@ export async function verifyUsageRollupAvailability(store){
  if(!saved){verifiedStores.delete(store);return false;}
  const bundle=await source();let value;try{value=JSON.parse(saved.value);}catch{throw conflict();}
  if(value.version!==1||value.checksum!==bundle.checksum)throw conflict();
- await verifyUsageRollups(store,bundle.sql);verifiedStores.add(store);return true;
+ await verifyUsageRollups(store);verifiedStores.add(store);return true;
 }
 export async function migrateUsageRollups(store,{apply=false,runtimeRole}={}){
  if(typeof apply!=='boolean')throw new TypeError('usage_rollup_apply_invalid');
@@ -65,7 +65,7 @@ export async function migrateUsageRollups(store,{apply=false,runtimeRole}={}){
  });
  verifiedStores.add(store);return changed;
 }
-export async function verifyUsageRollups(store,sql){
+async function verifyUsageRollupStructure(store,sql){
  sql??=(await source()).sql;
  // Compare the executable function bodies with the bundled source, not a mutable ready flag.
  const expected=[...sql.matchAll(/CREATE FUNCTION harbor\.(\w+)\([^]*?AS \$usage\$\n([^]*?)\n\$usage\$;/g)];
@@ -145,3 +145,118 @@ export function usageRollupMoneySql(scope){
  ${fields.map(field=>`CASE WHEN ${valid} THEN s.${field} END ${field}`).join(',')} FROM raw s LEFT JOIN harbor.pricing_versions v ON v.id=s.revision
  ) SELECT owner_id,${referenceRollupAggregateSql({standardOnly:true,condition:'NOT recent'})},${referenceRollupAggregateSql({standardOnly:true,condition:'recent',prefix:'recent_'})} FROM partial GROUP BY owner_id`;
 }
+
+// Fixed usage-extension maintenance only; no business endpoint can select its role bindings.
+const base=await readFile(migrationUrl,'utf8'),shapeSql=await readFile(new URL('./migrations/usage-rollup-cascade-temp-shape.sql',import.meta.url),'utf8'),prepare=await readFile(new URL('./migrations/usage-rollup-cascade-prepare.sql',import.meta.url),'utf8');
+const names=['usage_prepare_staging','usage_source_guard','usage_stage_source','flush_usage_rollups'],nested=['usage_prepare_staging','usage_add_delta','flush_usage_rollups'],core=['members','keys','sessions','requests','request_prices'],temporary=['harbor_usage_flushed','harbor_usage_stage','harbor_usage_delta'];const tables={usage_rollup_state:['SELECT'],usage_contributions:['SELECT','INSERT','UPDATE'],usage_hour_buckets:['SELECT','INSERT','UPDATE','DELETE']};
+const need=(ok,code)=>{if(!ok)throw Object.assign(Error(code),{code});},quote=name=>'"'+name.replaceAll('"','""')+'"',ordered=x=>Array.isArray(x)?x.map(ordered):x&&typeof x==='object'?Object.fromEntries(Object.keys(x).sort().map(k=>[k,ordered(x[k])])):x,hash=x=>createHash('sha256').update(typeof x==='string'?x:JSON.stringify(ordered(x))).digest('hex');
+const definition=name=>[...base.matchAll(/CREATE FUNCTION harbor[.](\w+)[^]*?\$usage\$;/g)].find(m=>m[1]===name)[0];
+const patches={usage_prepare_staging:prepare,usage_source_guard:definition('usage_source_guard').replace('CREATE FUNCTION','CREATE OR REPLACE FUNCTION').replace("IF to_regclass('pg_temp.harbor_usage_flushed') IS NOT NULL THEN","IF to_regclass('pg_temp.harbor_usage_flushed') IS NOT NULL THEN\n  PERFORM harbor.usage_prepare_staging();").replace('EXISTS(SELECT 1 FROM pg_temp.harbor_usage_flushed)','EXISTS(SELECT 1 FROM pg_temp.harbor_usage_flushed WHERE flushed)'),usage_stage_source:definition('usage_stage_source').replace('CREATE FUNCTION','CREATE OR REPLACE FUNCTION').replace('EXISTS(SELECT 1 FROM pg_temp.harbor_usage_flushed)','EXISTS(SELECT 1 FROM pg_temp.harbor_usage_flushed WHERE flushed)'),flush_usage_rollups:definition('flush_usage_rollups').replace('CREATE FUNCTION','CREATE OR REPLACE FUNCTION').replace("IF to_regclass('pg_temp.harbor_usage_stage') IS NULL THEN RETURN;END IF;","IF to_regclass('pg_temp.harbor_usage_stage') IS NULL THEN RETURN;END IF;\n PERFORM harbor.usage_prepare_staging();").replace('INSERT INTO pg_temp.harbor_usage_flushed VALUES(TRUE) ON CONFLICT DO NOTHING;','INSERT INTO pg_temp.harbor_usage_flushed(singleton,transaction_id,flushed) VALUES(TRUE,pg_current_xact_id(),TRUE) ON CONFLICT(singleton) DO UPDATE SET transaction_id=EXCLUDED.transaction_id,flushed=TRUE;')};
+const patchedSource=names.reduce((sql,name)=>sql.replace(definition(name),patches[name].replace('CREATE OR REPLACE FUNCTION','CREATE FUNCTION')),base),patchChecksum=hash(patchedSource);
+const stableBinding=b=>Object.fromEntries(['databaseOid','runtimeOid','runtimeSessionRoleOid','coreOwnerOid','coreTables','cascadeForeignKeyOid'].map(key=>[key,b[key]]));
+async function identity(store,binding,{checkDeployment=true}={}){
+ need(binding&&/^\d+$/.test(binding.databaseOid)&&/^\d+$/.test(binding.runtimeOid)&&/^\d+$/.test(binding.coreOwnerOid)&&/^\d+$/.test(binding.runtimeSessionRoleOid),'cascade_binding_required');
+ if(checkDeployment)need(hash(JSON.stringify(await store.all('SELECT version,checksum FROM harbor.schema_migrations ORDER BY version')))===binding.schemaDigest,'cascade_core_schema_changed');
+ const actual=await store.get("SELECT oid::text oid FROM pg_database WHERE datname=current_database()");need(actual.oid===binding.databaseOid,'cascade_database_changed');
+ let activation;if(checkDeployment){activation=await store.get('SELECT to_jsonb(a) value FROM harbor_operator.activation a WHERE singleton');need(hash(activation.value)===binding.activationDigest&&activation.value.database_oid===binding.databaseOid,'cascade_activation_changed');}
+ const role=await store.get('SELECT oid::text oid,rolname,rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE oid=$1::oid',binding.runtimeOid);need(role&&!['rolsuper','rolcreatedb','rolcreaterole','rolinherit','rolreplication','rolbypassrls'].some(k=>role[k]),'cascade_runtime_invalid');if(activation&&Object.hasOwn(activation.value,'runtime'))need(role.rolname===activation.value.runtime,'cascade_runtime_changed');
+ need(!await store.get("SELECT 1 FROM pg_shdepend d WHERE refclassid='pg_authid'::regclass AND refobjid=$1::oid AND deptype='o' AND NOT (d.dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND d.classid='pg_class'::regclass AND EXISTS(SELECT 1 FROM pg_class c WHERE c.oid=d.objid AND c.relpersistence='t')) LIMIT 1",binding.runtimeOid),'cascade_runtime_ownership');
+ need((await store.get("SELECT pg_has_role($1::oid,$2::oid,'SET') ok",binding.runtimeSessionRoleOid,binding.runtimeOid)).ok,'cascade_runtime_session_role_invalid');
+ const owner=await store.get('SELECT oid::text oid,rolname,rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls,rolcanlogin FROM pg_roles WHERE oid=$1::oid',binding.coreOwnerOid);need(owner&&!Object.entries(owner).some(([k,v])=>k.startsWith('rol')&&k!=='rolname'&&v),'cascade_core_owner_invalid');need(!await store.get('SELECT 1 FROM pg_auth_members WHERE member=ANY($1::oid[]) LIMIT 1',[binding.coreOwnerOid,binding.runtimeOid]),'cascade_role_membership');
+ const rows=await store.all("SELECT c.relname,c.oid::text oid,c.relowner::text owner,c.relkind,c.relpersistence,c.relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='harbor' AND c.relname=ANY($1::text[]) ORDER BY c.relname",core);need(rows.length===5&&rows.every(r=>r.owner===binding.coreOwnerOid&&r.oid===binding.coreTables[r.relname]&&r.relkind==='r'&&r.relpersistence==='p'&&!r.relrowsecurity),'cascade_core_identity');
+ const fk=await store.get("SELECT f.oid::text oid FROM pg_constraint f WHERE f.contype='f' AND f.conrelid='harbor.request_prices'::regclass AND f.confrelid='harbor.requests'::regclass AND f.confdeltype='c' AND f.convalidated AND f.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=f.conrelid AND attname='request_id')]::smallint[] AND f.confkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=f.confrelid AND attname='id')]::smallint[]");need(fk?.oid===binding.cascadeForeignKeyOid,'cascade_foreign_key_changed');
+ const current=await store.get('SELECT current_user::regrole::oid::text oid');return {runtime:role,owner,currentOid:current.oid};
+}
+async function objects(store){
+ const tracked=[...new Set([...nested,...names])];const f=await store.all("SELECT p.oid::text oid,p.proname name,p.proowner::text owner,p.oid::regprocedure::text reference FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='harbor' AND p.proname=ANY($1::text[]) ORDER BY p.proname",tracked);need(f.length===5,'cascade_function_identity');
+ const t=await store.all("SELECT c.oid::text oid,c.relname name,c.relowner::text owner FROM pg_class c WHERE c.oid=ANY(ARRAY['harbor.usage_rollup_state'::regclass,'harbor.usage_contributions'::regclass,'harbor.usage_hour_buckets'::regclass]) ORDER BY c.relname");return [...f.map(x=>({...x,kind:'function',privileges:nested.includes(x.name)?['EXECUTE']:[]})),...t.map(x=>({...x,kind:'table',reference:'harbor.'+quote(x.name),privileges:tables[x.name]}))];
+}
+async function aclDigest(store,object){
+ const row=await store.get(object.kind==='function'?"SELECT COALESCE(jsonb_agg(jsonb_build_array(a.grantor::text,a.grantee::text,a.privilege_type,a.is_grantable) ORDER BY a.grantor,a.grantee,a.privilege_type),'[]'::jsonb) value FROM pg_proc c CROSS JOIN LATERAL aclexplode(coalesce(c.proacl,acldefault('f',c.proowner))) a WHERE c.oid=$1::oid":"SELECT COALESCE(jsonb_agg(jsonb_build_array(a.grantor::text,a.grantee::text,a.privilege_type,a.is_grantable) ORDER BY a.grantor,a.grantee,a.privilege_type),'[]'::jsonb) value FROM pg_class c CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a WHERE c.oid=$1::oid",object.oid);return hash(row.value);
+}
+async function inspectUsageCascade(store,{binding,requireSafe=false}={}){
+ const marker=await store.get("SELECT to_regclass('harbor.usage_rollup_cascade_contract')::oid::text oid");if(!marker.oid){await verifyUsageRollupStructure(store);if(requireSafe)need(false,'usage_rollup_cascade_repair_required');return {installed:false,safe:false,legacyReadable:true};}
+ const rows=await objects(store),owners=new Set(rows.map(x=>x.owner));need(owners.size===1,'cascade_installer_owner_changed');const installer=[...owners][0];
+ const rel=await store.get("SELECT relowner::text owner,relkind,relpersistence,relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid=$1::oid",marker.oid);need(rel.owner===installer&&rel.relkind==='r'&&rel.relpersistence==='p'&&!rel.relrowsecurity&&!rel.relforcerowsecurity,'cascade_marker_owner');
+ const markerShape=await store.all("SELECT attname,format_type(atttypid,atttypmod) type,attnotnull FROM pg_attribute WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",marker.oid);need(JSON.stringify(markerShape)===JSON.stringify([{attname:'singleton',type:'boolean',attnotnull:true},{attname:'contract',type:'jsonb',attnotnull:true}]),'cascade_marker_shape');
+ const markerConstraints=await store.all("SELECT pg_get_constraintdef(oid) definition FROM pg_constraint WHERE conrelid=$1::oid AND contype<>'n' ORDER BY contype",marker.oid);need(markerConstraints.length===2&&markerConstraints.some(x=>x.definition==='CHECK (singleton)')&&markerConstraints.some(x=>x.definition==='PRIMARY KEY (singleton)'),'cascade_marker_shape');
+ need(!await store.get('SELECT 1 FROM pg_trigger WHERE tgrelid=$1::oid AND NOT tgisinternal',marker.oid)&&!await store.get('SELECT 1 FROM pg_attribute WHERE attrelid=$1::oid AND attacl IS NOT NULL',marker.oid),'cascade_marker_trigger');
+ const saved=await store.get('SELECT contract FROM harbor.usage_rollup_cascade_contract WHERE singleton');if(!binding)binding=saved?.contract?.rollbackState?.binding;await identity(store,binding,{checkDeployment:false});
+ const acl=await store.all("SELECT a.grantee::text grantee,a.privilege_type,a.is_grantable FROM pg_class c CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a WHERE c.oid=$1::oid",marker.oid);need(acl.every(a=>a.grantee===installer||[binding.runtimeOid,binding.coreOwnerOid].includes(a.grantee)&&a.privilege_type==='SELECT'&&!a.is_grantable),'cascade_marker_acl');
+ for(const principal of [binding.runtimeOid,binding.coreOwnerOid])need((await store.get("SELECT has_table_privilege($1::oid,$2::oid,'SELECT') ok",principal,marker.oid)).ok,'cascade_marker_select_missing');
+ need(saved&&saved.contract.version===1&&saved.contract.installerOid===installer&&saved.contract.cascadeForeignKeyOid===binding.cascadeForeignKeyOid&&saved.contract.patchChecksum===patchChecksum&&saved.contract.databaseOid===binding.databaseOid&&saved.contract.runtimeOid===binding.runtimeOid&&saved.contract.coreOwnerOid===binding.coreOwnerOid&&Object.keys(saved.contract.coreTables).length===5&&core.every(name=>saved.contract.coreTables[name]===binding.coreTables[name]),'cascade_marker_binding');
+ await verifyUsageRollupStructure(store,patchedSource);
+ for(const object of rows)for(const privilege of object.privileges){const allowed=await store.get(object.kind==='table'?'SELECT has_table_privilege($1::oid,$2::oid,$3) ok':'SELECT has_function_privilege($1::oid,$2::oid,$3) ok',binding.coreOwnerOid,object.oid,privilege);need(allowed.ok,'cascade_required_acl_missing');}
+ return {installed:true,safe:true,contract:saved.contract,markerOid:marker.oid,installerOid:installer};
+}
+async function assertUsageCascadeConnectionsDrained(store,{binding}={}){
+ need(binding&&/^\d+$/.test(binding.runtimeSessionRoleOid),'cascade_runtime_session_role_required');
+ await store.query('SELECT pg_stat_clear_snapshot()');
+ const row=await store.get("SELECT COUNT(*) n FROM pg_stat_activity WHERE datname=current_database() AND usesysid=$1::oid AND pid<>pg_backend_pid()",binding.runtimeSessionRoleOid);
+ need(row.n===0,'cascade_runtime_connections_not_drained');return {runtimeSessionsRemaining:0,readOnly:true};
+}
+async function repairUsageCascade(store,{binding,repairId,beforeCommit}={}){
+ need(typeof repairId==='string'&&/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(repairId),'cascade_repair_id_required');
+ return store.transaction(async()=>{
+  await store.query("SET LOCAL lock_timeout='250ms'");await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-usage-cascade-repair',0))");
+  await identity(store,binding);const prior=await inspectUsageCascade(store,{binding});if(prior.installed){need(prior.contract.repairId===repairId,'cascade_repair_id_changed');return {changed:false,safe:true,receipt:await recoverUsageCascadeReceipt(store,{binding,repairId})};}
+  const id=await identity(store,binding),rows=await objects(store);need(rows.every(x=>x.owner===id.currentOid),'cascade_installer_required');
+  need((await store.get('SELECT current_user::regrole::oid::text oid')).oid!==binding.runtimeOid,'cascade_installer_required');
+  await assertUsageCascadeConnectionsDrained(store,{binding});
+  const receipt={version:1,repairId,binding,patchChecksum,before:{},after:{},added:[]};
+  for(const object of rows){receipt.before[object.kind+':'+object.oid]=await aclDigest(store,object);for(const privilege of object.privileges){const exists=await store.get(object.kind==='table'?'SELECT has_table_privilege($1::oid,$2::oid,$3) ok':'SELECT has_function_privilege($1::oid,$2::oid,$3) ok',binding.coreOwnerOid,object.oid,privilege);if(!exists.ok){await store.query('GRANT '+privilege+' ON '+(object.kind==='table'?'TABLE ':'FUNCTION ')+object.reference+' TO '+quote(id.owner.rolname));receipt.added.push({kind:object.kind,oid:object.oid,privilege});}}receipt.after[object.kind+':'+object.oid]=await aclDigest(store,object);}
+  need((await store.get('SELECT has_database_privilege($1::oid,current_database(),\'TEMP\') ok',binding.coreOwnerOid)).ok,'cascade_core_temp_missing');
+  await store.query('CREATE TABLE harbor.usage_rollup_cascade_contract(singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK(singleton),contract JSONB NOT NULL)');await store.query('REVOKE ALL ON harbor.usage_rollup_cascade_contract FROM PUBLIC');await store.query('GRANT SELECT ON harbor.usage_rollup_cascade_contract TO '+quote(id.owner.rolname)+','+quote(id.runtime.rolname));
+  need(!await store.get("SELECT 1 WHERE to_regclass('pg_temp.harbor_usage_flushed') IS NOT NULL OR to_regclass('pg_temp.harbor_usage_stage') IS NOT NULL OR to_regclass('pg_temp.harbor_usage_delta') IS NOT NULL"),'cascade_installer_temp_in_use');
+  await store.query('SELECT harbor.usage_prepare_staging()');const legacyFlushedShape=(await store.get(shapeSql,(await store.get("SELECT 'pg_temp.harbor_usage_flushed'::regclass::oid oid")).oid)).value;await store.query('ALTER TABLE pg_temp.harbor_usage_flushed ADD COLUMN transaction_id xid8 NOT NULL DEFAULT pg_current_xact_id(),ADD COLUMN flushed BOOLEAN NOT NULL DEFAULT FALSE');const tempShapes={};for(const name of temporary)tempShapes[name]=(await store.get(shapeSql,(await store.get('SELECT to_regclass($1)::oid oid','pg_temp.'+name)).oid)).value;for(const name of temporary)await store.query('DROP TABLE pg_temp.'+name);
+  receipt.markerOid=(await store.get("SELECT 'harbor.usage_rollup_cascade_contract'::regclass::oid::text oid")).oid;receipt.markerAclDigest=await aclDigest(store,{kind:'table',oid:receipt.markerOid});const contract={rollbackState:JSON.parse(JSON.stringify(receipt)),version:1,repairId:receipt.repairId,databaseOid:binding.databaseOid,runtimeOid:binding.runtimeOid,coreOwnerOid:binding.coreOwnerOid,installerOid:id.currentOid,coreTables:binding.coreTables,cascadeForeignKeyOid:binding.cascadeForeignKeyOid,tempShapes,legacyFlushedShape,patchChecksum};await store.run('INSERT INTO harbor.usage_rollup_cascade_contract(contract) VALUES($1::jsonb)',JSON.stringify(contract));for(const name of names)await store.query(patches[name]);
+  receipt.contractDigest=hash((await store.get('SELECT contract FROM harbor.usage_rollup_cascade_contract WHERE singleton')).contract);receipt.markerOid=(await store.get("SELECT 'harbor.usage_rollup_cascade_contract'::regclass::oid::text oid")).oid;receipt.markerAclDigest=await aclDigest(store,{kind:'table',oid:receipt.markerOid});await inspectUsageCascade(store,{binding,requireSafe:true});await beforeCommit?.();return {changed:true,safe:true,receipt};
+ });
+}
+async function recoverUsageCascadeReceipt(store,{binding,repairId}={}){
+ const status=await inspectUsageCascade(store,{binding,requireSafe:true});need(status.contract.repairId===repairId&&status.contract.rollbackState?.repairId===repairId,'cascade_receipt_id_changed');
+ const receipt={...status.contract.rollbackState,contractDigest:hash(status.contract)};need(receipt.patchChecksum===patchChecksum&&receipt.markerOid===status.markerOid&&hash(stableBinding(receipt.binding))===hash(stableBinding(binding)),'cascade_receipt_binding_changed');return receipt;
+}
+async function rollbackUsageCascade(store,{receipt,activeBinding=receipt?.binding}={}){
+ need(receipt?.version===1&&receipt.patchChecksum===patchChecksum,'cascade_rollback_receipt_invalid');
+ return store.transaction(async()=>{
+ await store.query("SET LOCAL lock_timeout='250ms'");await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-usage-cascade-repair',0))");
+ need(hash(stableBinding(activeBinding))===hash(stableBinding(receipt.binding)),'cascade_rollback_active_binding_changed');const id=await identity(store,activeBinding);
+ if(!(await store.get("SELECT to_regclass('harbor.usage_rollup_cascade_contract')::oid oid")).oid){await verifyUsageRollupStructure(store);for(const object of await objects(store))need(await aclDigest(store,object)===receipt.before[object.kind+':'+object.oid],'cascade_rollback_recovery_changed');return {rolledBack:true,alreadyRolledBack:true,onlyAddedPrivilegesRevoked:true};}
+ const status=await inspectUsageCascade(store,{binding:receipt.binding,requireSafe:true}),rows=await objects(store);need(hash(Object.fromEntries(Object.entries(receipt).filter(([key])=>key!=='contractDigest')))===hash(status.contract.rollbackState),'cascade_rollback_receipt_changed');need(rows.every(x=>x.owner===id.currentOid)&&status.markerOid===receipt.markerOid&&status.contract.repairId===receipt.repairId&&hash(status.contract)===receipt.contractDigest,'cascade_rollback_binding_changed');need(await aclDigest(store,{kind:'table',oid:receipt.markerOid})===receipt.markerAclDigest,'cascade_rollback_marker_acl_changed');
+ for(const object of rows)need(await aclDigest(store,object)===receipt.after[object.kind+':'+object.oid],'cascade_rollback_acl_changed');
+ await assertUsageCascadeConnectionsDrained(store,{binding:activeBinding});
+ for(const name of names)await store.query(definition(name).replace('CREATE FUNCTION','CREATE OR REPLACE FUNCTION'));
+ for(const action of receipt.added){const object=rows.find(x=>x.kind===action.kind&&x.oid===action.oid);need(object?.privileges.includes(action.privilege),'cascade_rollback_action_invalid');await store.query('REVOKE '+action.privilege+' ON '+(object.kind==='table'?'TABLE ':'FUNCTION ')+object.reference+' FROM '+quote(id.owner.rolname));}
+ for(const object of rows)need(await aclDigest(store,object)===receipt.before[object.kind+':'+object.oid],'cascade_rollback_restore_mismatch');await store.query('DROP TABLE harbor.usage_rollup_cascade_contract');await verifyUsageRollupStructure(store);return {rolledBack:true,onlyAddedPrivilegesRevoked:true};
+ });
+}
+
+
+// Resolve a lost maintenance ACK only after its transaction has released the
+// same lock. A plain MVCC read could still observe the pre-repair generation.
+export async function resolveUsageRollupCascade(store,{binding}={}){
+ return store.transaction(async()=>{
+  await store.query("SET LOCAL lock_timeout='2000ms'");
+  await store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-usage-cascade-repair',0))");
+  const status=await inspectUsageCascade(store,{binding});return {safe:status.safe,legacyReadable:!status.safe};
+ });
+}
+export async function planUsageRollupCascade(store,{runtimeWitness}={}){
+ if(!await verifyUsageRollupAvailability(store))return {installed:false,safe:true,repairRequired:false};
+ need(runtimeWitness&&['databaseOid','currentRoleOid','sessionRoleOid','backendPid'].every(key=>typeof runtimeWitness[key]==='string'&&/^\d+$/.test(runtimeWitness[key])),'cascade_runtime_witness_required');
+ await store.query('SELECT pg_stat_clear_snapshot()');
+ const live=await store.get('SELECT datid::text database_oid,usesysid::text session_role_oid FROM pg_stat_activity WHERE pid=$1::integer',runtimeWitness.backendPid);
+ need(live?.database_oid===runtimeWitness.databaseOid&&live?.session_role_oid===runtimeWitness.sessionRoleOid,'cascade_runtime_witness_changed');
+ const activation=await store.get('SELECT to_jsonb(a) value FROM harbor_operator.activation a WHERE singleton');
+ const coreRows=await store.all("SELECT relname,oid::text oid,relowner::text owner FROM pg_class WHERE oid=ANY(ARRAY['harbor.members'::regclass,'harbor.keys'::regclass,'harbor.sessions'::regclass,'harbor.requests'::regclass,'harbor.request_prices'::regclass])");
+ need(coreRows.length===5&&new Set(coreRows.map(row=>row.owner)).size===1,'cascade_core_identity');
+ const foreignKey=await store.get("SELECT oid::text oid FROM pg_constraint WHERE contype='f' AND conrelid='harbor.request_prices'::regclass AND confrelid='harbor.requests'::regclass AND confdeltype='c'");
+ const binding={databaseOid:runtimeWitness.databaseOid,runtimeOid:runtimeWitness.currentRoleOid,runtimeSessionRoleOid:runtimeWitness.sessionRoleOid,coreOwnerOid:coreRows[0].owner,coreTables:Object.fromEntries(coreRows.map(row=>[row.relname,row.oid])),schemaDigest:hash(JSON.stringify(await store.all('SELECT version,checksum FROM harbor.schema_migrations ORDER BY version'))),activationDigest:hash(activation?.value),cascadeForeignKeyOid:foreignKey?.oid};
+ const actual=await identity(store,binding);const status=await inspectUsageCascade(store,{binding});return {binding,coreOwnerRole:actual.owner.rolname,safe:status.safe,repairRequired:!status.safe};
+}
+export async function verifyUsageRollups(store,sql){
+ if(sql!==undefined)return verifyUsageRollupStructure(store,sql);
+ await inspectUsageCascade(store);return true;
+}
+export {inspectUsageCascade as verifyUsageRollupCascadeAvailability,repairUsageCascade as repairUsageRollupCascade,rollbackUsageCascade as rollbackUsageRollupCascade,recoverUsageCascadeReceipt as recoverUsageRollupCascadeReceipt,assertUsageCascadeConnectionsDrained as verifyUsageRollupCascadeConnectionsDrained};
