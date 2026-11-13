@@ -8,6 +8,12 @@ Worker 首次进入持续运行状态时通过原有界后台队列安排一次 
 
 ## 服务器部署（GitLab CI/CD）
 
+### 会话用量查询索引
+
+`ci/storage-recovery/session-usage-index.sql` 为会话页提供 `(session_id, usage_at)` 覆盖索引，只包含请求 ID 和计价版本，不存对话正文。它不改变七天范围、分页或计价，应用启动时也不会自动安装。管理员先核对目标实例、数据库身份、可用磁盘及正在进行的建索引任务，再以表所有者在 autocommit 模式逐段执行 `statement-boundary` 分隔的三条语句；`CREATE INDEX CONCURRENTLY` 不能放入事务块。首尾检查拒绝同名异构或无效索引，失败保留现场，不自动删索引重试。
+
+该索引增加磁盘占用及请求写入的索引/WAL开销，安装后须验实际查询计划和页面加载时间。回退时先确认 `harbor.request_session_usage_cover` 的定义与脚本一致、有效且不属于约束，再单独执行 `DROP INDEX CONCURRENTLY harbor.request_session_usage_cover`；保留其他索引和业务数据，应用仍可读取，性能可能回到原水平。
+
 ### PostgreSQL 大盘迁移与恢复监督
 
 迁盘工具为 `ci/harbor-pg-storage-coordinator.py` 和 `ci/harbor-pg-storage-host.py`。启用前须由管理员安装受控工具、绑定原实例与数据库身份、校验迁移计划及挂载依赖；仅有源码或镜像不代表已经迁盘。切换保留原数据，目标库开始写入后禁止直接回退旧数据副本。当前实例的实际交付状态以发布验收记录为准。

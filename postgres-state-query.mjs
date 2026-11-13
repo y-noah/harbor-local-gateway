@@ -73,14 +73,21 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       if(view==='sessions'){
         const {sessions,page,total,totalPages}=await loadSessionPage({window,sessionPage,sessionPageSize,sessionQ,sessionType,sessionAccount,sessionStatus});
         const accounts=await store.all('SELECT id,name,kind,auth_mode,enabled,state,route_block,platform_models FROM harbor.accounts WHERE removed_at IS NULL ORDER BY id');
-        const rows=sessions.length?await store.all(`WITH source AS (
-            SELECT r.session_id,r.status,r.started,r.ended,CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
+        // Materialize only this page's narrow request identities. This keeps
+        // the existing time/session selectivity available to the planner while
+        // price joins cannot pull wide request rows into aggregate processing.
+        // The sessions DTO uses money and request counts, not duration groups.
+        const rows=sessions.length?await store.all(`WITH selected_requests AS MATERIALIZED (
+            SELECT id,session_id,price_version FROM harbor.requests
+            WHERE session_id=ANY($3::text[]) AND usage_at>=$1 AND usage_at<$2
+          ), source AS (
+            SELECT r.session_id,CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
               CASE WHEN ${validPrice} THEN p.revision END revision,
               ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
-            FROM harbor.requests r${joins} WHERE r.session_id=ANY($3::text[]) AND r.usage_at>=$1 AND r.usage_at<$2
+            FROM selected_requests r${joins}
           ), partial AS MATERIALIZED (
-            SELECT session_id,revision,${referencePartialAggregateSql()} FROM source GROUP BY session_id,revision
-          ) SELECT session_id,${referenceRollupAggregateSql()} FROM partial GROUP BY session_id`,window.start,window.end,sessions.map(row=>row.id)):[];
+            SELECT session_id,revision,${referencePartialAggregateSql({standardOnly:true})} FROM source GROUP BY session_id,revision
+          ) SELECT session_id,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY session_id`,window.start,window.end,sessions.map(row=>row.id)):[];
         const usage=new Map(rows.map(row=>[row.session_id,aggregate(row)])),empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(field=>[field,'0']))});
         return {view:'sessions',usageMetric:referenceMetric,usageWindow:window,observedAt:at,peopleLoaded:false,accounts,members:[],keys:[],requests:[],daily:[],audit:[],
           sessionsPagination:{page,pageSize:sessionPageSize,total,totalPages},sessions:sessions.map(row=>({...row,nightly_enabled:Number(participatesNightly(row,at)),upstream_thread:row.protocol==='responses'?(row.upstream_thread||row.id):row.upstream_id,standard:(usage.get(row.id)||empty).standard,request_count:(usage.get(row.id)||empty).requests}))};
