@@ -172,32 +172,54 @@ class Tests(unittest.TestCase):
    if str(path) in ['/proc/self/ns/net','/proc/1/ns/net']:return types.SimpleNamespace(st_dev=1,st_ino=1)
    return original(path,*args,**kwargs)
   with patch.object(Path,'stat',observed):yield
+ @contextlib.contextmanager
+ def entry_cgroup_layout(self,profile,*,v2=True,populated=None):
+  # Model the complete cgroup evidence independently of the Runner's host.
+  group=Path('/sys/fs/cgroup')/profile['entryCgroup'].lstrip('/')
+  original_file=Path.is_file;original_exists=Path.exists;original_read=Path.read_text
+  def is_file(path,*args,**kwargs):
+   return v2 if path==Path('/sys/fs/cgroup/cgroup.controllers') else original_file(path,*args,**kwargs)
+  def exists(path,*args,**kwargs):
+   return populated is not None if path==group else original_exists(path,*args,**kwargs)
+  def read(path,*args,**kwargs):
+   if path==group/'cgroup.events':
+    if populated is None:raise FileNotFoundError(str(path))
+    return f'populated {populated}\nfrozen 0\n'
+   return original_read(path,*args,**kwargs)
+  with patch.object(Path,'is_file',is_file),patch.object(Path,'exists',exists),patch.object(Path,'read_text',read):yield
  def test_pg_and_listener_absent_bootstrap_pg_before_entry_then_finish_original_entry(self):
   fixture,profile,saved,entryrow=self.absent_entry_fixture();host=fixture.host;fixture.fail(h.PG,137);up=[False]
   def control(*args,**kwargs):
    if not up[0]:raise ConnectionRefusedError('owned entry stopped')
    return {'slot':'candidate','phase':'active','epoch':1}
   host.entry.entry_state=control;commands=[]
-  with self.root_host_namespace(),patch.object(h,'no_entry_listeners',return_value=None),patch.object(h.os.path,'lexists',return_value=False),patch.object(h,'run',side_effect=lambda args,**kwargs:commands.append(args) or b''):
+  with self.root_host_namespace(),self.entry_cgroup_layout(profile),patch.object(h,'no_entry_listeners',return_value=None),patch.object(h.os.path,'lexists',return_value=False),patch.object(h,'run',side_effect=lambda args,**kwargs:commands.append(args) or b''):
    result=host.runtime_step();self.assertTrue(result['entryBootstrapRequired']);self.assertIn(('start',h.PG),fixture.calls);self.assertEqual(host.j['phase'],'runtime-entry-pending');self.assertFalse(any(call[0]=='remove_gate' for call in fixture.calls));self.assertEqual(commands[-1],['/usr/bin/systemctl','start','--no-block','harbor-gateway-entry.service'])
    up[0]=True;entryrow['State'].update(Running=True,Pid=444,Status='running');host.entry.socket_owner=lambda path:444;host.entry.process_cgroup=lambda pid:profile['entryCgroup'];self.assertTrue(host.runtime_step()['entryRestored'])
   self.assertEqual(host.j['phase'],'complete');self.assertTrue(all(call[1].get('entryBootstrap') for call in fixture.calls if call[0]=='saved' and call[1].get('phase')=='runtime-entry-pending'));self.assertNotIn('entryBootstrap',host.j);self.assertTrue(any(call[0]=='remove_gate' for call in fixture.calls));self.assertTrue(any(call[0]=='restore_writers' for call in fixture.calls))
  def test_unknown_entry_resource_or_changed_guard_never_bootstraps_pg(self):
-  for case in ['running','guard','mangle','tc','candidate']:
+  for case,error in [('running','host_entry_resources_not_absent'),('guard','host_entry_guard_changed'),('mangle','host_entry_guard_changed'),('tc','host_entry_guard_tc_changed'),('candidate','candidate_unowned')]:
    fixture,profile,saved,entryrow=self.absent_entry_fixture();host=fixture.host;fixture.fail(h.PG,1);host.entry.entry_state=lambda *args,**kwargs:(_ for _ in ()).throw(ConnectionRefusedError())
    if case=='running':entryrow['State'].update(Running=True,Pid=9,Status='running')
    elif case=='guard':saved['rulesDigest']='changed'
    elif case=='mangle':saved['mangleDigest']='changed'
    elif case=='tc':host.entry.tc_digest=lambda device:'changed'
    else:host.entry.refreshed_bypass=lambda profile:(_ for _ in ()).throw(RuntimeError('candidate_unowned'))
-   with self.root_host_namespace(),patch.object(h,'no_entry_listeners',return_value=None),patch.object(h.os.path,'lexists',return_value=False),patch.object(h,'run',side_effect=AssertionError('no systemd submission')):
-    with self.assertRaises(RuntimeError):host.runtime_step()
+   with self.root_host_namespace(),self.entry_cgroup_layout(profile),patch.object(h,'no_entry_listeners',return_value=None),patch.object(h.os.path,'lexists',return_value=False),patch.object(h,'run',side_effect=AssertionError('no systemd submission')):
+    with self.assertRaisesRegex(RuntimeError,error):host.runtime_step()
    self.assertFalse(any(call[0] in ['start','stop','remove_gate'] for call in fixture.calls));self.assertNotIn('entryBootstrap',host.j)
+ def test_empty_v2_group_proves_entry_absent_without_host_state(self):
+  fixture,profile,saved,entryrow=self.absent_entry_fixture();host=fixture.host;host.install_gate()
+  with self.root_host_namespace(),self.entry_cgroup_layout(profile,populated=0),patch.object(h,'no_entry_listeners',return_value=None),patch.object(h.os.path,'lexists',return_value=False):host.verify_absent_entry_bootstrap()
+  self.assertEqual(host.j['entryBootstrap']['containerId'],'owned-entry');self.assertFalse(any(call[0]=='start' for call in fixture.calls))
+ def test_missing_v2_layout_never_bootstraps_pg(self):
+  fixture,profile,saved,entryrow=self.absent_entry_fixture();host=fixture.host;fixture.fail(h.PG,1);host.entry.entry_state=lambda *args,**kwargs:(_ for _ in ()).throw(ConnectionRefusedError())
+  with self.root_host_namespace(),self.entry_cgroup_layout(profile,v2=False),patch.object(h,'no_entry_listeners',side_effect=AssertionError('layout must be checked first')),patch.object(h,'run',side_effect=AssertionError('no systemd submission')):
+   with self.assertRaisesRegex(RuntimeError,'host_entry_cgroup_layout_unknown'):host.runtime_step()
+  self.assertFalse(any(call[0] in ['start','stop','remove_gate','restore_writers'] for call in fixture.calls));self.assertNotIn('entryBootstrap',host.j)
  def test_listener_cgroup_descendants_and_wrong_control_owner_keep_gate(self):
-  fixture,profile,saved,entryrow=self.absent_entry_fixture();host=fixture.host;host.entry.entry_state=lambda *args,**kwargs:(_ for _ in ()).throw(ConnectionRefusedError());fixture.fail(h.PG,1);original_exists=Path.exists;original_read=Path.read_text
-  def exists(path):return True if str(path).endswith('harbor-no-existing-test-cgroup') else original_exists(path)
-  def read(path,*args,**kwargs):return 'populated 1\nfrozen 0\n' if str(path).endswith('harbor-no-existing-test-cgroup/cgroup.events') else original_read(path,*args,**kwargs)
-  with self.root_host_namespace(),patch.object(Path,'exists',exists),patch.object(Path,'read_text',read),patch.object(h,'no_entry_listeners',return_value=None):
+  fixture,profile,saved,entryrow=self.absent_entry_fixture();host=fixture.host;host.entry.entry_state=lambda *args,**kwargs:(_ for _ in ()).throw(ConnectionRefusedError());fixture.fail(h.PG,1)
+  with self.root_host_namespace(),self.entry_cgroup_layout(profile,populated=1),patch.object(h,'no_entry_listeners',return_value=None):
    with self.assertRaisesRegex(RuntimeError,'host_entry_resources_not_absent'):host.runtime_step()
   self.assertFalse(any(call[0]=='start' for call in fixture.calls))
   host.j['phase']='runtime-entry-pending';binding=host.upgrade.digest(host.upgrade.active_identity(fixture.active));host.j['entryBootstrap']={'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'profileDigest':'profile','activeIdentityDigest':binding,'containerId':'owned-entry','imageId':'owned-image'};entryrow['State'].update(Running=True,Pid=444,Status='running');host.entry.entry_state=lambda *args,**kwargs:{'phase':'active','slot':'candidate'};host.entry.socket_owner=lambda path:999;host.entry.process_cgroup=lambda pid:profile['entryCgroup'];fixture.calls=[]
