@@ -217,9 +217,17 @@ class Unified(unittest.TestCase):
      else:host.verify_application_material_mounts();self.assertEqual(len(calls),2)
  def test_interruption_requires_exact_current_approved_ticket(self):
   host=object.__new__(h.Host);raw=json.dumps({'interruptEntryClients':True,'to':{'image':'approved'},'materialsDirectory':'/materials','database':{'cluster':'123'}}).encode();host.plan={'interruptTicketSha256':h.sha(raw),'materialsDirectory':'/materials','systemId':'123'};calls=[];host.upgrade=types.SimpleNamespace(TICKET=Path('/ticket'),validate_ticket=lambda *args:calls.append('validate'),verify_installed_tools=lambda *args:calls.append('tools'),verify_source=lambda *args:calls.append('source'),drain_active_entry=lambda *args:calls.append(args));host.entry='entry';host.api={};host.active={'active':True};host.gw={};host.worker={};host.config={}
+  # This unit checks ticket authorization; receipt persistence and entry CAS
+  # are exercised by the dedicated early-recovery integration tests.
+  host.capture_early_hold=lambda:calls.append('capture')
+  host.drain_with_early_receipt=lambda ticket=None:host.upgrade.drain_active_entry(host.entry,ticket,host.api,host.active)
   with patch.object(h,'private',return_value=raw):host.hold_drain()
-  self.assertEqual(calls[:3],['validate','tools','source']);self.assertEqual(len(calls[-1]),4)
+  self.assertEqual(calls[:4],['validate','tools','source','capture']);self.assertEqual(calls[4],(host.entry,json.loads(raw),host.api,host.active))
   for data in [raw+b' ',json.dumps({'interruptEntryClients':False}).encode()]:
-   with patch.object(h,'private',return_value=data),self.assertRaises(RuntimeError):host.hold_drain()
-  self.assertEqual(len(calls),4)
+   with patch.object(h,'private',return_value=data),self.assertRaisesRegex(RuntimeError,'host_interrupt_ticket_changed'):host.hold_drain()
+   self.assertEqual(len(calls),5)
+  for changes,reason,expected in [({'interruptEntryClients':False},'host_interrupt_ticket_unapproved',['validate']),({'materialsDirectory':'/other-materials'},'host_interrupt_source_changed',['validate','tools','source']),({'database':{'cluster':'456'}},'host_interrupt_source_changed',['validate','tools','source'])]:
+   ticket={**json.loads(raw),**changes};data=json.dumps(ticket).encode();host.plan['interruptTicketSha256']=h.sha(data);calls.clear()
+   with patch.object(h,'private',return_value=data),self.assertRaisesRegex(RuntimeError,reason):host.hold_drain()
+   self.assertEqual(calls,expected)  # No capture or hold without exact authorization.
 if __name__=='__main__':unittest.main()
