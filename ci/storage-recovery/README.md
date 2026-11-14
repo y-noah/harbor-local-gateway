@@ -359,3 +359,24 @@ bootstrap在新infra ROOT预建`archive/`(PG999/0700)、独立`archive.key`(PG99
 PG 与应用材料可共用一次维护窗口：在新的 PG 迁盘 PLAN 中显式设置 `materialMove: {approvalSha256, nonce}`，绑定上述独立批准文件和 mover 的实际工具 SHA；缺省仍保持原 PG 流程。数据库冷拷证明、原逻辑路径绑定及禁止旧库回退的启动意图持久化后，PG host 在已有部署/入口锁内调用 mover 核心，不重入其 CLI 锁。五项材料根及完整配置完成后才启动原 PG 和应用，随后在两个应用容器内核对 data、runtime 及两项 spool 的实际 dev/inode；任何不一致均不得放流。进入目标启动授权后只能沿受控 target 恢复继续，不能将旧副本重新投入写入。
 
 需要中断长请求时，PLAN 还须以 `interruptTicketSha256` 绑定当前已批准且启用 `interruptEntryClients` 的发布票据；仅设置布尔值或沿用旧票据不能获得中断权限。源库恢复只在目标尚未授权、原根及原配置身份不变时允许；维护前若实际证实原 Worker 为低水位状态，恢复将等待本代启动进展并复核签名低水位、私有就绪、授权及鉴权，再恢复入口。该窄源恢复不降低目标上线健康门槛。挂载列表仅按完整结构规范化次序，未知属性、RW、User、Env/Cmd 等真实变化仍拒绝；升级此工具后须重新 collect 计划，不沿用旧签名。
+
+
+### 未触源时的入口恢复
+
+Host 在暂停前持久化原入口 epoch、进程代次、三容器、原数据根、应用材料及入口规则见证。只有本轮确实请求过 hold、原实例未变、尚未设置 gate／停止写入器或服务／换绑数据时，源恢复才直接以原 holding epoch 执行 CAS resume；不等待原长请求排空，不重启服务。明确拒绝的控制请求不能授予恢复权限；回执丢失只在已持久化的自有请求及精确下一 epoch 下核销，不重复发送。已完成 drain 的可信状态、已进入后续切换或无新见证的存量 journal 继续沿原完整恢复路径，不推测补造权限。
+
+失败日志仅记录固定阶段、异常类型和白名单控制诊断，不打印任意异常正文或命令输出。本机 `tests/gateway-entry-process.test.mjs` 的独立 Python 恢复用例覆盖真实长流、排空超时和排队请求恢复；其源身份使用合成能力，不能代替正式主机的容器、网络及独立任务验收。Agent 自身依赖该入口时，须在暂停前准备并验证无需 Agent 继续发命令的执行和恢复链路。
+
+### 已完成 PG 迁盘的 Host 与运行工具换代
+
+`bridge-pg-storage-host.py` 只做一次 Host 桥接及之后的显式四件工具刷新，不修改 PG PLAN、材料 approval、业务数据、CORE 或 RUNTIME。迁盘完成前仍严格采用原工具摘要。已迁完实例的批准 runtime manifest 与票据必须先匹配真实 ACTIVE/完成 release；Host import 前核验七件安装清单，只有 deploy、entry、upgrade、compose 四件可换代，其余迁盘工具保持固定。常驻 supervisor 发现合法新四件后保持进程和 writer 依赖，进入保护状态，等待显式刷新；旧 generation witness 阻止此时开始普通部署。
+
+首次桥接先从已审 CI 制品取得 installer 和新 Host，核 CI revision、pipeline、artifactJob 与精确 SHA。管理员批准固定 `/etc/harbor-pg-storage-host-bridge.json`（root/0600），字段为 `version:1`、`approved:true`、UUID `id`、原 `planSha256/runId/oldHostSha256`、批准 `newHostSha256/installerSha256` 与 `revision/pipeline/artifactJob`；工具不生成此批准。候选固定放在 `/var/lib/harbor-pg-storage-host-bridge/<id>/candidate.py`，目录与祖先受 root 保护，不接受任意参数路径。
+
+依次运行 `/usr/bin/python3 -I -B <已批准installer路径> inspect` 和 `install`。inspect 不创建目录/锁/receipt；install 先由旧 Host 复核同 runId 完成态、永久禁旧库、材料完成、实际根身份、ACTIVE、旧 intent 及静默 worker，保存旧 Host 和依赖 writer 状态，核旧 supervisor PID/InvocationID/cgroup 与实际退出，再写固定 generation receipt 和新 Host。新 Host 只在 receipt 绑定的原计划、PG/材料根及明确枚举的后续 boot/runtime 阶段接受桥接，正常重启不要求 phase 永远停在 complete。原迁盘未完成且无合法历史完成见证时不能借 phase 字符串升级。
+
+之后更新批准的四件工具及 manifest/票据后，普通部署前运行同 installer 的 `refresh`，它重新核合法工具与当前 ACTIVE，停止并确认旧 supervisor 退出，启动新 PID、核就绪并恢复原来活动的 Harbor writers。未活动的备份 job 不会额外启动。停止 online 会影响 Requires 它的 writers，不能把该操作当作仅重启一个 PID；备份停止按已有 unit 的取消/排空契约完成，不强杀。安装器不替代正式工具制品安装与批准，不自动安装任何工具。
+
+发布或启动失败保留 journal、原 Host 和原计划；用 `rollback` 显式恢复原 Host 与 receipt 缺省状态，前提是其他工具仍匹配原计划，不能用旧 Host 回滚已经换代的四件工具。首次安装资格与已有受信完成见证的恢复资格分别校验：已发布的同一桥接允许在明确的 boot/runtime 恢复阶段回退 Host，但仍保留原计划、PG/材料根、永久禁旧库及无其他 plannedOperation 等约束。若 supervisor 尚在恢复或暂停，返回 `recoveryPending:true/writersRestored:false` 并保持 writers 保护；原守卫恢复到 complete/running 后，再调用同一 `install/refresh/rollback` 操作完成核验和原活动 writer 恢复，不重复停止这个已验证的新 supervisor。中断状态保全拒绝盲目重装，可在固定批准与已知文件摘要下回退；不回滚数据库、不删除原 PLAN/approval、旧 intent 或未知文件。固定 generation receipt 只由安装器在验证过的完成态产生，新 Host 不自签。后续新 Host/CORE 升级不包含在这个一次桥接范围内。
+
+当前仅本机实现和定向验证，未执行正式主机的 installer、服务重启或工具换代。正式发布仍须对应批准 CI 与主机验收。

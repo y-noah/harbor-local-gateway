@@ -199,7 +199,10 @@ class Coordinator:
   recovery_mode(self.journal)
   try:
    need(not self.journal.get('oldDataRollbackForbidden',False) and not self.journal.get('targetBootAuthorized',False),'storage_old_data_rollback_forbidden')
-   o=self.ops;o.verify_original_recovery_checkpoint();self.mark('recovering-source')
+   o=self.ops
+   early=o.recover_held_source() if hasattr(o,'recover_held_source') else None
+   if early is not None:self.mark('source-restored');return early
+   o.verify_original_recovery_checkpoint();self.mark('recovering-source')
    o.restore_original_restart_policies();o.start_original_postgres();o.verify_original_postgres();o.start_applications(source_recovery=True);o.verify_current_approval_and_private_readiness(source_recovery=True);o.update_dynamic_network_snapshot()
    if o.managed_source_recovery():o.verify_original_full_instance(before_publish=True);o.refresh_active_entry();o.verify_existing_entry_restored()
    else:o.refresh_active_entry();o.verify_original_full_instance()

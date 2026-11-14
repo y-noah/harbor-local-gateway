@@ -148,3 +148,58 @@ test('release drain timeout rejects invalid budgets independently of shutdown',(
  for(const value of [0,-1,120001,1.5,'120000',null,true])assert.throws(()=>validateGatewayEntryProcessConfig({...config,drainTimeoutMs:value}));
  assert.equal(validateGatewayEntryProcessConfig({...config,drainTimeoutMs:120000}).shutdownTimeoutMs,100);
 });
+
+test('independent host recovery resumes real admission after drain failure while the original stream stays live',{skip:process.platform==='win32',timeout:6000},async t=>{
+ let source,calls=0;
+ const f=await fixture(t,{handler(req,res,slot){req.resume();calls++;if(req.url==='/slow'){source=res;res.write('original-stream');return;}res.end(slot);}});
+ f.config.initialSlot='candidate';f.config.drainTimeoutMs=500;f.config.limits={...limits,maxWaitMs:3000};const runtime=await f.start();
+ const first=call({host:'127.0.0.1',port:f.config.listenPort,path:'/slow'});first.catch(()=>{});await untilState(()=>!!source&&runtime.state().inflight===1);
+ // Only container facts are synthetic. The independent Python process uses
+ // real Unix HTTP control, durable receipts and the production recovery code.
+ const driver=String.raw`import http.client,importlib.util,json,socket,sys,types
+from pathlib import Path
+def load(path,name):
+ spec=importlib.util.spec_from_file_location(name,path);value=importlib.util.module_from_spec(spec);spec.loader.exec_module(value);return value
+h=load(sys.argv[1],'hold_recovery_host');core=load(sys.argv[2],'hold_recovery_core');upgrade=load(sys.argv[3],'hold_recovery_upgrade')
+class Client(http.client.HTTPConnection):
+ def connect(self):
+  self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);self.sock.settimeout(self.timeout);self.sock.connect(sys.argv[4])
+commands=[]
+def state(command=None,epoch=None,slot=None,*,timeout=3):
+ client=Client('localhost',timeout=timeout)
+ try:
+  body=None if command is None else json.dumps({'command':command,'expectedEpoch':epoch,**({'slot':slot} if slot else {})})
+  if command:commands.append(command)
+  client.request('GET' if command is None else 'POST','/state' if command is None else '/control',body=body,headers={} if command is None else {'Content-Type':'application/json'})
+  response=client.getresponse();value=json.loads(response.read())
+  assert response.status==200,value.get('error',{}).get('code')
+  return value
+ finally:client.close()
+host=object.__new__(h.Host);host.j={'phase':'holding-intent','writers':{}};host.plan={'runId':'synthetic'};host.planSha256='synthetic-plan';host.core=core
+host.entry=types.SimpleNamespace(ENTRY_CONFIG='synthetic-config',entry_state=state,execute=lambda args:b'{"nftables":[]}',private_json=lambda path:{'drainTimeoutMs':500})
+host.upgrade=types.SimpleNamespace(GATE='synthetic-gate',drain_active_entry=upgrade.drain_active_entry)
+host.early_source_facts=lambda:{'identity':'synthetic-unchanged-source'};host.load_current_durable_active=lambda:None
+host.immutable=lambda name:{'State':{'Health':{'Status':'healthy'}}};host.source_low_recovery_selected=lambda:False
+journal=Path(sys.argv[5]);host.save=lambda value:h.save(journal,value)
+host.capture_early_hold()
+try:host.drain_with_early_receipt()
+except RuntimeError as error:
+ assert str(error)=='PostgreSQL runtime upgrade: entry drain timeout'
+else:raise AssertionError('live original stream must prevent a successful drain')
+before=state();result=core.Coordinator(host,host.j).recover_source();after=state()
+assert json.loads(journal.read_bytes())['phase']=='source-restored'
+print(json.dumps({'result':result,'before':before,'after':after,'commands':commands}))
+`;
+ const args=[fileURLToPath(new URL('../ci/harbor-pg-storage-host.py',import.meta.url)),fileURLToPath(new URL('../ci/harbor-pg-storage-coordinator.py',import.meta.url)),upgradePath,f.controlPath,join(f.controlPath,'..','recovery.json')];
+ const recovery=run('python3',['-B','-c',driver,...args],{timeout:4000});let recoveryError;recovery.catch(error=>{recoveryError=error;});
+ let waiting;
+ try{
+  await untilState(()=>{if(recoveryError)throw recoveryError;return runtime.state().phase==='holding';});
+  waiting=f.data();await untilState(()=>runtime.state().queued===1);
+  const proof=JSON.parse((await recovery).stdout);assert.deepEqual(proof.commands,['hold','resume']);assert.equal(proof.before.inflight,1);assert.equal(proof.before.queued,1);assert.equal(proof.result.holdOnly,true);assert.equal(proof.result.servicesRestarted,false);assert.equal(proof.after.phase,'active');assert.equal(proof.after.epoch,2);
+  assert.equal((await waiting).text,'candidate');assert.equal(source.destroyed,false);assert.equal(runtime.state().inflight,1);assert.equal(calls,2);
+  source.end('-finished');assert.equal((await first).text,'original-stream-finished');await untilState(()=>runtime.state().inflight===0);
+ }finally{
+  if(source&&!source.destroyed)source.end();await recovery.catch(()=>{});await first.catch(()=>{});await waiting?.catch(()=>{});
+ }
+});

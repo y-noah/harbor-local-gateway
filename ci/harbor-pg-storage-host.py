@@ -13,7 +13,47 @@ ARCHIVE_COPY_LOCK=Path('/run/harbor-pg-archive-copy.lock')
 RUNTIME=Path('/usr/local/lib/harbor/entry-runtime.py')
 MATERIAL=Path('/usr/local/lib/harbor/harbor-material-storage.py')
 MATERIAL_MOVE=Path('/usr/local/lib/harbor/harbor-material-move.py')
+HOST_BRIDGE_APPROVAL=Path('/etc/harbor-pg-storage-host-bridge.json')
+HOST_GENERATION=Path('/etc/harbor-pg-storage-host-generation.json')
+RUNTIME_MANIFEST=Path('/etc/harbor-postgres-runtime-tools.json')
+RUNTIME_TICKET=Path('/etc/harbor-postgres-runtime-upgrade.json')
+MUTABLE_TOOLS=frozenset(map(str,[DEPLOY,ENTRY,UPGRADE,COMPOSE]))
+RUNTIME_TOOLS=MUTABLE_TOOLS|{str(MATERIAL),'/usr/local/lib/harbor/postgres-usage-cascade.py','/usr/local/lib/harbor/postgres-department-release.py'}
 _EMIT_PROGRESS=False
+_FAILURE_STAGE='startup'
+
+def diagnostic_stage(name):
+ global _FAILURE_STAGE
+ need(name in {'startup','hold_ticket','hold_tools','hold_source','hold_receipt','hold_drain','early_source_verify','early_source_resume','source_checkpoint','source_restart_policies','source_postgres_start','source_postgres_verify','source_applications_start','source_readiness','source_network','source_full_verify','source_entry_refresh','source_entry_verify'},'host_diagnostic_stage_invalid')
+ _FAILURE_STAGE=name
+
+def rejected_control(error):
+ detail=getattr(error,'diagnostic',None)
+ return type(error).__name__=='EntryControlError' and isinstance(detail,dict) and detail.get('reason') in {'entry_epoch_or_operation_conflict','entry_phase_conflict','entry_stopping'}
+
+def failure_summary(error):
+ kind=type(error).__name__
+ if kind not in {'RuntimeError','EntryControlError','TypeError','KeyError','ValueError','OSError','FileNotFoundError','PermissionError','TimeoutError','TimeoutExpired','JSONDecodeError','HTTPException','RemoteDisconnected','ConnectionResetError','BrokenPipeError','SystemExit','KeyboardInterrupt'}:kind='OtherError'
+ code=str(error) if isinstance(error,RuntimeError) and re.fullmatch('(?:host|storage)_[a-z0-9_]+',str(error)) else 'storage_move_failed_closed'
+ value={'error':code,'stage':_FAILURE_STAGE,'exceptionType':kind}
+ # Revalidate the entry helper's bounded projection at this final log boundary.
+ if kind=='EntryControlError':
+  detail=getattr(error,'diagnostic',None);safe={}
+  if isinstance(detail,dict):
+   enums={'reason':{'gateway_entry_drain_timeout','entry_epoch_or_operation_conflict','entry_phase_conflict','entry_stopping','entry_operation_failed'},'phase':{'active','holding','drained','closing','closed'},'slot':{'legacy','candidate'}}
+   for key,allowed in enums.items():
+    if isinstance(detail.get(key),str) and detail[key] in allowed:safe[key]=detail[key]
+   for key in ['epoch','inflight','queued']:
+    item=detail.get(key)
+    if type(item) is int and 0<=item<=9007199254740991:safe[key]=item
+  if safe:value['entryControl']=safe
+ reasons={'entry drain timeout':'entry_drain_timeout','entry drain failed':'entry_drain_failed','entry interrupt listener configuration':'entry_interrupt_listener_configuration','entry TCP socket ownership unknown':'entry_tcp_socket_ownership_unknown','entry TCP destroy unsupported or unconfirmed':'entry_tcp_destroy_unconfirmed','entry TCP inventory unavailable':'entry_tcp_inventory_unavailable','entry interrupt process changed':'entry_interrupt_process_changed','entry interrupt container changed':'entry_interrupt_container_changed','entry interrupt namespace changed':'entry_interrupt_namespace_changed','entry interrupt hold changed':'entry_interrupt_hold_changed','entry interrupt hold CAS':'entry_interrupt_hold_cas','held entry generation changed':'entry_held_generation_changed'}
+ if isinstance(error,RuntimeError):
+  for original,label in reasons.items():
+   if str(error)=='PostgreSQL runtime upgrade: '+original:value['upgradeReason']=label;break
+ return value
+
+
 BACKUP=['/opt/harbor-storage-tools/node/bin/node','/opt/harbor-storage-tools/app/storage-backup.mjs']
 
 # Source-recovery qualification only; identical to the reviewed online bootstrap
@@ -129,22 +169,104 @@ def no_entry_listeners(port,control):
  for line in Path('/proc/net/unix').read_text().splitlines()[1:]:
   fields=line.split(maxsplit=7);need(len(fields)>=7,'host_entry_socket_inventory_unknown');need(len(fields)<8 or fields[7]!=str(control),'host_entry_control_collision')
 
+def code_bytes(path):
+ path=Path(path)
+ for parent in path.parents:
+  info=parent.lstat();need(stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'host_tool_untrusted')
+ fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ with os.fdopen(fd,'rb') as stream:
+  info=os.fstat(stream.fileno());need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and info.st_size<=1048576,'host_tool_untrusted');raw=stream.read(1048577)
+  after=path.lstat();need(len(raw)==info.st_size and (info.st_dev,info.st_ino,info.st_mtime_ns,info.st_ctime_ns)==(after.st_dev,after.st_ino,after.st_mtime_ns,after.st_ctime_ns),'host_tool_changed')
+ return raw
+
+def object_digest(value):return sha(json.dumps(value,sort_keys=True,separators=(',',':')).encode())
+
+def completed_move(plan,journal):
+ if journal.get('scope')!=plan['scope'] or journal.get('runId')!=plan['runId'] or journal.get('phase')!='complete' or journal.get('oldDataRollbackForbidden') is not True:return False
+ selected=plan.get('materialMove')
+ return selected is None or journal.get('materialMove')==dict(selected,phase='complete')
+
+def bridge_roots(plan):
+ def identity(path):
+  info=Path(path).lstat();need(stat.S_ISDIR(info.st_mode),'host_bridge_root_invalid');return [info.st_dev,info.st_ino,info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode)]
+ base=Path('/opt/product-development/harbor-local-gateway/postgres-infra')
+ value={'systemId':plan['systemId'],'pgContainer':plan['containers'][PG],'db':identity(base/'db'),'archive':identity(base/'archive')}
+ if plan.get('materialMove') is not None:
+  raw=private(Path('/etc/harbor-data-paths.json'));config=json.loads(raw)
+  value['materialConfigSha256']=sha(raw);value['materialRoots']={name:{side:identity(row[side]) for side in ['logical','target']} for name,row in config['roots'].items()}
+ return value
+
+def verify_host_bridge(plan,plan_sha,journal,actual):
+ receipt=json.loads(private(HOST_GENERATION));approval_raw=private(HOST_BRIDGE_APPROVAL);approval=json.loads(approval_raw)
+ keys={'version','approved','id','planSha256','runId','oldHostSha256','newHostSha256','installerSha256','revision','pipeline','artifactJob'}
+ need(set(approval)==keys and approval.get('version')==1 and approval.get('approved') is True and str(uuid.UUID(approval['id']))==approval['id'],'host_bridge_approval_invalid')
+ need(set(receipt)=={'contract','approvalSha256','binding','migrationCompleted','roots'} and receipt['contract']=='harbor-pg-storage-host-generation-v1' and receipt['migrationCompleted'] is True and receipt['approvalSha256']==sha(approval_raw) and receipt['binding']=={k:approval[k] for k in keys-{'approved'}},'host_bridge_receipt_changed')
+ historical=journal.get('scope')==plan['scope'] and journal.get('runId')==plan['runId'] and journal.get('oldDataRollbackForbidden') is True and journal.get('targetBootAuthorized') is True and journal.get('phase') in ['complete','boot-start-intent','boot-containers-ready','runtime-recovering','runtime-entry-pending']
+ selected=plan.get('materialMove');need(selected is None or journal.get('materialMove')==dict(selected,phase='complete'),'host_material_completion_missing')
+ need(historical and approval['planSha256']==plan_sha and approval['runId']==plan['runId'] and approval['oldHostSha256']==plan['toolSha256'][str(Path(__file__))] and approval['newHostSha256']==actual,'host_bridge_scope_changed')
+ need(receipt['roots']==bridge_roots(plan),'host_bridge_roots_changed')
+ need(all(isinstance(approval[k],str) and re.fullmatch('[a-f0-9]{64}',approval[k]) for k in ['planSha256','oldHostSha256','newHostSha256','installerSha256']) and re.fullmatch('[a-f0-9]{40}',approval['revision']) and all(type(approval[k]) is int and approval[k]>0 for k in ['pipeline','artifactJob']),'host_bridge_ci_identity_invalid')
+ return receipt
+
+def verified_runtime_tools(plan,journal):
+ # This runs before importing any replaceable module. Root approval is the
+ # existing trust boundary; a root-owned executable alone is not approval.
+ if not completed_move(plan,journal):verify_host_bridge(plan,sha(private(PLAN,262144)),journal,sha(code_bytes(Path(__file__))))
+ manifest=json.loads(private(RUNTIME_MANIFEST));ticket=json.loads(private(RUNTIME_TICKET))
+ need(set(manifest)=={'version','contract','revision','files'} and type(manifest['version']) is int and manifest['version']==1 and manifest['contract']=='harbor-postgres-runtime-tools-v1' and set(manifest['files'])==RUNTIME_TOOLS,'host_runtime_manifest_invalid')
+ need(ticket.get('version')==1 and ticket.get('contract')=='harbor-postgres-runtime-upgrade-v1' and ticket.get('approved') is True and re.fullmatch('[a-f0-9]{40}',manifest.get('revision','')) and manifest['revision']==ticket.get('hostToolsRevision'),'host_runtime_revision_unapproved')
+ for name,digest in manifest['files'].items():
+  need(isinstance(digest,str) and re.fullmatch('[a-f0-9]{64}',digest) and sha(code_bytes(name))==digest,'host_runtime_tool_changed')
+ need(manifest['files'][str(MATERIAL)]==plan['toolSha256'][str(MATERIAL)],'host_material_tool_changed')
+ active=json.loads(private(Path('/var/lib/harbor-entry/active.json')))
+ authorization=active.get('approval',{});identifier=authorization.get('deploymentId','')
+ need(re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',identifier),'host_runtime_active_invalid')
+ record=json.loads(private(Path('/var/lib/harbor-postgres-upgrades')/identifier/'release.json'));previous=record.get('ticket',{})
+ target=previous.get('to',{});previous_digest=object_digest(previous)
+ identity={k:copy.deepcopy(active.get(k)) for k in ['version','image','approval','configDigest','mounts','storageMarkerDigest','storageMarkerPath']}|{'candidate':{k:active.get('candidate',{}).get(k) for k in ['containerId','imageId','port']}}
+ control=journal.get('runtimeControl',{});planned=journal.get('plannedOperation',{}).get('targetTicketDigest')==previous_digest and control.get('mode') in ['planned','recovering','paused']
+ recovering=control.get('mode') in ['recovering','paused'] and control.get('selectedActiveDigest')==object_digest(identity)
+ pending=record.get('phase') in ['committing','committed'] and (planned or recovering)
+ need((record.get('phase')=='complete' or pending) and record.get('contract')=='harbor-postgres-runtime-upgrade-v1' and record.get('ticketDigest')==previous_digest and previous.get('deploymentId')==identifier and authorization.get('receiptDigest')==previous_digest and authorization.get('contract')==previous.get('contract'),'host_runtime_record_unapproved')
+ need(all(authorization.get(k)==target.get(k) for k in ['revision','configDigest','manifestDigest']) and active.get('image')==target.get('image') and previous.get('database',{}).get('cluster')==plan['systemId'],'host_runtime_active_changed')
+ candidate=active.get('candidate',{});recorded=record.get('candidate',{})
+ need(recorded.get('containerId')==candidate.get('containerId') and recorded.get('imageId')==candidate.get('imageId') and candidate.get('imageId') in [target.get('configDigest'),target.get('manifestDigest')],'host_runtime_candidate_unapproved')
+ source=ticket.get('from',{});to=ticket.get('to',{})
+ from_active=source.get('activeIdentityDigest')==object_digest(identity) and source.get('containerId')==active.get('candidate',{}).get('containerId') and source.get('workerId')==record.get('workerId') and source.get('imageId')==active.get('candidate',{}).get('imageId') and source.get('image')==active.get('image')
+ to_active=object_digest(ticket)==previous_digest and to==target
+ need(from_active or to_active,'host_runtime_ticket_not_current')
+ need(ticket.get('materialsDirectory')==previous.get('materialsDirectory')==plan['materialsDirectory'] and ticket.get('database',{}).get('cluster')==plan['systemId'],'host_runtime_materials_changed')
+ for name,identifier,role in [(GW,active['candidate']['containerId'],'gateway'),(WORKER,record['workerId'],'worker')]:
+  rows=json.loads(run(['/usr/bin/docker','container','inspect',name]));need(len(rows)==1,'host_runtime_pair_ambiguous');row=rows[0];config=row.get('Config',{});labels=config.get('Labels',{})
+  need(row.get('Id')==identifier and row.get('Image')==active['candidate']['imageId'] and config.get('Image')==active['image'] and config.get('Cmd')==['node','/app/postgres-'+role+'.mjs'] and labels.get('com.aistrong.project')==GW and labels.get('com.harbor.activation-deployment-id')==authorization['deploymentId'] and labels.get('com.harbor.activation-receipt')==authorization['receiptDigest'],'host_runtime_pair_changed')
+ return {name:manifest['files'][name] for name in MUTABLE_TOOLS}
+
 class Host:
  def __init__(self):
   need(os.geteuid()==0,'host_root_required');raw=private(PLAN,262144);self.planSha256=sha(raw);self.plan=json.loads(raw);p=self.plan
   need(p.get('scope')=='harbor-pg-storage-move-v1' and p.get('approved') is True and re.fullmatch('[a-f0-9]{32}',p.get('runId','')),'host_plan_unapproved')
   need(p.get('tlsVerifyFull') is True and re.fullmatch('[0-9]{1,20}',p.get('systemId','')),'host_database_identity_missing')
   need(set(p.get('containers',{}))=={PG,GW,WORKER} and all(re.fullmatch('[a-f0-9]{64}',v.get('id','')) and re.fullmatch('[a-f0-9]{64}',v.get('signature','')) for v in p['containers'].values()),'host_inventory_missing')
-  self.core=load(CORE,'harbor_pg_storage_core')
   expected={str(v) for v in [CORE,Path(__file__),DEPLOY,ENTRY,UPGRADE,COMPOSE,RUNTIME,MATERIAL]}
   material=p.get('materialMove');need(material is None or isinstance(material,dict) and set(material)=={'approvalSha256','nonce'} and re.fullmatch('[a-f0-9]{64}',material.get('approvalSha256','')) and str(uuid.UUID(material.get('nonce','')))==material['nonce'],'host_material_plan_invalid')
   if material is not None:expected.add(str(MATERIAL_MOVE))
   need(set(p.get('toolSha256',{}))==expected,'host_tool_inventory_missing')
-  for name,digest in p['toolSha256'].items():need(re.fullmatch('[a-f0-9]{64}',digest) and sha(Path(name).read_bytes())==digest,'host_tool_changed')
+  self.j=json.loads(private(STATE)) if STATE.exists() else {'scope':p['scope'],'runId':p['runId'],'phase':'planned'}
+  need(self.j.get('scope')==p['scope'] and self.j.get('runId')==p['runId'],'host_state_scope_changed')
+  self.runtimeTools=None
+  if completed_move(p,self.j) or os.path.lexists(HOST_GENERATION):self.runtimeTools=verified_runtime_tools(p,self.j)
+  for name,digest in p['toolSha256'].items():
+   need(isinstance(digest,str) and re.fullmatch('[a-f0-9]{64}',digest),'host_tool_changed');actual=sha(code_bytes(name))
+   if actual==digest:continue
+   if name==str(Path(__file__)):verify_host_bridge(p,self.planSha256,self.j,actual)
+   else:need(self.runtimeTools is not None and name in MUTABLE_TOOLS and self.runtimeTools[name]==actual,'host_tool_changed')
+  self.core=load(CORE,'harbor_pg_storage_core')
   self.wrapper=load(DEPLOY,'harbor_storage_wrapper');self.entry=load(ENTRY,'harbor_storage_entry');self.upgrade=load(UPGRADE,'harbor_storage_upgrade');self.pg=load(COMPOSE,'harbor_storage_compose');self.runtime=load(RUNTIME,'harbor_storage_entry_runtime')
   need(getattr(self.pg,'STORAGE_STARTUP_CONTRACT',None)=='harbor-pg-storage-boot-v1','host_factory_guard_not_installed')
   self.config=self.entry.private_json(Path('/etc/harbor-gateway-deploy.json'));self.poll_interval_seconds=supervision_interval(self.config);self.j=json.loads(private(STATE)) if STATE.exists() else {'scope':p['scope'],'runId':p['runId'],'phase':'planned'}
   need(self.j.get('scope')==p['scope'] and self.j.get('runId')==p['runId'],'host_state_scope_changed');self.api={**vars(self.wrapper),'STACK':p.get('materialsDirectory')};self.gw=None;self.worker=None;self.active=None;self.ticket=None
+  if self.runtimeTools is not None:
+   ticket=self.upgrade.private_json(RUNTIME_TICKET);self.upgrade.validate_ticket(ticket,ticket['to']['image'],self.config);self.upgrade.verify_installed_tools(ticket);self.upgrade.record_for(self.entry.private_json(self.entry.ACTIVE)['approval'])
  def reload_locked_state(self):
   need(sha(private(PLAN,262144))==self.planSha256,'host_plan_changed')
   current=json.loads(private(STATE)) if STATE.exists() else {'scope':self.plan['scope'],'runId':self.plan['runId'],'phase':'planned'}
@@ -241,15 +363,92 @@ class Host:
    if mode is not None:
     status=self.upgrade.active_authorization(self.active['image']);need(status.get('state')=='active' and self.upgrade.approval_binding(status)==self.active['approval'],'host_database_approval_changed');need(time.monotonic()<deadline,'host_source_recovery_not_ready');return mode
    time.sleep(min(.2,max(0,deadline-time.monotonic())))
+ def early_source_facts(self):
+  # No active_record(): that helper republishes profiles and is not read-only.
+  self.verify_source_recovery_materials();active=self.entry.private_json(self.entry.ACTIVE)
+  need(self.upgrade.digest(self.upgrade.active_identity(active))==self.plan['activeIdentityDigest'],'host_early_active_changed')
+  processes={}
+  for name in [PG,GW,WORKER]:
+   row=self.immutable(name);state=row['State']
+   need(state.get('Running') is True and type(state.get('Pid')) is int and state['Pid']>0 and isinstance(state.get('StartedAt'),str) and state['StartedAt'] and type(row.get('RestartCount')) is int and not any(state.get(k) for k in ['Paused','Restarting','Dead','OOMKilled','Error']),'host_early_process_not_running')
+   need(row['HostConfig']['RestartPolicy']==self.plan['containers'][name]['restartPolicy'],'host_early_restart_policy_changed')
+   processes[name]={'id':row['Id'],'signature':sig(row),'pid':state['Pid'],'startedAt':state['StartedAt'],'restarts':row['RestartCount'],'networkDigest':container_generation(row)['networkDigest']}
+  network=self.upgrade.network_snapshot(self.ticket,self.entry,self.immutable(GW),self.immutable(WORKER));network['candidateNetworkContainerIds']=sorted(network['candidateNetworkContainerIds'])
+  entry_state=self.entry.private_json(self.entry.STATE);view=entry_state.get('activeRuntimeConfig')
+  need(entry_state.get('phase')=='activated' and isinstance(view,dict) and entry_state.get('candidate')==active.get('candidate'),'host_early_entry_rules_unknown');self.entry.verify_resources(entry_state,view)
+  runtime=self.runtime.inspect_entry(self.entry);pid=runtime.get('State',{}).get('Pid')
+  need(type(pid) is int and pid>1 and runtime['State'].get('Running') is True and not any(runtime['State'].get(k) for k in ['Paused','Restarting','Dead']),'host_early_entry_not_running')
+  need(self.entry.socket_owner(Path(self.entry.CONTROL))==pid,'host_early_entry_owner_changed')
+  return {'activeDigest':self.upgrade.digest(active),'candidate':active['candidate'],'processes':processes,'network':network,'entryStateDigest':self.upgrade.digest(entry_state),'entry':{'id':runtime['Id'],'pid':pid,'startedAt':runtime['State']['StartedAt'],'ticks':self.entry.process_ticks(pid),'cgroup':self.entry.process_cgroup(pid)},'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+ def early_source_window(self):
+  return self.j.get('phase') in ['holding-intent','held'] and not any(key in self.j for key in ['gate','gateIntent','writersPauseStarted','restartPolicies','autostartFenced','oldRoots','mountpointIdentities']) and not self.j.get('oldDataRollbackForbidden',False) and not self.j.get('targetBootAuthorized',False)
+ def capture_early_hold(self):
+  diagnostic_stage('hold_receipt');need(self.early_source_window(),'host_early_hold_window_changed')
+  tables=json.loads(self.entry.execute(['/usr/sbin/nft','--json','list','tables']));need(not any(row.get('table',{}).get('name')==self.upgrade.GATE for row in tables.get('nftables',[])),'host_early_gate_present')
+  control=self.entry.entry_state();need(control.get('slot')=='candidate' and control.get('phase')=='active' and type(control.get('epoch')) is int and control['epoch']>=0,'host_early_entry_not_active')
+  facts=self.early_source_facts();current=self.entry.entry_state();need(all(current.get(k)==control.get(k) for k in ['slot','phase','epoch']),'host_early_entry_changed')
+  receipt={'version':1,'planSha256':self.planSha256,'runId':self.plan['runId'],'source':facts,'activeEpoch':control['epoch'],'holdingEpoch':control['epoch']+1}
+  need('earlyHoldRecovery' not in self.j or self.j['earlyHoldRecovery']==receipt,'host_early_receipt_changed');self.j['earlyHoldRecovery']=receipt;self.save(self.j)
+ def drain_with_early_receipt(self,ticket=None):
+  # Bind the actual hold CAS to the epoch recorded before admission changes.
+  import types
+  proxy=types.SimpleNamespace(**vars(self.entry));original=self.entry.entry_state
+  def controlled(command=None,epoch=None,*args,**kwargs):
+   receipt=self.j['earlyHoldRecovery']
+   if command in ['hold','drain']:
+    expected=receipt['activeEpoch'] if command=='hold' else receipt['holdingEpoch']
+    need(epoch==expected,'host_early_hold_epoch_changed');receipt[command+'Requested']=True;self.save(self.j)
+   try:return original(command,epoch,*args,**kwargs)
+   except RuntimeError as error:
+    # Only a protocol-defined rejection proves this CAS was not applied.
+    if command in ['hold','drain'] and rejected_control(error):receipt[command+'Rejected']=True;self.save(self.j)
+    raise
+  proxy.entry_state=controlled;diagnostic_stage('hold_drain')
+  if ticket is None:return self.upgrade.drain_active_entry(proxy)
+  return self.upgrade.drain_active_entry(proxy,ticket,self.api,self.active)
+ def recover_held_source(self):
+  # Legacy journals and any progressed switch retain the full recovery path.
+  receipt=self.j.get('earlyHoldRecovery')
+  if receipt is None or not self.early_source_window():return None
+  diagnostic_stage('early_source_verify')
+  need(receipt.get('version')==1 and receipt.get('runId')==self.plan['runId'] and receipt.get('planSha256')==self.planSha256 and type(receipt.get('activeEpoch')) is int and receipt.get('holdingEpoch')==receipt['activeEpoch']+1,'host_early_receipt_invalid')
+  # A completed drain belongs to full recovery, which can safely restart an
+  # otherwise verified source. Do not apply hold-only health/generation gates.
+  observed=self.entry.entry_state()
+  if receipt.get('holdRequested') is True and not receipt.get('holdRejected',False) and receipt.get('drainRequested') is True and not receipt.get('drainRejected',False) and observed.get('slot')=='candidate' and observed.get('phase')=='drained' and observed.get('epoch')==receipt['holdingEpoch']+1:return None
+  self.load_current_durable_active();need(self.early_source_facts()==receipt.get('source'),'host_early_source_changed')
+  tables=json.loads(self.entry.execute(['/usr/sbin/nft','--json','list','tables']));need(not any(row.get('table',{}).get('name')==self.upgrade.GATE for row in tables.get('nftables',[])),'host_early_gate_present')
+  # No login probe, WAL switch or database mutation in the hold-only path.
+  # The source baseline was established before hold; verify the same processes
+  # remain healthy, retaining its previously qualified worker storage-low case.
+  health={name:self.immutable(name)['State'].get('Health',{}).get('Status') for name in [PG,GW,WORKER]}
+  need(health[PG]=='healthy' and health[GW]=='healthy' and (health[WORKER]=='healthy' or health[WORKER]=='unhealthy' and self.source_low_recovery_selected()),'host_early_source_not_ready')
+  control=self.entry.entry_state();need(control.get('slot')=='candidate','host_early_entry_changed')
+  if control.get('phase')=='active' and control.get('epoch')==receipt['activeEpoch']:
+   return {'sourceRestored':True,'holdOnly':True,'entryAlreadyActive':True,'servicesRestarted':False}
+  need(receipt.get('holdRequested') is True and not receipt.get('holdRejected',False),'host_early_hold_unconfirmed')
+  resume=receipt.get('resumeRequested')
+  if resume=={'phase':'holding','epoch':receipt['holdingEpoch']} and not receipt.get('resumeRejected',False) and control.get('phase')=='active' and control.get('epoch')==receipt['holdingEpoch']+1:
+   return {'sourceRestored':True,'holdOnly':True,'resumeAcknowledgedByObservation':True,'servicesRestarted':False}
+  need(control.get('phase')=='holding' and control.get('epoch')==receipt['holdingEpoch'],'host_early_entry_changed')
+  need(self.early_source_facts()==receipt['source'],'host_early_source_changed');diagnostic_stage('early_source_resume')
+  receipt['resumeRequested']={'phase':'holding','epoch':receipt['holdingEpoch']};self.save(self.j)
+  try:resumed=self.entry.entry_state('resume',receipt['holdingEpoch'])
+  except RuntimeError as error:
+   if rejected_control(error):receipt['resumeRejected']=True;self.save(self.j)
+   raise
+  need(resumed.get('slot')=='candidate' and resumed.get('phase')=='active' and resumed.get('epoch')==receipt['holdingEpoch']+1,'host_early_resume_unconfirmed')
+  return {'sourceRestored':True,'holdOnly':True,'servicesRestarted':False}
  def hold_drain(self):
-  expected=self.plan.get('interruptTicketSha256')
-  if expected is None:return self.upgrade.drain_active_entry(self.entry)
+  diagnostic_stage('hold_ticket');expected=self.plan.get('interruptTicketSha256')
+  if expected is None:
+   self.capture_early_hold();return self.drain_with_early_receipt()
   need(isinstance(expected,str) and re.fullmatch('[a-f0-9]{64}',expected),'host_interrupt_ticket_unapproved')
   raw=private(self.upgrade.TICKET);need(sha(raw)==expected,'host_interrupt_ticket_changed');ticket=json.loads(raw)
-  self.upgrade.validate_ticket(ticket,ticket.get('to',{}).get('image'),self.config);need(ticket.get('interruptEntryClients') is True,'host_interrupt_ticket_unapproved');self.upgrade.verify_installed_tools(ticket)
-  self.upgrade.verify_source(ticket,self.active,self.gw,self.worker)
+  self.upgrade.validate_ticket(ticket,ticket.get('to',{}).get('image'),self.config);need(ticket.get('interruptEntryClients') is True,'host_interrupt_ticket_unapproved');diagnostic_stage('hold_tools');self.upgrade.verify_installed_tools(ticket)
+  diagnostic_stage('hold_source');self.upgrade.verify_source(ticket,self.active,self.gw,self.worker)
   need(ticket.get('materialsDirectory')==self.plan['materialsDirectory'] and ticket.get('database',{}).get('cluster')==self.plan['systemId'],'host_interrupt_source_changed')
-  return self.upgrade.drain_active_entry(self.entry,ticket,self.api,self.active)
+  self.capture_early_hold();return self.drain_with_early_receipt(ticket)
  def install_gate(self):
   boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip();binding=self.upgrade.digest(self.upgrade.active_identity(self.active));intent=self.j.get('gateIntent',{})
   tables=json.loads(self.entry.execute(['/usr/sbin/nft','--json','list','tables']));exists=any(row.get('table',{}).get('name')==self.upgrade.GATE for row in tables.get('nftables',[]))
@@ -345,6 +544,7 @@ class Host:
    if current['HostConfig']['RestartPolicy']['Name']!='no':run(['/usr/bin/docker','update','--restart=no',row['Id']])
   self.require_docker_restart_disabled();self.j['autostartFenced']=True;self.save(self.j)
  def restore_original_restart_policies(self):
+  diagnostic_stage('source_restart_policies')
   if 'restartPolicies' not in self.j:return
   need(not self.j.get('oldDataRollbackForbidden',False),'host_restart_policy_restore_forbidden')
   for name,policy in self.j['restartPolicies'].items():
@@ -375,7 +575,18 @@ class Host:
   selected=self.plan.get('materialMove')
   if selected is None:return None
   for path in [MATERIAL_MOVE,MATERIAL]:need(sha(path.read_bytes())==self.plan['toolSha256'][str(path)],'host_material_tool_changed')
-  mover=load(MATERIAL_MOVE,'harbor_unified_material_move');raw=private(mover.APPROVAL);need(sha(raw)==selected['approvalSha256'],'host_material_approval_changed');value,rows=mover.approval()
+  mover=load(MATERIAL_MOVE,'harbor_unified_material_move');raw=private(mover.APPROVAL);need(sha(raw)==selected['approvalSha256'],'host_material_approval_changed')
+  if getattr(self,'runtimeTools',None) is not None:
+   # The immutable approval was validated during migration. Revalidate the
+   # completed bindings without weakening the mover's strict migration API.
+   value=json.loads(raw);need(set(value.get('guards',{}))==set(mover.GUARD_FILES),'host_material_guards_missing')
+   for name,digest in value['guards'].items():
+    current=sha(mover.guard_code(Path(name)))
+    need(current==digest or name in MUTABLE_TOOLS and self.runtimeTools.get(name)==current,'host_material_guard_changed')
+   need(set(value.get('tools',{}))=={str(MATERIAL_MOVE),str(MATERIAL)} and all(sha(code_bytes(name))==digest for name,digest in value['tools'].items()),'host_material_tool_changed')
+   durable=mover.g.private_json(mover.STATE,33554432);need(durable.get('phase')=='complete' and durable.get('nonce')==selected['nonce'] and durable.get('approvalSha256')==selected['approvalSha256'],'host_material_completion_missing')
+   need(mover.g.private_json(mover.g.CONFIG)==mover.final_configuration(value,durable),'host_material_configuration_changed');mover.g.guard(list(mover.g.TARGETS),required=True);rows=[]
+  else:value,rows=mover.approval()
   need(value['nonce']==selected['nonce'] and value['materialsDirectory']==self.plan['materialsDirectory'] and value['diskUuid']==self.plan['targetFilesystemUuid'] and value['containers']=={name:self.plan['containers'][name]['id'] for name in [GW,WORKER]},'host_material_scope_changed')
   return mover,value,rows
  def prepare_application_materials(self):
@@ -436,6 +647,7 @@ class Host:
    path=Path(row['logical']);expected=row['sourceId']
    need(not os.path.lexists(path) if expected is None else os.path.lexists(path) and mover.g.identity(path)[:2]==expected,'host_source_material_root_changed')
  def start_applications(self,*,source_recovery=False):
+  diagnostic_stage('source_applications_start')
   need(type(source_recovery) is bool,'host_application_start_mode_invalid')
   if source_recovery:
    self.verify_source_recovery_materials()
@@ -451,6 +663,7 @@ class Host:
   else:self.verify_application_material_mounts()
   self.gw=self.row(GW);self.worker=self.row(WORKER);self.j['applicationsStartEpochMs']=int(datetime.fromisoformat(self.worker['State']['StartedAt'].replace('Z','+00:00')).timestamp()*1000);self.j['workerGeneration']={'id':self.worker['Id'],'startedAt':self.worker['State']['StartedAt']};self.save(self.j)
  def verify_current_approval_and_private_readiness(self,*,source_recovery=False):
+  diagnostic_stage('source_readiness')
   need(type(source_recovery) is bool,'host_readiness_mode_invalid')
   if source_recovery and self.managed_source_recovery():return self.wait_source_recovery_ready()
   def ready():
@@ -468,6 +681,7 @@ class Host:
   bridge=json.loads(run(['/usr/sbin/ip','-j','link','show','dev',ticket['network']['bridge']]))[0]
   return bridge
  def update_dynamic_network_snapshot(self,boot=False):
+  diagnostic_stage('source_network')
   self.gw=self.row(GW);self.worker=self.row(WORKER);ticket=copy.deepcopy(self.ticket)
   current=self.entry.private_json(self.entry.ACTIVE)
   need(self.upgrade.active_identity(current)==self.upgrade.active_identity(self.active),'host_active_changed')
@@ -479,7 +693,8 @@ class Host:
   snapshot=self.upgrade.network_snapshot(ticket,self.entry,self.gw,self.worker);current=self.entry.private_json(self.entry.ACTIVE)
   need(self.upgrade.active_identity(current)==self.upgrade.active_identity(self.active),'host_active_changed')
   current['networkSnapshot']={**current.get('networkSnapshot',{}),**snapshot};self.entry.save_json(self.entry.ACTIVE,current)
- def refresh_active_entry(self):self.entry.refresh_active()
+ def refresh_active_entry(self):
+  diagnostic_stage('source_entry_refresh');self.entry.refresh_active()
  def verify_full_instance(self,on_target=True):
   self.data_mounts() if on_target else self.verify_original_roots();self.pg.verify_started_composition(self.api,self.active['image'],self.config,self.j['applicationsStartEpochMs'],self.active['approval']);self.entry.active_record()
  def remove_gate(self,gate):
@@ -492,7 +707,7 @@ class Host:
   for name in reversed(self.core.WRITERS):
    if original.get(name,{}).get('ActiveState') in ['active','activating','reloading']:run(['/usr/bin/systemctl','start','--no-block',name])
  def record_failure(self,journal,old_data_allowed):
-  journal['failure']={'oldDataRollbackAllowedForExplicitRecovery':old_data_allowed,'automaticOldDataRollback':False};self.save(journal)
+  journal['failure']={'oldDataRollbackAllowedForExplicitRecovery':old_data_allowed,'automaticOldDataRollback':False,**failure_summary(sys.exc_info()[1])};self.save(journal)
  def require_boot_guard_and_mounts(self):
   self.data_mounts();state=self.entry.private_json(self.entry.STATE);need(state.get('phase')=='boot-guarded','host_boot_guard_required')
   need(state.get('guardFingerprint')==self.entry.guard_fingerprint(self.entry.validate(self.entry.private_json(self.entry.PROFILE))) and state.get('rulesDigest')==self.entry.state_rules_digest(),'host_boot_guard_changed');self.j['bootId']=Path('/proc/sys/kernel/random/boot_id').read_text().strip();self.save(self.j)
@@ -510,6 +725,7 @@ class Host:
   need(self.gw['Id']==self.active['candidate']['containerId'] and self.gw['Image']==self.active['candidate']['imageId'] and self.worker['Image']==self.gw['Image'] and self.worker['Id']==record.get('workerId'),'host_boot_pair_identity_changed')
   for row in [self.gw,self.worker]:need(self.entry.candidate_mounts(row,self.active['approval'])==self.active['mounts'],'host_boot_material_mounts_changed')
  def verify_existing_entry_restored(self):
+  diagnostic_stage('source_entry_verify')
   state=self.entry.private_json(self.entry.STATE);control=self.entry.entry_state();need(state.get('phase')=='activated' and control.get('phase')=='active' and control.get('slot')=='candidate','host_entry_not_restored');self.load_current_durable_active();self.entry.verify_resources(state,state['activeRuntimeConfig'])
  def ensure_instance_boot_guard(self):
   if self.j.get('phase') in ['boot-arm-intent','boot-installed']:self.install_instance_boot_guard()
@@ -521,7 +737,12 @@ class Host:
    need('..' not in Path(name).parts and not name.startswith('/') and re.fullmatch('[a-f0-9]{64}',digest),'host_boot_unit_receipt_invalid');path=Path('/etc/systemd/system')/name;self.entry.trusted_parents(path);info=path.lstat();need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o644 and info.st_nlink==1 and sha(path.read_bytes())==digest,'host_boot_unit_changed')
  def signal_online_ready(self):
   unit=self.core.STORAGE_ONLINE;state=self.state_unit(unit);need(state.get('MainPID')==str(os.getpid()) and self.entry.process_cgroup(os.getpid())=='/system.slice/'+unit,'host_notify_unit_not_owned');address=os.environ.get('NOTIFY_SOCKET','');need(address.startswith(('/', '@')),'host_notify_socket_missing')
+  if getattr(self,'runtimeTools',None) is not None:
+   self.j['supervisorTools']={'files':self.runtimeTools,'hostSha256':sha(code_bytes(Path(__file__))),'pid':os.getpid(),'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip()};self.save(self.j)
   with socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM) as peer:peer.settimeout(1);peer.connect(('\0'+address[1:]) if address.startswith('@') else address);peer.sendall(b'READY=1')
+ def verify_supervisor_tools(self,row):
+  if self.runtimeTools is not None:
+   need(self.j.get('supervisorTools')=={'files':self.runtimeTools,'hostSha256':sha(code_bytes(Path(__file__))),'pid':int(row['MainPID']),'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip()},'host_approved_tools_refresh_required')
  def activate_running_units(self):
   unit=self.j.get('workerUnit');need(isinstance(unit,str),'host_handoff_parent_not_owned');parent=self.state_unit(unit);need(parent.get('MainPID')==str(os.getpid()),'host_handoff_parent_not_owned')
   self.j['handoff']={'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'parentPid':os.getpid(),'parentTicks':self.entry.process_ticks(os.getpid()),'parentUnit':unit};self.save(self.j)
@@ -557,18 +778,22 @@ class Host:
   for label,row in self.j.get('oldRoots',{}).items():need(label in ['db','archive'] and row.get('path')==str(self.core.BASE/('.harbor-pg-rollback-'+self.plan['runId']+'-'+label)) and not os.path.lexists(row['path']),'host_original_data_already_renamed')
   for label,path in [('db',self.core.SOURCE_DB),('archive',self.core.SOURCE_ARCHIVE)]:need(self.core.identity(path.lstat())[:5]==self.plan['sourceRoots'][label],'host_original_root_changed')
  def verify_original_recovery_checkpoint(self):
+  diagnostic_stage('source_checkpoint')
   self.verify_original_roots();self.load_current_durable_active();need(self.upgrade.digest(self.upgrade.active_identity(self.active))==self.plan['activeIdentityDigest'],'host_original_approval_changed')
   for name in [PG,GW,WORKER]:self.immutable(name)
   row=self.row(PG)
   if not row['State']['Running']:
    need(row['State'].get('Pid')==0 and not any(row['State'].get(k) for k in ['Restarting','Paused','Dead','OOMKilled','Error']),'host_original_pg_state_unknown');self.require_clean_control(self.core.SOURCE_DB)
  def start_original_postgres(self):
+  diagnostic_stage('source_postgres_start')
   self.verify_original_roots()
   if getattr(self,'archive_lease',None) is not None:os.close(self.archive_lease);self.archive_lease=None
   row=self.immutable(PG)
   if not row['State']['Running']:run(['/usr/bin/docker','start',row['Id']])
- def verify_original_postgres(self):self.verify_postgres_mount_tls_report_wal(on_target=False)
+ def verify_original_postgres(self):
+  diagnostic_stage('source_postgres_verify');self.verify_postgres_mount_tls_report_wal(on_target=False)
  def verify_original_full_instance(self,*,before_publish=False):
+  diagnostic_stage('source_full_verify')
   if not self.managed_source_recovery():return self.verify_full_instance(on_target=False)
   need(before_publish is True,'host_source_verification_after_publish');mode=self.wait_source_recovery_ready();self.verify_persistent_network();port=self.config['port'];stack=self.api['STACK'];deadline=self.source_recovery_deadline
   code="const{request}=await import('node:http');let done=false;const finish=v=>{if(done)return;done=true;process.stdout.write(v?'true':'false',()=>process.exit(v?0:1));};setTimeout(()=>finish(false),10000);const base=new URL('http://127.0.0.1:8092'),status=(path,headers)=>new Promise((resolve,reject)=>{const req=request(new URL(path,base),{headers:{Host:base.host,Connection:'close',...headers},signal:AbortSignal.timeout(2000)},reply=>{reply.resume();reply.once('end',()=>resolve(reply.statusCode));reply.once('error',reject);});req.once('error',reject);req.end();});try{for(const[path,expected,headers]of [['/health',200,{}],['/ready',200,{}],['/api/admin/state',401,{}],['/health',403,{Host:'untrusted.invalid'}]])if(await status(path,headers)!==expected)throw Error();finish(true);}catch{finish(false);}"
@@ -903,6 +1128,7 @@ def verify_factory_guard(config):
  for name in [host.core.STORAGE_START,host.core.STORAGE_ONLINE]:
   row=host.state_unit(name);need(row.get('UnitFileState')=='enabled','host_factory_boot_guard_not_enabled')
   if name==host.core.STORAGE_ONLINE:need(row.get('ActiveState')=='active' and row.get('SubState')=='running' and int(row.get('MainPID','0'))>0,'host_factory_supervisor_not_running')
+  if name==host.core.STORAGE_ONLINE:host.verify_supervisor_tools(row)
  return {'contract':'harbor-pg-storage-boot-v1','completed':True,'samePostgres':True,'mountsVerified':True}
 
 def worker_paths(host,action,nonce=None):
@@ -987,10 +1213,16 @@ def supervise_online(host):
   # that unhealthy applications already satisfy their own recovery conditions.
   if host.j.get('phase')=='boot-containers-ready':
    with locks(host):host.reload_locked_state();host.core.Coordinator(host,host.j).boot_online()
-  else:host.signal_online_ready()
+  else:
+   with locks(host):host.reload_locked_state();host.signal_online_ready()
  while not stopped:
   try:
-   with locks(host):host.reload_locked_state();host.runtime_step()
+   with locks(host):
+    host.reload_locked_state()
+    # Requires=online writers must not be stopped by an implicit supervisor
+    # exit. The explicit bridge refresh snapshots/restores that dependency set.
+    need(host.runtimeTools is None or verified_runtime_tools(host.plan,host.j)==host.runtimeTools,'host_approved_tools_refresh_required')
+    host.runtime_step()
   except BlockingIOError:pass
   except (RuntimeError,OSError,ValueError,subprocess.TimeoutExpired):print(json.dumps({'supervision':'protected','error':'host_runtime_reconcile_failed'}),flush=True)
   if not stopped:time.sleep(host.poll_interval_seconds)
@@ -1033,5 +1265,4 @@ def main():
 if __name__=='__main__':
  try:print(json.dumps(main()))
  except BaseException as error:
-  code=str(error) if isinstance(error,RuntimeError) and re.fullmatch('(?:host|storage)_[a-z0-9_]+',str(error)) else 'storage_move_failed_closed'
-  print(json.dumps({'failed':True,'error':code,'inspectOriginalUnitBeforeRetry':True}));raise SystemExit(1)
+  print(json.dumps({'failed':True,**failure_summary(error),'inspectOriginalUnitBeforeRetry':True}));raise SystemExit(1)
