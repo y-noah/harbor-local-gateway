@@ -1,6 +1,7 @@
+import {scheduledRecoveryId,originalScheduledId,sameScheduledIdentity,priorDailyExpiryBoundary} from './scheduled-task-identity.mjs';
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {setTimeout as delay} from 'node:timers/promises';
-import {AppError,usageWindow,nextDailyReset} from './store.mjs';
+import {AppError,usageWindow} from './store.mjs';
 import {balanceSettings,planBalanceWorkloads,nightlyWindow,quotaFreshnessMs} from './balancing.mjs';
 import {lockPostgresRouting} from './postgres-routing.mjs';
 import {transferSchedule,transferWindow} from './transfer-schedule.mjs';
@@ -29,16 +30,31 @@ export function createPostgresPlanningJobs(store,{jobs,clock=Date.now,input={},t
     for(const row of obsolete)await jobs.cancel(row.id);
     if(!enabled||!window.due)return null;
     if(scope){expiryScope=await departments.resolve(expiryScope);if(expiryScope.department_id!==scope.department_id||expiryScope.role!=='system'||expiryScope.purpose!=='routing.expiry')throw new AppError(403,'周期恢复身份不匹配','department_forbidden');}
-    const expiry=nextDailyReset(window.end)-86400000,dependencyId=departmentPlanningJobId('routing.expiry',expiry,scope);await jobs.enqueue('routing.expiry',{id:dependencyId,payload:{boundary:expiry},...(scope?{scope:expiryScope}:{})});
+    const expiry=window.end,dependencyId=departmentPlanningJobId('routing.expiry',expiry,scope);await jobs.enqueue('routing.expiry',{id:dependencyId,payload:{boundary:expiry},...(scope?{scope:expiryScope}:{})});
     const policy=await departments.setting(scope,'request_handoff_policy')??{};
     const revision=policy.mode==='request-boundary'?await store.get('SELECT revision,job_id FROM harbor.nightly_plan_revisions WHERE slot=$1'+(scope?' AND department_id=$2':'')+' ORDER BY revision DESC LIMIT 1',window.key,...(scope?[scope.department_id]:[])):null;
-    return jobs.enqueue('routing.nightly',{id:revision?.job_id??departmentPlanningJobId('routing.nightly',window.key,scope),target:window.key,payload:{boundary:window.end,...(revision?{revision:revision.revision}:{})},dependencyId,...(scope?{scope}:{})});
+    const id=revision?.job_id??departmentPlanningJobId('routing.nightly',window.key,scope),payload={boundary:window.end,...(revision?{revision:revision.revision}:{})};
+    return store.transaction(async()=>{
+      const existing=await store.get('SELECT * FROM harbor.background_jobs WHERE id=$1'+(scope?' AND department_id=$2':'')+' FOR UPDATE',id,...(scope?[scope.department_id]:[]));
+      const oldDependency=departmentPlanningJobId('routing.expiry',priorDailyExpiryBoundary(window.end),scope);
+      if(existing&&existing.dependency_id!==dependencyId&&existing.dependency_id===oldDependency&&existing.kind==='routing.nightly'&&existing.target===window.key&&existing.payload.boundary===payload.boundary&&existing.payload.revision===payload.revision&&Object.keys(existing.payload).length===Object.keys(payload).length){
+        // Scheduling inspects a locked pending/cancelled predecessor; only execution owns a lease.
+        const actor=await jobs.authorizePersistedActor(existing,{requireLease:false});
+        if(scope&&(!actor||actor.department_id!==scope.department_id||actor.role!=='system'||actor.purpose!=='routing.nightly'))throw new AppError(403,'原定时任务身份不匹配','department_forbidden');
+        // Never replace a job that already committed a plan or another result.
+        if(existing.result!==null||await store.get('SELECT id FROM harbor.routing_plans WHERE id=$1',id))return {id,created:false};
+        await jobs.cancel(id);
+        return jobs.enqueue('routing.nightly',{id:scheduledRecoveryId(id),target:window.key,payload,dependencyId,...(scope?{scope}:{})});
+      }
+      return jobs.enqueue('routing.nightly',{id,target:window.key,payload,dependencyId,...(scope?{scope}:{})});
+    });
   }
   async function execute(job,{signal}={}){
     const scope=await jobs.authorizePersistedActor(job);
-    const nightly=job.kind==='routing.nightly',boundary=job.payload?.boundary,window=Number.isSafeInteger(boundary)?transferWindow(boundary,await scheduleConfig(scope)):null,expiry=Number.isSafeInteger(boundary)?nextDailyReset(boundary)-86400000:null;
+    const nightly=job.kind==='routing.nightly',boundary=job.payload?.boundary,window=Number.isSafeInteger(boundary)?transferWindow(boundary,await scheduleConfig(scope)):null,expiry=Number.isSafeInteger(boundary)?boundary:null;
     const revision=nightly&&job.payload?.revision!==undefined?await store.get('SELECT job_id FROM harbor.nightly_plan_revisions WHERE slot=$1 AND revision=$2'+(scope?' AND department_id=$3':''),job.target,Number.isSafeInteger(job.payload.revision)?job.payload.revision:-1,...(scope?[scope.department_id]:[])):null;
-    if(nightly?(!window||!window.due||window.end!==boundary||boundary<0||(revision?job.id!==revision.job_id:job.id!==departmentPlanningJobId('routing.nightly',window.key,scope))||job.target!==window.key||job.dependency_id!==departmentPlanningJobId('routing.expiry',expiry,scope)||Object.keys(job.payload).length!==(revision?2:1)):job.kind!==kind||Object.keys(job.payload||{}).length)throw new AppError(400,'规划任务参数无效','job_payload_invalid');
+    if(nightly?(!window||!window.due||window.end!==boundary||boundary<0||(revision?!sameScheduledIdentity(revision.job_id,job.id):!sameScheduledIdentity(departmentPlanningJobId('routing.nightly',window.key,scope),job.id))||job.target!==window.key||job.dependency_id!==departmentPlanningJobId('routing.expiry',expiry,scope)||Object.keys(job.payload).length!==(revision?2:1)):job.kind!==kind||Object.keys(job.payload||{}).length)throw new AppError(400,'规划任务参数无效','job_payload_invalid');
+    if(nightly&&originalScheduledId(job.id)!==job.id){const predecessor=await store.get('SELECT dependency_id,result FROM harbor.background_jobs WHERE id=$1'+(scope?' AND department_id=$2':''),originalScheduledId(job.id),...(scope?[scope.department_id]:[]));if(!predecessor||predecessor.result!==null||predecessor.dependency_id!==departmentPlanningJobId('routing.expiry',priorDailyExpiryBoundary(boundary),scope)||predecessor.dependency_id===job.dependency_id||await store.get('SELECT id FROM harbor.routing_plans WHERE id=$1',originalScheduledId(job.id)))throw new AppError(409,'原定时任务不能替代','job_identity_conflict');}
     stopped(signal);
     const saved=await jobs.owned(job,()=>store.get('SELECT result FROM harbor.background_jobs WHERE id=$1',job.id));
     if(saved.result!==null)return saved.result;
@@ -81,7 +97,7 @@ export function createPostgresPlanningJobs(store,{jobs,clock=Date.now,input={},t
         await lockPostgresRouting(store);stopped(signal);
         const current=await readConfiguration(scope);
         const replacement=captured.requestBoundary?await store.get('SELECT job_id FROM harbor.nightly_plan_revisions WHERE slot=$1'+(scope?' AND department_id=$2':'')+' ORDER BY revision DESC LIMIT 1',job.target,...(scope?[scope.department_id]:[])):null;
-        if(replacement&&replacement.job_id!==job.id)throw new AppError(409,'计划已被恢复修订替代','nightly_plan_expired');
+        if(replacement&&!sameScheduledIdentity(replacement.job_id,job.id))throw new AppError(409,'计划已被恢复修订替代','nightly_plan_expired');
         if(!(await store.get('SELECT $1::jsonb=$2::jsonb equal',JSON.stringify(current),JSON.stringify(captured.configuration))).equal||!transferWindow(await jobs.now(),current.transfer_schedule).due||transferWindow(await jobs.now(),current.transfer_schedule).key!==job.target)throw new AppError(409,'定时转移配置已变化，未保存旧计划','nightly_plan_expired');
       }
       await store.run('INSERT INTO harbor.routing_plans(id,created,expires,header,bytes'+(scope?',department_id':'')+') VALUES($1,$2,$3,$4::jsonb,$5'+(scope?',$6':'')+')',job.id,at,nightly?Math.min(at+ttlMs,window.until):at+ttlMs,encodedHeader,bytes,...(scope?[scope.department_id]:[]));

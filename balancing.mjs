@@ -1,4 +1,5 @@
-import {AppError,id,nextDailyReset,participatesNightly,usageWindow} from './store.mjs';
+import {AppError,id,participatesNightly,usageWindow} from './store.mjs';
+import {transferSchedule,transferWindow,nextTransferReset} from './transfer-schedule.mjs';
 import {planNightly} from './nightly-plan.mjs';
 import {accountPackageBudget,packageBudget,packageFingerprint} from './account-package-budget.mjs';
 import {quoteReference,referenceMetric} from './pricing.mjs';
@@ -49,11 +50,11 @@ export function automaticWeights(accounts,at,options={}){
   const weights=new Map(accounts.map(a=>[a.id,eligible.includes(a)?group.weights[a.id]:byId.get(a.id)?.mode==='excluded'?0:null]));
   return {eligible,weights,reason,packageEnabled:true,legacyCompatibility:false,strict:true,packages:assessment,snapshots:new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)])),basis:{at,formula:'converted_remaining_capacity / max(hours_to_reset, 24); min(converted_window_budgets)',package_policy:options.packagePolicy,accounts:assessment.items}};
 }
-export const nextWeightReset=nextDailyReset;
+export const nextWeightReset=(at,settings={nightly:true},schedule={})=>nextTransferReset(at,settings,schedule);
 const median=values=>{if(!values.length)return null;const sorted=[...values].sort((a,b)=>a-b),n=sorted.length;return n%2?sorted[(n-1)/2]:(sorted[n/2-1]+sorted[n/2])/2;};
 // Workload is a relative estimate, never a quota admission check.
-export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false,quoteUsage=row=>quoteReference(row)}){
-  const window=nightlyWindow(at),bySession=new Map(),latest=new Map();
+export function planBalance({accounts,sessions,requests,at,quietMinutes=30,preparing=new Set(),weighted=false,quoteUsage=row=>quoteReference(row),window=nightlyWindow(at),configuredWeights=null}){
+  const bySession=new Map(),latest=new Map();
   for(const r of requests){
     if(!r.session_id)continue;
     latest.set(r.session_id,Math.max(latest.get(r.session_id)||0,r.started,r.ended||r.started));
@@ -83,7 +84,7 @@ export function planBalance({accounts,sessions,requests,at,quietMinutes=30,prepa
     }
     workloads.push({...s,measuredAtoms,estimatedAtoms,unknown,running:rows.some(r=>['queued','running'].includes(r.status)),last:latest.get(s.id),afterBoundary:rows.some(r=>r.started>=window.end)});
   }
-  return planBalanceWorkloads({accounts,workloads,at,quietMinutes,preparing,weighted,priceRevisions:[...new Set(requests.map(r=>r.price_version).filter(Boolean))]});
+  return planBalanceWorkloads({accounts,workloads,at,quietMinutes,preparing,weighted,window,configuredWeights,priceRevisions:[...new Set(requests.map(r=>r.price_version).filter(Boolean))]});
 }
 
 // This is the existing quota comparison boundary; extra dispatch metadata
@@ -97,7 +98,7 @@ export function planningAccountGroup(account,{at,packagePolicy={enabled:false}}=
 // Both the legacy reader and PostgreSQL aggregates feed this unchanged policy.
 export function planBalanceWorkloads({accounts,workloads,at,quietMinutes=30,preparing=new Set(),weighted=false,packagePolicy={enabled:false},configuredWeights=null,priceRevisions=[],window=nightlyWindow(at),requestBoundary=false}){
   if(typeof requestBoundary!=='boolean')throw new AppError(503,'请求边界规划模式无效','planning_configuration');
-  if(configuredWeights?.mode==='manual'&&configuredWeights.expires>at)return {metric:referenceMetric,priceRevisions,window,moves:[],skipped:[{reason:'manual_weights_active',accounts:accounts.filter(a=>!isApi(a)).map(a=>a.id),version:configuredWeights.version,expires:configuredWeights.expires}],summaries:[]};
+  if(configuredWeights?.mode==='manual')return {metric:referenceMetric,priceRevisions,window,moves:[],skipped:[{reason:'manual_weights_active',accounts:accounts.filter(a=>!isApi(a)).map(a=>a.id),version:configuredWeights.version,expires:configuredWeights.expires}],summaries:[]};
   const eligible=accounts.filter(a=>available(a)&&!isApi(a)),snapshots=new Map(eligible.map(a=>[a.id,quotaSnapshot(a,at)]));
   const accountById=new Map(accounts.map(account=>[account.id,account])),active=new Map(),uncertainAccounts=new Set(),skipped=[];
   for(const s of workloads){
@@ -145,17 +146,17 @@ export function planBalanceWorkloads({accounts,workloads,at,quietMinutes=30,prep
 
 export function routingAutoState(accounts,at,previous=null,force=false,options={}){
   accounts=accounts.filter(a=>!isApi(a));
-  const cycle=nextWeightReset(at)-day;
+  const cycle=previous?.cycle??0;
   const snapshots=new Map(accounts.map(a=>[a.id,quotaSnapshot(a,at)])),assessment=packageBudget(accounts,{at,enabled:!!options.packagePolicy?.enabled,protocol:options.protocol,model:options.model}),identities=Object.fromEntries(assessment.items.map(row=>[row.id,packageFingerprint({identity:row.identity,available:available(accounts.find(account=>account.id===row.id))})])),scope=packageFingerprint({policy:{enabled:!!options.packagePolicy?.enabled,version:options.packagePolicy?.enabled?options.packagePolicy.version??0:0,smoothing_hours:24},compatibility:assessment.items.map(row=>[row.id,row.reason==='package_scope_mismatch'?'incompatible':'compatible'])}),identityChanged=!previous||previous.scope!==scope||JSON.stringify(previous.identities)!==JSON.stringify(identities);
   const assessed=new Map(assessment.items.map(item=>[item.id,item])),states=Object.fromEntries(accounts.map(a=>{const item=assessed.get(a.id),capacity=options.packagePolicy?.enabled&&item.mode!=='legacy';return [a.id,a.route_block==='quota_exhausted'||item.exhausted?0:capacity?item.eligible?1:previous?.states[a.id]??null:snapshots.get(a.id)?snapshots.get(a.id).remaining>0?1:0:previous?.states[a.id]??null];}));
-  const changed=!previous||previous.cycle!==cycle||identityChanged||accounts.some(a=>states[a.id]!==null&&states[a.id]!==previous.states[a.id]);
+  const changed=!previous||identityChanged||accounts.some(a=>states[a.id]!==null&&states[a.id]!==previous.states[a.id]);
   const calculated=force||changed||previous?.pending?automaticWeights(accounts.map(a=>states[a.id]===0?{...a,route_block:'quota_exhausted'}:a),at,options):null;
   let saved=previous,audit=null;
   if(force||changed||previous?.pending&&!calculated.reason){
     // A failed refresh cannot erase the last known allocation or resurrect an exhausted account.
     const retain=calculated.reason&&previous&&!identityChanged&&Object.values(previous.weights).every(Number.isFinite)&&Object.values(previous.weights).some(weight=>weight>0);
     const weights=retain?Object.fromEntries(accounts.map(a=>[a.id,states[a.id]===0?0:previous.weights[a.id]??0])):Object.fromEntries(calculated.weights);
-    const trigger=force||(!previous?'initialize':previous.cycle!==cycle?'nightly':'quota');
+    const trigger=force||(!previous?'initialize':'quota');
     saved={cycle,states,identities,scope,weights,reason:calculated.reason,pending:!!calculated.reason,basis:retain?previous.basis??null:calculated.basis,updated:at,trigger};
     audit={cycle,reason:trigger,weights,previous:previous?.weights??null,basis:saved.basis,retained:!!retain};
   }
@@ -164,7 +165,7 @@ export function routingAutoState(accounts,at,previous=null,force=false,options={
 }
 
 export function routingDistribution(accounts,{at,weighted,system,configured}){
-  const subscriptions=accounts.filter(a=>!isApi(a)),active=configured.mode==='manual'&&configured.expires>at;
+  const subscriptions=accounts.filter(a=>!isApi(a)),active=configured.mode==='manual';
   const subscriptionMode=!weighted?'legacy':active?'manual':system.strict?'capacity':system.eligible.some(a=>system.weights.get(a.id)===null)?'fallback':'auto';
   const subEligible=subscriptionMode==='manual'?subscriptions.filter(a=>available(a)&&!system.packages?.items.some(item=>item.id===a.id&&item.reason==='package_scope_mismatch')):subscriptionMode==='legacy'&&!system.packageEnabled?subscriptions.filter(available):system.eligible;
   const desired=a=>['legacy','fallback'].includes(subscriptionMode)?1:subscriptionMode==='manual'?configured.weights[a.id]||0:system.weights.get(a.id)||0;
@@ -192,7 +193,7 @@ export function routingAllocation(state,previous={}){
 export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>null,clock=Date.now,stopping=()=>false}){
   let running=null;
   const settings=()=>balanceSettings({...readSetting('balancing',{}),weighted:readSetting('routing_strategy',{weighted:false}).weighted});
-  const saveSettings=value=>{balanceSettings(value);return atomic(()=>{const next=balanceSettings({...settings(),...value}),{weighted,...legacy}=next;writeSetting('balancing',legacy);writeSetting('routing_strategy',{weighted});store.audit('balancing.settings',JSON.stringify(next));return next;});};
+  const saveSettings=value=>{balanceSettings(value);return atomic(()=>{const previous=settings(),next=balanceSettings({...previous,...value}),{weighted,...legacy}=next;if(next.nightly!==previous.nightly){const schedule=transferSchedule({...readSetting('transfer_schedule',{}),version:transferSchedule(readSetting('transfer_schedule',{})).version+1,effective:clock()});writeSetting('transfer_schedule',schedule);rebaseTemporary(next,schedule);}writeSetting('balancing',legacy);writeSetting('routing_strategy',{weighted});store.audit('balancing.settings',JSON.stringify(next));return next;});};
   const readSetting=(name,fallback)=>JSON.parse(store.get('SELECT value FROM gateway_settings WHERE name=?',name)?.value||JSON.stringify(fallback));
   const writeSetting=(name,value)=>store.run('INSERT INTO gateway_settings(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',name,JSON.stringify(value));
   const manual=()=>readSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:0});
@@ -203,16 +204,10 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     return system;
   }
   const previousSettings=readSetting('balancing',{});
-  // Older manual routes had no deadline. Recover only human actions, not automatic moves.
-  const legacy=store.all("SELECT s.id,s.created FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.nightly_enabled=0 AND s.nightly_expires IS NULL AND a.auth_mode='subscription'");
-  if(legacy.length)atomic(()=>{
-    const actions=new Map();
-    for(const row of store.all("SELECT at,action,detail FROM audit WHERE action IN ('session.route','session.nightly') ORDER BY at")){
-      let detail;try{detail=JSON.parse(row.detail);}catch{continue;}
-      if(row.action==='session.route'&&!detail.reason||row.action==='session.nightly'&&detail.enabled===false){const sid=detail.session||detail.sessionId;actions.set(sid,Math.max(actions.get(sid)||0,row.at));}
-    }
-    for(const s of legacy){const expires=nextDailyReset(actions.get(s.id)??s.created);store.run('UPDATE sessions SET nightly_expires=? WHERE id=?',expires,s.id);store.audit('session.nightly.deadline',JSON.stringify({session:s.id,expires}));}
-  });
+  const transferConfig=()=>transferSchedule(readSetting('transfer_schedule',{}));
+  const nextReset=()=>nextTransferReset(clock(),settings(),transferConfig());
+  function rebaseTemporary(config,schedule){const expires=nextTransferReset(clock(),config,schedule),current=manual();if(current.mode==='manual')writeSetting('routing_weights',{...current,expires,version:current.version+1});store.run("UPDATE sessions SET nightly_expires=? WHERE nightly_enabled=0 AND account_id IN (SELECT id FROM accounts WHERE auth_mode='subscription')",expires);}
+  function saveTransferSchedule(value){if(!value||Object.keys(value).some(k=>!['times','expected_version'].includes(k))||!Array.isArray(value.times))throw new AppError(400,'定时转移设置无效','transfer_schedule_invalid');return atomic(()=>{const previous=transferConfig();if(value.expected_version!==previous.version)throw new AppError(409,'定时转移配置已变化','transfer_schedule_conflict');const next=transferSchedule({times:value.times,version:previous.version+1,effective:clock()});writeSetting('transfer_schedule',next);rebaseTemporary(settings(),next);store.audit('balancing.transfer_schedule',JSON.stringify({...next,previous}));return next;});}
   if(Object.hasOwn(previousSettings,'weighted'))atomic(()=>{const {weighted,...legacy}=previousSettings;if(!store.get("SELECT name FROM gateway_settings WHERE name='routing_strategy'"))writeSetting('routing_strategy',{weighted});writeSetting('balancing',legacy);});
   function saveWeights(value){
     if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!['mode','weights','expected_version'].includes(k))||!['auto','manual'].includes(value.mode)||!Number.isSafeInteger(value.expected_version))throw new AppError(400,'权重设置无效');
@@ -224,7 +219,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
         const ids=new Set(store.all("SELECT id FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND removed_at IS NULL").map(a=>a.id));
         if(!weights||typeof weights!=='object'||Array.isArray(weights)||!Object.keys(weights).length||Object.entries(weights).some(([key,v])=>!ids.has(key)||!Number.isFinite(v)||v<0||v>100||Math.abs(v*100-Math.round(v*100))>1e-8)||Math.abs(Object.values(weights).reduce((n,v)=>n+v,0)-100)>1e-8)throw new AppError(400,'请填写有效账号权重，最多两位小数且总和必须为100%');
       }else if(value.weights!==undefined)throw new AppError(400,'自动模式无需填写权重');
-      const next={mode:value.mode,weights,expires:value.mode==='manual'?nextWeightReset(clock()):null,version:current.version+1};
+      const next={mode:value.mode,weights,expires:value.mode==='manual'?nextReset():null,version:current.version+1};
       writeSetting('routing_weights',next);if(value.mode==='auto')syncWeights(undefined,clock(),'manual');store.audit('balancing.weights',JSON.stringify({...next,previous:current}));return next;
     });
   }
@@ -253,7 +248,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
         try{target=account.kind==='codex'?selectAccount({protocol:session.protocol}):store.get("SELECT a.* FROM accounts a WHERE a.kind=? AND a.enabled=1 AND a.removed_at IS NULL AND a.state IN ('ready','degraded') ORDER BY (SELECT COUNT(*) FROM sessions s WHERE s.account_id=a.id),a.last_used,a.id LIMIT 1",account.kind);}
         catch(e){if(e.code!=='no_account')throw e;throw new AppError(409,'没有可接收会话的同类型正权重账号，未停用或迁移任何会话','disable_no_target');}
         if(!target)throw new AppError(409,'没有可接收会话的同类型账号，未停用或迁移任何会话','disable_no_target');
-        const legacy=session.protocol!=='responses',expires=isApi(account)&&!isApi(target)&&!session.nightly_enabled&&session.nightly_expires===null?nextWeightReset(clock()):session.nightly_expires;
+        const legacy=session.protocol!=='responses',expires=isApi(account)&&!isApi(target)&&!session.nightly_enabled&&session.nightly_expires===null?nextReset():session.nightly_expires;
         store.run(`UPDATE sessions SET account_id=?,upstream_thread=?,route_version=route_version+1,nightly_expires=?,updated=?${legacy?",upstream_id=NULL,state='new',message_count=0,history_digest='',cum_input=0,cum_output=0,cum_cached=0":''} WHERE id=?`,target.id,id(),expires,clock(),session.id);
         store.audit('session.route',JSON.stringify({sessionId:session.id,from:accountId,to:target.id,reason:'account_disabled',version:session.route_version+1}));
         moved.push(session.id);
@@ -276,7 +271,7 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     if(!account)throw new AppError(503,'没有可用的目标账号','no_account');
     if(current.account_id===target)return current;
     return atomic(()=>{
-      const source=store.get('SELECT auth_mode FROM accounts WHERE id=?',current.account_id),expires=isApi(source)&&!isApi(account)&&!current.nightly_enabled&&current.nightly_expires===null?nextWeightReset(clock()):current.nightly_expires;
+      const source=store.get('SELECT auth_mode FROM accounts WHERE id=?',current.account_id),expires=isApi(source)&&!isApi(account)&&!current.nightly_enabled&&current.nightly_expires===null?nextReset():current.nightly_expires;
       store.run('UPDATE sessions SET account_id=?,upstream_thread=?,route_version=route_version+1,nightly_expires=? WHERE id=?',target,id(),expires,current.id);
       store.audit('session.route',JSON.stringify({session:current.id,from:current.account_id,to:target,reason}));return store.get('SELECT * FROM sessions WHERE id=?',current.id);
     });
@@ -314,28 +309,27 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     return atomic(()=>move(session,selectAccount({protocol}).id,blocked?account.route_block:'weight_zero'));
   }
   async function plan(at,preview=false){
+    const schedule=transferConfig();
     const accounts=store.all("SELECT * FROM accounts WHERE kind='codex' AND auth_mode='subscription' AND enabled=1 AND removed_at IS NULL");
     const refreshed=await Promise.all(accounts.map(a=>Promise.resolve().then(()=>preview?readQuota(a):refreshQuota(a,true)).catch(()=>null)));
     const freshById=new Map(accounts.map((a,index)=>{const current=store.get('SELECT quota_json,route_epoch FROM accounts WHERE id=?',a.id);return [a.id,{snapshot:refreshed[index],epoch:!preview&&refreshed[index]&&current.quota_json===JSON.stringify(refreshed[index])?current.route_epoch:a.route_epoch}];}));
     if(stopping())throw new AppError(503,'服务正在停止');
+    if(!preview&&(!settings().nightly||JSON.stringify(schedule)!==JSON.stringify(transferConfig())||transferWindow(clock(),schedule).key!==transferWindow(at,schedule).key))throw new AppError(409,'定时调整配置已变化','nightly_plan_changed');
     const planningAccounts=store.all('SELECT * FROM accounts').map(a=>({...a,quota_json:freshById.get(a.id)?.epoch===a.route_epoch&&freshById.get(a.id)?.snapshot?JSON.stringify(freshById.get(a.id).snapshot):null}));
     if(!preview&&settings().weighted)syncWeights(planningAccounts,clock(),'nightly');
-    return planBalance({accounts:planningAccounts,sessions:store.all('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id'),requests:store.all("SELECT * FROM requests WHERE COALESCE(ended,started)>=? OR status IN ('queued','running')",nightlyWindow(at).start),at:clock(),quietMinutes:settings().quietMinutes,weighted:settings().weighted,preparing,quoteUsage:(r,revision)=>store.pricing.quoteAt(r,revision)});
+    return planBalance({accounts:planningAccounts,sessions:store.all('SELECT s.*,m.enabled member_enabled,m.removed_at member_removed FROM sessions s JOIN members m ON m.id=s.member_id'),requests:store.all("SELECT * FROM requests WHERE COALESCE(ended,started)>=? OR status IN ('queued','running')",transferWindow(at,transferConfig()).start),at:clock(),quietMinutes:settings().quietMinutes,weighted:settings().weighted,preparing,window:transferWindow(at,transferConfig()),configuredWeights:manual(),quoteUsage:(r,revision)=>store.pricing.quoteAt(r,revision)});
   }
   async function tick(){
-    const at=clock(),window=nightlyWindow(at);
-    if(stopping())return;
-    atomic(()=>{
-      for(const s of store.all('SELECT id,nightly_expires FROM sessions WHERE nightly_enabled=0 AND nightly_expires<=?',at)){
-        store.run('UPDATE sessions SET nightly_enabled=1,nightly_expires=NULL WHERE id=?',s.id);
-        store.audit('session.nightly.expired',JSON.stringify({session:s.id,expires:s.nightly_expires}));
-      }
-    });
-    const configured=manual();if(configured.mode==='manual'&&configured.expires<=at){writeSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:configured.version+1});store.audit('balancing.weights.expired',String(configured.expires));}
-    if(settings().weighted&&(!settings().nightly||!window.due))syncWeights();
+    const at=clock(),window=transferWindow(at,transferConfig());
     if(stopping()||running||!settings().nightly||!window.due)return;
     const claim=store.run("INSERT OR IGNORE INTO balance_runs(day,started,status) VALUES(?,?,'running')",window.key,at);
     if(!claim.changes)return;
+    atomic(()=>{
+      for(const s of store.all("SELECT id,nightly_expires FROM sessions WHERE nightly_enabled=0 AND (nightly_expires IS NULL OR nightly_expires<=?) AND account_id IN (SELECT id FROM accounts WHERE auth_mode='subscription')",window.end)){
+        store.run('UPDATE sessions SET nightly_enabled=1,nightly_expires=NULL WHERE id=?',s.id);store.audit('session.nightly.expired',JSON.stringify({session:s.id,expires:s.nightly_expires}));
+      }
+      const configured=manual();if(configured.mode==='manual'&&(configured.expires===null||configured.expires<=window.end)){writeSetting('routing_weights',{mode:'auto',weights:{},expires:null,version:configured.version+1});store.audit('balancing.weights.expired',String(configured.expires));}
+    });
     running=(async()=>{
       try{
         const result=await plan(at),applied=[];
@@ -365,5 +359,5 @@ export function createBalancer({store,preparing,refreshQuota,readQuota=async()=>
     })().finally(()=>{running=null;});
     return running;
   }
-  return {settings,saveSettings,saveWeights,selectAccount,disableAccount,explain,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs WHERE started>=? AND started<? ORDER BY day DESC LIMIT 1',usageWindow(clock()).start,usageWindow(clock()).end)||null};}};
+  return {settings,saveSettings,saveTransferSchedule,nextReset,saveWeights,selectAccount,disableAccount,explain,atomic,distribution,syncWeights,move,block,recover,route,tick,preview:()=>plan(clock(),true),pending:()=>running,status:()=>{const state=distribution();return {settings:settings(),transfers:{...transferConfig(),next:nextReset()},weights:{mode:state.mode,reason:state.reason,configuration:state.configuration,accounts:state.accounts},lastRun:store.get('SELECT * FROM balance_runs WHERE started>=? AND started<? ORDER BY day DESC LIMIT 1',usageWindow(clock()).start,usageWindow(clock()).end)||null};}};
 }

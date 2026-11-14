@@ -7,7 +7,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { Store, AppError, id, now, hash, usageWindow, nextDailyReset, modelAllowlist } from './store.mjs';
+import { Store, AppError, id, now, hash, usageWindow, modelAllowlist } from './store.mjs';
 import { runCodex, checkLogin, runnerEnv, codexAuthArgs } from './codex.mjs';
 import {readRateLimits,normalizeLimits,accountCapacity} from './rates.mjs';
 import {retainCodexQuotaDenials,codexQuotaDenials} from './codex-entitlements.mjs';
@@ -316,6 +316,7 @@ export function createGateway(options={}) {
         if(path==='/api/admin/pricing'&&method==='GET')return json(res,200,store.pricing.status());
         if(path==='/api/admin/pricing'&&method==='PATCH')return json(res,200,store.pricing.configure(await body(req)));
         if(path==='/api/admin/pricing/refresh'&&method==='POST')return json(res,200,await store.pricing.refresh({force:true}));
+        if(path==='/api/admin/balancing/schedule'&&method==='PATCH')return json(res,200,balancer.saveTransferSchedule(await body(req)));
         if(path==='/api/admin/balancing/weights'&&method==='PATCH')return json(res,200,balancer.saveWeights(await body(req)));
         if(path==='/api/admin/balancing/preview'&&method==='POST'){
           const result=await balancer.preview();
@@ -337,7 +338,7 @@ export function createGateway(options={}) {
           if(!session||session.member_removed)throw new AppError(404,'会话不存在');
           const enabled=b.enabled===undefined?session.enabled:bool(b.enabled);
           let nightly=b.nightly_enabled===undefined?(b.account_id!==undefined?0:session.nightly_enabled):bool(b.nightly_enabled);
-          let nightlyExpires=nightly?null:(b.account_id!==undefined||b.nightly_enabled!==undefined?nextDailyReset((options.clock||Date.now)()):session.nightly_expires);
+          let nightlyExpires=nightly?null:(b.account_id!==undefined||b.nightly_enabled!==undefined?balancer.nextReset():session.nightly_expires);
           let accountId=session.account_id,upstreamThread=session.upstream_thread,version=session.route_version;
           if(b.account_id!==undefined){
             if(session.protocol!=='responses')throw new AppError(409,'旧 CLI Session 的上下文保存在原账号目录，暂不支持切换绑定账号','session_route_unsupported');

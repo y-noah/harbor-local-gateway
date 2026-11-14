@@ -28,8 +28,11 @@ test('预览完整写入部门计划，跨部门及缺失scope不能查看',inte
 });
 test('同日周期恢复按部门入队，恢复权重只改本部门',integration,async t=>{
  const f=await fixture(t),router=createPostgresRouter(f.store,{clock:f.clock}),maintenance=createPostgresRoutingMaintenance(f.store,{jobs:f.jobs,router});
- for(const department of [f.a,f.b])await f.store.run("UPDATE harbor.department_settings SET value=$1::jsonb WHERE department_id=$2 AND name='routing_weights'",JSON.stringify({mode:'manual',weights:{},expires:f.clock()-1,version:1}),department.id);
+ for(const department of [f.a,f.b])await f.store.run("UPDATE harbor.department_settings SET value=$1::jsonb WHERE department_id=$2 AND name='routing_weights'",JSON.stringify({mode:'manual',weights:{},expires:f.clock()-3600000,version:1}),department.id);
  const scope=f.issuer.system({purpose:'routing.expiry',departmentId:f.a.id}),other=f.issuer.system({purpose:'routing.expiry',departmentId:f.b.id});
+ assert.equal(await maintenance.schedule({scope}),null);assert.equal(await maintenance.schedule({scope:other}),null);
+ await f.store.run("UPDATE harbor.department_settings SET value=$1::jsonb WHERE department_id=$2 AND name='balancing'",JSON.stringify({nightly:true}),f.a.id);assert.equal(await maintenance.schedule({scope:other}),null,'other disabled department stays disabled');
+ await f.store.run("UPDATE harbor.department_settings SET value=$1::jsonb WHERE department_id=$2 AND name='balancing'",JSON.stringify({nightly:true}),f.b.id);
  const a=await maintenance.schedule({scope}),b=await maintenance.schedule({scope:other});assert.notEqual(a.id,b.id);
  const job=await f.jobs.claim(['routing.expiry']);await maintenance.handlers[job.kind](job);
  const values=await f.store.all("SELECT department_id,value FROM harbor.department_settings WHERE name='routing_weights' AND department_id=ANY($1::text[])",[f.a.id,f.b.id]);

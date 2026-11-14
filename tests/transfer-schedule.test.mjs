@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {transferSchedule,transferWindow,defaultTransferTimes} from '../transfer-schedule.mjs';
+import {transferSchedule,transferWindow,nextTransferReset,defaultTransferTimes} from '../transfer-schedule.mjs';
 
 const at=value=>Date.parse('2026-11-03T'+value+'+08:00');
 test('transfer schedule defaults to five actual Beijing slots and keeps the 02:00 historical identity',()=>{
@@ -34,4 +34,12 @@ test('custom slots have stable identities even on either side of 02:00 and calen
 test('invalid or ambiguous transfer settings fail explicitly rather than changing the schedule',()=>{
   for(const value of [null,[],{times:[]},{times:null},{times:['2:00']},{times:['24:00']},{times:['02:60']},{times:['02:00',0]},{timezone:'UTC'},{version:-1},{effective:-1},{cron:'*'}])assert.throws(()=>transferSchedule(value),{code:'transfer_schedule_invalid'});
   for(const value of [NaN,-1,1.5])assert.throws(()=>transferWindow(value),{code:'transfer_schedule_invalid'});
+});
+
+test('temporary reset follows configured future slots only while enabled',()=>{
+ const at=Date.parse('2026-11-03T01:59:00+08:00'),schedule={times:['10:00','16:00']};
+ assert.equal(nextTransferReset(at,{nightly:false},schedule),null);
+ assert.equal(nextTransferReset(at,{nightly:true},schedule),Date.parse('2026-11-03T10:00:00+08:00'));
+ const boundary=Date.parse('2026-11-03T10:00:00+08:00');assert.equal(nextTransferReset(boundary,{nightly:true},schedule),Date.parse('2026-11-03T16:00:00+08:00'));
+ assert.equal(nextTransferReset(at,{nightly:true},{times:['02:00']}),Date.parse('2026-11-03T02:00:00+08:00'));
 });

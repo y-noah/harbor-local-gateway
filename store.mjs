@@ -23,12 +23,7 @@ export const token = () => 'hg_' + randomBytes(30).toString('base64url');
 export const id = () => randomUUID();
 export const now = () => Date.now();
 export const requestPhases=new Set(['queued','credentials','upstream','streaming','cli','settling','ok','failed','unknown','interrupted','cancelled','rejected']);
-export function nextDailyReset(at) {
-  const day=86400000,offset=8*3600000;
-  const end=Math.floor((at+offset)/day)*day-offset+2*3600000;
-  return end>at?end:end+day;
-}
-export const participatesNightly=(s,at)=>!!s.nightly_enabled||(Number.isFinite(s.nightly_expires)&&s.nightly_expires<=at);
+export const participatesNightly=s=>!!s.nightly_enabled;
 export class AppError extends Error {
   constructor(status, message, code = 'invalid_request') { super(message); this.status = status; this.code = code; }
 }

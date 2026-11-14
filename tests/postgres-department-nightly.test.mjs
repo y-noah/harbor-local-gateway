@@ -1,3 +1,7 @@
+import {createPostgresPlanningJobs as createPriorPlanning} from './fixtures/prior-daily-planning.mjs';
+import {createPostgresNightlyRevisions as createPriorRevisions} from './fixtures/prior-daily-revisions.mjs';
+import {transferWindow} from '../transfer-schedule.mjs';
+import {scheduledRecoveryId} from '../scheduled-task-identity.mjs';
 import {createPostgresNightlyRevisions} from '../postgres-nightly-revisions.mjs';
 import {createPostgresNightly} from '../postgres-nightly.mjs';
 import {createSessionRequestHandoff} from '../session-request-handoff.mjs';
@@ -109,4 +113,54 @@ for(const completedGroup of [false,true])test('现代部门停用恢复'+(comple
  const f=await fixture(t),r=await runtime(t,f),{planning,scope}=await prepare(f,f.a);await r.nightly.runOnce();const job=await f.jobs.claim(['routing.nightly']),result=await planning.handlers[job.kind](job);await f.jobs.complete(job,result);const plan=await f.store.get('SELECT p.*,j.target FROM harbor.routing_plans p JOIN harbor.background_jobs j ON j.id=p.id WHERE p.id=$1',result.plan_id),revisions=createPostgresNightlyRevisions(f.store,{clock:f.clock,departmentActors:f.departments});await revisions.ensure(plan,{scope});
  if(completedGroup){await f.store.run("INSERT INTO harbor.routing_plan_items(plan_id,section,ordinal,payload,bytes) VALUES($1,'groups',1,'{}',2)",plan.id);await f.store.run("INSERT INTO harbor.automatic_handoff_groups(id,plan_id,slot,group_ordinal,requested,expires,status,finished,department_id) VALUES($1,$2,$3,1,$4,$5,'completed',$4,$6)",randomUUID(),plan.id,plan.target,f.clock(),f.clock()+60000,f.a.id);}
  await f.departments.updateDepartment(f.superAdmin,f.a.id,{enabled:false,expected_version:0});await r.nightly.recover();assert.equal((await f.store.get('SELECT status FROM harbor.nightly_plan_applications WHERE plan_id=$1',plan.id)).status,'interrupted');assert.equal((await f.store.get('SELECT status FROM harbor.balance_runs WHERE plan_id=$1',plan.id)).status,'interrupted');await r.nightly.runOnce();assert.equal(r.nightly.status().lastError,null);
+});
+
+for(const install of [false,true])for(const revised of [false,true])test('旧基线10点任务升级恢复：部门 '+install+' 已有修订 '+revised,integration,async t=>{
+ const f=await fixture(t,{install});f.advance(8*3600000);const department=install?f.a:null,scope=department?f.issuer.system({purpose:'routing.nightly',departmentId:department.id}):undefined,expiryScope=department?f.issuer.system({purpose:'routing.expiry',departmentId:department.id}):undefined,input={scope,expiryScope},slot=transferWindow(f.clock());
+ const setting=async(name,value)=>{if(department)await f.store.run('UPDATE harbor.department_settings SET value=$1::jsonb WHERE department_id=$2 AND name=$3',JSON.stringify(value),department.id,name);else await f.store.run('INSERT INTO harbor.gateway_settings(name,value) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value',name,JSON.stringify(value));};
+ await setting('balancing',{nightly:true});await setting('request_handoff_policy',{mode:revised?'request-boundary':'quiet',version:1});
+ const prior=createPriorPlanning(f.store,{jobs:f.jobs,clock:f.clock}),old=await prior.schedule(input);let oldExpiry=await f.jobs.claim(['routing.expiry']);assert.equal(oldExpiry.payload.boundary,slot.end-8*3600000);await f.jobs.complete(oldExpiry,{sessionsRestored:0,weightsExpired:false});
+ await f.store.run('INSERT INTO harbor.nightly_cycle_ready(day,at'+(department?',department_id':'')+') VALUES($1,$2'+(department?',$3':'')+')',slot.key,f.clock(),...(department?[department.id]:[]));
+ if(revised){
+  const job=await f.jobs.claim(['routing.nightly']),result=await prior.handlers[job.kind](job);await f.jobs.complete(job,result);
+  const parent={...await f.store.get('SELECT * FROM harbor.routing_plans WHERE id=$1',job.id),target:slot.key},oldRevisions=createPriorRevisions(f.store,{clock:f.clock,departmentActors:f.departments});await oldRevisions.ensure(parent,{scope});await oldRevisions.request(parent,'gateway_restart',{scope});await prior.schedule(input);
+ }
+ const pending=await f.store.get("SELECT * FROM harbor.background_jobs WHERE kind='routing.nightly' AND status='pending' ORDER BY id DESC LIMIT 1"),oldRevision=await f.store.all('SELECT * FROM harbor.nightly_plan_revisions ORDER BY revision');assert.ok(pending);assert.equal(pending.dependency_id,oldExpiry.id);
+ const planner=createPostgresPlanningJobs(f.store,{jobs:f.jobs,clock:f.clock}),maintenance=createPostgresRoutingMaintenance(f.store,{jobs:f.jobs,router:createPostgresRouter(f.store,{clock:f.clock})}),replacement=await planner.schedule(input);assert.equal(replacement.id,scheduledRecoveryId(pending.id));assert.equal((await planner.schedule(input)).id,replacement.id);
+ const preserved=await f.store.get('SELECT * FROM harbor.background_jobs WHERE id=$1',pending.id);assert.equal(preserved.status,'cancelled');assert.equal(preserved.result,null);assert.equal(preserved.dependency_id,pending.dependency_id);assert.deepEqual(preserved.payload,pending.payload);assert.deepEqual(await f.store.all('SELECT * FROM harbor.nightly_plan_revisions ORDER BY revision'),oldRevision);
+ assert.equal(await f.jobs.claim(['routing.nightly']),null,'old 02 completion must not release the replacement');const expiry=await f.jobs.claim(['routing.expiry']);assert.equal(expiry.payload.boundary,slot.end);await f.jobs.complete(expiry,await maintenance.handlers[expiry.kind](expiry));
+ const job=await f.jobs.claim(['routing.nightly']);assert.equal(job.id,replacement.id);const result=await planner.handlers[job.kind](job);await f.jobs.complete(job,result);const r=await runtime(t,f,{modern:revised});await r.nightly.apply(job.id);
+ const run=await f.store.get('SELECT plan_id,status FROM harbor.balance_runs WHERE day=$1'+(department?' AND department_id=$2':''),slot.key,...(department?[department.id]:[]));assert.equal(run.plan_id,job.id);assert.equal(run.status,'completed');
+ assert.equal((await planner.schedule(input)).id,job.id);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.routing_plans')).n,revised?2:1,'completed effects are not recreated');
+ if(revised){const revisions=createPostgresNightlyRevisions(f.store,{clock:f.clock,departmentActors:f.departments}),summary=await revisions.summary(slot.key,{scope});assert.equal(summary.revisions.at(-1).revision,1);assert.equal(summary.revisions.at(-1).plan_id,job.id);}
+});
+
+test('部门调度保存与人工交接双连接交错遵循同一锁序',integration,async t=>{
+ const f=await fixture(t),a=await workload(f,f.a),sessionId=a.sessions[0],gate=createSessionRequestHandoff();
+ const handoffs=createPostgresSessionHandoffs(f.store,{gate,clock:f.clock,departmentActors:f.departments,validateTarget:async()=>true});
+ const ticket=gate.arrive(a.member);await ticket.bind(sessionId);
+ await f.store.run("UPDATE harbor.department_settings SET value=$1::jsonb WHERE department_id=$2 AND name='balancing'",JSON.stringify({nightly:true}),f.a.id);
+ await f.store.run('UPDATE harbor.sessions SET nightly_enabled=0,nightly_expires=$1 WHERE id=$2',f.clock()+3600000,sessionId);
+ const accepted=await handoffs.handle('/api/admin/sessions/'+sessionId+'/handoffs','POST',{account_id:a.accounts[1],expected_route_version:0},{scope:f.scopeA});
+ assert.equal(accepted.status,202);
+ const query=f.store.query.bind(f.store);let rebaseHeld=false,configPid,handoffPid,release;
+ const barrier=new Promise(resolve=>{release=resolve;});let saving;
+ f.store.query=async(sql,args=[])=>{
+  const pid=f.store.context.getStore()?.client.processID;
+  if(sql.startsWith('UPDATE harbor.session_handoffs h SET source_nightly_expires=')){configPid=pid;rebaseHeld=true;await barrier;}
+  if(rebaseHeld&&sql.includes("pg_advisory_xact_lock(hashtextextended('harbor-routing-state'"))handoffPid=pid;
+  return query(sql,args);
+ };
+ try{
+  saving=createPostgresRouter(f.store,{clock:f.clock}).saveSettings({nightly:false},{scope:f.scopeA});saving.catch(()=>{});
+  await waitFor(()=>rebaseHeld);ticket.close();await waitFor(()=>!!handoffPid);
+  assert.notEqual(configPid,handoffPid,'configuration and handoff must own distinct real PG connections');
+  await waitFor(async()=>!!await f.store.get("SELECT pid FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock'",handoffPid));
+  release();await saving;
+  await waitFor(async()=> (await f.store.get('SELECT status FROM harbor.session_handoffs WHERE id=$1',accepted.value.handoff_id)).status!=='waiting');
+  const decision=await f.store.get('SELECT status,reason,source_nightly_expires,pin_expires FROM harbor.session_handoffs WHERE id=$1',accepted.value.handoff_id);
+  assert.deepEqual(decision,{status:'completed',reason:null,source_nightly_expires:null,pin_expires:null});
+  assert.deepEqual(await f.store.get('SELECT account_id,route_version,nightly_expires FROM harbor.sessions WHERE id=$1',sessionId),{account_id:a.accounts[1],route_version:1,nightly_expires:null});
+  assert.equal(handoffs.status().lastError,null);
+ }finally{release();ticket.close();await saving?.catch(()=>{});await handoffs.close();f.store.query=query;}
 });

@@ -1,7 +1,7 @@
 """Single Harbor instance adapter, prepared offline. No import-time operations.
 No credentials, arbitrary paths/images, activation creation or global Docker edits.
 """
-import contextlib,copy,fcntl,hashlib,http.client,importlib.machinery,importlib.util,json,os,re,socket,signal,stat,subprocess,sys,time,uuid
+import contextlib,copy,ctypes,fcntl,hashlib,http.client,importlib.machinery,importlib.util,json,os,re,socket,signal,stat,subprocess,sys,time,uuid
 from urllib.parse import urlsplit,parse_qs
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +9,9 @@ CORE=Path(__file__).with_name('harbor-pg-storage-coordinator.py')
 ROOT=Path('/sdc-disk/harbor-data');PLAN=ROOT/'.pg-storage-plan.json';STATE=ROOT/'.pg-storage-state.json';PROOF=ROOT/'.pg-storage-archive-proof.json'
 PG='harbor-local-gateway-postgres-infra';GW='harbor-local-gateway';WORKER=GW+'-worker'
 DEPLOY=Path('/usr/local/bin/harbor-gateway-deploy');ENTRY=Path('/usr/local/lib/harbor/gateway-entry-controller.py');UPGRADE=Path('/usr/local/lib/harbor/postgres-upgrade-deploy.py');COMPOSE=Path('/usr/local/lib/harbor/postgres-deploy.py')
+ARCHIVE_COPY_LOCK=Path('/run/harbor-pg-archive-copy.lock')
 RUNTIME=Path('/usr/local/lib/harbor/entry-runtime.py')
+MATERIAL=Path('/usr/local/lib/harbor/harbor-material-storage.py')
 _EMIT_PROGRESS=False
 BACKUP=['/opt/harbor-storage-tools/node/bin/node','/opt/harbor-storage-tools/app/storage-backup.mjs']
 
@@ -31,6 +33,16 @@ def save(path,value):
  os.replace(temporary,path);fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
  try:os.fsync(fd)
  finally:os.close(fd)
+
+def rename_noreplace(source,target):
+ # Linux same-filesystem atomic publication must never replace a foreign root,
+ # including an empty directory appearing after the preflight stat.
+ libc=ctypes.CDLL(None,use_errno=True);rename=getattr(libc,'renameat2',None)
+ need(rename is not None,'host_archive_adopt_atomic_rename_unavailable')
+ rename.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint];rename.restype=ctypes.c_int
+ if rename(-100,os.fsencode(source),-100,os.fsencode(target),1)!=0:
+  code=ctypes.get_errno();raise OSError(code,os.strerror(code))
+
 
 def load(path,name):
  for p in [path,*path.parents]:
@@ -76,7 +88,7 @@ class Host:
   need(p.get('tlsVerifyFull') is True and re.fullmatch('[0-9]{1,20}',p.get('systemId','')),'host_database_identity_missing')
   need(set(p.get('containers',{}))=={PG,GW,WORKER} and all(re.fullmatch('[a-f0-9]{64}',v.get('id','')) and re.fullmatch('[a-f0-9]{64}',v.get('signature','')) for v in p['containers'].values()),'host_inventory_missing')
   self.core=load(CORE,'harbor_pg_storage_core')
-  expected={str(v) for v in [CORE,Path(__file__),DEPLOY,ENTRY,UPGRADE,COMPOSE,RUNTIME]};need(set(p.get('toolSha256',{}))==expected,'host_tool_inventory_missing')
+  expected={str(v) for v in [CORE,Path(__file__),DEPLOY,ENTRY,UPGRADE,COMPOSE,RUNTIME,MATERIAL]};need(set(p.get('toolSha256',{}))==expected,'host_tool_inventory_missing')
   for name,digest in p['toolSha256'].items():need(re.fullmatch('[a-f0-9]{64}',digest) and sha(Path(name).read_bytes())==digest,'host_tool_changed')
   self.wrapper=load(DEPLOY,'harbor_storage_wrapper');self.entry=load(ENTRY,'harbor_storage_entry');self.upgrade=load(UPGRADE,'harbor_storage_upgrade');self.pg=load(COMPOSE,'harbor_storage_compose');self.runtime=load(RUNTIME,'harbor_storage_entry_runtime')
   need(getattr(self.pg,'STORAGE_STARTUP_CONTRACT',None)=='harbor-pg-storage-boot-v1','host_factory_guard_not_installed')
@@ -101,7 +113,7 @@ class Host:
   mounted=json.loads(run(['/usr/bin/findmnt','--json','--target','/sdc-disk','--output','TARGET,UUID']))['filesystems'];need(len(mounted)==1 and mounted[0].get('target')=='/sdc-disk' and mounted[0].get('uuid')==uuid_expected,'host_target_mount_changed')
   need(ROOT.stat().st_dev==Path('/sdc-disk').stat().st_dev!=Path('/').stat().st_dev,'host_target_wrong_filesystem')
  def data_mounts(self):
-  self.target_disk()
+  self.target_disk();self.pg.material_storage_guard(self.plan['materialsDirectory'])
   for source,target in [(self.core.SOURCE_DB,self.core.TARGET/'db'),(self.core.SOURCE_ARCHIVE,self.core.TARGET/'archive')]:
    a,b=source.lstat(),target.lstat();need(stat.S_ISDIR(a.st_mode) and stat.S_ISDIR(b.st_mode) and (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino) and a.st_uid==999 and b.st_dev==ROOT.stat().st_dev,'host_bound_path_mismatch')
    mounted=json.loads(run(['/usr/bin/findmnt','--json','--mountpoint',str(source),'--output','TARGET']))['filesystems'];need(len(mounted)==1 and mounted[0].get('target')==str(source),'host_original_path_not_mount')
@@ -537,6 +549,104 @@ class Host:
   need(allowed,'host_planned_result_unknown');self.verify_runtime_facts();need(self.upgrade.digest(self.upgrade.active_identity(self.entry.private_json(self.entry.ACTIVE)))==binding,'host_active_changed')
   # This is fact-only: it cannot resume a held entry or start a failed service.
   self.record_runtime_ready(resolve_operation=True);return {'released':True,'originalRestored':binding==operation['beforeActiveDigest']}
+ def archive_adopt_facts(self):
+  approved=self.plan.get('archivePrecopy');need(isinstance(approved,dict),'host_archive_adopt_unapproved')
+  purpose=Path(approved.get('directory',''));need(purpose.parent==ROOT and purpose.name not in ['','postgres'] and purpose==Path(os.path.normpath(purpose)),'host_archive_adopt_path_invalid')
+  stamp=self.core.identity(purpose.lstat())[:5]
+  need(stamp==approved.get('directoryIdentity') and stat.S_ISDIR(stamp[4]) and stamp[2:4]==[0,0] and stat.S_IMODE(stamp[4])==0o700,'host_archive_adopt_purpose_changed')
+  values={}
+  for label,name in [('intent','copy.intent.json'),('complete','copy.complete.json'),('proof','archive-proof.json')]:
+   raw=private(purpose/name);need(sha(raw)==approved.get(label+'Sha256'),'host_archive_adopt_'+label+'_changed');values[label]=json.loads(raw)
+  intent,complete,proof=(values[k] for k in ['intent','complete','proof']);binding=approved.get('binding')
+  need(isinstance(binding,dict) and intent.get('binding')==binding==complete.get('binding') and binding.get('cluster')==self.plan['systemId'] and intent.get('eligible') is False and intent.get('sourceDeletionAllowed') is False,'host_archive_adopt_binding_changed')
+  need(complete.get('eligible') is False and all(complete.get(k) is False for k in ['sourceDeleted','sourceMounted','servicesChanged']) and complete.get('proofSha256')==approved['proofSha256'],'host_archive_adopt_complete_invalid')
+  need(proof.get('version')==1 and proof.get('eligible') is False and isinstance(proof.get('files'),dict) and isinstance(proof.get('directories'),dict) and isinstance(proof.get('unstable'),list) and complete.get('files')==len(proof['files']) and complete.get('unstableFiles')==len(proof['unstable']),'host_archive_adopt_proof_invalid')
+  need(proof.get('sourceRoot')==self.plan['sourceRoots']['archive'] and proof.get('targetRoot')==approved.get('targetRoot'),'host_archive_adopt_root_changed')
+  self.current_identity()
+  need(approved.get('deploymentId')==self.ticket.get('deploymentId') and isinstance(approved.get('deploymentId'),str) and approved.get('activeIdentityDigest')==self.plan['activeIdentityDigest'],'host_archive_adopt_release_changed')
+  paths=binding.get('paths',{});need(set(paths)=={'db','archive','control','targetRoot'} and paths['db'].get('path')==str(self.core.SOURCE_DB) and paths['archive'].get('path')==str(self.core.SOURCE_ARCHIVE) and paths['control'].get('path')==str(self.core.SOURCE_DB/'18/docker/global/pg_control') and paths['targetRoot'].get('path')==str(ROOT),'host_archive_adopt_source_path_changed')
+  for row in paths.values():
+   path=Path(row['path']);info=path.lstat();need(not path.is_symlink() and {'path':str(path),'dev':info.st_dev,'ino':info.st_ino,'uid':info.st_uid,'gid':info.st_gid,'mode':stat.S_IMODE(info.st_mode)}==row,'host_archive_adopt_source_identity_changed')
+  fd=os.open(paths['control']['path'],os.O_RDONLY|os.O_NOFOLLOW)
+  try:need(str(int.from_bytes(os.read(fd,8),'little'))==self.plan['systemId'],'host_archive_adopt_cluster_changed')
+  finally:os.close(fd)
+  pg=self.immutable(PG);state=pg['State'];need({k:pg[k] for k in ['Id','Image']}|{k:state[k] for k in ['Pid','StartedAt']}==binding.get('container') and state.get('Running') is True and not any(state.get(k) for k in ['Paused','Restarting','Dead','OOMKilled']),'host_archive_adopt_pg_generation_changed')
+  mounts=binding.get('mounts',[]);actual=[{'source':m['Source'],'destination':m['Destination'],'rw':m['RW']} for m in pg['Mounts'] if m['Destination'] in [r['destination'] for r in mounts]]
+  need(mounts and sorted(actual,key=lambda r:r['source'])==sorted(mounts,key=lambda r:r['source']),'host_archive_adopt_pg_mounts_changed')
+  units=approved.get('writerUnits');need(isinstance(units,list) and units and len(set(units))==len(units) and all(isinstance(v,str) and re.fullmatch(r'harbor-pg-archive-[a-z0-9-]+\.service',v) for v in units),'host_archive_adopt_units_invalid')
+  for name in units:
+   value=self.state_unit(name,allow_absent=True);need(value.get('ActiveState') in ['inactive','failed'] and value.get('MainPID')=='0','host_archive_adopt_writer_active')
+   group=value.get('ControlGroup','')
+   if group:
+    need(group.startswith('/') and group!='/' and group==os.path.normpath(group),'host_archive_adopt_cgroup_invalid');events=Path('/sys/fs/cgroup')/group.lstrip('/')/'cgroup.events'
+    if events.exists():need(dict(line.split() for line in events.read_text().splitlines()).get('populated')=='0','host_archive_adopt_writer_active')
+  return approved,purpose,proof
+ def verify_archive_adopt_target(self,path,proof):
+  need(self.core.identity(path.lstat())[:5]==proof['targetRoot'] and path.stat().st_dev==ROOT.stat().st_dev,'host_archive_adopt_target_changed')
+  files,dirs=self.core.inventory(path,999)
+  need(set(files)==set(proof['files']) and all(stamp==proof['files'][name].get('target') for name,stamp in files.items()),'host_archive_adopt_files_changed')
+  need(set(dirs)==set(proof['directories']) and all(self.core.identity((path/name).lstat())[:5]==proof['directories'][name] for name in dirs),'host_archive_adopt_directories_changed')
+ def archive_adopt_unmounted(self,purpose):
+  # Inspect kernel mount metadata only: never read archived file contents.
+  disk=ROOT.stat().st_dev;roots=[purpose,self.core.TARGET]
+  staging=self.j.get('archiveAdopt',{}).get('staging')
+  if staging is not None:
+   path=Path(staging);need(path.parent==ROOT and re.fullmatch(r'\.pg-storage-adopt-[a-f0-9]{32}',path.name),'host_archive_adopt_staging_invalid');roots.append(path)
+  forbidden=[str(p) for p in roots];fsroots=['/'+str(p.relative_to('/sdc-disk')) for p in roots]
+  for line in Path('/proc/self/mountinfo').read_text().splitlines():
+   fields=line.split();need(len(fields)>=10,'host_archive_adopt_mount_inventory_unknown')
+   unescape=lambda value:re.sub(r'\\([0-7]{3})',lambda match:chr(int(match[1],8)),value)
+   point,fsroot=unescape(fields[4]),unescape(fields[3])
+   need(not any(point==v or point.startswith(v+'/') for v in forbidden),'host_archive_adopt_target_mounted')
+   if fields[2]==str(os.major(disk))+':'+str(os.minor(disk)) and not (point=='/sdc-disk' and fsroot=='/'):
+    need(not any(fsroot==v or fsroot.startswith(v+'/') or v.startswith(fsroot.rstrip('/')+'/') for v in fsroots),'host_archive_adopt_target_referenced')
+  ids=run(['/usr/bin/docker','container','ls','--all','--quiet','--no-trunc']).decode().splitlines()
+  if ids:
+   need(all(re.fullmatch('[a-f0-9]{64}',v) for v in ids),'host_archive_adopt_container_inventory_unknown')
+   rows=json.loads(run(['/usr/bin/docker','container','inspect',*ids]));need(isinstance(rows,list) and {r.get('Id') for r in rows}==set(ids),'host_archive_adopt_container_inventory_unknown')
+   for row in rows:
+    for mount in row.get('Mounts',[]):
+     if mount.get('Type') not in ['bind','volume']:continue
+     source=mount.get('Source');need(isinstance(source,str) and source.startswith('/'),'host_archive_adopt_mount_source_unknown');need(not any(source==v or source.startswith(v+'/') or v.startswith(source.rstrip('/')+'/') for v in forbidden),'host_archive_adopt_target_referenced')
+ def adopt_archive(self):
+  need(self.j['phase'] in ['planned','archive-adopting','archive-prepared'],'host_archive_adopt_phase_invalid')
+  approved,purpose,proof=self.archive_adopt_facts();self.archive_adopt_unmounted(purpose)
+  old=purpose/'archive';target=self.core.TARGET;new=target/'archive';claim=self.j.get('archiveAdopt')
+  scope={'version':1,'planSha256':self.planSha256,'directory':str(purpose),'proofSha256':approved['proofSha256'],'archiveRoot':proof['targetRoot']}
+  if claim is None:
+   need(self.j['phase']=='planned' and not os.path.lexists(target) and not os.path.lexists(PROOF),'host_archive_adopt_foreign_target')
+   self.verify_archive_adopt_target(old,proof)
+   staging=ROOT/('.pg-storage-adopt-'+uuid.uuid4().hex);staging.mkdir(mode=0o700);(staging/'db').mkdir(mode=0o700);os.chown(staging/'db',999,999);self.core.sync_dir(staging/'db');self.core.sync_dir(staging);self.core.sync_dir(ROOT)
+   claim={**scope,'staging':str(staging),'targetRoot':self.core.identity(staging.lstat())[:5],'dbRoot':self.core.identity((staging/'db').lstat())[:5]}
+   self.j.update(phase='archive-adopting',archiveAdopt=claim)
+   try:self.save(self.j)
+   except BaseException:
+    # Only a confirmed old journal permits reclaiming this still-empty stage.
+    # A lost write ACK keeps the inode-bound stage for the next locked retry.
+    try:
+     durable=json.loads(private(STATE))
+     if durable.get('scope')==self.plan['scope'] and durable.get('runId')==self.plan['runId'] and durable.get('phase')=='planned' and 'archiveAdopt' not in durable and self.core.identity(staging.lstat())[:5]==claim['targetRoot'] and self.core.identity((staging/'db').lstat())[:5]==claim['dbRoot'] and {p.name for p in staging.iterdir()}=={'db'} and not any((staging/'db').iterdir()):
+      (staging/'db').rmdir();staging.rmdir();self.core.sync_dir(ROOT)
+    except BaseException:pass # Unknown durability never authorizes deletion.
+    raise
+  need(isinstance(claim,dict) and all(claim.get(k)==v for k,v in scope.items()),'host_archive_adopt_journal_changed')
+  staging=Path(claim.get('staging',''));need(staging.parent==ROOT and re.fullmatch(r'\.pg-storage-adopt-[a-f0-9]{32}',staging.name),'host_archive_adopt_staging_invalid')
+  stage_exists=os.path.lexists(staging);target_exists=os.path.lexists(target);need(stage_exists!=target_exists,'host_archive_adopt_target_ambiguous')
+  current=staging if stage_exists else target
+  need(self.core.identity(current.lstat())[:5]==claim.get('targetRoot') and stat.S_ISDIR(current.lstat().st_mode),'host_archive_adopt_claim_changed')
+  need(self.core.identity((current/'db').lstat())[:5]==claim.get('dbRoot') and not any((current/'db').iterdir()),'host_archive_adopt_db_changed')
+  need(set(p.name for p in current.iterdir())<=({'db'} if stage_exists else {'db','archive'}),'host_archive_adopt_foreign_target')
+  if stage_exists:rename_noreplace(staging,target);self.core.sync_dir(ROOT)
+  old_exists=os.path.lexists(old);new_exists=os.path.lexists(new);need(old_exists!=new_exists,'host_archive_adopt_archive_ambiguous')
+  self.verify_archive_adopt_target(old if old_exists else new,proof)
+  if old_exists:rename_noreplace(old,new)
+  # Fsync both parents even when a prior rename completed but its ACK was lost.
+  self.core.sync_dir(purpose);self.core.sync_dir(target);self.core.sync_dir(ROOT)
+  canonical=json.dumps(proof,sort_keys=True,separators=(',',':')).encode()
+  if os.path.lexists(PROOF):need(private(PROOF)==canonical,'host_archive_adopt_foreign_proof')
+  else:save(PROOF,proof)
+  self.j.update(phase='archive-prepared',archiveProofSha256=sha(private(PROOF)),createdTargetRoots={'db':claim['dbRoot'],'archive':proof['targetRoot']});self.save(self.j)
+  return {'prepared':True,'adopted':True,'eligible':False,'databaseCopied':False,'servicesChanged':False}
  def precopy(self):
   need(self.j['phase']=='planned','host_precopy_already_started');self.current_identity()
   need(not self.core.TARGET.exists(),'host_target_already_exists');self.core.TARGET.mkdir(mode=0o700)
@@ -549,6 +659,13 @@ READONLY_PROBE=r"""import {readFile,stat} from 'node:fs/promises';import {create
 
 WAL_PROBE=r"""import {readFile} from 'node:fs/promises';import {setTimeout as delay} from 'node:timers/promises';import {createRecordingProbeStore} from '/opt/harbor-storage-report/postgres-recording-storage.mjs';import {recordingDatabaseIdentity,loadRecordingStorageReportKey,verifyRecordingStorageReport} from '/opt/harbor-storage-report/postgres-storage-report.mjs';import {loadPostgresBackupArchiveProfile} from '/opt/harbor-storage-report/postgres-backup-context.mjs';import {inspectArchivedWal} from '/opt/harbor-storage-report/postgres-recovery.mjs';
 const budget=Number(process.argv[1]);if(!Number.isSafeInteger(budget)||budget<30000||budget>300000)process.exit(1);const cfg=JSON.parse(await readFile('/run/harbor-infra-control/publisher.json','utf8')),store=createRecordingProbeStore({connection:{host:cfg.socketDirectory,port:cfg.port,user:'postgres',database:cfg.database}});let archive;try{let valid=false;for(const deadline=performance.now()+budget;performance.now()<deadline;){try{const row=await store.get('SELECT payload,signature FROM harbor.recording_storage_reports WHERE singleton=TRUE');const verified=verifyRecordingStorageReport(row,await loadRecordingStorageReportKey(cfg.keyFile),await recordingDatabaseIdentity(store)),started=await store.get('SELECT ceil(extract(epoch FROM pg_postmaster_start_time())*1000)::bigint started');if(verified.sampled_at<Number(started.started))throw Error();valid=true;break;}catch{await delay(100);}}if(!valid)throw Error();archive=await loadPostgresBackupArchiveProfile();const {name}=await store.get('SELECT pg_walfile_name(pg_switch_wal()) name');let ok=false;for(const deadline=performance.now()+budget;performance.now()<deadline;){try{const proof=await inspectArchivedWal({name,directory:archive.configuration.archiveDirectory,key:archive.key,requireBoundName:true});if(proof.systemIdentifier!==archive.configuration.expectedCluster)throw Error();ok=true;break;}catch{await delay(100);}}if(!ok)throw Error();console.log(JSON.stringify({freshReport:true,newWalAuthenticated:true,restorePerformed:false}));}catch{process.exitCode=1;}finally{archive?.key.fill(0);await store.close();}"""
+
+@contextlib.contextmanager
+def archive_copy_lock():
+ fd=os.open(ARCHIVE_COPY_LOCK,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK)
+ try:
+  info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'host_archive_adopt_lock_untrusted');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);yield
+ finally:os.close(fd)
 
 @contextlib.contextmanager
 def locks(host,deployment_fd=None):
@@ -574,7 +691,7 @@ def collect_readonly():
  disk=json.loads(run(['/usr/bin/findmnt','--json','--target','/sdc-disk','--output','TARGET,UUID']))['filesystems'];need(len(disk)==1 and disk[0]['target']=='/sdc-disk','host_collect_sdc_not_mounted')
  network=json.loads(run(['/usr/bin/docker','network','inspect',ticket['network']['name']]))[0];need(network['Id']==ticket['network']['id'] and set(network.get('Containers',{}))=={v['id'] for v in rows.values()},'host_collect_network_changed')
  raw=private(Path(ticket['materialsDirectory'])/'secrets/postgres.env',65536).decode();values=dict(line.split('=',1) for line in raw.splitlines() if line and not line.startswith('#'));url=urlsplit(values.get('HARBOR_DATABASE_URL',''));query=parse_qs(url.query);need(url.scheme in ['postgres','postgresql'] and query.get('sslmode')==['verify-full'] and query.get('sslrootcert')==['/run/secrets/postgres-ca.crt'],'host_collect_tls_not_verified')
- return {'scope':core.SCOPE,'approved':False,'readOnly':True,'runId':uuid.uuid4().hex,'systemId':ticket['database']['cluster'],'tlsVerifyFull':True,'activeIdentityDigest':upgrade.digest(upgrade.active_identity(active)),'materialsDirectory':ticket['materialsDirectory'],'containers':rows,'sourceRoots':{k:core.identity(v.lstat())[:5] for k,v in [('db',core.SOURCE_DB),('archive',core.SOURCE_ARCHIVE)]},'targetFilesystemUuid':disk[0]['uuid'],'networkPersistentDigest':sha(json.dumps({k:network.get(k) for k in ['Name','Id','Driver','Internal','IPAM','Options','Labels']},sort_keys=True).encode()),'toolSha256':{str(v):sha(v.read_bytes()) for v in [CORE,Path(__file__),DEPLOY,ENTRY,UPGRADE,COMPOSE,RUNTIME]},'noLargeDirectoryScan':True,'noCredentialValuesRetained':True}
+ return {'scope':core.SCOPE,'approved':False,'readOnly':True,'runId':uuid.uuid4().hex,'systemId':ticket['database']['cluster'],'tlsVerifyFull':True,'activeIdentityDigest':upgrade.digest(upgrade.active_identity(active)),'materialsDirectory':ticket['materialsDirectory'],'containers':rows,'sourceRoots':{k:core.identity(v.lstat())[:5] for k,v in [('db',core.SOURCE_DB),('archive',core.SOURCE_ARCHIVE)]},'targetFilesystemUuid':disk[0]['uuid'],'networkPersistentDigest':sha(json.dumps({k:network.get(k) for k in ['Name','Id','Driver','Internal','IPAM','Options','Labels']},sort_keys=True).encode()),'toolSha256':{str(v):sha(v.read_bytes()) for v in [CORE,Path(__file__),DEPLOY,ENTRY,UPGRADE,COMPOSE,RUNTIME,MATERIAL]},'noLargeDirectoryScan':True,'noCredentialValuesRetained':True}
 
 def verify_factory_guard(config):
  host=Host();need(config==host.config and config.get('postgres_storage_startup_guard') is True,'host_factory_root_configuration_changed');need(host.j.get('phase')=='complete' and host.j.get('oldDataRollbackForbidden') is True,'host_factory_move_not_complete');host.data_mounts();host.immutable(PG);host.require_docker_restart_disabled();host.verify_installed_unit_files();need(host.row(PG)['HostConfig']['RestartPolicy']['Name']=='no','host_factory_pg_autostart_enabled')
@@ -676,11 +793,11 @@ def supervise_online(host):
 
 def main():
  global _EMIT_PROGRESS
- actions=['collect-readonly','precopy','launch-switch','launch-recover-source','launch-recover-target','switch','recover-source','recover-target','boot-start','boot-online','pause','resume','reconcile','status']
+ actions=['collect-readonly','adopt-archive','precopy','launch-switch','launch-recover-source','launch-recover-target','switch','recover-source','recover-target','boot-start','boot-online','pause','resume','reconcile','status']
  need(len(sys.argv) in [2,3] and sys.argv[1] in actions and (len(sys.argv)==3)==(sys.argv[1] in ['recover-source','recover-target']),'host_action_invalid')
  action=sys.argv[1]
  if action=='collect-readonly':return collect_readonly()
- host=Host();_EMIT_PROGRESS=action in ['precopy','switch','recover-source','recover-target','boot-start','boot-online','pause','resume']
+ host=Host();_EMIT_PROGRESS=action in ['adopt-archive','precopy','switch','recover-source','recover-target','boot-start','boot-online','pause','resume']
  if action.startswith('launch-'):return launch_switch(host,action.removeprefix('launch-'))
  if action=='boot-online':return supervise_online(host)
  worker_unit=None
@@ -693,6 +810,8 @@ def main():
    if action in ['recover-source','recover-target']:host.core.recovery_mode(host.j)
    need(require_switch_worker(host,action,sys.argv[2] if len(sys.argv)==3 else None)==worker_unit,'host_switch_worker_changed');host.j['workerUnit']=worker_unit;host.save(host.j)
   coordinator=host.core.Coordinator(host,host.j)
+  if action=='adopt-archive':
+   with archive_copy_lock():return host.adopt_archive()
   if action=='precopy':return host.precopy()
   if action=='switch':return coordinator.switch()
   if action=='recover-source':return coordinator.recover_source()

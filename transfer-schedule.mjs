@@ -20,3 +20,5 @@ export function transferWindow(at,value={}){
   const key=previous.time==='02:00'?date:date+'-'+previous.time.replace(':','');
   return {key,start:previous.at-16*60*minute,end:previous.at,until:next.at,time:previous.time,timezone:schedule.timezone,due:previous.at>schedule.effective,next:next.at};
 }
+
+export const nextTransferReset=(at,settings={},schedule={})=>settings.nightly===true?transferWindow(at,schedule).next:null;

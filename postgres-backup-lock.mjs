@@ -1,3 +1,4 @@
+import {requireMaterialMaintenanceInactive} from './harbor-material-storage.mjs';
 import {open,lstat,realpath,readFile,mkdir,readdir,rm} from 'node:fs/promises';
 import {constants} from 'node:fs';
 import {spawn} from 'node:child_process';
@@ -10,7 +11,7 @@ export const backupCoordinationFiles=Object.freeze({lock:'.backup-coordination.l
 const fail=code=>{throw transferError(code);};
 const same=(a,b)=>a.dev===b.dev&&a.ino===b.ino;
 export async function backupCoordinationCodeDigest(){
- const names=['postgres-backup-lock.mjs','postgres-recovery.mjs','storage-backup.mjs','postgres-backup.mjs','postgres-backup-context.mjs','postgres-backup-restore.mjs','postgres-backup-schedule.mjs','postgres-backup-handoff.mjs','storage-operator-backup-application.mjs','postgres-backup-retention.mjs','postgres-backup-wal-catalog.mjs','migration-artifacts.mjs','postgres-backup-recovery-point.mjs','postgres-periodic-application-retention.mjs','postgres-periodic-application-cycle.mjs','postgres-periodic-application-backup.mjs','postgres-periodic-application-materials.mjs','postgres-periodic-application-policy.mjs','postgres-periodic-application-key.mjs','postgres-periodic-application-restore.mjs','postgres-periodic-application-runtime.mjs','postgres-periodic-application-installed-runtime.mjs','postgres-periodic-application-runtime-child.mjs','postgres-periodic-wal-cache.mjs','postgres-periodic-base-verification.mjs','postgres-periodic-receiver-verification.mjs','storage-receiver-periodic-attestation.mjs','storage-restored-runtime-shutdown.mjs','instance.mjs','storage-operator-backup-recordings.mjs','recording-context-store.mjs','recording-request-context.mjs','recording-text-metadata.mjs','recording-attachment.mjs','recording-literal.mjs','conversation-capture.mjs','recording-context-configuration.mjs','record-redaction.mjs','storage-operator-backup-devices.mjs','ci/postgres-preflight.mjs','postgres-worker-startup.mjs','storage-receiver-candidate-files.mjs','postgres-storage-report.mjs'];
+ const names=['harbor-material-storage.mjs','postgres-backup-lock.mjs','postgres-recovery.mjs','storage-backup.mjs','postgres-backup.mjs','postgres-backup-context.mjs','postgres-backup-restore.mjs','postgres-backup-schedule.mjs','postgres-backup-handoff.mjs','storage-operator-backup-application.mjs','postgres-backup-retention.mjs','postgres-backup-wal-catalog.mjs','migration-artifacts.mjs','postgres-backup-recovery-point.mjs','postgres-periodic-application-retention.mjs','postgres-periodic-application-cycle.mjs','postgres-periodic-application-backup.mjs','postgres-periodic-application-materials.mjs','postgres-periodic-application-policy.mjs','postgres-periodic-application-key.mjs','postgres-periodic-application-restore.mjs','postgres-periodic-application-runtime.mjs','postgres-periodic-application-installed-runtime.mjs','postgres-periodic-application-runtime-child.mjs','postgres-periodic-wal-cache.mjs','postgres-periodic-base-verification.mjs','postgres-periodic-receiver-verification.mjs','storage-receiver-periodic-attestation.mjs','storage-restored-runtime-shutdown.mjs','instance.mjs','storage-operator-backup-recordings.mjs','recording-context-store.mjs','recording-request-context.mjs','recording-text-metadata.mjs','recording-attachment.mjs','recording-literal.mjs','conversation-capture.mjs','recording-context-configuration.mjs','record-redaction.mjs','storage-operator-backup-devices.mjs','ci/postgres-preflight.mjs','postgres-worker-startup.mjs','storage-receiver-candidate-files.mjs','postgres-storage-report.mjs'];
  const hash=createHash('sha256');for(const name of [...names,'postgres-backup-observation.mjs'])hash.update(name+'\0').update(await readFile(new URL('./'+name,import.meta.url)));return hash.digest('hex');
 }
 
@@ -40,7 +41,8 @@ export async function withBackupArchiveLock({directory,uid=process.getuid(),excl
 }
 
 export async function withPostgresBackupOperation(record,operation,{signal}={}){
- return withBackupArchiveLock({directory:record.archiveDirectory,uid:record.restoreUid,signal},operation);
+ if(record.scope==='existing-cluster')await requireMaterialMaintenanceInactive();
+ return withBackupArchiveLock({directory:record.archiveDirectory,uid:record.restoreUid,signal},async lease=>{if(record.scope==='existing-cluster')await requireMaterialMaintenanceInactive();return operation(lease);});
 }
 
 export async function readBackupCoordinationIntent({directory,key,uid=process.getuid()}={}){

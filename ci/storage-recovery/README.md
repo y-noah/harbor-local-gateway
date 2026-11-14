@@ -335,3 +335,23 @@ bootstrap在新infra ROOT预建`archive/`(PG999/0700)、独立`archive.key`(PG99
 `request-overview-index.sql` 是可选的在线性能索引，不改变 schema migration 版本或业务数据。由管理员针对已核对的目标数据库，以同一连接、自动提交模式依次执行三个 `-- statement-boundary` 分隔的语句；不能塞进业务 migration 事务。先核对同名索引的表、字段及有效性，再并发创建 `(usage_at) INCLUDE(status)`，最后重验定义。连接局部设置有界 `lock_timeout` 和 `statement_timeout`；失败保留现场，不自动删除未知或无效同名索引。该索引让近7天每日计数只读取窄索引，查询本身仍能在未安装索引时正确运行。回滚查询代码无需删索引；确需撤销时，在确认无其他维护占用后单独执行 `DROP INDEX CONCURRENTLY harbor.request_overview_cover`，不删除请求记录。新的安装或逻辑恢复后如需同等性能，应重新执行本脚本；物理备份保留该索引。实际收益须以目标环境的执行时间、Index Only Scan 和 Heap Fetches 核对，不以索引存在冒充性能通过。
 
 `request-statistics-indexes.sql` 同样只通过管理员自动提交逐段执行，提供员工／会话聚合与默认类型聚合的两份窄覆盖索引。它们只覆盖各自需要的身份、时间、状态及价格版本，不包含正文、错误、客户端信息或上游返回的模型字符串，避免无界模型字段触发 B-tree 元组长度限制。类型查询按当前分组只投影必要身份，跨维度筛选仍按原字段执行；带额外筛选时允许优化器选择其他索引或堆扫描。两份索引前后都核对精确字段顺序与有效性，同名冲突拒绝，旧业务代码和数据库版本不变。保留以目标环境真实执行计划与耗时为依据；只在确认不再需要时分别并发删除该脚本声明的索引，不处理其他索引或请求记录。
+
+## 已完成归档预复制的受控复用
+
+固定 root 工具 `harbor-pg-storage-host.py adopt-archive` 只复用已完成的在线归档预复制，不复制数据库、不切挂载、不停止服务、不删除源文件。默认不启用；必须在原固定迁盘 PLAN 中显式批准 `archivePrecopy`，绑定预复制目录、`directoryIdentity`、`intentSha256`、`completeSha256`、`proofSha256`、`targetRoot`、原完整 `binding`、当前 `deploymentId`、规范化 `activeIdentityDigest` 及全部 `writerUnits`。身份数组沿用 `core.identity(... )[:5]`，包含完整文件类型与模式；入口身份摘要必须按既有 `upgrade.active_identity` 计算，不能使用整个 ACTIVE 文件的 SHA 替代。
+
+该动作取得原部署、入口、备份锁及原归档复制锁，确认复制单元已停止，复核源集群、PG 代次、目录 inode 和证明摘要后，按持久 claim 将归档同盘原子移动到正式目标，保留文件 inode，未知目标目录也不覆盖。相同批准可在移动或状态写入中断后续行，身份变化则拒绝。完成仅返回 `archive-prepared`、`eligible:false`；正式切换仍须停写后的严格归档增量核验与数据库冷拷。撤销批准可阻止后续新动作，已经移动的目录不得手工移回，须沿原 journal 继续或使用原受控恢复流程。
+
+## Harbor 材料目录迁盘保护
+
+`ci/harbor-material-storage.py` 使用系统盘上的 root/0600 `/etc/harbor-data-paths.json` 管理五类固定用途：恢复暂存 `/sdc-disk/harbor-data/restore`、应用 `application/data` 与 `application/runtime`、发布物料 `release-materials`、发布临时目录 `release-tmp`。应用仍使用原 `local-assurance/<UUID>/pg-data|runtime`，恢复仍使用 `/var/lib/harbor-restore`，通过精确 bind 保留逻辑入口；发布生成入口统一使用新盘。配置版本1，contract 为 `harbor-material-storage-v1`，包含 `diskUuid` 和五项 `roots`；每项仅含 `logical/target/uid/targetInode`，由实际迁移结果生成，不能猜 inode 或从请求/环境变量覆盖。
+
+从未安装该配置的环境保持原行为。配置存在后，部署工厂、PG 启动/监督及每次正式恢复写入前核 UUID、精确 mountpoint 和目标 dev/inode；缺盘、错盘、换根或 bind 缺失均拒绝，禁止在底层旧目录重建大文件。root 固定的 `/etc/harbor-material-maintenance.json` 在最终配置生成前即阻止应用启动、新备份/恢复操作和物料分配。备份操作在取得原共享归档锁前后复核标记；迁盘仅短暂取得独占锁排空旧操作，重型冷拷期间释放该锁，WAL 归档沿原路径继续。
+
+第一次安装先用已核 UUID 执行 root `harbor-material-storage.py provision-release <UUID>`，只创建新盘的两项发布根并返回 `harbor-release-storage-allocation-v1` 的 UUID/dev/inode 事实。新版 producer 将该事实和 helper SHA 固定在自己的审批绑定中，再调用 `allocate_approved` 直接在新盘创建工作目录，不能先在 `/tmp` 制作大包再搬运。此阶段不生成完整五根配置，也不证明应用可启动。完整迁盘之后，普通 root 分配入口为 `harbor-material-storage.py allocate release-materials|release-tmp <安全名称>`；旧 `/tmp/harbor-release-*` 只保留原副本，不建立依赖可写 `/tmp` 父目录的永久 bind unit。
+
+安装范围必须包含新 helper，并同步当前宿主工具 manifest/票据的 revision 与完整文件 SHA；历史 release/ACTIVE 不改写。业务 imageManifest 同时绑定 helper、Node 保护适配器与恢复代码，备份工具源码投影和协调代码摘要也随之更新。仓库源码检查通过不代表宿主工具已安装。
+
+存量管理入口 `ci/harbor-material-move.py plan` 只读取路径、inode、容器 ID 和工具 SHA，输出 `approved:false` 候选，不扫描文件正文、不写审批。根协调者核对后将明确批准的同一计划存入 root/0600 `/etc/harbor-material-move.json`。`prepare → switch → status` 只在原部署/入口锁下操作；应用须以原容器 ID 确认停稳、restart=no，备份写入服务/定时器停稳，image staging 关闭。冷拷独立核 SHA、权限和完整 inode 元数据；原目录按 nonce 保留，bind unit 明确依赖 UUID 持久磁盘 unit。`prepare` 可续同一复制 journal，`switch` 可续失败的 mount；最终开放保护前持久化 `activation-ready`，此后只允许向前完成，不允许旧数据回退。更早阶段可显式 `rollback`，但任何目标文件身份改变都会拒绝旧数据回退。工具不自行重启业务/备份，也不删除原副本；协调者须完成真实业务、重启保护和后续写入落盘验收。
+
+计划中的 `legacyTemporary` 记录实际根 `uid` 并沿用其权限，不要求历史临时材料归 root，也不修改源 owner。可选 `runtimeRebuildableCaches` 缺省或空数组时完整复制；唯一支持值 `['codex-launcher-aliases']` 只排除应用 runtime 中真实 `accounts/*/tmp/arg0` 目录，由客户端重建。该路径根若为链接仍拒绝，同名普通文件仍复制；其他链接和凭据目录不豁免。此选择绑定原审批和复制 journal，不能在续跑时临时更改。审批阶段仅校验计划，最终存储配置仍使用实际、互异的目标 inode。

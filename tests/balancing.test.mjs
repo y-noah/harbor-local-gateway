@@ -14,6 +14,7 @@ function priceFixture(store){const cfg=store.pricing.status().settings;if(!cfg.m
 function pricedStore(...args){return priceFixture(new Store(...args));}
 import {createGateway} from '../server.mjs';
 import {createResponsesTransport,structuredFailure,refreshCredentials} from '../responses.mjs';
+import {transferWindow} from '../transfer-schedule.mjs';
 import {balanceSettings,nightlyWindow,planBalance,createBalancer,automaticWeights,nextWeightReset} from '../balancing.mjs';
 
 const at=Date.parse('2026-10-14T02:00:15+08:00'),hour=3600000;
@@ -21,6 +22,7 @@ const account=(id,remaining=50)=>({id,kind:'codex',enabled:1,removed_at:null,sta
 const session=(id,account_id,extra={})=>({id,account_id,member_id:'member',member_enabled:1,member_removed:null,protocol:'responses',enabled:1,nightly_enabled:1,route_version:0,...extra});
 const request=(session_id,weight,extra={})=>({session_id,started:at-2*hour,ended:at-hour,status:'ok',model:'fixture-model',input:Math.round(weight*10000),output:0,usage_unknown:0,...extra});
 const plan=(accounts,sessions,requests,extra={})=>planBalance({accounts,sessions,requests,at,quoteUsage:r=>quoteReference(r,{rates:plannerRates,aliases:[]}),...extra});
+function existingSchedule(store){store.run("INSERT INTO gateway_settings(name,value) VALUES('transfer_schedule',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",JSON.stringify({times:['02:00'],timezone:'Asia/Shanghai',version:0,effective:0}));}
 const until=async fn=>{const deadline=Date.now()+3000;while(!await fn()){assert.ok(Date.now()<deadline,'condition timeout');await new Promise(r=>setTimeout(r,5));}};
 
 test('nightly calendar is Beijing 02:00 with exact 16-hour window and one-minute trigger',()=>{
@@ -192,10 +194,10 @@ test('scheduler persists one daily execution, versioned moves and restart idempo
  try{
   for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   for(const i of [1,2,3,4]){const s='s'+i;store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'a','responses',?,?)",s,m.memberId,at-2*hour,at-hour);store.run("INSERT INTO requests(id,member_id,account_id,session_id,started,ended,status,input,model,ip,agent) VALUES(?,?,'a',?,?,?,'ok',100,'fixture-model','127.0.0.1','fixture')",'r'+i,m.memberId,s,at-2*hour,at-hour);}
-  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async a=>{refreshes++;return JSON.parse(a.quota_json);}});const b=create();b.saveSettings({nightly:true});
+  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async a=>{refreshes++;return JSON.parse(a.quota_json);}});const b=create();b.saveSettings({nightly:true});existingSchedule(store);
   await Promise.all([b.tick(),b.tick()]);assert.equal(refreshes,2);assert.ok(store.get("SELECT COUNT(*) n FROM sessions WHERE account_id='b'").n>0);assert.equal(store.get('SELECT status FROM balance_runs').status,'completed');
   const routes=store.all('SELECT id,account_id,route_version FROM sessions');await create().tick();assert.equal(refreshes,2);assert.deepEqual(store.all('SELECT id,account_id,route_version FROM sessions'),routes);
-  clock+=24*hour+60000;await create().tick();assert.equal(refreshes,2,'missed window never catches up in daytime');
+  clock+=24*hour+60000;await create().tick();assert.equal(refreshes,4,'restart recovers only the current configured slot');
  }finally{store.close();}
 });
 test('preview computes the complete direction-first plan and the nightly batch applies each session only once',async()=>{
@@ -208,7 +210,7 @@ test('preview computes the complete direction-first plan and the nightly batch a
    store.run("INSERT INTO requests(id,member_id,account_id,session_id,started,ended,status,input,model,ip) VALUES(?,?,'b',?,?,?,'ok',?,'fixture','fixture')",'r'+i,member.memberId,'s'+i,at-2*hour,at-hour,w);
   }
   const read=async a=>JSON.parse(a.quota_json),b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:read,readQuota:read});
-  b.saveSettings({nightly:true,weighted:true});const before=store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),auditCount=store.get('SELECT COUNT(*) n FROM audit').n;
+  b.saveSettings({nightly:true,weighted:true});existingSchedule(store);const before=store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),auditCount=store.get('SELECT COUNT(*) n FROM audit').n;
   const preview=await b.preview();assert.equal(preview.moves.length,4);
   assert.deepEqual(store.all('SELECT id,account_id,route_version FROM sessions ORDER BY id'),before);assert.equal(store.get('SELECT COUNT(*) n FROM audit').n,auditCount);
   await b.tick();const run=store.get('SELECT * FROM balance_runs'),saved=JSON.parse(run.summary);
@@ -231,7 +233,7 @@ for(const expires of [false,true])test('a complete nightly combination is commit
    store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,model,ip) VALUES(?,?,?,?,?,?,'ok',?,'fixture','fixture')",'r-'+sid,member.memberId,sid,aid,at-2*hour,at-hour,weight);
   }
   const read=async a=>JSON.parse(a.quota_json),b=createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:read,readQuota:read});
-  b.saveSettings({nightly:true,weighted:true});const before=store.all('SELECT id,account_id,route_version,upstream_thread FROM sessions ORDER BY id');
+  b.saveSettings({nightly:true,weighted:true});existingSchedule(store);const before=store.all('SELECT id,account_id,route_version,upstream_thread FROM sessions ORDER BY id');
   const preview=await b.preview();assert.equal(preview.moves.length,2);assert.deepEqual(preview.summaries[0].after,{a:50,b:50});
   const audit=store.audit.bind(store);store.audit=(action,detail)=>{audit(action,detail);if(expires&&action==='session.route')clock=at+1000;};
   await b.tick();const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
@@ -260,7 +262,7 @@ test('a group becoming busy rolls back its whole combination without cancelling 
     store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,model,ip) VALUES(?,?,?,?,?,?,'ok',?,'fixture','fixture')",'r-'+sid,members[index].memberId,sid,aid,at-2*hour,at-hour,weight);
    }
   }
-  const b=createBalancer({store,preparing,clock:()=>at,refreshQuota:async a=>JSON.parse(a.quota_json)});b.saveSettings({nightly:true,weighted:true});
+  const b=createBalancer({store,preparing,clock:()=>at,refreshQuota:async a=>JSON.parse(a.quota_json)});b.saveSettings({nightly:true,weighted:true});existingSchedule(store);
   const before=store.all("SELECT id,account_id,route_version,upstream_thread FROM sessions WHERE id LIKE '0-%' ORDER BY id"),audit=store.audit.bind(store);
   store.audit=(action,detail)=>{audit(action,detail);if(action==='session.route'&&JSON.parse(detail).session.startsWith('0-'))preparing.add(members[0].memberId);};
   await b.tick();const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
@@ -292,7 +294,7 @@ test('nightly refresh failure skips cached quota and concurrent manual binding i
  const store=pricedStore(':memory:');const member=store.createMember('Fixture',null,null);
  try{
   for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
-  const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async()=>undefined});b.saveSettings({nightly:true});await b.tick();
+  const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async()=>undefined});b.saveSettings({nightly:true});existingSchedule(store);await b.tick();
   const result=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);assert.equal(result.moves.length,0);assert.equal(result.skipped.filter(s=>s.reason==='quota_unavailable').length,2);
   store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES('s',?,'a','responses',?,?)",member.memberId,at,at);
   const original=store.get("SELECT * FROM sessions WHERE id='s'");b.move(original,'b','manual');assert.throws(()=>b.move(original,'a','nightly'),e=>e.code==='session_route_conflict');
@@ -398,18 +400,15 @@ test('manual 100/0 validates the admin contract and official zero does not overr
  assert.equal((await patch({mode:'auto',expected_version:1})).status,200);
  assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');
 });
-test('manual settings expire at the next Beijing 02:00 even with nightly disabled, restart or missed trigger',async()=>{
+test('disabled scheduling retains manual settings across 02:00, restart and reads; enabling waits for a future slot',async()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-expiry-'));let store,clock=Date.parse('2026-10-15T23:00:00+08:00');
  try{
   store=pricedStore(join(root,'db.sqlite'));for(const a of ['a','b'])store.run("INSERT INTO accounts(id,name,home,state) VALUES(?,?,?,'ready')",a,a,a);
   const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});
-  let b=create();b.saveSettings({weighted:true});b.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});
-  const expires=Date.parse('2026-10-16T02:00:00+08:00');assert.equal(b.status().weights.configuration.expires,expires);assert.equal(nextWeightReset(expires),expires+24*hour);
-  store.db.close();store=pricedStore(join(root,'db.sqlite'));b=create();assert.equal(b.status().weights.mode,'manual');
-  clock=expires+3*hour;assert.equal(b.status().weights.configuration.mode,'auto','deadline is enforced before maintenance');
-  await b.tick();assert.equal(b.status().weights.configuration.mode,'auto');assert.equal(b.status().weights.configuration.version,2);assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0);
-  const before=store.get("SELECT value FROM gateway_settings WHERE name='routing_schedule'");
-  assert.throws(()=>b.atomic(()=>{b.selectAccount();throw Error('rollback');}));assert.deepEqual(store.get("SELECT value FROM gateway_settings WHERE name='routing_schedule'"),before);
+  let b=create();b.saveSettings({weighted:true});b.saveWeights({mode:'manual',weights:{a:100,b:0},expected_version:0});assert.equal(b.status().weights.configuration.expires,null);
+  store.db.close();store=pricedStore(join(root,'db.sqlite'));b=create();clock=Date.parse('2026-10-16T05:00:00+08:00');await b.tick();assert.equal(b.status().weights.mode,'manual');assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0);
+  b.saveTransferSchedule({times:['10:00'],expected_version:0});b.saveSettings({nightly:true});await b.tick();assert.equal(b.status().weights.mode,'manual');assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0);
+  const deadline=Date.parse('2026-10-16T10:00:00+08:00');assert.equal(b.status().weights.configuration.expires,deadline);clock=deadline;assert.equal(b.status().weights.mode,'manual','read cannot restore before scheduler commits');await b.tick();assert.equal(b.status().weights.configuration.mode,'auto');assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,1);await b.tick();assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,1);
  }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
 });
 test('nightly uses the same hourly weights and accepts quota recovered by its own refresh',async()=>{
@@ -419,7 +418,7 @@ test('nightly uses the same hourly weights and accepts quota recovered by its ow
   for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   for(let i=0;i<10;i++){store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'b','responses',?,?)",'night-'+i,m.memberId,at-2*hour,at-hour);store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,ip,model,input) VALUES(?,?,?,'b',?,?,'ok','fixture','fixture',10)",'r'+i,m.memberId,'night-'+i,at-2*hour,at-hour);}
   const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async a=>{const q=JSON.parse(a.quota_json);b.recover(a,q);return q;}});
-  b.saveSettings({weighted:true,nightly:true,failover:true});b.block(store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
+  b.saveSettings({weighted:true,nightly:true,failover:true});existingSchedule(store);b.block(store.get("SELECT * FROM accounts WHERE id='a'"),'quota_exhausted');
   await b.tick();const result=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);
   assert.equal(store.get("SELECT route_block FROM accounts WHERE id='a'").route_block,null);
   assert.ok(Math.abs(result.summaries[0].target.a-68.9655172414)<1e-8);assert.equal(store.get("SELECT COUNT(*) n FROM sessions WHERE account_id='a'").n,7);
@@ -429,7 +428,7 @@ test('weighted switch preserves the old balancing settings contract across disab
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-rollback-'));let store;
  try{
   store=pricedStore(join(root,'db.sqlite'));const create=()=>createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async()=>null});
-  let b=create();b.saveSettings({weighted:true,failover:true,nightly:true});
+  let b=create();b.saveSettings({weighted:true,failover:true,nightly:true});existingSchedule(store);
   assert.deepEqual(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),{failover:true,nightly:true,quietMinutes:30});
   b.saveSettings({weighted:false});assert.deepEqual(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='balancing'").value),{failover:true,nightly:true,quietMinutes:30});
   store.db.close();store=pricedStore(join(root,'db.sqlite'));b=create();assert.equal(b.settings().weighted,false);assert.equal(b.settings().nightly,true);
@@ -437,7 +436,7 @@ test('weighted switch preserves the old balancing settings contract across disab
  }finally{store?.db.close();rmSync(root,{recursive:true,force:true});}
 });
 
-test('automatic weights change only at initialization, quota transitions or the Beijing daily reset',async()=>{
+test('automatic weights change only at initialization, quota transitions or explicit scheduled refresh',async()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-weight-auto-restart-'));let store=pricedStore(join(root,'db.sqlite')),clock=at;
  try{
   for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
@@ -450,10 +449,10 @@ test('automatic weights change only at initialization, quota transitions or the 
   assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),[0,100]);
   store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',60,24).quota_json,'a');
   assert.ok(b.status().weights.accounts[0].effective>original[0],'official recovery recomputes automatic shares');
-  clock+=24*hour;
+  const recovered=b.status().weights.accounts[0].effective;clock+=24*hour;
   for(const a of [timedAccount('a',10,24,clock),timedAccount('b',90,160,clock)])store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
-  await b.tick();assert.ok(Math.abs(b.status().weights.accounts[0].effective-42.5531914894)<1e-8);
-  assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0,'weight reset is independent of nightly migrations');
+  await b.tick();assert.equal(b.status().weights.accounts[0].effective,recovered);
+  assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0,'disabled scheduling does not reset weights');
  }finally{store.close();rmSync(root,{recursive:true,force:true});}
 });
 test('manual positive weights permit an exhausted subscription and strict zero never becomes fallback',async t=>{
@@ -486,7 +485,7 @@ test('positive changes retain an existing binding while zero reroutes once even 
  await app.send();assert.equal(app.store.get('SELECT route_version FROM sessions').route_version,1);
  assert.deepEqual(app.calls.map(c=>c.home),['a','a','b','b']);
 });
-test('stale exhausted snapshots stay at zero across restart and a failed daily refresh completes on fresh evidence',async()=>{
+test('stale snapshots keep weights across restart and explicit scheduled refresh retries on fresh evidence',async()=>{
  const store=pricedStore(':memory:');let clock=at;
  try{
   for(const a of [timedAccount('a',30,24),timedAccount('b',90,160)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
@@ -494,7 +493,7 @@ test('stale exhausted snapshots stay at zero across restart and a failed daily r
   const original=b.status().weights.accounts.map(a=>a.effective),saved=store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value;
   store.run('UPDATE accounts SET quota_json=? WHERE id=?',timedAccount('a',10,24).quota_json,'a');b.status();
   assert.equal(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value,saved,'normal refresh is not a write event');
-  clock+=24*hour;b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),original);
+  clock+=24*hour;b=create();assert.deepEqual(b.status().weights.accounts.map(a=>a.effective),original);b.syncWeights(undefined,clock,'nightly');
   assert.equal(JSON.parse(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value).pending,true);
   for(const a of [timedAccount('a',10,24,clock),timedAccount('b',90,160,clock)])store.run('UPDATE accounts SET quota_json=? WHERE id=?',a.quota_json,a.id);
   assert.ok(Math.abs(b.status().weights.accounts[0].effective-42.5531914894)<1e-8,'the pending daily calculation finishes although both quotas stayed positive');
@@ -623,8 +622,8 @@ for(const manual of [false,true])test('recovery while weighted is disabled refre
  assert.equal(app.store.get("SELECT value FROM gateway_settings WHERE name='routing_weights'")?.value,configuration,'automatic cache refresh preserves manual values, version and expiry');
 });
 
-test('manual routes and exclusions expire at the next Beijing 02:00; clients cannot extend them',async t=>{
- let time=Date.parse('2026-10-20T23:00:00+08:00');const app=await gateway(t,{clock:()=>time});await app.send();const s=app.store.get('SELECT * FROM sessions');
+test('manual routes and exclusions restore only at a configured enabled slot; clients cannot extend them',async t=>{
+ let time=Date.parse('2026-10-20T23:00:00+08:00');const app=await gateway(t,{clock:()=>time});app.balancer.saveTransferSchedule({times:['02:00'],expected_version:0});app.balancer.saveSettings({nightly:true});await app.send();const s=app.store.get('SELECT * FROM sessions');
  const patch=body=>fetch(app.base+'/api/admin/sessions/'+s.id,{method:'PATCH',headers:{Authorization:'Bearer fixture-admin','Content-Type':'application/json'},body:JSON.stringify(body)});
  const deadline=Date.parse('2026-10-21T02:00:00+08:00');
  assert.equal((await patch({account_id:'b',expected_route_version:0})).status,200);
@@ -641,26 +640,13 @@ test('manual routes and exclusions expire at the next Beijing 02:00; clients can
  assert.equal((await patch({nightly_enabled:true})).status,200);assert.equal(app.store.get('SELECT nightly_expires FROM sessions').nightly_expires,null);
 });
 
-test('legacy manual routes use the latest human action, ignore automatic moves, and recover after restart',async()=>{
+test('legacy pins remain fixed across restart while scheduling is disabled and restore only after enabling',async()=>{
  const root=mkdtempSync(join(tmpdir(),'harbor-session-deadline-')),file=join(root,'db.sqlite');let store=pricedStore(file),clock=at;
  try{
-  const member=store.createMember('Fixture',null,null);
-  for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
-  for(const sid of ['old','recent','no-audit'])store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated,nightly_enabled) VALUES(?,?,'a','responses',?,?,0)",sid,member.memberId,at-48*hour,at);
-  const audit=(when,action,detail)=>store.run('INSERT INTO audit VALUES(?,?,?,?)',Math.random().toString(),when,action,JSON.stringify(detail));
-  audit(at-26*hour,'session.nightly',{session:'old',enabled:false});audit(at-25*hour,'session.route',{sessionId:'old',from:'b',to:'a'});
-  audit(at,'session.route',{session:'old',from:'b',to:'a',reason:'weight_zero'});
-  audit(at-10*60000,'session.route',{sessionId:'recent',from:'b',to:'a'});
-  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,readQuota:async a=>JSON.parse(a.quota_json),refreshQuota:async a=>JSON.parse(a.quota_json)});
-  let b=create();assert.equal(store.get("SELECT nightly_expires FROM sessions WHERE id='old'").nightly_expires,nextWeightReset(at-25*hour));
-  assert.equal(store.get("SELECT nightly_expires FROM sessions WHERE id='recent'").nightly_expires,nextWeightReset(at-10*60000));
-  assert.equal(store.snapshot(at).sessions.find(s=>s.id==='old').nightly_enabled,1,'effective before maintenance');
-  const before=store.all('SELECT * FROM sessions'),audits=store.get('SELECT COUNT(*) n FROM audit').n;
-  await b.preview();assert.deepEqual(store.all('SELECT * FROM sessions'),before);assert.equal(store.get('SELECT COUNT(*) n FROM audit').n,audits);
-  store.close();store=pricedStore(file);b=create();await b.tick();
-  assert.ok(store.all('SELECT nightly_enabled FROM sessions').every(s=>s.nightly_enabled===1));assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.nightly.expired'").n,3);
-  await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.nightly.expired'").n,3);
-  assert.equal(store.get('SELECT COUNT(*) n FROM balance_runs').n,0,'disabled nightly still expires manual settings');
+  const member=store.createMember('Fixture',null,null);store.run("INSERT INTO accounts(id,name,home,state) VALUES('a','a','a','ready')");
+  for(const sid of ['old','no-deadline'])store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated,nightly_enabled,nightly_expires) VALUES(?,?,'a','responses',?,?,0,?)",sid,member.memberId,at-48*hour,at,sid==='old'?at-hour:null);
+  const create=()=>createBalancer({store,preparing:new Set(),clock:()=>clock,refreshQuota:async()=>null});let b=create();const before=store.all('SELECT * FROM sessions');await b.tick();assert.deepEqual(store.all('SELECT * FROM sessions'),before);assert.ok(store.snapshot(at).sessions.every(s=>s.nightly_enabled===0));
+  store.close();store=pricedStore(file);b=create();await b.tick();assert.deepEqual(store.all('SELECT * FROM sessions'),before);b.saveTransferSchedule({times:['13:00'],expected_version:0});b.saveSettings({nightly:true});await b.tick();assert.ok(store.all('SELECT nightly_enabled FROM sessions').every(s=>s.nightly_enabled===0));clock=Date.parse('2026-10-14T13:00:00+08:00');await b.tick();assert.ok(store.all('SELECT nightly_enabled FROM sessions').every(s=>s.nightly_enabled===1));assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.nightly.expired'").n,2);await b.tick();assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.nightly.expired'").n,2);
  }finally{store.close();rmSync(root,{recursive:true,force:true});}
 });
 
@@ -670,7 +656,7 @@ test('nightly rechecks a manual hold created while quota refresh was in progress
   const member=store.createMember('Fixture',null,null);
   for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
   for(let i=0;i<5;i++){store.run("INSERT INTO sessions(id,member_id,account_id,protocol,created,updated) VALUES(?,?,'a','responses',?,?)",'s'+i,member.memberId,at-2*hour,at-hour);store.run("INSERT INTO requests(id,member_id,session_id,account_id,started,ended,status,input,model,ip) VALUES(?,?,?,'a',?,?,'ok',20,'fixture','fixture')",'r'+i,member.memberId,'s'+i,at-2*hour,at-hour);}
-  const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async a=>{store.run('UPDATE sessions SET nightly_enabled=0,nightly_expires=?',nextWeightReset(at));return JSON.parse(a.quota_json);}});b.saveSettings({nightly:true,weighted:true});await b.tick();
+  const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async a=>{store.run('UPDATE sessions SET nightly_enabled=0,nightly_expires=?',nextWeightReset(at));return JSON.parse(a.quota_json);}});b.saveSettings({nightly:true,weighted:true});existingSchedule(store);await b.tick();
   const saved=JSON.parse(store.get('SELECT summary FROM balance_runs').summary);assert.equal(saved.applied.length,0);assert.equal(store.get('SELECT MAX(route_version) n FROM sessions').n,0);
  }finally{store.close();}
 });
@@ -723,4 +709,13 @@ test('late failure from a disabled source cannot poison the migrated Responses s
  app.balancer.disableAccount('a');const moved=app.store.get('SELECT * FROM sessions');app.mode('network');app.release();assert.equal((await pending).status,502);
  assert.deepEqual(app.store.get('SELECT * FROM sessions'),moved);assert.equal(app.store.get("SELECT enabled FROM accounts WHERE id='a'").enabled,0);
  app.mode('ok');assert.equal((await app.send()).status,200);assert.equal(app.calls.at(-1).home,'b');
+});
+
+test('disabling while a scheduled quota refresh waits prevents automatic weight recalculation and migration',async()=>{
+ const store=pricedStore(':memory:');let release,entered;const started=new Promise(resolve=>{entered=resolve;}),waiting=new Promise(resolve=>{release=resolve;});
+ try{
+  for(const a of [account('a',20),account('b',80)])store.run("INSERT INTO accounts(id,name,home,state,quota_json) VALUES(?,?,?,'ready',?)",a.id,a.id,a.id,a.quota_json);
+  const b=createBalancer({store,preparing:new Set(),clock:()=>at,refreshQuota:async a=>{entered();await waiting;return JSON.parse(a.quota_json);}});b.saveSettings({nightly:true,weighted:true});existingSchedule(store);b.syncWeights();const before=store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value;
+  const running=b.tick();await started;b.saveSettings({nightly:false});release();await running;assert.equal(store.get("SELECT value FROM gateway_settings WHERE name='routing_auto'").value,before);assert.equal(store.get("SELECT COUNT(*) n FROM audit WHERE action='session.route'").n,0);
+ }finally{release?.();store.close();}
 });

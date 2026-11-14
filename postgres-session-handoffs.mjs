@@ -4,7 +4,7 @@ import {createDepartmentScopeIssuer,requireDepartmentScope} from './department-a
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {isPostgresDepartmentActorService} from './postgres-departments.mjs';
 import {createAdminDepartments} from './postgres-admin-departments.mjs';
-import {AppError,id,nextDailyReset,usageWindow,participatesNightly} from './store.mjs';
+import {AppError,id,usageWindow,participatesNightly} from './store.mjs';
 import {lockPostgresRouting} from './postgres-routing.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 
@@ -159,18 +159,20 @@ export function createPostgresSessionHandoffs(store,{gate,readStore=store,queryQ
     // entering the transaction. Once started, report its actual final result.
     alive(signal);if(currentStage)currentStage.stage='applying';
     await store.transaction(async()=>{
-      if(decision.department_id)await departmentActors.authorizeHandoffActor(decisionId,{lock:true});
+      // Match schedule rebase: member/routing/session before the handoff row.
+      // Revalidate the persisted actor inside the same transaction after those locks.
       alive(signal);const {session}=await inspect(decision.session_id,{lock:true});alive(signal);
+      if(decision.department_id)await departmentActors.authorizeHandoffActor(decisionId,{lock:true});
       const row=await store.get('SELECT * FROM harbor.session_handoffs WHERE id=$1 FOR UPDATE',decisionId);
       if(row?.status!=='waiting'||session.account_id!==row.source_account_id||session.route_version!==row.expected_route_version||session.nightly_enabled!==row.source_nightly_enabled||session.nightly_expires!==row.source_nightly_expires)failure('session_route_conflict','会话绑定或人工配置已变化');
-      if(row.expires<=clock()||row.pin_expires!==null&&row.pin_expires<=clock())failure('session_handoff_expired','本次转移已过期');
+      if(row.expires<=clock())failure('session_handoff_expired','本次转移已过期');
       const source=await store.get('SELECT route_epoch FROM harbor.accounts WHERE id=$1 FOR SHARE',session.account_id),currentTarget=await targetAccount(row.target_account_id,{lock:true});
       if(source?.route_epoch!==row.source_epoch||currentTarget.route_epoch!==row.target_epoch)failure('session_account_changed','源或目标账号状态已变化');
       if(await store.get("SELECT id FROM harbor.requests WHERE session_id=$1 AND status IN ('queued','running') LIMIT 1",session.id))failure('session_busy','旧请求结算尚未完成，本次交接取消');
-      const current=await sourceContext(session);if(current?.key_id!==last?.key_id||current?.model!==last?.model)failure('session_route_conflict','模型或访问权限已变化，请重新规划');
-      const version=session.route_version+1,at=clock();
-      await store.run('UPDATE harbor.sessions SET account_id=$1,upstream_thread=$2,route_version=$3,nightly_enabled=0,nightly_expires=$4,handoff_requires_replay=1 WHERE id=$5',row.target_account_id,id(),version,row.pin_expires,session.id);
-      await store.run("UPDATE harbor.session_handoffs SET status='completed',finished=$1,applied_route_version=$2 WHERE id=$3",at,version,row.id);
+      const context=await sourceContext(session);if(context?.key_id!==last?.key_id||context?.model!==last?.model)failure('session_route_conflict','模型或访问权限已变化，请重新规划');
+      const version=session.route_version+1,at=clock(),pinExpires=currentTarget.auth_mode==='openai_api'?null:await routingDepartments.nextReset(await current({lock:true}),at);
+      await store.run('UPDATE harbor.sessions SET account_id=$1,upstream_thread=$2,route_version=$3,nightly_enabled=0,nightly_expires=$4,handoff_requires_replay=1 WHERE id=$5',row.target_account_id,id(),version,pinExpires,session.id);
+      await store.run("UPDATE harbor.session_handoffs SET status='completed',finished=$1,applied_route_version=$2,pin_expires=$4 WHERE id=$3",at,version,row.id,pinExpires);
       await audit('session.route',{sessionId:session.id,from:row.source_account_id,to:row.target_account_id,version,reason:'manual',handoff:row.id});
       await audit('session.handoff.completed',{session:session.id,handoff:row.id,version});alive(signal);
     });
@@ -218,7 +220,7 @@ export function createPostgresSessionHandoffs(store,{gate,readStore=store,queryQ
           await store.run("UPDATE harbor.session_handoffs SET status='superseded',finished=$1,reason='replaced' WHERE id=$2",clock(),previous.id);
           await audit('session.handoff.superseded',{session:sessionId,handoff:previous.id,replacement:row.id});
         }
-        const at=clock();Object.assign(row,{source_account_id:session.account_id,target_account_id:target.id,expected_route_version:session.route_version,source_epoch:source.route_epoch,target_epoch:target.route_epoch,source_nightly_enabled:session.nightly_enabled,source_nightly_expires:session.nightly_expires,pin_expires:target.auth_mode==='openai_api'?null:nextDailyReset(at),origin:'manual',status:'waiting',requested:at,expires:at+pendingMs});
+        const at=clock();Object.assign(row,{source_account_id:session.account_id,target_account_id:target.id,expected_route_version:session.route_version,source_epoch:source.route_epoch,target_epoch:target.route_epoch,source_nightly_enabled:session.nightly_enabled,source_nightly_expires:session.nightly_expires,pin_expires:target.auth_mode==='openai_api'?null:await routingDepartments.nextReset(scope,at),origin:'manual',status:'waiting',requested:at,expires:at+pendingMs});
         await store.run(`INSERT INTO harbor.session_handoffs(id,session_id,member_id,source_account_id,target_account_id,expected_route_version,source_epoch,target_epoch,source_nightly_enabled,source_nightly_expires,pin_expires,origin,status,requested,expires${scope?',department_id,actor_kind,actor_id,actor_version':''})
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'manual','waiting',$12,$13${scope?',$14,$15,$16,$17':''})`,row.id,sessionId,session.member_id,row.source_account_id,row.target_account_id,row.expected_route_version,row.source_epoch,row.target_epoch,row.source_nightly_enabled,row.source_nightly_expires,row.pin_expires,at,row.expires,...(scope?[scope.department_id,scope.role,scope.credential_id,scope.credential_version]:[]));
         if(row.replaces_handoff_id)await store.run('UPDATE harbor.session_handoffs SET replaces_handoff_id=$1 WHERE id=$2',row.replaces_handoff_id,row.id);

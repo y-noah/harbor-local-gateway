@@ -1,8 +1,8 @@
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {createPostgresAudit} from './postgres-audit.mjs';
 import {codexQuotaDenials} from './codex-entitlements.mjs';
-import {AppError,hash,id,nextDailyReset,usageWindow} from './store.mjs';
-import {transferSchedule,transferWindow} from './transfer-schedule.mjs';
+import {AppError,hash,id,usageWindow} from './store.mjs';
+import {transferSchedule,transferWindow,nextTransferReset} from './transfer-schedule.mjs';
 import {createPostgresAccountPackages} from './postgres-account-packages.mjs';
 import {createPostgresExtraRuntime,classifyExtraPackage,noteExtraDispatchRoutingLock,readExtraDispatchSettings,registerExtraDispatchPreferenceReader} from './postgres-extra-runtime.mjs';
 import {consumptionSource,consumptionCandidateGroups,normalizeConsumptionPolicy} from './consumption-policy.mjs';
@@ -53,7 +53,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
       const {save,audit:detail,...value}=routingAutoState(accounts,at,saved.get('routing_auto')||null,force,options);system=value;
       if(save&&persist&&persistAuto){await write('routing_auto',save,department);await audit(department,'balancing.weights.auto',detail,at);}
     }else system=automaticWeights(accounts.filter(a=>a.auth_mode!=='openai_api'),at,options);
-    const configured=saved.get('routing_weights')||{mode:'auto',weights:{},expires:null,version:0},manualActive=configured.mode==='manual'&&configured.expires>at,effectiveWeighted=settings.weighted||packagePolicy.enabled&&(!system.legacyCompatibility||manualActive);
+    const configured=saved.get('routing_weights')||{mode:'auto',weights:{},expires:null,version:0},manualActive=configured.mode==='manual',effectiveWeighted=settings.weighted||packagePolicy.enabled&&(!system.legacyCompatibility||manualActive);
     const baseDistribution=routingDistribution(accounts,{at,weighted:effectiveWeighted,system,configured}),extraView=await extraRuntime.routingView(accounts,{model,protocol,packagePolicy,distribution:baseDistribution}),distribution=extraView.distribution;
     const select=async()=>{
       if(department){if(!store.context.getStore())failure(503,'部门路由选择必须位于受理事务内','database_transaction_required');await access.resolve(scope,{write:true});}
@@ -104,7 +104,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
         }
         const target=await destination.select();
         if(target.id!==account.id){
-          const expires=api&&target.auth_mode!=='openai_api'&&!session.nightly_enabled&&session.nightly_expires===null?nextDailyReset(at):session.nightly_expires;
+          const expires=api&&target.auth_mode!=='openai_api'&&!session.nightly_enabled&&session.nightly_expires===null?await access.nextReset(department,at):session.nightly_expires;
           const changed=await store.get('UPDATE harbor.sessions SET account_id=$1,upstream_thread=$2,route_version=route_version+1,nightly_expires=$3 WHERE id=$4 AND route_version=$5 RETURNING *',target.id,id(),expires,session.id,session.route_version);
           if(!changed)failure(409,'会话绑定已变化','session_route_conflict');
           await audit(department,'session.route',{session:session.id,from:account.id,to:target.id,reason:blocked?account.route_block:'weight_zero'},at,{kind:'session',id:session.id});session=changed;account=target;
@@ -147,7 +147,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
             target=[...alternatives].sort((a,b)=>a.bindings-b.bindings||a.last_used-b.last_used||a.id.localeCompare(b.id))[0];if(target)target.bindings++;
           }
           if(!target)failure(409,'没有可接收会话的同类型正权重账号，未停用或迁移任何会话','disable_no_target');
-          const expires=account.auth_mode==='openai_api'&&target.auth_mode!=='openai_api'&&!session.nightly_enabled&&session.nightly_expires===null?nextDailyReset(at):session.nightly_expires;
+          const expires=account.auth_mode==='openai_api'&&target.auth_mode!=='openai_api'&&!session.nightly_enabled&&session.nightly_expires===null?await access.nextReset(department,at):session.nightly_expires;
           changes.push({id:session.id,target:target.id,thread:id(),expires,version:session.route_version,audit:id()});
           if(session.protocol!=='responses')resetTextSessions++;
         }
@@ -180,9 +180,18 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
     const running=()=>{if(isStopping())throw new AppError(503,'调度管理正在关闭','service_stopping');};
     running();const result=await operation(department);running();return result;
   });
+  async function rebaseTemporarySettings(department,settings,schedule){
+    const expires=nextTransferReset(clock(),settings,schedule),current=await access.setting(department,'routing_weights',{lock:true});
+    if(current?.mode==='manual')await write('routing_weights',{...current,expires,version:current.version+1},department);
+    // Only the schedule-derived deadline changes. Preserve an accepted manual
+    // handoff if its complete source binding still matches before the rebase.
+    await store.run("UPDATE harbor.session_handoffs h SET source_nightly_expires=$1 FROM harbor.sessions s JOIN harbor.accounts a ON a.id=s.account_id WHERE h.session_id=s.id AND h.origin='manual' AND h.status='waiting' AND h.automatic_group_id IS NULL AND s.nightly_enabled=0 AND a.auth_mode='subscription' AND h.source_account_id=s.account_id AND h.expected_route_version=s.route_version AND h.source_epoch=a.route_epoch AND h.source_nightly_enabled=s.nightly_enabled AND h.source_nightly_expires IS NOT DISTINCT FROM s.nightly_expires"+(department?' AND s.department_id=$2 AND h.department_id=$2':''),expires,...(department?[department.department_id]:[]));
+    await store.run("UPDATE harbor.sessions SET nightly_expires=$1 WHERE nightly_enabled=0 AND EXISTS(SELECT 1 FROM harbor.accounts a WHERE a.id=harbor.sessions.account_id AND a.auth_mode='subscription')"+(department?' AND department_id=$2':''),expires,...(department?[department.department_id]:[]));
+  }
   async function saveSettings(value,{scope}={}){
     balanceSettings(value);return managementTransaction(scope,async department=>{
       const {settings}=await state(clock(),{persist:false,scope}),next=balanceSettings({...settings,...value}),{weighted,...legacy}=next;
+      if(next.nightly!==settings.nightly){const previous=transferSchedule(await access.setting(department,'transfer_schedule')??{}),schedule={...previous,version:previous.version+1,effective:clock()};await write('transfer_schedule',schedule,department);await rebaseTemporarySettings(department,next,schedule);}
       await write('balancing',legacy,department);await write('routing_strategy',{weighted},department);await audit(department,'balancing.settings',next,clock());return next;
     });
   }
@@ -193,7 +202,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
       const previous=transferSchedule(await access.setting(department,'transfer_schedule',{lock:true})??{});
       if(previous.version!==value.expected_version)failure(409,'定时转移配置已变化，请刷新后重试','transfer_schedule_conflict');
       const next=transferSchedule({...desired,version:previous.version+1,effective:clock()});
-      await write('transfer_schedule',next,department);await audit(department,'balancing.transfer_schedule',{...next,previous},clock());return next;
+      await write('transfer_schedule',next,department);await rebaseTemporarySettings(department,await access.setting(department,'balancing')??{},next);await audit(department,'balancing.transfer_schedule',{...next,previous},clock());return next;
     });
   }
   async function saveWeights(value,{scope}={}){
@@ -205,7 +214,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
         weights=value.weights;const ids=new Set((await store.all("SELECT id FROM harbor.accounts WHERE kind='codex' AND auth_mode='subscription' AND removed_at IS NULL"+(department?' AND department_id=$1':'')+" ORDER BY id FOR SHARE",...(department?[department.department_id]:[]))).map(a=>a.id));
         if(!weights||typeof weights!=='object'||Array.isArray(weights)||!Object.keys(weights).length||Object.entries(weights).some(([key,v])=>!ids.has(key)||!Number.isFinite(v)||v<0||v>100||Math.abs(v*100-Math.round(v*100))>1e-8)||Math.abs(Object.values(weights).reduce((n,v)=>n+v,0)-100)>1e-8)failure(400,'请填写有效账号权重，最多两位小数且总和必须为100%');
       }else if(value.weights!==undefined)failure(400,'自动模式无需填写权重');
-      const next={mode:value.mode,weights,expires:value.mode==='manual'?nextDailyReset(clock()):null,version:current.version+1};
+      const next={mode:value.mode,weights,expires:value.mode==='manual'?await access.nextReset(department,clock()):null,version:current.version+1};
       await write('routing_weights',next,department);if(value.mode==='auto')await state(clock(),{force:'manual',scope});await audit(department,'balancing.weights',{...next,previous:current},clock());return next;
     });
   }
@@ -219,7 +228,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
       }
       const transfers=transferSchedule(await access.setting(department,'transfer_schedule')??{});
       const window=usageWindow(at),lastRun=department?null:await store.get('SELECT day,started,ended,status FROM harbor.balance_runs WHERE started>=$1 AND started<$2 ORDER BY started DESC,day DESC LIMIT 1',window.start,window.end);
-      return {settings,strategy,transfers:{...transfers,next:transferWindow(at,transfers).next},weights:{mode:distribution.mode,reason:distribution.reason,configuration:distribution.configuration,accounts:distribution.accounts},lastRun:lastRun||null,...(department?{lastRunAvailable:false}:{})};
+      return {settings,strategy,transfers:{...transfers,next:nextTransferReset(at,settings,transfers)},weights:{mode:distribution.mode,reason:distribution.reason,configuration:distribution.configuration,accounts:distribution.accounts},lastRun:lastRun||null,...(department?{lastRunAvailable:false}:{})};
     },{level:'REPEATABLE READ',readOnly:true});
   }
   async function syncWeights(force=false,at=clock(),{scope}={}){return store.transaction(async()=>{await access.resolve(scope,{write:true});await lockPostgresRouting(store);return state(at,{force,scope});});}

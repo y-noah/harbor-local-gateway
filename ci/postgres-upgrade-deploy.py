@@ -6,12 +6,14 @@ from contextlib import contextmanager
 CONTRACT='harbor-postgres-runtime-upgrade-v1'
 TICKET=Path('/etc/harbor-postgres-runtime-upgrade.json')
 TOOLS_MANIFEST=Path('/etc/harbor-postgres-runtime-tools.json')
-HOST_FILES=('/usr/local/bin/harbor-gateway-deploy','/usr/local/lib/harbor/postgres-deploy.py','/usr/local/lib/harbor/gateway-entry-controller.py','/usr/local/lib/harbor/postgres-upgrade-deploy.py','/usr/local/lib/harbor/postgres-usage-cascade.py','/usr/local/lib/harbor/postgres-department-release.py')
+HOST_FILES=('/usr/local/bin/harbor-gateway-deploy','/usr/local/lib/harbor/postgres-deploy.py','/usr/local/lib/harbor/gateway-entry-controller.py','/usr/local/lib/harbor/postgres-upgrade-deploy.py','/usr/local/lib/harbor/harbor-material-storage.py','/usr/local/lib/harbor/postgres-usage-cascade.py','/usr/local/lib/harbor/postgres-department-release.py')
 RELEASES=Path('/var/lib/harbor-postgres-upgrades')
 ENTRY=Path('/usr/local/lib/harbor/gateway-entry-controller.py')
 LOCAL=Path('/usr/local/lib/harbor/local-assurance-deploy.py')
 STACK=Path('/opt/product-development/harbor-local-gateway')
 GATE='harbor_postgres_upgrade_gate'
+BACKUP_QUALIFICATION=Path('/etc/harbor-retained-service-qualification.json')
+BACKUP_CONTRACT='harbor-retained-service-restore-v1'
 UUID=r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}'
 DIGEST=r'sha256:[a-f0-9]{64}'
 
@@ -34,7 +36,11 @@ def load(path,name):
  path=Path(path)
  for parent in [path,*path.parents]:
   info=parent.lstat();need((stat.S_ISREG(info.st_mode) if parent==path else stat.S_ISDIR(info.st_mode)) and info.st_uid==0 and not info.st_mode&0o022,'untrusted installed helper')
- spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+ spec=importlib.util.spec_from_file_location(name,path)
+ if spec is None:
+  from importlib import machinery
+  spec=importlib.util.spec_from_loader(name,machinery.SourceFileLoader(name,str(path)))
+ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 
 def trusted_code_bytes(path):
  path=Path(path)
@@ -247,7 +253,7 @@ def run_with_metadata_residency(image,config,api,ticket,entry):
  with metadata_residency(config):return run_upgrade(image,config,api,ticket,entry)
 
 def deploy(image,config,archive,api):
- need(retained_service_pairs(config)==0,'backup_pair_restore_unqualified')
+ verify_retention_qualification(config)
  need(archive is None,'installed CI image required');ticket=validate_ticket(private_json(TICKET),image,config);verify_installed_tools(ticket);entry=load(api['ENTRY_HELPER'],'runtime_upgrade_entry')
  with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry))
 
@@ -393,6 +399,63 @@ def retained_service_pairs(config):
  need(type(value) is int and value in (0,1),'postgres_retained_service_pairs must be 0 or 1')
  return value
 
+def verify_retention_qualification(config,ticket=None):
+ keep=retained_service_pairs(config)
+ if not keep:return None
+ try:report=private_json(BACKUP_QUALIFICATION)
+ except Exception as error:raise RuntimeError('PostgreSQL runtime upgrade: backup_pair_restore_unqualified') from error
+ checks=['pair_rotation','reverse_publication','entry_rebind','restore_failure_preserves_source','ordinary_cleanup']
+ need(type(report) is dict and set(report)=={'contract','hostToolsRevision','evidenceDigest','checks'} and report['contract']==BACKUP_CONTRACT and re.fullmatch('[a-f0-9]{40}',report.get('hostToolsRevision','')) and re.fullmatch('[a-f0-9]{64}',report.get('evidenceDigest','')) and type(report['checks']) is dict and set(report['checks'])==set(checks) and all(report['checks'][name] is True for name in checks),'backup_pair_restore_unqualified')
+ if ticket is not None:need(report['hostToolsRevision']==ticket['hostToolsRevision'],'backup qualification host revision changed')
+ return report
+
+def backup_configuration(config):
+ # Operator configuration stays in a private snapshot, never in CLI output.
+ return {key:copy.deepcopy(value) for key,value in config.items() if key!='postgres_retained_service_pairs'}
+
+DEPARTMENT_CONTRACT='harbor-department-isolation-v1'
+def department_contract(proof):
+ need(type(proof) is dict,'department_proof_unknown')
+ value=proof.get('department_isolation_contract')
+ if value is None:
+  need('department_isolation_installed' not in proof,'department_marker_without_contract');return None
+ need(value==DEPARTMENT_CONTRACT and type(proof.get('department_isolation_installed')) is bool,'department_proof_invalid');return value
+
+def department_upgrade_guard(pg,api,ticket,gateway,worker,common,target_proof):
+ target=department_contract(target_proof);activate=ticket.get('activateDepartmentIsolation',False)
+ need(type(activate) is bool,'department_activation_flag')
+ if activate:need(target==DEPARTMENT_CONTRACT,'department_activation_target_unsupported')
+ original=api['source_image_preflight'];proofs=[]
+ def guarded(instance,requested):
+  proof=original(instance,requested);source=department_contract(proof)
+  if proof.get('department_isolation_installed',False):need(target==DEPARTMENT_CONTRACT,'department_installed_requires_compatible_target')
+  if activate:need(source==DEPARTMENT_CONTRACT,'department_bridge_release_required')
+  return proof
+ api['source_image_preflight']=guarded
+ if target==DEPARTMENT_CONTRACT:
+  for instance,role in [(gateway,'gateway'),(worker,'worker')]:
+   values=pg.container_shutdown(api,instance,role)
+   need(type(values) is dict,'department_source_shutdown_unknown')
+   requested=[next((label+'='+str(values[key]) for key,label in pg.SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
+   proofs.append(guarded(instance,requested))
+ return proofs
+
+def qualify_backup(pg,api,config,ticket,active,gateway,worker,common,target_proof):
+ report=verify_retention_qualification(config,ticket)
+ if report is None:return None
+ proofs=[]
+ for row,role in [(gateway,'gateway'),(worker,'worker')]:
+  values=pg.container_shutdown(api,row,role)
+  requested=[next((label+'='+str(values[key]) for key,label in pg.SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
+  source=api['source_image_preflight'](row,requested)
+  contracts={key for key in source.keys()|target_proof.keys() if key.endswith('_contract')}|{'contract','schema_digest','database_digest','device_ca_digest'}
+  need(all(source.get(key)==target_proof.get(key) for key in contracts),'backup code/data/recording contracts are incompatible')
+  need(pg.rollback_environment_matches(row,ticket['materialsDirectory'],source.get('context_capture_guard_contract')=='v1'),'backup original environment is incompatible')
+  proofs.append(source)
+ image=api['inspect_image'](ticket['from']['image']);need(image and image.get('Id')==ticket['from']['imageId'],'backup immutable image changed')
+ prior=active.get('approval',{});need(prior.get('configDigest')==ticket['from']['imageId'] and re.fullmatch(DIGEST,prior.get('manifestDigest','')),'backup source image approval unavailable')
+ return {'contract':BACKUP_CONTRACT,'qualificationDigest':digest(report),'hostToolsRevision':ticket['hostToolsRevision'],'image':ticket['from']['image'],'configDigest':ticket['from']['imageId'],'manifestDigest':prior['manifestDigest'],'configuration':backup_configuration(config),'active':copy.deepcopy(active),'sourceProofs':proofs,'sameDatabase':True}
+
 def retired_container(api,identifier):
  result=api['docker']('container','inspect',identifier,check=False,timeout=10)
  if result.returncode==0:
@@ -407,9 +470,15 @@ def retired_pair(record,api):
  need(all(re.fullmatch('[a-f0-9]{64}',source.get(key,'')) for key in ['containerId','workerId']) and source['containerId']!=source['workerId'] and re.fullmatch(DIGEST,source.get('imageId','')),'retired source identity invalid')
  return {'release':ticket['deploymentId'],'members':[{'id':source[field],'image':source['imageId'],'previous':name+'-previous','retired':name+'-retired-pg-'+source[field][:12],'role':role} for name,field,role in [(api['NAME'],'containerId','gateway'),(api['NAME']+'-worker','workerId','worker')]]}
 
-def retired_cleanup(config,api,entry,record=None):
+def retained_backup(entry,record,api):
+ pair=retired_pair(record,api);snapshot=entry.private_json(release_path(pair['release'])/'backup.json')
+ need(digest(snapshot)==record.get('backupDigest') and snapshot.get('contract')==BACKUP_CONTRACT and snapshot.get('sameDatabase') is True and snapshot.get('image')==record['ticket']['from']['image'] and snapshot.get('configDigest')==record['ticket']['from']['imageId'] and re.fullmatch(DIGEST,snapshot.get('manifestDigest','')) and type(snapshot.get('configuration')) is dict,'backup snapshot binding invalid')
+ return snapshot
+
+def retired_cleanup(config,api,entry,record=None,protect_retained=False):
  """Retry exact committed code pairs; never removes volumes or images."""
- need(retained_service_pairs(config)==0,'backup_pair_restore_unqualified');ledger_path=RELEASES/'retired-services.json'
+ need(type(protect_retained) is bool,'retention protection must be boolean')
+ keep=retained_service_pairs(config) or protect_retained;verify_retention_qualification(config);ledger_path=RELEASES/'retired-services.json'
  ledger=entry.private_json(ledger_path) if ledger_path.exists() else {'version':1,'pairs':[]}
  need(type(ledger) is dict and set(ledger)=={'version','pairs'} and type(ledger['version']) is int and ledger['version']==1 and type(ledger['pairs']) is list,'retired service ledger invalid')
  records={}
@@ -451,17 +520,35 @@ def retired_cleanup(config,api,entry,record=None):
   matches=[name for name in [member['previous'],member['retired']] if (api['inspect_container'](name) or {}).get('Id')==member['id']]
   need(len(matches)==1,'retired service name changed');return matches[0]
  remaining=[]
- for pair in ledger['pairs']:
+ candidates=[pair for pair in ledger['pairs'] if records[pair['release']].get('backupDigest')]
+ retained=candidates[-1] if keep and candidates else None
+ if keep and record is not None:need(retained is not None and retained['release']==record['ticket']['deploymentId'],'new backup qualification missing')
+ # Qualify the replacement before removing any previously recoverable pair.
+ if retained is not None:retained_backup(entry,records[retained['release']],api)
+ original_pairs=list(ledger['pairs'])
+ ordered=([retained] if retained else [])+[pair for pair in ledger['pairs'] if pair is not retained]
+ for pair in ordered:
   try:
    located=[locate(member) for member in pair['members']]
+   if pair is retained:
+    need(all(located),'backup service pair is incomplete')
+    for member,name in zip(pair['members'],located):
+     if name!=member['retired']:
+      need(api['inspect_container'](member['retired']) is None,'backup retired name occupied');locate(member);api['docker']('rename',member['id'],member['retired']);need(locate(member)==member['retired'],'backup retirement rename unconfirmed')
+    remaining.append(pair);status['retainedPairs']=1
+    saved=records[pair['release']];saved['cleanup']={'state':'retained','retainedPairs':1,'pendingPairs':0,'sameDatabase':True};entry.save_json(release_path(pair['release'])/'release.json',saved)
+    continue
    for member,name in zip(pair['members'],located):
     if name is not None:
      locate(member);api['docker']('rm',member['id']);need(retired_container(api,member['id']) is None,'retired deletion unconfirmed')
    saved=records[pair['release']];saved['cleanup']={'state':'complete','retainedPairs':0,'pendingPairs':0,'sameDatabase':True};entry.save_json(release_path(pair['release'])/'release.json',saved)
    ledger['pairs']=[item for item in ledger['pairs'] if item is not pair];entry.save_json(ledger_path,ledger)
   except Exception:
-   remaining.append(pair);status.update(state='pending',errorCategory='retired_service_cleanup_pending');status['pendingPairs']+=1
- ledger['pairs']=remaining;entry.save_json(ledger_path,ledger)
+   if pair not in remaining:remaining.append(pair)
+   status.update(state='pending',errorCategory='retired_service_cleanup_pending');status['pendingPairs']+=1
+   if pair is retained:
+    remaining.extend(item for item in ordered if item is not pair and item not in remaining);break
+ ledger['pairs']=[pair for pair in original_pairs if pair in remaining];entry.save_json(ledger_path,ledger)
  return status
 
 def finish_retired_cleanup(config,api,entry,record,path):
@@ -475,47 +562,23 @@ def finish_retired_cleanup(config,api,entry,record,path):
  except Exception:record['cleanup']={'state':'pending','errorCategory':'retired_service_cleanup_record_failed'}
  return record['cleanup']
 
-DEPARTMENT_CONTRACT='harbor-department-isolation-v1'
-def department_contract(proof):
- need(type(proof) is dict,'department_proof_unknown')
- value=proof.get('department_isolation_contract')
- if value is None:
-  need('department_isolation_installed' not in proof,'department_marker_without_contract');return None
- need(value==DEPARTMENT_CONTRACT and type(proof.get('department_isolation_installed')) is bool,'department_proof_invalid');return value
-
-def department_upgrade_guard(pg,api,ticket,gateway,worker,common,target_proof):
- target=department_contract(target_proof);activate=ticket.get('activateDepartmentIsolation',False)
- need(type(activate) is bool,'department_activation_flag')
- if activate:need(target==DEPARTMENT_CONTRACT,'department_activation_target_unsupported')
- original=api['source_image_preflight'];proofs=[]
- def guarded(instance,requested):
-  proof=original(instance,requested);source=department_contract(proof)
-  if proof.get('department_isolation_installed',False):need(target==DEPARTMENT_CONTRACT,'department_installed_requires_compatible_target')
-  if activate:need(source==DEPARTMENT_CONTRACT,'department_bridge_release_required')
-  return proof
- api['source_image_preflight']=guarded
- if target==DEPARTMENT_CONTRACT:
-  for instance,role in [(gateway,'gateway'),(worker,'worker')]:
-   values=pg.container_shutdown(api,instance,role)
-   need(type(values) is dict,'department_source_shutdown_unknown')
-   requested=[next((label+'='+str(values[key]) for key,label in pg.SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
-   proofs.append(guarded(instance,requested))
- return proofs
-
 def run_upgrade(image,config,api,ticket,entry):
- need(retained_service_pairs(config)==0,'backup_pair_restore_unqualified: retained pair restore is not qualified')
+ verify_retention_qualification(config,ticket)
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
  preflight_timeout=pg.preflight_timeout_seconds(config.get('postgres_preflight_timeout_seconds',30))
  active,original,gateway=entry.active_record();worker=api['inspect_container'](api['NAME']+'-worker');verify_source(ticket,active,gateway,worker);check_storage(ticket)
- if RELEASES.exists():need(retired_cleanup(config,api,entry)['state']=='complete','retired_service_cleanup_pending: retry before starting another upgrade')
+ if RELEASES.exists():need(retired_cleanup(config,api,entry,protect_retained=True)['state']=='complete','retired_service_cleanup_pending: retry before starting another upgrade')
  pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout};common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);proof=pg.image_proof(pg_api,image,common)
  need(all(proof[k]==ticket[v] for k,v in [('database_digest','databaseDigest'),('schema_digest','schemaDigest'),('device_ca_digest','deviceCaDigest')]),'new image changed database/schema/device identity')
  pg.container_shutdown(pg_api,gateway,'gateway');pg.container_shutdown(pg_api,worker,'worker')
  pg_api['source_image_preflight']=pg.prepare_source_image_preflights(pg_api,[(gateway,'gateway'),(worker,'worker')],common)
  consumption_upgrade_guard(pg,pg_api,ticket,entry,gateway,common,proof)
  department_sources=department_upgrade_guard(pg,pg_api,ticket,gateway,worker,common,proof)
+ backup=qualify_backup(pg,pg_api,config,ticket,active,gateway,worker,common,proof)
  network_snapshot(ticket,entry,gateway,worker)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
+ if backup is not None:
+  entry.save_json(path/'backup.json',backup);record['backupDigest']=digest(backup);entry.save_json(path/'release.json',record)
  context=SimpleNamespace(config=original,state=entry.private_json(entry.STATE));entry.EntryDeployment.enter_probe_worker(context);entry.EntryDeployment.allow_probe_worker(context)
  active=entry.private_json(entry.ACTIVE);record['fromActive']=active;entry.save_json(path/'release.json',record);gate=None;gate_attempted=False;commit_started=False
  if proof.get('usage_rollup_cascade_contract') is not None:
@@ -578,3 +641,55 @@ def run_upgrade(image,config,api,ticket,entry):
    if gate is not None:gate_remove(entry,gate)
    record['phase']='rolled-back-pg';entry.save_json(path/'release.json',record)
   raise
+
+
+def retained_restore_ticket(config,api,entry,expected_release):
+ """Build a new root ticket; never accepts image/source fields from a client."""
+ import uuid
+ active=entry.private_json(entry.ACTIVE);current=private_json(TICKET)
+ verify_retention_qualification({**config,'postgres_retained_service_pairs':1},current)
+ current_matches=active.get('approval',{}).get('deploymentId')==current.get('deploymentId') and approval_binding(active['approval'])==approval_binding(approval(current))
+ retry=current.get('restoreBackupRelease')==expected_release and current.get('from',{}).get('activeIdentityDigest')==digest(active_identity(active))
+ need(current_matches or retry,'another root deployment ticket is pending')
+ ledger=entry.private_json(RELEASES/'retired-services.json');need(ledger.get('version')==1 and type(ledger.get('pairs')) is list and len(ledger['pairs'])==1,'exactly one retained service pair required')
+ pair=ledger['pairs'][0];need(pair.get('release')==expected_release and re.fullmatch(UUID,expected_release),'retained release selection changed')
+ record=entry.private_json(release_path(expected_release)/'release.json');need(pair==retired_pair(record,api),'retained release binding changed');snapshot=retained_backup(entry,record,api)
+ need(backup_configuration(config)==snapshot['configuration'],'retained service configuration changed; requalification required')
+ for member in pair['members']:
+  row=retired_container(api,member['id']);need(row and row.get('Image')==member['image'] and row.get('State',{}).get('Running') is False and row.get('Config',{}).get('Cmd')==['node','/app/postgres-'+member['role']+'.mjs'] and row['Config'].get('Labels',{}).get('com.aistrong.project')==api['NAME'] and (api['inspect_container'](member['retired']) or {}).get('Id')==member['id'],'retained service pair changed')
+  mounts={v.get('Destination'):(v.get('Source'),v.get('RW')) for v in row.get('Mounts',[]) if v.get('Destination') in ['/app/data','/app/runtime']}
+  need(mounts=={'/app/data':(record['ticket']['materialsDirectory']+'/pg-data',True),'/app/runtime':(record['ticket']['materialsDirectory']+'/runtime',True)},'retained service materials changed')
+ if retry:need(current.get('to',{}).get('image')==snapshot['image'] and current['to'].get('configDigest')==snapshot['configDigest'],'pending restore target differs')
+ image=api['inspect_image'](snapshot['image']);need(image and image.get('Id')==snapshot['configDigest'],'retained image is missing or changed')
+ gateway=api['inspect_container'](api['NAME']);worker=api['inspect_container'](api['NAME']+'-worker');need(gateway and worker and gateway['Id']==active.get('candidate',{}).get('containerId') and all(row.get('State',{}).get('Running') is True for row in [gateway,worker]),'current source pair is unavailable')
+ ticket={key:copy.deepcopy(value) for key,value in current.items() if key not in ['deploymentId','from','to','restoreBackupRelease']}
+ ticket.update(deploymentId=str(uuid.uuid4()),restoreBackupRelease=expected_release,**{'from':{'image':active['image'],'imageId':gateway['Image'],'containerId':gateway['Id'],'workerId':worker['Id'],'activeIdentityDigest':digest(active_identity(active))},'to':{'image':snapshot['image'],'revision':snapshot['image'].rsplit(':',1)[1],'configDigest':snapshot['configDigest'],'manifestDigest':snapshot['manifestDigest']}})
+ validate_ticket(ticket,snapshot['image'],config);verify_source(ticket,active,gateway,worker);check_storage(ticket);network_snapshot(ticket,entry,gateway,worker)
+ return ticket
+
+def retained_command(argv):
+ import argparse,sys
+ parser=argparse.ArgumentParser(description='Harbor 同库保留版本管理；不恢复数据库快照')
+ parser.add_argument('action',choices=['retained-status','restore-retained']);parser.add_argument('--expected-release');args=parser.parse_args(argv)
+ need(os.geteuid()==0,'retained service command requires root')
+ wrapper=load(Path(HOST_FILES[0]),'retained_restore_wrapper');config=private_json(Path(wrapper.CONFIG));entry=load(ENTRY,'retained_restore_entry')
+ # Match the normal wrapper lock order. deploy() takes the controller lock once.
+ with open('/run/harbor-gateway-deploy.lock','a') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  if args.action=='retained-status':
+   with controller_lock(entry):
+    ledger=entry.private_json(RELEASES/'retired-services.json') if (RELEASES/'retired-services.json').exists() else {'pairs':[]}
+    result={'sameDatabase':True,'databaseBackup':False,'pairs':[{'release':pair['release'],'members':len(pair['members'])} for pair in ledger['pairs']]}
+  else:
+   need(args.expected_release is not None,'expected retained release required')
+   with controller_lock(entry):
+    ticket=retained_restore_ticket(config,vars(wrapper),entry,args.expected_release);verify_installed_tools(ticket)
+    # Fresh ordinary preflight revalidates schema/extensions/recording and both
+    # directions before admission is held; the old proof is never reused.
+    entry.save_json(TICKET,ticket)
+   result=wrapper.storage_deployment(config,ticket['to']['image'],None,'deploy-entry-postgres',lock.fileno())
+  print(json.dumps(result,sort_keys=True))
+
+if __name__=='__main__':
+ import sys
+ retained_command(sys.argv[1:])

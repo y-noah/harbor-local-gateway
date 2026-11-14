@@ -165,7 +165,21 @@ def secure(path,uid,mode,directory=False):
     if stat.S_ISLNK(info.st_mode) or info.st_uid!=uid or invalid_mode or (not stat.S_ISDIR(info.st_mode) if directory else not stat.S_ISREG(info.st_mode)):
         raise ValueError('PostgreSQL protected material ownership or permissions are invalid')
 
+MATERIAL_STORAGE_CONTRACT='harbor-material-storage-v1'
+MATERIAL_CONFIG=Path('/etc/harbor-data-paths.json')
+MATERIAL_MAINTENANCE=Path('/etc/harbor-material-maintenance.json')
+MATERIAL_HELPER=Path('/usr/local/lib/harbor/harbor-material-storage.py')
+def material_storage_guard(stack):
+    if not os.path.lexists(MATERIAL_CONFIG) and not os.path.lexists(MATERIAL_MAINTENANCE):return {'enabled':False}
+    import importlib.util
+    for parent in MATERIAL_HELPER.parents:secure(parent,0,None,True)
+    secure(MATERIAL_HELPER,0,0o644)
+    spec=importlib.util.spec_from_file_location('harbor_material_storage_guard',MATERIAL_HELPER)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module.guard(['application-data','application-runtime'],expected={'application-data':Path(stack)/'pg-data','application-runtime':Path(stack)/'runtime'},required=True)
+
 def configuration(config,stack):
+    material_storage_guard(stack)
     if config.get('postgres_legacy_source_engine') not in (None,'sqlite'):raise ValueError('Legacy source engine configuration is invalid')
     for parent in [*Path(stack).parents,Path(stack)]:secure(parent,0,None,True)
     secure(Path(stack)/'secrets',0,0o700,True)

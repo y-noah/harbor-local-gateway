@@ -1,6 +1,7 @@
 import {createAdminDepartments} from './postgres-admin-departments.mjs';
 import {createPostgresAudit} from './postgres-audit.mjs';
-import {AppError,id,nextDailyReset} from './store.mjs';
+import {AppError,id} from './store.mjs';
+import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {bool} from './admin-input.mjs';
 import {lockPostgresRouting} from './postgres-routing.mjs';
 
@@ -31,7 +32,7 @@ export function createPostgresSessionAdmin(store,{clock=Date.now,isPreparing=()=
       const session=await store.get('SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 FOR UPDATE',match[1],owner.id);if(!session)throw new AppError(404,'会话不存在');departments.same(scope,session);
       const enabled=payload.enabled===undefined?session.enabled:bool(payload.enabled);
       let nightly=payload.nightly_enabled===undefined?(payload.account_id!==undefined?0:session.nightly_enabled):bool(payload.nightly_enabled);
-      let expires=nightly?null:payload.account_id!==undefined||payload.nightly_enabled!==undefined?nextDailyReset(clock()):session.nightly_expires;
+      let expires=nightly?null:payload.account_id!==undefined||payload.nightly_enabled!==undefined?await createRoutingDepartments(store).nextReset(scope,clock()):session.nightly_expires;
       let accountId=session.account_id,thread=session.upstream_thread,version=session.route_version;
       if(payload.account_id!==undefined){
         if(session.protocol!=='responses')throw new AppError(409,'旧CLI会话上下文不能人工切换账号','session_route_unsupported');

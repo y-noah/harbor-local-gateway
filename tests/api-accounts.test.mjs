@@ -61,7 +61,7 @@ test('official API failures are redacted, not replayed, and leave configured wei
 test('disabling a Key migrates its fixed session and removal erases the upstream ciphertext',async t=>{
  const a=await setup(t),id=await a.add();await a.call('/api/admin/accounts/'+id+'/check','POST',{});const f=await a.call('/api/admin/sessions','POST',{member_id:a.member.memberId,account_id:id});
  a.store.run("INSERT INTO accounts(id,name,home,state) VALUES('sub','Subscription fixture','unused','ready')");
- const stop=await a.call('/api/admin/accounts/'+id,'PATCH',{enabled:false});assert.equal(stop.status,200);assert.equal(stop.body.moved,1);const session=a.store.get('SELECT * FROM sessions WHERE id=?',f.body.session_id);assert.equal(session.account_id,'sub');assert.ok(session.nightly_expires>Date.now());
+ const stop=await a.call('/api/admin/accounts/'+id,'PATCH',{enabled:false});assert.equal(stop.status,200);assert.equal(stop.body.moved,1);const session=a.store.get('SELECT * FROM sessions WHERE id=?',f.body.session_id);assert.equal(session.account_id,'sub');assert.equal(session.nightly_expires,null,'disabled scheduling preserves the migrated subscription pin');assert.equal(session.nightly_enabled,0);
  assert.equal((await a.call('/api/admin/accounts/'+id,'DELETE')).status,200);const removed=a.store.get('SELECT * FROM accounts WHERE id=?',id);assert.equal(removed.api_secret_cipher,null);assert.equal(removed.api_secret_digest,null);assert.equal(a.store.upstreamKey(removed),null);
 });
 

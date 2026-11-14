@@ -1,3 +1,4 @@
+import {nextTransferReset} from './transfer-schedule.mjs';
 import {AppError} from './store.mjs';
 import {requireDepartmentScope} from './department-access.mjs';
 import {verifyDepartmentIsolationAvailability,assertDepartmentIsolationReadiness,departmentSettingNames} from './postgres-departments.mjs';
@@ -38,5 +39,6 @@ export function createRoutingDepartments(store,{clock=Date.now}={}){
   if(scope)await store.run('INSERT INTO harbor.department_settings(department_id,name,value,version) VALUES($1,$2,$3::jsonb,$4) ON CONFLICT(department_id,name) DO UPDATE SET value=EXCLUDED.value,version=harbor.department_settings.version+1',scope.department_id,name,JSON.stringify(value),value.version??0);
   else await store.run('INSERT INTO harbor.gateway_settings(name,value) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value',name,JSON.stringify(value));
  }
- const result={resolve,same,identity,settings,setting,write};instances.set(store,result);return result;
+ async function nextReset(scope,at=clock()){const values=await settings(scope,['balancing','transfer_schedule']);return nextTransferReset(at,values.get('balancing')??{},values.get('transfer_schedule')??{});}
+ const result={resolve,same,identity,settings,setting,write,nextReset};instances.set(store,result);return result;
 }

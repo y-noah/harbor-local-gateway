@@ -1,8 +1,8 @@
 import copy,importlib.util,json,os,stat,tempfile,unittest
-from contextlib import nullcontext
+from contextlib import nullcontext,contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock,patch
+from unittest.mock import Mock,patch,MagicMock
 ROOT=Path(__file__).parents[1]
 def module(name,path):
  spec=importlib.util.spec_from_file_location(name,ROOT/path);value=importlib.util.module_from_spec(spec);spec.loader.exec_module(value);return value
@@ -289,7 +289,9 @@ class RetiredServiceCleanupTests(unittest.TestCase):
    if args[:2]==('container','inspect'):
     row=inspect(args[2]);return SimpleNamespace(returncode=0 if row else 1,stdout=json.dumps([row]) if row else '')
    if args[:2]==('container','ls'):return SimpleNamespace(returncode=0,stdout='')
-   calls.append(args);self.assertEqual(args[0],'rm');self.assertEqual(len(args),2);key=next(name for name,row in rows.items() if row['Id']==args[1]);rows.pop(key)
+   calls.append(args);key=next(name for name,row in rows.items() if row['Id']==args[1])
+   if args[0]=='rename':rows[args[2]]=rows.pop(key)
+   else:self.assertEqual(args[0],'rm');self.assertEqual(len(args),2);rows.pop(key)
   api={'NAME':NAME,'inspect_container':inspect,'docker':docker};record={'contract':upgrade.CONTRACT,'ticket':t,'ticketDigest':upgrade.digest(t),'phase':'committed'};entry.ACTIVE=Path(directory)/'active.json';entry.save_json(entry.ACTIVE,{'candidate':{'containerId':'c'*64},'networkSnapshot':{'candidateNetworkContainerIds':['c'*64,'d'*64]}});(Path(directory)/t['deploymentId']).mkdir(exist_ok=True)
   return rows,calls,entry,api,record
  def test_default_removes_exact_stopped_pair_without_volumes_or_images(self):
@@ -346,7 +348,7 @@ class RetiredServiceCleanupTests(unittest.TestCase):
     return original(*args,**kwargs)
    api['docker']=fail;self.assertEqual(upgrade.finish_retired_cleanup({},api,entry,record,Path(directory)/record['ticket']['deploymentId'])['state'],'pending');self.assertEqual(calls,[]);self.assertTrue(all('--no-trunc' in args and 'id='+'a'*64 in args for args in queries));self.assertEqual(len(entry.private_json(Path(directory)/'retired-services.json')['pairs']),1)
  def test_deploy_rejects_unqualified_policy_before_supervisor_or_ticket_access(self):
-  for value in [1,None,True,2,'0']:
+  for value in [None,True,2,'0']:
    with self.subTest(value=value),patch.object(upgrade,'private_json') as read,patch.object(upgrade,'supervised_upgrade') as supervise,patch.object(upgrade,'load') as loader,self.assertRaises(RuntimeError):upgrade.deploy(IMAGE,{**CONFIG,'postgres_retained_service_pairs':value},None,{})
    read.assert_not_called();supervise.assert_not_called();loader.assert_not_called()
  def test_rollback_record_and_active_reference_prevent_cleanup_before_rm(self):
@@ -371,5 +373,89 @@ class RetiredServiceCleanupTests(unittest.TestCase):
    self.assertEqual(calls,[]);self.assertEqual(entry.private_json(path/'release.json')['phase'],'committed')
    # An operator-confirmed completion retries the same exact record and pair.
    self.assertEqual(upgrade.finish_retired_cleanup({},api,entry,record,path)['state'],'complete');self.assertFalse(rows)
+
+
+class RetainedBackupTests(unittest.TestCase):
+ fixture=RetiredServiceCleanupTests.fixture
+ def backup(self,directory,entry,record):
+  snapshot={'contract':upgrade.BACKUP_CONTRACT,'image':OLD,'configDigest':record['ticket']['from']['imageId'],'manifestDigest':'sha256:'+'f'*64,'configuration':upgrade.backup_configuration(CONFIG),'active':active(),'sameDatabase':True}
+  path=Path(directory)/record['ticket']['deploymentId'];path.mkdir(exist_ok=True);entry.save_json(path/'backup.json',snapshot);record['backupDigest']=upgrade.digest(snapshot);return snapshot
+ def test_qualified_pair_retained_then_rotates_as_pair_and_default_zero_cleans(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'verify_retention_qualification',return_value={'verified':'synthetic'}):
+   rows,calls,entry,api,record=self.fixture(directory);self.backup(directory,entry,record);config={**CONFIG,'postgres_retained_service_pairs':1}
+   first=upgrade.finish_retired_cleanup(config,api,entry,record,Path(directory)/record['ticket']['deploymentId']);self.assertEqual(first['retainedPairs'],1);self.assertEqual(len(rows),2);self.assertTrue(all('-retired-pg-' in name for name in rows));self.assertTrue(all(call[0]=='rename' for call in calls))
+   next_record=copy.deepcopy(record);next_record['ticket']['deploymentId']='00000000-0000-0000-0000-000000000003';next_record['ticket']['from'].update(containerId='e'*64,workerId='f'*64);next_record['ticketDigest']=upgrade.digest(next_record['ticket']);self.backup(directory,entry,next_record)
+   for name,identifier,role in [(NAME,'e'*64,'gateway'),(NAME+'-worker','f'*64,'worker')]:
+    row=target(ticket(),role);row.update(Id=identifier,Image='sha256:'+'b'*64);row['State']['Running']=False;rows[name+'-previous']=row
+   result=upgrade.finish_retired_cleanup(config,api,entry,next_record,Path(directory)/next_record['ticket']['deploymentId']);self.assertEqual(result['state'],'complete');self.assertEqual(result['retainedPairs'],1);self.assertEqual({row['Id'] for row in rows.values()},{'e'*64,'f'*64});self.assertEqual(len(entry.private_json(Path(directory)/'retired-services.json')['pairs']),1)
+   self.assertEqual(upgrade.retired_cleanup(CONFIG,api,entry)['state'],'complete');self.assertFalse(rows)
+ def test_new_backup_retirement_failure_preserves_old_pair(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'verify_retention_qualification',return_value={}):
+   rows,calls,entry,api,record=self.fixture(directory);self.backup(directory,entry,record);config={**CONFIG,'postgres_retained_service_pairs':1};upgrade.finish_retired_cleanup(config,api,entry,record,Path(directory)/record['ticket']['deploymentId']);calls.clear();original=api['docker']
+   next_record=copy.deepcopy(record);next_record['ticket']['deploymentId']='00000000-0000-0000-0000-000000000003';next_record['ticket']['from'].update(containerId='e'*64,workerId='f'*64);next_record['ticketDigest']=upgrade.digest(next_record['ticket']);self.backup(directory,entry,next_record)
+   for name,identifier,role in [(NAME,'e'*64,'gateway'),(NAME+'-worker','f'*64,'worker')]:
+    row=target(ticket(),role);row.update(Id=identifier,Image='sha256:'+'b'*64);row['State']['Running']=False;rows[name+'-previous']=row
+   def fail(*args,**kwargs):
+    if args[0]=='rename':raise RuntimeError('synthetic rename failure')
+    return original(*args,**kwargs)
+   api['docker']=fail;result=upgrade.finish_retired_cleanup(config,api,entry,next_record,Path(directory)/next_record['ticket']['deploymentId']);self.assertEqual(result['state'],'pending');self.assertEqual(len(rows),4);self.assertFalse(any(call[0]=='rm' for call in calls));self.assertEqual(len(entry.private_json(Path(directory)/'retired-services.json')['pairs']),2)
+   api['docker']=original;self.assertEqual(upgrade.retired_cleanup(config,api,entry)['state'],'complete');self.assertEqual({row['Id'] for row in rows.values()},{'e'*64,'f'*64})
+ def test_fresh_backup_contract_mismatch_refuses_qualification(self):
+  t=ticket();proof={'contract':'synthetic','schema_digest':'4'*64,'database_digest':'3'*64,'device_ca_digest':'5'*64,'consumption_policy_contract':'v1'};composition=Mock();composition.SHUTDOWN_ENV={};composition.container_shutdown.return_value={};composition.rollback_environment_matches.return_value=True;api={'source_image_preflight':Mock(return_value=proof),'inspect_image':Mock(return_value={'Id':t['from']['imageId']})}
+  with patch.object(upgrade,'verify_retention_qualification',return_value={}):
+   value=upgrade.qualify_backup(composition,api,{**CONFIG,'postgres_retained_service_pairs':1},t,active(),{}, {},[],proof);self.assertEqual(len(value['sourceProofs']),2)
+   for key in ['schema_digest','database_digest','device_ca_digest','consumption_policy_contract']:
+    with self.subTest(key=key),self.assertRaises(RuntimeError):upgrade.qualify_backup(composition,api,CONFIG,t,active(),{},{},[],{**proof,key:'changed'})
+   composition.rollback_environment_matches.return_value=False
+   with self.assertRaises(RuntimeError):upgrade.qualify_backup(composition,api,CONFIG,t,active(),{},{},[],proof)
+ def test_reverse_ticket_is_built_from_retained_binding_and_current_source(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'verify_retention_qualification',return_value={}),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot'):
+   rows,calls,entry,api,record=self.fixture(directory);self.backup(directory,entry,record);config={**CONFIG,'postgres_retained_service_pairs':1};upgrade.finish_retired_cleanup(config,api,entry,record,Path(directory)/record['ticket']['deploymentId']);t=ticket();current={**active(),'image':IMAGE,'approval':upgrade.approval_binding(upgrade.approval(t)),'candidate':{'containerId':'c'*64,'imageId':t['to']['configDigest'],'port':8092},'networkSnapshot':{'candidateNetworkContainerIds':['c'*64,'d'*64]}};entry.save_json(entry.ACTIVE,current);rows[NAME]=target(t);rows[NAME+'-worker']=target(t,'worker');api['inspect_image']=Mock(return_value={'Id':t['from']['imageId']})
+   with patch.object(upgrade,'private_json',return_value=t):reverse=upgrade.retained_restore_ticket(config,api,entry,t['deploymentId'])
+   self.assertEqual(reverse['from']['containerId'],'c'*64);self.assertEqual(reverse['from']['workerId'],'d'*64);self.assertEqual(reverse['to']['image'],OLD);self.assertEqual(reverse['to']['configDigest'],'sha256:'+'b'*64);self.assertNotEqual(reverse['deploymentId'],t['deploymentId']);self.assertEqual(reverse['hostToolsRevision'],t['hostToolsRevision']);self.assertEqual(reverse['restoreBackupRelease'],t['deploymentId'])
+   with patch.object(upgrade,'private_json',return_value=reverse):retry=upgrade.retained_restore_ticket(config,api,entry,t['deploymentId'])
+   self.assertNotEqual(retry['deploymentId'],reverse['deploymentId'])
+   with patch.object(upgrade,'private_json',return_value=t),self.assertRaises(RuntimeError):upgrade.retained_restore_ticket({**config,'port':9999},api,entry,t['deploymentId'])
+
+ def test_restore_command_releases_controller_before_deploy_and_uses_installed_wrapper(self):
+  held={'controller':0};entry=Mock();fake=SimpleNamespace(CONFIG='/etc/harbor-gateway-deploy.json');t=ticket();t['restoreBackupRelease']=t['deploymentId']
+  @contextmanager
+  def controlled(_entry):
+   self.assertEqual(held['controller'],0);held['controller']=1
+   try:yield
+   finally:held['controller']=0
+  def plan(*args):self.assertEqual(held['controller'],1);return t
+  def deployment(config,image,archive,action,fd):self.assertEqual(held['controller'],0);self.assertEqual(config,CONFIG);self.assertEqual(action,'deploy-entry-postgres');self.assertEqual(fd,123);return {'state':'active','sameDatabase':True}
+  fake.storage_deployment=Mock(side_effect=deployment)
+  handle=MagicMock();handle.__enter__.return_value.fileno.return_value=123
+  with patch.object(upgrade.os,'geteuid',return_value=0),patch.object(upgrade,'load',side_effect=[fake,entry]) as load,patch.object(upgrade,'private_json',return_value=CONFIG),patch.object(upgrade,'controller_lock',side_effect=controlled),patch.object(upgrade,'retained_restore_ticket',side_effect=plan),patch.object(upgrade,'verify_installed_tools') as verify,patch.object(upgrade,'deploy') as deploy,patch('builtins.open',return_value=handle),patch.object(upgrade.fcntl,'flock') as flock,patch('builtins.print'):
+   upgrade.retained_command(['restore-retained','--expected-release',t['deploymentId']])
+   self.assertEqual(str(load.call_args_list[0].args[0]),upgrade.HOST_FILES[0]);self.assertEqual(flock.call_count,1);verify.assert_called_once_with(t);entry.save_json.assert_called_once_with(upgrade.TICKET,t);deploy.assert_not_called();fake.storage_deployment.assert_called_once()
+ def test_qualification_requires_explicit_real_recovery_evidence_and_current_tools(self):
+  checks={name:True for name in ['pair_rotation','reverse_publication','entry_rebind','restore_failure_preserves_source','ordinary_cleanup']};report={'contract':upgrade.BACKUP_CONTRACT,'hostToolsRevision':'9'*40,'evidenceDigest':'a'*64,'checks':checks};config={**CONFIG,'postgres_retained_service_pairs':1}
+  with patch.object(upgrade,'private_json',return_value=report):self.assertEqual(upgrade.verify_retention_qualification(config,ticket()),report)
+  for bad in [{**report,'checks':{**checks,'reverse_publication':False}},{**report,'evidenceDigest':''},{**report,'hostToolsRevision':'8'*40}]:
+   with patch.object(upgrade,'private_json',return_value=bad),self.assertRaises(RuntimeError):upgrade.verify_retention_qualification(config,ticket())
+  with patch.object(upgrade,'private_json',side_effect=FileNotFoundError),self.assertRaisesRegex(RuntimeError,'backup_pair_restore_unqualified'):upgrade.verify_retention_qualification(config,ticket())
+
+ def test_ordinary_failed_preflight_keeps_previously_qualified_backup(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'verify_retention_qualification',return_value={}):
+   rows,calls,entry,api,record=self.fixture(directory);self.backup(directory,entry,record);upgrade.finish_retired_cleanup({**CONFIG,'postgres_retained_service_pairs':1},api,entry,record,Path(directory)/record['ticket']['deploymentId']);calls.clear();rows[NAME]=target(ticket());rows[NAME+'-worker']=target(ticket(),'worker');entry.active_record.return_value=(entry.private_json(entry.ACTIVE),{},rows[NAME]);api['inspect_image']=Mock();composition=Mock();composition.preflight_timeout_seconds.return_value=30;composition.configuration.return_value=([],{});composition.image_proof.side_effect=RuntimeError('synthetic candidate preflight failed')
+   with patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),self.assertRaisesRegex(RuntimeError,'candidate preflight failed'):upgrade.run_upgrade(IMAGE,CONFIG,api,ticket(),entry)
+   self.assertFalse(any(call[0]=='rm' for call in calls));self.assertEqual(len(entry.private_json(Path(directory)/'retired-services.json')['pairs']),1);self.assertTrue(any(row['Id']=='a'*64 for row in rows.values()));self.assertTrue(any(row['Id']=='b'*64 for row in rows.values()));self.assertTrue(rows[NAME]['State']['Running']);entry.entry_state.assert_not_called()
+ def test_storage_guard_lifecycle_receives_unchanged_config_on_restore_success_and_failure(self):
+  config={**CONFIG,'postgres_retained_service_pairs':1,'postgres_storage_startup_guard':True}
+  for fails in [False,True]:
+   with self.subTest(fails=fails):
+    helper=Mock();helper.deployment_begin.return_value='synthetic-planned';helper.deployment_finish.return_value={'released':True}
+    def service(image,actual,archive):
+     self.assertEqual(actual,config);self.assertEqual(image,OLD);self.assertIsNone(archive)
+     if fails:raise RuntimeError('synthetic restore failed')
+     return {'state':'active'}
+    with patch.object(wrapper,'storage_operation_helper',return_value=helper),patch.object(wrapper,'deploy_entry_postgres',side_effect=service):
+     if fails:
+      with self.assertRaisesRegex(RuntimeError,'restore failed'):wrapper.storage_deployment(config,OLD,None,'deploy-entry-postgres',123)
+     else:self.assertEqual(wrapper.storage_deployment(config,OLD,None,'deploy-entry-postgres',123)['state'],'active')
+    helper.deployment_begin.assert_called_once_with(config,OLD,123);helper.deployment_finish.assert_called_once_with(config,'synthetic-planned',not fails,123)
 
 if __name__=='__main__':unittest.main()
