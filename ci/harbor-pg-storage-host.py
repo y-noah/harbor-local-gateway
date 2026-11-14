@@ -12,8 +12,56 @@ DEPLOY=Path('/usr/local/bin/harbor-gateway-deploy');ENTRY=Path('/usr/local/lib/h
 ARCHIVE_COPY_LOCK=Path('/run/harbor-pg-archive-copy.lock')
 RUNTIME=Path('/usr/local/lib/harbor/entry-runtime.py')
 MATERIAL=Path('/usr/local/lib/harbor/harbor-material-storage.py')
+MATERIAL_MOVE=Path('/usr/local/lib/harbor/harbor-material-move.py')
 _EMIT_PROGRESS=False
 BACKUP=['/opt/harbor-storage-tools/node/bin/node','/opt/harbor-storage-tools/app/storage-backup.mjs']
+
+# Source-recovery qualification only; identical to the reviewed online bootstrap
+# probe. Target deployment continues to require the ordinary full preflight.
+SOURCE_RECOVERY_LOW_PROBE = r'''
+import {readFile} from 'node:fs/promises';
+import {scryptSync,timingSafeEqual} from 'node:crypto';
+import {PostgresStore} from '/app/postgres-store.mjs';
+import {workerStartupKind,workerStartupResult} from '/app/postgres-worker-startup.mjs';
+let cookie='',password='',store,storage,qualified=false,timedOut=false,outputSent=false;
+const workAbort=new AbortController();
+const deadline=new Promise((_,reject)=>workAbort.signal.addEventListener('abort',()=>reject(Error('deadline')),{once:true}));
+const workTimer=setTimeout(()=>{timedOut=true;workAbort.abort();},15000);
+const hardTimer=setTimeout(()=>finish(false,1),20000);
+function finish(value,code=0){if(outputSent)return;outputSent=true;clearTimeout(workTimer);clearTimeout(hardTimer);process.stdout.write(value?'true':'false',()=>process.exit(code));}
+const bounded=async(operation,ms)=>{let timer;try{return await Promise.race([Promise.resolve().then(operation),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('cleanup deadline')),ms);})]);}finally{clearTimeout(timer);}};
+const request=async(path,options={},cleanup=false)=>fetch('http://127.0.0.1:8092'+path,{...options,redirect:'error',signal:cleanup?AbortSignal.timeout(2000):AbortSignal.any([workAbort.signal,AbortSignal.timeout(5000)])});
+const low=value=>{
+ if(!value||typeof value!=='object')return false;
+ const b=value.binding??{},d=value.diagnostics??{},now=Date.now();
+ return value.status==='low'&&value.captureAllowed===false&&b.source==='signed_database_report'&&b.verified===true&&b.reason===null&&d.reason==='low'&&d.probeFailure===null&&Number.isSafeInteger(b.expires_at)&&b.expires_at>now&&Number.isSafeInteger(value.checked)&&now-value.checked>=0&&now-value.checked<=5000;
+};
+try{await Promise.race([deadline,(async()=>{
+ let input='';for await(const part of process.stdin){input+=part;if(input.length>1024)throw Error('input');}
+ const {since}=JSON.parse(input);if(!Number.isSafeInteger(since)||since<0||since>Date.now())throw Error('since');
+ const settings=JSON.parse(await readFile('/app/data/settings.json','utf8')),expected=settings.adminPasswordHash;
+ password=(await readFile('/app/data/管理密码.txt','utf8')).split(/\r?\n/).map(v=>v.trim()).filter(Boolean)[1];
+ if(typeof password!=='string'||!expected||typeof expected.salt!=='string'||! /^[a-f0-9]{64}$/.test(expected.digest))throw Error('credential');
+ if(!timingSafeEqual(scryptSync(password,expected.salt,32,{N:16384,r:8,p:1}),Buffer.from(expected.digest,'hex')))throw Error('credential');
+ if((await request('/ready')).status!==200)throw Error('ready');
+ const login=await request('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password})});password='';
+ if(login.status!==200)throw Error('login');cookie=login.headers.get('set-cookie')?.split(';')[0]??'';if(!cookie)throw Error('cookie');await login.arrayBuffer();
+ store=new PostgresStore({connectionString:process.env.HARBOR_DATABASE_URL,connection:{query_timeout:2500},connectionTimeoutMs:2500,statementTimeoutMs:2500,poolSize:1});
+ const row=await store.transaction(()=>store.get("SELECT EXISTS(SELECT 1 FROM harbor.background_jobs WHERE kind=$1 AND status='completed' AND created>=$2 AND claimed_at>=$2 AND updated>=$2 AND result=$3::jsonb) progress",workerStartupKind,since,JSON.stringify(workerStartupResult)),{readOnly:true});
+ if(row.progress!==true)throw Error('startup');
+ const response=await request('/api/admin/status',{headers:{Cookie:cookie}});if(response.status!==200)throw Error('status');
+ const body=await response.text();if(body.length>2097152)throw Error('budget');
+ storage=JSON.parse(body).recordingStorage;qualified=low(storage)&&(await request('/ready')).status===200;
+})()]);}catch{qualified=false;}finally{
+ password='';clearTimeout(workTimer);workAbort.abort();
+ // Logout must not wait behind a stuck database close or transaction rollback.
+ await Promise.all([
+  bounded(async()=>{if(cookie){const out=await request('/api/auth/logout',{method:'POST',headers:{'content-type':'application/json',Cookie:cookie},body:'{}'},true);await out.arrayBuffer();if(out.status!==200)throw Error('logout');}},2500).catch(()=>{qualified=false;}),
+  bounded(()=>store?.close(),2500).catch(()=>{qualified=false;})
+ ]);cookie='';
+}
+finish(qualified&&!timedOut&&low(storage));
+'''
 
 def need(value,code):
  if not value:raise RuntimeError(code)
@@ -55,7 +103,7 @@ def run(args,timeout=60):
  need(p.returncode==0,'host_command_failed');return p.stdout
 
 def sig(row):
- return sha(json.dumps({'Id':row.get('Id'),'Image':row.get('Image'),'Config':row.get('Config'),'HostConfig':{k:v for k,v in row.get('HostConfig',{}).items() if k!='RestartPolicy'},'Mounts':[{k:m.get(k) for k in ['Type','Source','Destination','Mode','RW','Propagation']} for m in row.get('Mounts',[])]},sort_keys=True,separators=(',',':')).encode())
+ return sha(json.dumps({'Id':row.get('Id'),'Image':row.get('Image'),'Config':row.get('Config'),'HostConfig':{k:v for k,v in row.get('HostConfig',{}).items() if k!='RestartPolicy'},'Mounts':sorted(copy.deepcopy(row.get('Mounts',[])),key=lambda value:json.dumps(value,sort_keys=True,separators=(',',':')))},sort_keys=True,separators=(',',':')).encode())
 
 def wait(check,seconds,code):
  end=time.monotonic()+seconds
@@ -88,7 +136,10 @@ class Host:
   need(p.get('tlsVerifyFull') is True and re.fullmatch('[0-9]{1,20}',p.get('systemId','')),'host_database_identity_missing')
   need(set(p.get('containers',{}))=={PG,GW,WORKER} and all(re.fullmatch('[a-f0-9]{64}',v.get('id','')) and re.fullmatch('[a-f0-9]{64}',v.get('signature','')) for v in p['containers'].values()),'host_inventory_missing')
   self.core=load(CORE,'harbor_pg_storage_core')
-  expected={str(v) for v in [CORE,Path(__file__),DEPLOY,ENTRY,UPGRADE,COMPOSE,RUNTIME,MATERIAL]};need(set(p.get('toolSha256',{}))==expected,'host_tool_inventory_missing')
+  expected={str(v) for v in [CORE,Path(__file__),DEPLOY,ENTRY,UPGRADE,COMPOSE,RUNTIME,MATERIAL]}
+  material=p.get('materialMove');need(material is None or isinstance(material,dict) and set(material)=={'approvalSha256','nonce'} and re.fullmatch('[a-f0-9]{64}',material.get('approvalSha256','')) and str(uuid.UUID(material.get('nonce','')))==material['nonce'],'host_material_plan_invalid')
+  if material is not None:expected.add(str(MATERIAL_MOVE))
+  need(set(p.get('toolSha256',{}))==expected,'host_tool_inventory_missing')
   for name,digest in p['toolSha256'].items():need(re.fullmatch('[a-f0-9]{64}',digest) and sha(Path(name).read_bytes())==digest,'host_tool_changed')
   self.wrapper=load(DEPLOY,'harbor_storage_wrapper');self.entry=load(ENTRY,'harbor_storage_entry');self.upgrade=load(UPGRADE,'harbor_storage_upgrade');self.pg=load(COMPOSE,'harbor_storage_compose');self.runtime=load(RUNTIME,'harbor_storage_entry_runtime')
   need(getattr(self.pg,'STORAGE_STARTUP_CONTRACT',None)=='harbor-pg-storage-boot-v1','host_factory_guard_not_installed')
@@ -112,8 +163,9 @@ class Host:
   uuid_expected=self.plan.get('targetFilesystemUuid');need(isinstance(uuid_expected,str) and re.fullmatch('[a-fA-F0-9-]{8,64}',uuid_expected),'host_target_uuid_missing')
   mounted=json.loads(run(['/usr/bin/findmnt','--json','--target','/sdc-disk','--output','TARGET,UUID']))['filesystems'];need(len(mounted)==1 and mounted[0].get('target')=='/sdc-disk' and mounted[0].get('uuid')==uuid_expected,'host_target_mount_changed')
   need(ROOT.stat().st_dev==Path('/sdc-disk').stat().st_dev!=Path('/').stat().st_dev,'host_target_wrong_filesystem')
- def data_mounts(self):
-  self.target_disk();self.pg.material_storage_guard(self.plan['materialsDirectory'])
+ def data_mounts(self,*,verify_material=True):
+  self.target_disk()
+  if verify_material:self.pg.material_storage_guard(self.plan['materialsDirectory'])
   for source,target in [(self.core.SOURCE_DB,self.core.TARGET/'db'),(self.core.SOURCE_ARCHIVE,self.core.TARGET/'archive')]:
    a,b=source.lstat(),target.lstat();need(stat.S_ISDIR(a.st_mode) and stat.S_ISDIR(b.st_mode) and (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino) and a.st_uid==999 and b.st_dev==ROOT.stat().st_dev,'host_bound_path_mismatch')
    mounted=json.loads(run(['/usr/bin/findmnt','--json','--mountpoint',str(source),'--output','TARGET']))['filesystems'];need(len(mounted)==1 and mounted[0].get('target')==str(source),'host_original_path_not_mount')
@@ -128,7 +180,76 @@ class Host:
   need(self.upgrade.digest(self.upgrade.active_identity(self.active))==self.plan.get('activeIdentityDigest'),'host_active_changed')
   for name in [PG,GW,WORKER]:need(self.row(name)['HostConfig']['RestartPolicy']==self.plan['containers'][name].get('restartPolicy'),'host_source_restart_policy_changed')
   record=self.upgrade.record_for(self.active['approval']);need(record.get('phase')=='complete','host_current_release_not_complete');self.currentReleasePhase=record['phase'];self.ticket=record['ticket'];need(self.ticket['database']['cluster']==self.plan['systemId'],'host_system_id_changed');self.api['STACK']=self.ticket['materialsDirectory'];self.j.setdefault('writers',{});self.save(self.j)
- def hold_drain(self):self.upgrade.drain_active_entry(self.entry)
+ def source_pair_processes(self):
+  result={}
+  for name in [GW,WORKER]:
+   row=self.immutable(name);state=row['State'];need(state.get('Running') is True and type(state.get('Pid')) is int and state['Pid']>0 and isinstance(state.get('StartedAt'),str) and state['StartedAt'] and not any(state.get(k) for k in ['Paused','Restarting','Dead','OOMKilled','Error']) and type(row.get('RestartCount')) is int and row['RestartCount']>=0,'host_source_pair_not_running')
+   result[name]={'id':row['Id'],'signature':sig(row),'pid':state['Pid'],'startedAt':state['StartedAt'],'restarts':row.get('RestartCount'),'networkDigest':container_generation(row)['networkDigest']}
+  return result
+ def probe_source_storage_low(self,gateway,worker,*,required=True,timeout=30):
+  since=int(datetime.fromisoformat(worker['State']['StartedAt'].replace('Z','+00:00')).timestamp()*1000)
+  result=subprocess.run(['/usr/bin/docker','--host','unix:///var/run/docker.sock','exec','--interactive','--env','NODE_OPTIONS=',gateway['Id'],'node','--input-type=module','--eval',SOURCE_RECOVERY_LOW_PROBE],input=json.dumps({'since':since}).encode(),capture_output=True,timeout=timeout,env={'PATH':'/usr/bin:/bin','HOME':'/root'})
+  qualified=result.returncode==0 and result.stdout==b'true' and result.stderr==b''
+  if required:need(qualified,'host_source_storage_low_unproven')
+  return qualified
+ def observe_source_recovery_baseline(self):
+  if self.plan.get('materialMove') is None:return
+  # This is a live observation before hold/stop, never an opt-in PLAN boolean.
+  before=self.source_pair_processes();gateway=self.immutable(GW);worker=self.immutable(WORKER)
+  need(gateway['State'].get('Health',{}).get('Status')=='healthy','host_source_gateway_not_healthy');health=worker['State'].get('Health',{}).get('Status');need(health in ['healthy','unhealthy'],'host_source_worker_health_unknown')
+  kind='healthy'
+  if health=='unhealthy':self.probe_source_storage_low(gateway,worker);kind='storage-low'
+  need(self.source_pair_processes()==before,'host_source_baseline_generation_changed')
+  baseline={'version':1,'kind':kind,'planSha256':self.planSha256,'activeIdentityDigest':self.plan['activeIdentityDigest'],'originalProcesses':before}
+  if 'sourceRecoveryBaseline' in self.j:need(self.j['sourceRecoveryBaseline']==baseline,'host_source_baseline_changed')
+  else:self.j['sourceRecoveryBaseline']=baseline;self.save(self.j)
+ def source_low_recovery_selected(self):
+  baseline=self.j.get('sourceRecoveryBaseline')
+  if baseline is None:return False
+  need(self.plan.get('materialMove') is not None and isinstance(baseline,dict) and type(baseline.get('version')) is int and baseline.get('version')==1 and baseline.get('kind') in ['healthy','storage-low'] and baseline.get('planSha256')==self.planSha256 and baseline.get('activeIdentityDigest')==self.plan['activeIdentityDigest'] and isinstance(baseline.get('originalProcesses'),dict) and set(baseline['originalProcesses'])=={GW,WORKER},'host_source_baseline_unproven')
+  for name in [GW,WORKER]:
+   original=baseline['originalProcesses'][name];need(original.get('id')==self.plan['containers'][name]['id'] and original.get('signature')==self.plan['containers'][name]['signature'] and type(original.get('pid')) is int and original['pid']>0 and isinstance(original.get('startedAt'),str) and original['startedAt'] and type(original.get('restarts')) is int and original['restarts']>=0,'host_source_baseline_unproven')
+  return baseline['kind']=='storage-low'
+ def managed_source_recovery(self):
+  return self.plan.get('materialMove') is not None and self.j.get('sourceRecoveryBaseline') is not None
+ def source_recovery_network(self):
+  snapshot=self.upgrade.network_snapshot(self.ticket,self.entry,self.immutable(GW),self.immutable(WORKER));snapshot['candidateNetworkContainerIds']=sorted(snapshot['candidateNetworkContainerIds']);return snapshot
+ def verify_source_recovery_processes(self):
+  self.verify_source_recovery_materials();self.source_low_recovery_selected();current=self.source_pair_processes();baseline=self.j['sourceRecoveryBaseline']
+  need(current==self.j.get('sourceRecoveryProcesses') and self.source_recovery_network()==self.j.get('sourceRecoveryNetwork') and all(current[name]['restarts']==baseline['originalProcesses'][name].get('restarts') for name in [GW,WORKER]),'host_source_recovery_generation_changed')
+  worker=self.immutable(WORKER);need(self.j.get('workerGeneration')=={'id':worker['Id'],'startedAt':worker['State']['StartedAt']} and self.j.get('applicationsStartEpochMs')==int(datetime.fromisoformat(worker['State']['StartedAt'].replace('Z','+00:00')).timestamp()*1000),'host_source_recovery_worker_generation_changed')
+  return current
+ def wait_source_recovery_ready(self):
+  deadline=getattr(self,'source_recovery_deadline',None);need(isinstance(deadline,(float,int)),'host_source_recovery_deadline_missing');low_allowed=self.source_low_recovery_selected()
+  while True:
+   need(time.monotonic()<deadline,'host_source_recovery_not_ready');before=self.verify_source_recovery_processes();gateway=self.immutable(GW);worker=self.immutable(WORKER);health=[row['State'].get('Health',{}).get('Status') for row in [gateway,worker]];need(all(value in ['starting','healthy','unhealthy'] for value in health),'host_source_recovery_health_unknown');mode=None
+   if health==['healthy','healthy']:
+    strict=True
+    for name in [GW,WORKER]:
+     remaining=deadline-time.monotonic();need(remaining>0,'host_source_recovery_not_ready');args=['/usr/bin/docker','exec',self.row(name)['Id'],'node','/app/ci/postgres-preflight.mjs']
+     if name==WORKER:args+=['--progress-since',str(self.j['applicationsStartEpochMs'])]
+     try:reply=subprocess.run(args,stdin=subprocess.DEVNULL,capture_output=True,timeout=min(30,remaining));strict=strict and reply.returncode==0
+     except subprocess.TimeoutExpired:strict=False
+     need(time.monotonic()<deadline,'host_source_recovery_not_ready');self.verify_source_recovery_processes()
+    if strict:mode='healthy'
+   if mode is None and low_allowed and health[0]=='healthy' and health[1] in ['healthy','unhealthy']:
+    remaining=deadline-time.monotonic();need(remaining>0,'host_source_recovery_not_ready')
+    try:
+     if self.probe_source_storage_low(gateway,worker,required=False,timeout=min(30,remaining)):mode='storage-low'
+    except (OSError,subprocess.SubprocessError):pass
+   need(time.monotonic()<deadline,'host_source_recovery_not_ready');need(self.verify_source_recovery_processes()==before,'host_source_recovery_generation_changed')
+   if mode is not None:
+    status=self.upgrade.active_authorization(self.active['image']);need(status.get('state')=='active' and self.upgrade.approval_binding(status)==self.active['approval'],'host_database_approval_changed');need(time.monotonic()<deadline,'host_source_recovery_not_ready');return mode
+   time.sleep(min(.2,max(0,deadline-time.monotonic())))
+ def hold_drain(self):
+  expected=self.plan.get('interruptTicketSha256')
+  if expected is None:return self.upgrade.drain_active_entry(self.entry)
+  need(isinstance(expected,str) and re.fullmatch('[a-f0-9]{64}',expected),'host_interrupt_ticket_unapproved')
+  raw=private(self.upgrade.TICKET);need(sha(raw)==expected,'host_interrupt_ticket_changed');ticket=json.loads(raw)
+  self.upgrade.validate_ticket(ticket,ticket.get('to',{}).get('image'),self.config);need(ticket.get('interruptEntryClients') is True,'host_interrupt_ticket_unapproved');self.upgrade.verify_installed_tools(ticket)
+  self.upgrade.verify_source(ticket,self.active,self.gw,self.worker)
+  need(ticket.get('materialsDirectory')==self.plan['materialsDirectory'] and ticket.get('database',{}).get('cluster')==self.plan['systemId'],'host_interrupt_source_changed')
+  return self.upgrade.drain_active_entry(self.entry,ticket,self.api,self.active)
  def install_gate(self):
   boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip();binding=self.upgrade.digest(self.upgrade.active_identity(self.active));intent=self.j.get('gateIntent',{})
   tables=json.loads(self.entry.execute(['/usr/sbin/nft','--json','list','tables']));exists=any(row.get('table',{}).get('name')==self.upgrade.GATE for row in tables.get('nftables',[]))
@@ -250,12 +371,88 @@ class Host:
   # This is one fresh archived WAL segment, not a basebackup or PITR rehearsal.
   run(BACKUP+['retention-prepare'],timeout=120)
   budget=self.pg.preflight_timeout_seconds(self.config.get('postgres_preflight_timeout_seconds',30));run(['/usr/bin/docker','exec',PG,'gosu','postgres','/usr/local/bin/node','--input-type=module','-e',WAL_PROBE,str(budget*1000)],timeout=budget*2+10)
- def start_applications(self):
+ def material_mover(self):
+  selected=self.plan.get('materialMove')
+  if selected is None:return None
+  for path in [MATERIAL_MOVE,MATERIAL]:need(sha(path.read_bytes())==self.plan['toolSha256'][str(path)],'host_material_tool_changed')
+  mover=load(MATERIAL_MOVE,'harbor_unified_material_move');raw=private(mover.APPROVAL);need(sha(raw)==selected['approvalSha256'],'host_material_approval_changed');value,rows=mover.approval()
+  need(value['nonce']==selected['nonce'] and value['materialsDirectory']==self.plan['materialsDirectory'] and value['diskUuid']==self.plan['targetFilesystemUuid'] and value['containers']=={name:self.plan['containers'][name]['id'] for name in [GW,WORKER]},'host_material_scope_changed')
+  return mover,value,rows
+ def prepare_application_materials(self):
+  selected=self.material_mover()
+  if selected is None:return
+  need(self.j.get('targetBootAuthorized') is True and self.j.get('oldDataRollbackForbidden') is True,'host_material_target_not_armed')
+  mover,value,rows=selected
+  # The caller already owns the deploy/controller locks. Only the additional
+  # material lock is acquired here; calling mover.main/locks would reenter them.
+  fd=os.open('/run/harbor-material-move.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+  try:
+   info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'host_material_lock_untrusted');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+   state=mover.g.private_json(mover.STATE,33554432) if os.path.lexists(mover.STATE) else None
+   if state is not None:need(state.get('nonce')==value['nonce'] and state.get('approvalSha256')==self.plan['materialMove']['approvalSha256'],'host_material_state_changed')
+   if state is not None and state.get('phase') in ['activation-ready','complete']:
+    result=mover.switch(value,state)
+   else:
+    mover.quiescent(value);need(self.immutable(PG)['State']['Running'] is False,'host_material_postgres_running')
+    lease=os.open(mover.ARCHIVE_LOCK,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+     info=os.fstat(lease);need(stat.S_ISREG(info.st_mode) and info.st_uid==999 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'host_material_archive_lock_untrusted');fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+     receipt=mover.maintenance_receipt(value)
+     if os.path.lexists(mover.g.MAINTENANCE):need(mover.g.private_json(mover.g.MAINTENANCE)==receipt,'host_material_maintenance_changed')
+     else:
+      need(state is None and not os.path.lexists(mover.g.CONFIG),'host_material_maintenance_missing');mover.save(mover.g.MAINTENANCE,receipt)
+    finally:os.close(lease)
+    if state is None or state.get('phase') in ['copying','copied']:
+     mover.prepare(value,rows);state=mover.g.private_json(mover.STATE,33554432)
+     need(state.get('nonce')==value['nonce'] and state.get('approvalSha256')==self.plan['materialMove']['approvalSha256'] and state.get('phase')=='copied','host_material_state_changed')
+    result=mover.switch(value,state)
+   durable=mover.g.private_json(mover.STATE,33554432);need(result.get('phase')=='complete' and durable.get('phase')=='complete' and durable.get('nonce')==value['nonce'] and durable.get('approvalSha256')==self.plan['materialMove']['approvalSha256'],'host_material_activation_incomplete');mover.g.guard(list(mover.g.TARGETS),required=True)
+   self.j['materialMove']={'nonce':value['nonce'],'approvalSha256':self.plan['materialMove']['approvalSha256'],'phase':'complete'};self.save(self.j)
+  finally:os.close(fd)
+ def verify_application_material_mounts(self):
+  selected=self.material_mover()
+  if selected is None:return
+  mover,value,_=selected;mover.g.guard(list(mover.g.TARGETS),required=True)
+  receipt=self.j.get('materialMove');need(receipt=={'nonce':value['nonce'],'approvalSha256':self.plan['materialMove']['approvalSha256'],'phase':'complete'},'host_material_completion_missing')
+  config=mover.g.private_json(mover.g.CONFIG);paths=[]
+  for purpose,destination in [('application-data','/app/data'),('application-runtime','/app/runtime')]:
+   root=config['roots'][purpose];logical=Path(root['logical']);need(logical==Path(self.plan['materialsDirectory'])/('pg-data' if purpose=='application-data' else 'runtime'),'host_material_namespace_scope_changed')
+   paths.append((logical,destination))
+   if purpose=='application-data':paths.extend((logical/name,destination+'/'+name) for name in ['recording-spool','metering-spool'])
+  expected=[{'path':destination,'dev':str(path.stat().st_dev),'ino':str(path.stat().st_ino)} for path,destination in paths]
+  code="import{stat}from'node:fs/promises';for(const row of JSON.parse(process.argv[1])){const actual=await stat(row.path,{bigint:true});if(String(actual.dev)!==row.dev||String(actual.ino)!==row.ino)process.exit(1);}console.log(JSON.stringify({materialMountsVerified:true}));"
+  for name in [GW,WORKER]:
+   before=self.row(name);selected=self.gw if name==GW else self.worker;need(selected is not None and before.get('Id')==selected.get('Id') and sig(before)==sig(selected) and before['State'].get('Running') is True,'host_material_application_not_running')
+   need(json.loads(run(['/usr/bin/docker','exec',before['Id'],'node','--input-type=module','-e',code,json.dumps(expected)]))=={'materialMountsVerified':True},'host_material_namespace_mismatch')
+   after=self.row(name);need(sig(after)==sig(before) and container_generation(after)==container_generation(before),'host_material_application_generation_changed')
+ def verify_source_recovery_materials(self):
+  need(self.j.get('oldDataRollbackForbidden',False) is False and self.j.get('targetBootAuthorized',False) is False,'host_source_material_recovery_forbidden')
+  self.verify_original_roots()
+  selected=self.material_mover()
+  if selected is None:return
+  mover,_,rows=selected
+  need(not any(os.path.lexists(path) for path in [mover.STATE,mover.g.CONFIG,mover.g.MAINTENANCE]),'host_source_material_authority_changed')
+  for row in rows:
+   path=Path(row['logical']);expected=row['sourceId']
+   need(not os.path.lexists(path) if expected is None else os.path.lexists(path) and mover.g.identity(path)[:2]==expected,'host_source_material_root_changed')
+ def start_applications(self,*,source_recovery=False):
+  need(type(source_recovery) is bool,'host_application_start_mode_invalid')
+  if source_recovery:
+   self.verify_source_recovery_materials()
+   if self.managed_source_recovery() and self.j.get('sourceRecoveryProcesses') is not None:need(self.source_pair_processes()==self.j['sourceRecoveryProcesses'] and self.source_recovery_network()==self.j.get('sourceRecoveryNetwork'),'host_source_recovery_generation_changed')
   for name in [GW,WORKER]:
    row=self.gw if name==GW else self.worker;need(row is not None,'host_current_active_not_loaded');actual=self.row(name);need(actual['Id']==row['Id'] and sig(actual)==sig(row),'host_application_changed')
    if not actual['State']['Running']:run(['/usr/bin/docker','start',actual['Id']])
+  if source_recovery:
+   self.verify_source_recovery_materials()
+   if self.managed_source_recovery():
+    current=self.source_pair_processes();network=self.source_recovery_network();saved=self.j.get('sourceRecoveryProcesses');need(saved is None or saved==current and self.j.get('sourceRecoveryNetwork')==network,'host_source_recovery_generation_changed');self.j['sourceRecoveryProcesses']=current;self.j['sourceRecoveryNetwork']=network
+    if not hasattr(self,'source_recovery_deadline'):self.source_recovery_deadline=time.monotonic()+120
+  else:self.verify_application_material_mounts()
   self.gw=self.row(GW);self.worker=self.row(WORKER);self.j['applicationsStartEpochMs']=int(datetime.fromisoformat(self.worker['State']['StartedAt'].replace('Z','+00:00')).timestamp()*1000);self.j['workerGeneration']={'id':self.worker['Id'],'startedAt':self.worker['State']['StartedAt']};self.save(self.j)
- def verify_current_approval_and_private_readiness(self):
+ def verify_current_approval_and_private_readiness(self,*,source_recovery=False):
+  need(type(source_recovery) is bool,'host_readiness_mode_invalid')
+  if source_recovery and self.managed_source_recovery():return self.wait_source_recovery_ready()
   def ready():
    a,b=self.row(GW),self.row(WORKER)
    if any(not row['State']['Running'] or row['State'].get('Health',{}).get('Status')!='healthy' for row in [a,b]):return False
@@ -371,7 +568,13 @@ class Host:
   row=self.immutable(PG)
   if not row['State']['Running']:run(['/usr/bin/docker','start',row['Id']])
  def verify_original_postgres(self):self.verify_postgres_mount_tls_report_wal(on_target=False)
- def verify_original_full_instance(self):self.verify_full_instance(on_target=False)
+ def verify_original_full_instance(self,*,before_publish=False):
+  if not self.managed_source_recovery():return self.verify_full_instance(on_target=False)
+  need(before_publish is True,'host_source_verification_after_publish');mode=self.wait_source_recovery_ready();self.verify_persistent_network();port=self.config['port'];stack=self.api['STACK'];deadline=self.source_recovery_deadline
+  code="const{request}=await import('node:http');let done=false;const finish=v=>{if(done)return;done=true;process.stdout.write(v?'true':'false',()=>process.exit(v?0:1));};setTimeout(()=>finish(false),10000);const base=new URL('http://127.0.0.1:8092'),status=(path,headers)=>new Promise((resolve,reject)=>{const req=request(new URL(path,base),{headers:{Host:base.host,Connection:'close',...headers},signal:AbortSignal.timeout(2000)},reply=>{reply.resume();reply.once('end',()=>resolve(reply.statusCode));reply.once('error',reject);});req.once('error',reject);req.end();});try{for(const[path,expected,headers]of [['/health',200,{}],['/ready',200,{}],['/api/admin/state',401,{}],['/health',403,{Host:'untrusted.invalid'}]])if(await status(path,headers)!==expected)throw Error();finish(true);}catch{finish(false);}"
+  remaining=deadline-time.monotonic();need(remaining>0,'host_source_recovery_not_ready');reply=subprocess.run(['/usr/bin/docker','exec',self.gw['Id'],'node','--input-type=module','--eval',code],stdin=subprocess.DEVNULL,capture_output=True,timeout=min(12,remaining));need(reply.returncode==0 and reply.stdout==b'true' and reply.stderr==b'','host_source_authentication_changed')
+  need(self.pg.device_http_code(stack,self.config,'/ready')==200 and self.pg.device_http_code(stack,self.config,'/api/admin/state')==401 and self.pg.device_http_code(stack,self.config,'/health',{'Host':'untrusted.invalid'})==403,'host_source_authentication_changed');self.entry.active_record();self.verify_source_recovery_processes();need(time.monotonic()<deadline,'host_source_recovery_not_ready')
+  need(before_publish is True,'host_source_verification_after_publish');return mode
  def verify_cold_target_proof(self,label):
   self.target_disk();path=PROOF if label=='archive' else ROOT/'.pg-storage-db-proof.json';raw=private(path)
   need(sha(raw)==self.j.get('dbProofSha256' if label=='db' else 'archiveProofSha256'),'host_cold_proof_changed');proof=json.loads(raw);need(proof.get('eligible') is True,'host_target_not_cold_verified')
@@ -387,7 +590,9 @@ class Host:
    for label in ['db','archive']:self.verify_cold_target_proof(label)
   if control['phase']=='active':self.upgrade.drain_active_entry(self.entry)
   if not self.j.get('targetBootAuthorized',False):self.fence_docker_autostart();self.bind_original_paths()
-  self.data_mounts();self.install_gate()
+  if self.plan.get('materialMove') is not None:self.data_mounts(verify_material=False)
+  else:self.data_mounts()
+  self.install_gate()
  def runtime_generation(self):
   return {name:container_generation(self.row(name)) for name in [PG,GW,WORKER]}
  def record_runtime_ready(self,resolve_operation=False):

@@ -171,6 +171,7 @@ class Coordinator:
  def switch(self):
   o=self.ops;need(self.journal.get('phase')=='archive-prepared','storage_phase_invalid');o.current_identity()
   try:
+   o.observe_source_recovery_baseline()
    self.mark('holding-intent');o.hold_drain();self.mark('held')
    gate=o.install_gate();self.mark('gated',gate=gate)
    writers=o.pause_writers();self.mark('writers-paused',writers=writers)
@@ -180,6 +181,7 @@ class Coordinator:
    o.finalize_archive();o.copy_cold_database();self.mark('cold-verified')
    o.bind_original_paths();self.mark('bound')
    self.mark('boot-arm-intent',oldDataRollbackForbidden=True,targetBootAuthorized=True)
+   o.prepare_application_materials()
    o.install_instance_boot_guard();self.mark('boot-installed')
    self.mark('target-start-intent')
    o.start_postgres();o.verify_postgres_mount_tls_report_wal();self.mark('pg-ready')
@@ -198,7 +200,9 @@ class Coordinator:
   try:
    need(not self.journal.get('oldDataRollbackForbidden',False) and not self.journal.get('targetBootAuthorized',False),'storage_old_data_rollback_forbidden')
    o=self.ops;o.verify_original_recovery_checkpoint();self.mark('recovering-source')
-   o.restore_original_restart_policies();o.start_original_postgres();o.verify_original_postgres();o.start_applications();o.verify_current_approval_and_private_readiness();o.update_dynamic_network_snapshot();o.refresh_active_entry();o.verify_original_full_instance()
+   o.restore_original_restart_policies();o.start_original_postgres();o.verify_original_postgres();o.start_applications(source_recovery=True);o.verify_current_approval_and_private_readiness(source_recovery=True);o.update_dynamic_network_snapshot()
+   if o.managed_source_recovery():o.verify_original_full_instance(before_publish=True);o.refresh_active_entry();o.verify_existing_entry_restored()
+   else:o.refresh_active_entry();o.verify_original_full_instance()
    if self.journal.get('gate') is not None:o.remove_gate(self.journal['gate'])
    o.restore_writers(self.journal['writers'],nonblocking=True);o.verify_writer_restoration(self.journal['writers']);self.mark('source-restored');return {'sourceRestored':True,'partialTargetRetained':True,'targetNeverArmed':True}
   except BaseException:
@@ -206,7 +210,7 @@ class Coordinator:
  def recover_target(self):
   recovery_mode(self.journal)
   try:
-   o=self.ops;o.verify_target_recovery_checkpoint();self.mark('boot-arm-intent',oldDataRollbackForbidden=True,targetBootAuthorized=True);o.install_instance_boot_guard();self.mark('target-start-intent');o.start_postgres();o.verify_postgres_mount_tls_report_wal();o.start_applications();o.verify_current_approval_and_private_readiness();o.update_dynamic_network_snapshot();o.refresh_active_entry();o.verify_full_instance();o.record_runtime_ready();self.mark('unit-handoff-intent');o.activate_running_units();self.mark('units-active');o.remove_gate(self.journal['gate']);o.restore_writers(self.journal['writers'],nonblocking=True);o.verify_writer_restoration(self.journal['writers']);self.mark('complete');return {'targetRestored':True,'oldDataRollbackForbidden':True}
+   o=self.ops;o.verify_target_recovery_checkpoint();self.mark('boot-arm-intent',oldDataRollbackForbidden=True,targetBootAuthorized=True);o.prepare_application_materials();o.install_instance_boot_guard();self.mark('target-start-intent');o.start_postgres();o.verify_postgres_mount_tls_report_wal();o.start_applications();o.verify_current_approval_and_private_readiness();o.update_dynamic_network_snapshot();o.refresh_active_entry();o.verify_full_instance();o.record_runtime_ready();self.mark('unit-handoff-intent');o.activate_running_units();self.mark('units-active');o.remove_gate(self.journal['gate']);o.restore_writers(self.journal['writers'],nonblocking=True);o.verify_writer_restoration(self.journal['writers']);self.mark('complete');return {'targetRestored':True,'oldDataRollbackForbidden':True}
   except BaseException:
    self.ops.record_failure(self.journal,old_data_allowed=not self.journal.get("oldDataRollbackForbidden",False));raise
  def boot_start(self):

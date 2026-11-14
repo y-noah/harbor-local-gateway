@@ -43,7 +43,11 @@ class Mirror(unittest.TestCase):
    self.assertLess(time.monotonic(),deadline);time.sleep(.001);os.utime(p,ns=(stamp.st_atime_ns,stamp.st_mtime_ns))
   result=self.m.finalize(proof,source_stopped=True);self.assertEqual(result['copiedFiles'],1);self.assertEqual((self.target/'a.enc').read_bytes(),b'bbb')
  def test_changed_target_is_preserved_and_not_overwritten(self):
-  self.put(self.source,'a.enc',b'aaa');proof=self.m.online();self.put(self.target,'a.enc',b'bad')
+  self.put(self.source,'a.enc',b'aaa');proof=self.m.online();path=self.put(self.target,'a.enc',b'bad');before=proof['files']['a.enc']['target']
+  # This case verifies changed metadata rejection. Same-tick same-size writes
+  # can retain both timestamps on coarse filesystems; control mtime explicitly.
+  os.utime(path,ns=(path.stat().st_atime_ns,before[7]+1_000_000_000))
+  self.assertNotEqual(path.stat().st_mtime_ns,before[7]);self.assertNotEqual(m.identity(path.stat()),before)
   with self.assertRaisesRegex(RuntimeError,'storage_unknown_or_changed_target_file'):self.m.finalize(proof,source_stopped=True)
   self.assertEqual((self.target/'a.enc').read_bytes(),b'bad')
  def test_unknown_target_is_never_deleted(self):

@@ -355,3 +355,7 @@ bootstrap在新infra ROOT预建`archive/`(PG999/0700)、独立`archive.key`(PG99
 存量管理入口 `ci/harbor-material-move.py plan` 只读取路径、inode、容器 ID 和工具 SHA，输出 `approved:false` 候选，不扫描文件正文、不写审批。根协调者核对后将明确批准的同一计划存入 root/0600 `/etc/harbor-material-move.json`。`prepare → switch → status` 只在原部署/入口锁下操作；应用须以原容器 ID 确认停稳、restart=no，备份写入服务/定时器停稳，image staging 关闭。冷拷独立核 SHA、权限和完整 inode 元数据；原目录按 nonce 保留，bind unit 明确依赖 UUID 持久磁盘 unit。`prepare` 可续同一复制 journal，`switch` 可续失败的 mount；最终开放保护前持久化 `activation-ready`，此后只允许向前完成，不允许旧数据回退。更早阶段可显式 `rollback`，但任何目标文件身份改变都会拒绝旧数据回退。工具不自行重启业务/备份，也不删除原副本；协调者须完成真实业务、重启保护和后续写入落盘验收。
 
 计划中的 `legacyTemporary` 记录实际根 `uid` 并沿用其权限，不要求历史临时材料归 root，也不修改源 owner。可选 `runtimeRebuildableCaches` 缺省或空数组时完整复制；唯一支持值 `['codex-launcher-aliases']` 只排除应用 runtime 中真实 `accounts/*/tmp/arg0` 目录，由客户端重建。该路径根若为链接仍拒绝，同名普通文件仍复制；其他链接和凭据目录不豁免。此选择绑定原审批和复制 journal，不能在续跑时临时更改。审批阶段仅校验计划，最终存储配置仍使用实际、互异的目标 inode。
+
+PG 与应用材料可共用一次维护窗口：在新的 PG 迁盘 PLAN 中显式设置 `materialMove: {approvalSha256, nonce}`，绑定上述独立批准文件和 mover 的实际工具 SHA；缺省仍保持原 PG 流程。数据库冷拷证明、原逻辑路径绑定及禁止旧库回退的启动意图持久化后，PG host 在已有部署/入口锁内调用 mover 核心，不重入其 CLI 锁。五项材料根及完整配置完成后才启动原 PG 和应用，随后在两个应用容器内核对 data、runtime 及两项 spool 的实际 dev/inode；任何不一致均不得放流。进入目标启动授权后只能沿受控 target 恢复继续，不能将旧副本重新投入写入。
+
+需要中断长请求时，PLAN 还须以 `interruptTicketSha256` 绑定当前已批准且启用 `interruptEntryClients` 的发布票据；仅设置布尔值或沿用旧票据不能获得中断权限。源库恢复只在目标尚未授权、原根及原配置身份不变时允许；维护前若实际证实原 Worker 为低水位状态，恢复将等待本代启动进展并复核签名低水位、私有就绪、授权及鉴权，再恢复入口。该窄源恢复不降低目标上线健康门槛。挂载列表仅按完整结构规范化次序，未知属性、RW、User、Env/Cmd 等真实变化仍拒绝；升级此工具后须重新 collect 计划，不沿用旧签名。
