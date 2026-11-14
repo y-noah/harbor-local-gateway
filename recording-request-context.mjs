@@ -5,14 +5,15 @@ import {recordingLiteral} from './recording-literal.mjs';
 import {recordingTextMetadata,finalizeRecordingTokens} from './recording-text-metadata.mjs';
 
 const media=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
-const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','item_reference','compaction']);
+const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','item_reference','compaction']);
 const textTypes=new Set(['text','input_text','output_text','summary_text','refusal']);
-const scalarFields=new Set(['role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments','code','container_id','server_label','approval_request_id']);
-const toolItems=new Set(['function_call','custom_tool_call','function_call_output','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call']);
+const scalarFields=new Set(['role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments','code','container_id','server_label','approval_request_id','reason']);
+const toolItems=new Set(['function_call','custom_tool_call','function_call_output','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response']);
 const toolFacts=['status','error','duration_ms','elapsed_ms'];
 const itemFields={additional_tools:['type','id','role','tools'],function_call:['type','id','call_id','name','namespace','arguments',...toolFacts],custom_tool_call:['type','id','call_id','name','namespace','input',...toolFacts],function_call_output:['type','id','call_id','name','namespace','output',...toolFacts],custom_tool_call_output:['type','id','call_id','name','namespace','output',...toolFacts],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
 Object.assign(itemFields,{shell_call:['type','id','call_id','action',...toolFacts],shell_call_output:['type','id','call_id','output','max_output_length',...toolFacts],apply_patch_call:['type','id','call_id','operation',...toolFacts],apply_patch_call_output:['type','id','call_id','output',...toolFacts]});
 Object.assign(itemFields,{code_interpreter_call:['type','id','code','container_id','outputs',...toolFacts],mcp_call:['type','id','name','server_label','arguments','approval_request_id','output',...toolFacts]});
+Object.assign(itemFields,{mcp_list_tools:['type','id','server_label','tools','error'],mcp_approval_request:['type','id','arguments','name','server_label'],mcp_approval_response:['type','approval_request_id','approve','id','reason']});
 const schemaBranches=new Set(['allOf','anyOf','oneOf','not','items','prefixItems','contains','additionalProperties','unevaluatedProperties','unevaluatedItems','propertyNames','if','then','else','additionalItems','contentSchema']);
 export const requestContextReasons=Object.freeze(['invalid_payload','unsupported_tools','unsupported_input','unsupported_instructions','ambiguous_input','unsupported_content','unsupported_field','schema_name_collision','size_limit']);
 
@@ -46,10 +47,10 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     }
     if(!value||typeof value!=='object')return value;
     if(protocol&&slot==='code_output'&&(!['logs','image'].includes(value.type)||value.type==='logs'&&typeof value.logs!=='string')){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
-    if(protocol&&media.has(value.type)){
+    if(protocol&&slot!=='mcp_tool'&&media.has(value.type)){
       return attachment(value);
     }
-    if(protocol&&value.type==='reasoning'){
+    if(protocol&&slot!=='mcp_tool'&&value.type==='reasoning'){
       // Raw reasoning content is a known exclusion, just like encrypted content;
       // do not inspect or persist it when retaining the public summary.
       for(const key in value){if(--nodes<0){cut();break;}if(Object.hasOwn(value,key)&&!['type','id','summary','content','encrypted_content','status'].includes(key))reasons.add('unsupported_field');}
@@ -59,7 +60,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     }
     if(protocol&&['content','summary'].includes(slot)&&!textTypes.has(value.type)){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(protocol&&textTypes.has(value.type)&&typeof value[value.type==='refusal'?'refusal':'text']==='string'&&value[value.type==='refusal'?'refusal':'text'].length&&(value.type!=='output_text'||!Array.isArray(value.logprobs)||!value.logprobs.length))tokenSequence.incomplete=true;
-    const slotFields=slot==='function'?['name','namespace','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','namespace','function','mode','tools']:slot==='code_output'?['type','logs']:null;
+    const slotFields=slot==='function'?['name','namespace','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','namespace','function','mode','tools']:slot==='code_output'?['type','logs']:slot==='mcp_tool'?['name','input_schema','annotations','description']:null;
     const fields=slotFields||itemFields[value.type]||(value.role!==undefined||value.type==='message'?['type','role','id','content','name','status','channel','phase',...(value.role==='assistant'?['tool_calls','refusal']:[]),...(value.role==='tool'?['tool_call_id']:[])]:null);
     if(protocol&&!slotFields&&value.type!==undefined&&!itemTypes.has(value.type)&&!textTypes.has(value.type)&&value.type!=='function'){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     const result=Object.create(null);
@@ -80,9 +81,12 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       // Never retain opaque compaction/reasoning blobs, even as redacted data.
       if(protocol&&['encrypted_content','reasoning_content','thinking'].includes(key)){opaqueReasoningExcluded++;continue;}
       if(protocol&&fields&&!fields.includes(key)){reasons.add('unsupported_field');continue;}
-      const nullableMetadata=(['phase','namespace'].includes(key)||toolItems.has(value.type)&&key==='status'||value.type==='code_interpreter_call'&&key==='code'||value.type==='mcp_call'&&key==='approval_request_id')&&value[key]===null;
+      const nullableMetadata=(['phase','namespace'].includes(key)||toolItems.has(value.type)&&key==='status'||value.type==='code_interpreter_call'&&key==='code'||value.type==='mcp_call'&&key==='approval_request_id'||value.type==='mcp_approval_response'&&['id','reason'].includes(key)||slot==='mcp_tool'&&key==='description')&&value[key]===null;
       if(protocol&&slotFields&&['id','type','name','namespace','arguments','mode'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
       if(protocol&&(value.role!==undefined||itemTypes.has(value.type))&&scalarFields.has(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
+      if(protocol&&slot==='mcp_tool'&&(['name','description'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata)){reasons.add('unsupported_content');continue;}
+      if(protocol&&value.type==='mcp_approval_response'&&key==='approve'&&typeof value[key]!=='boolean'){reasons.add('unsupported_content');continue;}
+      if(protocol&&value.type==='mcp_list_tools'&&(key==='tools'&&!Array.isArray(value[key])||key==='error'&&value[key]!==null&&typeof value[key]!=='string')){reasons.add('unsupported_content');continue;}
       if(protocol&&toolItems.has(value.type)&&['duration_ms','elapsed_ms'].includes(key)&&(!Number.isFinite(value[key])||value[key]<0)){reasons.add('unsupported_content');continue;}
       if(protocol&&value.type==='shell_call_output'&&key==='max_output_length'&&value[key]!==null&&(!Number.isSafeInteger(value[key])||value[key]<0)){reasons.add('unsupported_content');continue;}
       if(protocol&&(value.type==='shell_call'&&key==='action'||value.type==='apply_patch_call'&&key==='operation')&&(!value[key]||typeof value[key]!=='object'||Array.isArray(value[key]))){reasons.add('unsupported_content');continue;}
@@ -91,6 +95,15 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       if(protocol&&textTypes.has(value.type)&&!['type',value.type==='refusal'?'refusal':'text',...(value.type==='output_text'?['annotations','logprobs']:[])].includes(key)){reasons.add('unsupported_field');continue;}
       if(protocol&&value.type==='output_text'&&['annotations','logprobs'].includes(key)){
         result[key]=recordingTextMetadata(key,value[key],{maxBytes:maxBytes-bytes,onNodes:count=>{nodes-=count;return nodes>=0;},onTruncate:cut,onRedact,tokenSequence,expectedText:value.text,onUnsupported:reason=>reasons.add(reason)});continue;
+      }
+      if(protocol&&value.type==='mcp_list_tools'&&key==='tools'){
+        result.tools=visible(value.tools,depth+1,true,'mcp_tool');continue;
+      }
+      if(protocol&&slot==='mcp_tool'&&key==='input_schema'){
+        result.input_schema=visible(value.input_schema,depth+1,false,null,false,'definition');continue;
+      }
+      if(protocol&&slot==='mcp_tool'&&key==='annotations'){
+        result.annotations=literal(value.annotations,depth+1);continue;
       }
       if(protocol&&value.type==='additional_tools'&&key==='tools'){
         result.tools=visible(value.tools,depth+1,false,null,false,'tools');continue;
@@ -101,7 +114,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       if(protocol&&textTypes.has(value.type)&&['text','refusal'].includes(key)&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='refusal'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='content'&&value[key]!==null&&typeof value[key]!=='string'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
-      if(protocol&&(key==='output'&&toolItems.has(value.type)&&value.type.endsWith('_output')||key==='action'&&value.type==='shell_call'||key==='operation'&&value.type==='apply_patch_call'||value.type==='code_interpreter_call'&&key==='code'||value.type==='mcp_call'&&['arguments','output'].includes(key)||key==='error'&&toolItems.has(value.type)||key==='content'&&value.role==='tool')){
+      if(protocol&&(key==='output'&&toolItems.has(value.type)&&value.type.endsWith('_output')||key==='action'&&value.type==='shell_call'||key==='operation'&&value.type==='apply_patch_call'||value.type==='code_interpreter_call'&&key==='code'||['mcp_call','mcp_approval_request'].includes(value.type)&&['arguments','output'].includes(key)||value.type==='mcp_approval_response'&&key==='reason'||key==='error'&&toolItems.has(value.type)||key==='content'&&value.role==='tool')){
         Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key])&&(key==='content'||key==='output'&&['function_call_output','custom_tool_call_output'].includes(value.type)),onTruncate:cut,onRedact,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
       }
       if(schema==='definition'&&['properties','patternProperties','$defs','definitions','dependentSchemas','dependentRequired','dependencies'].includes(key)&&value[key]&&typeof value[key]==='object'&&!Array.isArray(value[key])){
