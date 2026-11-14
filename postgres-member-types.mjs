@@ -31,9 +31,31 @@ export function createPostgresMemberTypes(store,{readStore=store,clock=Date.now,
   async function list({signal,scope}={}){
     const trusted=await departments.resolve(scope);
     return read(()=>readStore.transaction(async()=>{
-      const rows=await readStore.all(`SELECT t.*,p.created configured_at,p.allowed_models,p.usage_limits,
-        (SELECT COUNT(*) FROM harbor.members m WHERE m.usage_type_id=t.id AND m.removed_at IS NULL${trusted?' AND m.department_id=t.department_id':''}) members
-        FROM harbor.member_types t LEFT JOIN harbor.member_type_templates p ON p.type_id=t.id AND p.version=t.default_version${trusted?' AND p.department_id=t.department_id':''}${trusted?.view==='department'?' WHERE t.department_id=$1':''} ORDER BY t.code,t.id`,...(trusted?.view==='department'?[trusted.department_id]:[]));
+      // Match the batch preview's inherited-source rule; values alone do not
+      // prove inheritance. Counts may overlap when one component is retained.
+      const inherited=source=>`COALESCE(${source}->>'kind' IN ('type','employee') AND jsonb_typeof(${source}->'type_id')='string',false)`;
+      const outdated=source=>`(${source}->>'type_id' IS DISTINCT FROM m.usage_type_id OR ${source}->>'template_version' IS DISTINCT FROM m.default_version::text)`;
+      const rows=await readStore.all(`WITH typed_members AS MATERIALIZED (
+        SELECT m.id,m.usage_type_id,t.default_version,m.configuration_source->'models' models_source,m.configuration_source->'limits' limits_source${trusted?',m.department_id':''}
+        FROM harbor.members m JOIN harbor.member_types t ON t.id=m.usage_type_id${trusted?' AND t.department_id=m.department_id':''}
+        WHERE m.removed_at IS NULL${trusted?.view==='department'?' AND m.department_id=$1':''}
+      ), key_sources AS (
+        SELECT k.member_id,BOOL_OR(NOT ${inherited('k.model_source')}) exceptions,
+          BOOL_OR(${inherited('k.model_source')} AND ${outdated('k.model_source')}) pending
+        FROM harbor.keys k JOIN typed_members m ON m.id=k.member_id${trusted?' AND k.department_id=m.department_id':''}
+        WHERE k.removed_at IS NULL GROUP BY k.member_id
+      ), member_counts AS (
+        SELECT m.usage_type_id,COUNT(*) members,
+          COUNT(*) FILTER(WHERE m.default_version IS NOT NULL AND (
+            ${inherited('m.models_source')} AND ${outdated('m.models_source')} OR
+            ${inherited('m.limits_source')} AND ${outdated('m.limits_source')} OR
+            ${inherited('m.models_source')} AND COALESCE(k.pending,false))) pending_members,
+          COUNT(*) FILTER(WHERE NOT ${inherited('m.models_source')} OR NOT ${inherited('m.limits_source')} OR COALESCE(k.exceptions,false)) exception_members
+        FROM typed_members m LEFT JOIN key_sources k ON k.member_id=m.id GROUP BY m.usage_type_id
+      ) SELECT t.*,p.created configured_at,p.allowed_models,p.usage_limits,
+        COALESCE(c.members,0) members,COALESCE(c.pending_members,0) pending_members,COALESCE(c.exception_members,0) exception_members
+        FROM harbor.member_types t LEFT JOIN harbor.member_type_templates p ON p.type_id=t.id AND p.version=t.default_version${trusted?' AND p.department_id=t.department_id':''}
+        LEFT JOIN member_counts c ON c.usage_type_id=t.id${trusted?.view==='department'?' WHERE t.department_id=$1':''} ORDER BY t.code,t.id`,...(trusted?.view==='department'?[trusted.department_id]:[]));
       return {models:[...await knownModels(readStore,trusted)].sort(),types:rows.map(({allowed_models,usage_limits,...type})=>({...type,configured:type.default_version!==null,defaults:type.default_version===null?null:{allowed_models,usage_limits}}))};
     },{level:'REPEATABLE READ',readOnly:true}),{signal});
   }
