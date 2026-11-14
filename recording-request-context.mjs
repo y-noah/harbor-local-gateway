@@ -15,10 +15,17 @@ Object.assign(itemFields,{shell_call:['type','id','call_id','action',...toolFact
 Object.assign(itemFields,{code_interpreter_call:['type','id','code','container_id','outputs',...toolFacts],mcp_call:['type','id','name','server_label','arguments','approval_request_id','output',...toolFacts]});
 Object.assign(itemFields,{mcp_list_tools:['type','id','server_label','tools','error'],mcp_approval_request:['type','id','arguments','name','server_label'],mcp_approval_response:['type','approval_request_id','approve','id','reason']});
 Object.assign(itemFields,{web_search_call:['type','id','status','action'],file_search_call:['type','id','status','queries','results'],computer_call:['type','id','call_id','status','pending_safety_checks','action','actions'],computer_call_output:['type','call_id','id','status','output','acknowledged_safety_checks']});
+const callerItems=new Set(['function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
+for(const type of callerItems)itemFields[type].push('caller');
+for(const type of ['function_call','custom_tool_call'])itemFields[type].push('async');
+itemFields.shell_call.push('environment');
+const callerFields={direct:['type'],program:['type','caller_id']};
+const shellEnvironmentFields={local:['type','skills'],container_reference:['type','container_id']};
+const nullableItemIds=new Set(['function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
 const computerActionFields={click:['type','button','x','y','keys'],double_click:['type','x','y','keys'],drag:['type','path','keys'],keypress:['type','keys'],move:['type','x','y','keys'],screenshot:['type'],scroll:['type','x','y','scroll_x','scroll_y','keys'],type:['type','text'],wait:['type']};
 const webActionFields={search:['type','query','queries','sources'],open_page:['type','url'],find_in_page:['type','pattern','url']};
-const factFields={web_source:['type','url'],file_result:['attributes','file_id','filename','score','text'],safety_check:['id','code','message'],coordinate:['x','y']};
-const factSlots=new Set([...Object.keys(factFields),'web_action','computer_action']);
+const factFields={web_source:['type','url'],file_result:['attributes','file_id','filename','score','text'],safety_check:['id','code','message'],coordinate:['x','y'],local_skill:['name','description','path']};
+const factSlots=new Set([...Object.keys(factFields),'web_action','computer_action','tool_caller','shell_environment']);
 const schemaBranches=new Set(['allOf','anyOf','oneOf','not','items','prefixItems','contains','additionalProperties','unevaluatedProperties','unevaluatedItems','propertyNames','if','then','else','additionalItems','contentSchema']);
 export const requestContextReasons=Object.freeze(['invalid_payload','unsupported_tools','unsupported_input','unsupported_instructions','ambiguous_input','unsupported_content','unsupported_field','schema_name_collision','size_limit']);
 
@@ -45,7 +52,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     if(Array.isArray(value)){
       // Filter raw logs together before per-field filtering consumes a split
       // credential prefix. Keep the same node/byte budget as other fragments.
-      let codeLogs=null,resultTexts=null;const factTextKey=slot==='file_result'||slot==='computer_action'?'text':slot==='safety_check'?'message':null;
+      let codeLogs=null,resultTexts=null;const factTextKey=slot==='file_result'||slot==='computer_action'?'text':slot==='safety_check'?'message':slot==='local_skill'?'description':null;
       if(protocol&&slot==='code_output'){
         const parts=[];for(const child of value){if(parts.length>=nodes){cut();break;}parts.push(child?.type==='logs'&&typeof child.logs==='string'?child.logs:'');}
         codeLogs=redactRecordParts(parts,{maxBytes:maxBytes-bytes,maxParts:maxNodes,onTruncate:cut,onRedact}).parts;
@@ -58,7 +65,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     }
     if(protocol&&factSlots.has(slot)&&(!value||typeof value!=='object'||Array.isArray(value))){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(!value||typeof value!=='object')return value;
-    if(protocol&&(slot==='web_action'&&!Object.hasOwn(webActionFields,value.type)||slot==='computer_action'&&!Object.hasOwn(computerActionFields,value.type)||slot==='web_source'&&value.type!=='url')){reasons.add('unsupported_content');return {content:'[未支持的工具动作已省略]'};}
+    if(protocol&&(slot==='web_action'&&!Object.hasOwn(webActionFields,value.type)||slot==='computer_action'&&!Object.hasOwn(computerActionFields,value.type)||slot==='web_source'&&value.type!=='url'||slot==='tool_caller'&&!Object.hasOwn(callerFields,value.type)||slot==='shell_environment'&&!Object.hasOwn(shellEnvironmentFields,value.type))){reasons.add('unsupported_content');return {content:'[未支持的工具动作已省略]'};}
     if(protocol&&slot==='code_output'&&(!['logs','image'].includes(value.type)||value.type==='logs'&&typeof value.logs!=='string')){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(protocol&&slot!=='mcp_tool'&&!factSlots.has(slot)&&media.has(value.type)){
       return attachment(value);
@@ -73,7 +80,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     }
     if(protocol&&['content','summary'].includes(slot)&&!textTypes.has(value.type)){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(protocol&&textTypes.has(value.type)&&typeof value[value.type==='refusal'?'refusal':'text']==='string'&&value[value.type==='refusal'?'refusal':'text'].length&&(value.type!=='output_text'||!Array.isArray(value.logprobs)||!value.logprobs.length))tokenSequence.incomplete=true;
-    const slotFields=slot==='function'?['name','namespace','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','namespace','function','mode','tools']:slot==='code_output'?['type','logs']:slot==='mcp_tool'?['name','input_schema','annotations','description']:slot==='web_action'?webActionFields[value.type]:slot==='computer_action'?computerActionFields[value.type]:factFields[slot]||null;
+    const slotFields=slot==='function'?['name','namespace','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','namespace','function','mode','tools']:slot==='code_output'?['type','logs']:slot==='mcp_tool'?['name','input_schema','annotations','description']:slot==='web_action'?webActionFields[value.type]:slot==='computer_action'?computerActionFields[value.type]:slot==='tool_caller'?callerFields[value.type]:slot==='shell_environment'?shellEnvironmentFields[value.type]:factFields[slot]||null;
     const fields=slotFields||itemFields[value.type]||(value.role!==undefined||value.type==='message'?['type','role','id','content','name','status','channel','phase',...(value.role==='assistant'?['tool_calls','refusal']:[]),...(value.role==='tool'?['tool_call_id']:[])]:null);
     if(protocol&&!slotFields&&value.type!==undefined&&!itemTypes.has(value.type)&&!textTypes.has(value.type)&&value.type!=='function'){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     const result=Object.create(null);
@@ -96,12 +103,12 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       // Never retain opaque compaction/reasoning blobs, even as redacted data.
       if(protocol&&['encrypted_content','reasoning_content','thinking'].includes(key)){opaqueReasoningExcluded++;continue;}
       if(protocol&&fields&&!fields.includes(key)){reasons.add('unsupported_field');continue;}
-      const nullableMetadata=(['phase','namespace'].includes(key)||toolItems.has(value.type)&&key==='status'||value.type==='code_interpreter_call'&&key==='code'||value.type==='mcp_call'&&key==='approval_request_id'||value.type==='mcp_approval_response'&&['id','reason'].includes(key)||slot==='mcp_tool'&&key==='description'||value.type==='computer_call_output'&&key==='id'||slot==='safety_check'&&['code','message'].includes(key))&&value[key]===null;
+      const nullableMetadata=(['phase','namespace'].includes(key)||toolItems.has(value.type)&&key==='status'||value.type==='code_interpreter_call'&&key==='code'||value.type==='mcp_call'&&key==='approval_request_id'||value.type==='mcp_approval_response'&&['id','reason'].includes(key)||slot==='mcp_tool'&&key==='description'||value.type==='computer_call_output'&&key==='id'||slot==='safety_check'&&['code','message'].includes(key)||!slotFields&&(key==='id'&&nullableItemIds.has(value.type)||value.type==='function_call_output'&&['call_id','name'].includes(key)))&&value[key]===null;
       if(protocol&&slotFields&&['id','type','name','namespace','arguments','mode'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
       if(protocol&&(value.role!==undefined||itemTypes.has(value.type))&&scalarFields.has(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
       if(protocol&&slot==='mcp_tool'&&(['name','description'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata)){reasons.add('unsupported_content');continue;}
       if(protocol&&factSlots.has(slot)){
-        const stringField=(slot==='web_action'&&['query','pattern','url'].includes(key)||slot==='web_source'&&key==='url'||slot==='file_result'&&['file_id','filename','text'].includes(key)||slot==='safety_check'&&['id','code','message'].includes(key)||slot==='computer_action'&&['button','text'].includes(key));
+        const stringField=(slot==='web_action'&&['query','pattern','url'].includes(key)||slot==='web_source'&&key==='url'||slot==='file_result'&&['file_id','filename','text'].includes(key)||slot==='safety_check'&&['id','code','message'].includes(key)||slot==='computer_action'&&['button','text'].includes(key)||slot==='tool_caller'&&key==='caller_id'||slot==='shell_environment'&&key==='container_id'||slot==='local_skill'&&['name','description','path'].includes(key));
         const nullable=(slot==='web_action'&&key==='url'&&value.type!=='search'||slot==='safety_check'&&['code','message'].includes(key))&&value[key]===null;
         if(stringField&&typeof value[key]!=='string'&&!nullable){reasons.add('unsupported_content');continue;}
         if(['x','y','scroll_x','scroll_y'].includes(key)&&!Number.isSafeInteger(value[key])){reasons.add('unsupported_content');continue;}
@@ -112,7 +119,17 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
         if(key==='attributes'){result[key]=literal(value[key],depth+1);continue;}
         if(['queries','keys'].includes(key)){const list=key==='keys'&&value[key]===null&&value.type!=='keypress'?null:strings(value[key]);result[key]=searchTexts&&key==='queries'&&Array.isArray(list)?list.map((part,index)=>typeof value[key][index]==='string'?searchTexts[index+(searchQuery?1:0)]??'':part):list;continue;}
         if(searchTexts&&key==='query'){result.query=searchTexts[0]??'';continue;}
-        if(key==='sources'||key==='path'){if(!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}result[key]=visible(value[key],depth+1,true,key==='sources'?'web_source':'coordinate');continue;}
+        if(slot==='web_action'&&key==='sources'||slot==='computer_action'&&key==='path'){if(!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}result[key]=visible(value[key],depth+1,true,key==='sources'?'web_source':'coordinate');continue;}
+      }
+      if(protocol&&key==='caller'&&callerItems.has(value.type)){
+        if(value.caller!==null&&(!value.caller||typeof value.caller!=='object'||Array.isArray(value.caller))){reasons.add('unsupported_content');continue;}result.caller=value.caller===null?null:visible(value.caller,depth+1,true,'tool_caller');continue;
+      }
+      if(protocol&&key==='async'&&['function_call','custom_tool_call'].includes(value.type)&&typeof value.async!=='boolean'){reasons.add('unsupported_content');continue;}
+      if(protocol&&key==='environment'&&value.type==='shell_call'){
+        if(value.environment!==null&&(!value.environment||typeof value.environment!=='object'||Array.isArray(value.environment))){reasons.add('unsupported_content');continue;}result.environment=value.environment===null?null:visible(value.environment,depth+1,true,'shell_environment');continue;
+      }
+      if(protocol&&slot==='shell_environment'&&key==='skills'){
+        if(!Array.isArray(value.skills)){reasons.add('unsupported_content');continue;}result.skills=visible(value.skills,depth+1,true,'local_skill');continue;
       }
       if(protocol&&key==='status'&&['web_search_call','file_search_call','computer_call','computer_call_output'].includes(value.type)){
         const allowed=value.type.startsWith('computer_')?['in_progress','completed','incomplete']:['in_progress','searching','completed','failed','incomplete'];if(!(value.type==='computer_call_output'&&value.status===null)&&!allowed.includes(value.status)){reasons.add('unsupported_content');continue;}
