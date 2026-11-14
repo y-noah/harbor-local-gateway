@@ -361,6 +361,14 @@ PG 与应用材料可共用一次维护窗口：在新的 PG 迁盘 PLAN 中显�
 需要中断长请求时，PLAN 还须以 `interruptTicketSha256` 绑定当前已批准且启用 `interruptEntryClients` 的发布票据；仅设置布尔值或沿用旧票据不能获得中断权限。源库恢复只在目标尚未授权、原根及原配置身份不变时允许；维护前若实际证实原 Worker 为低水位状态，恢复将等待本代启动进展并复核签名低水位、私有就绪、授权及鉴权，再恢复入口。该窄源恢复不降低目标上线健康门槛。挂载列表仅按完整结构规范化次序，未知属性、RW、User、Env/Cmd 等真实变化仍拒绝；升级此工具后须重新 collect 计划，不沿用旧签名。
 
 
+### 退役尚未触源的失败尝试
+
+`retire-unstarted-pg-move.py inspect|retire` 只为已失败、原源实例一直未变且入口已经恢复 active 的尝试释放准备名称，不恢复服务、不完成迁盘、不暂停入口。默认 `inspect` 不创建历史目录。存在目标启动授权、真实停写／停服／换绑、非空目标数据库、材料迁移状态、活动或未知 worker 等情况均拒绝；空 writers 及与原进程代次一致的源恢复见证不视为已经触源。
+
+执行前从批准 CI 取得脚本并核对摘要。固定 root／0600 的 `/etc/harbor-pg-storage-retirement.json` 绑定 `version:1`、`approved:true`、UUID `id`、旧 `runId`、`files`（旧 PLAN、STATE、归档 proof、材料批准、原 worker intent 及失败 log 的原始 SHA）、`installerSha256`、`revision`、`pipeline` 和 `artifactJob`。工具不签发该批准，也不接受任意证据路径。
+
+`retire` 将已接纳的归档按原 inode 送回旧计划的预复制目录；旧 PG 控制件及空目标壳原样归档至 `/sdc-disk/harbor-data/.pg-storage-retired/<旧run>/`，材料批准原件同文件系统移至 `/etc/harbor-pg-storage-retired/<旧run>/`。移动前统一持久化意图及目录见证，中断后沿同一批准续跑，不删除未知文件、不重写旧 journal 为完成、不重新复制归档正文。只有独立退役收据达到 `retired-source-untouched` 且旧 canonical 名称已释放后，才能更新批准的新工具，重新 collect／plan 并用原 `adopt-archive` 接纳归档；新 run 仍须完成真实冷拷及切盘验收。
+
 ### 未触源时的入口恢复
 
 Host 在暂停前持久化原入口 epoch、进程代次、三容器、原数据根、应用材料及入口规则见证。只有本轮确实请求过 hold、原实例未变、尚未设置 gate／停止写入器或服务／换绑数据时，源恢复才直接以原 holding epoch 执行 CAS resume；不等待原长请求排空，不重启服务。明确拒绝的控制请求不能授予恢复权限；回执丢失只在已持久化的自有请求及精确下一 epoch 下核销，不重复发送。已完成 drain 的可信状态、已进入后续切换或无新见证的存量 journal 继续沿原完整恢复路径，不推测补造权限。
