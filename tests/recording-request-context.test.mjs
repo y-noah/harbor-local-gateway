@@ -4,6 +4,23 @@ import {captureRequestContext,captureRequestContextAsync} from '../recording-req
 import {RecordingStore} from '../recording-store.mjs';
 import {randomBytes} from 'node:crypto';
 
+test('代码解释器与MCP历史保留可见执行信息且不要求虚构call_id',async()=>{
+ const input=[{type:'code_interpreter_call',id:'synthetic-code',code:'print("synthetic")',container_id:'synthetic-container',outputs:[{type:'logs',logs:'合成日志'},{type:'image',url:'https://private.example/image.png'}],status:'completed'},
+ {type:'mcp_call',id:'synthetic-mcp',name:'lookup',server_label:'synthetic',arguments:'{"query":"合成输入","api_key":"private-mcp-secret"}',approval_request_id:null,output:'合成输出',error:null,status:'completed'}];
+ const original=structuredClone(input),view=captureRequestContext({input});assert.equal(view.state,'complete');assert.deepEqual(input,original);assert.deepEqual(await captureRequestContextAsync({input}),view);
+ const [code,mcp]=view.components.map(item=>item.content.value);assert.equal(code.code,input[0].code);assert.equal(code.outputs[0].logs,'合成日志');assert.equal(code.outputs[1].content,'[附件数据已省略]');assert.equal(mcp.output,'合成输出');assert.equal(mcp.approval_request_id,null);assert.equal(mcp.error,null);assert.equal(Object.hasOwn(mcp,'call_id'),false);
+ for(const secret of ['private-mcp-secret','private.example'])assert.ok(!JSON.stringify(view).includes(secret));
+ const nullable=captureRequestContext({input:[{type:'code_interpreter_call',id:'code',code:null,outputs:null},{type:'mcp_call',id:'mcp',arguments:'{}',output:null}]});assert.equal(nullable.state,'complete');
+ for(const logs of [['Authorization: Bearer ','private-split-secret'],['{"api_key":"','private-json-secret"}']]){
+  const payload={input:[{type:'code_interpreter_call',outputs:logs.map(logs=>({type:'logs',logs}))}]},result=captureRequestContext(payload);for(const secret of ['private-split-secret','private-json-secret'])assert.ok(!JSON.stringify(result).includes(secret));assert.deepEqual(await captureRequestContextAsync(payload),result);
+ }
+ const optional=captureRequestContext({input:[{type:'shell_call_output',output:[],status:null,max_output_length:null}]});assert.equal(optional.state,'complete');assert.equal(optional.components[0].content.value.status,null);assert.equal(optional.components[0].content.value.max_output_length,null);
+ for(const item of [{type:'code_interpreter_call',code:42},{type:'code_interpreter_call',outputs:{}},{type:'mcp_call',arguments:{}},{type:'mcp_call',output:[]}]){const result=captureRequestContext({input:[item]});assert.equal(result.state,'incomplete');assert.ok(result.reasons.includes('unsupported_content'));}
+ for(const output of [null,42,'invalid',[],{type:'unknown',value:'private-hidden'},{type:'logs',logs:{}},{type:'logs',logs:'ok',image_url:'https://private.example/hidden',thinking:'private-opaque'}]){
+  const payload={input:[{type:'code_interpreter_call',outputs:[output]}]},result=captureRequestContext(payload);assert.equal(result.state,'incomplete');for(const secret of ['private-hidden','private.example','private-opaque'])assert.ok(!JSON.stringify(result).includes(secret));assert.deepEqual(await captureRequestContextAsync(payload),result);
+ }
+});
+
 test('shell与apply_patch历史保留可见命令补丁和结构化执行结果',async()=>{
  const input=[{type:'shell_call',id:'shell',call_id:'shell-id',action:{commands:['echo synthetic'],timeout_ms:1000,max_output_length:1024},status:'completed'},
  {type:'shell_call_output',call_id:'shell-id',max_output_length:1024,output:[{stdout:'合成输出',stderr:'',outcome:{type:'exit',exit_code:0}},{stdout:'',stderr:'合成超时',outcome:{type:'timeout'}}]},
