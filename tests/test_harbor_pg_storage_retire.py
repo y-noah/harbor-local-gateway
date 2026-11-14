@@ -25,8 +25,18 @@ def inventory(root,uid):
 class Retirement(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();base=Path(self.tmp.name);self.disk=base/'disk';self.etc=base/'etc';self.disk.mkdir();self.etc.mkdir();self.runid='a'*32;self.purpose=self.disk/'archive-precopy';self.purpose.mkdir(mode=0o700);self.target=self.disk/'postgres';self.target.mkdir(mode=0o700);(self.target/'db').mkdir(mode=0o700);archive=self.target/'archive';archive.mkdir(mode=0o700);(archive/'wal').write_bytes(b'original encrypted WAL payload');self.archive_inode=archive.stat().st_ino;self.payload=(archive/'wal').read_bytes()
+  # Systemd/Docker are already synthetic here; their cgroup filesystem must be
+  # synthetic too, including negative layout and residual-population cases.
+  self.cgroup=base/'cgroup';self.cgroup.mkdir();(self.cgroup/'cgroup.controllers').write_text('cpu memory pids\n')
+  for name in ['harbor-pg-storage-move-'+self.runid+'.service','harbor-pg-archive-copy.service']:
+   group=self.cgroup/'system.slice'/name;group.mkdir(parents=True);(group/'cgroup.events').write_text('populated 0\nfrozen 0\n')
+  cgroup=self.cgroup;system=Path('/sys/fs/cgroup')
+  class FixturePath(type(Path())):
+   def __new__(cls,*args):
+    path=super().__new__(cls,*args)
+    return cgroup/path.relative_to(system) if path==system or system in path.parents else path
   paths={'ROOT':self.disk,'PLAN':self.disk/'.pg-storage-plan.json','STATE':self.disk/'.pg-storage-state.json','PROOF':self.disk/'.pg-storage-archive-proof.json','MATERIAL':self.etc/'material.json','HISTORY':self.disk/'.pg-storage-retired','ETC_HISTORY':self.etc/'retired','ABSENT':(self.disk/'cold-db-proof',self.etc/'material-state',self.etc/'material-maintenance',self.etc/'material-config')}
-  self.patches=[patch.object(r,key,value) for key,value in paths.items()]+[patch.object(r,'MANDATORY',{paths[k] for k in ['PLAN','STATE','PROOF','MATERIAL']}),patch.object(r,'read',side_effect=local_read),patch.object(r,'directory',side_effect=lambda path: self.assertEqual(stat.S_IMODE(Path(path).lstat().st_mode),0o700)),patch.object(old,'ROOT',self.disk)]
+  self.patches=[patch.object(r,key,value) for key,value in paths.items()]+[patch.object(r,'Path',FixturePath),patch.object(r,'MANDATORY',{paths[k] for k in ['PLAN','STATE','PROOF','MATERIAL']}),patch.object(r,'read',side_effect=local_read),patch.object(r,'directory',side_effect=lambda path: self.assertEqual(stat.S_IMODE(Path(path).lstat().st_mode),0o700)),patch.object(old,'ROOT',self.disk)]
   for p in self.patches:p.start()
   self.rows={}
   for i,name in enumerate([old.PG,old.GW,old.WORKER]):self.rows[name]={'Id':str(i+1)*64,'Image':'sha256:'+'1'*64,'Config':{},'HostConfig':{'RestartPolicy':{'Name':'unless-stopped'}},'Mounts':[],'NetworkSettings':{},'RestartCount':0,'State':{'Running':True,'Pid':100+i,'StartedAt':'2026-01-01T00:00:00Z'}}
@@ -68,7 +78,7 @@ class Retirement(unittest.TestCase):
  def unit(self,name,allow_absent=False):
   if name in ['start.service','online.service']:return {'LoadState':'not-found'}
   if name=='harbor-pg-archive-copy.service':return {'LoadState':'not-found','MainPID':'0','ActiveState':'inactive','ControlGroup':''}
-  return {'LoadState':'loaded','MainPID':'123' if self.worker_live else '0','ActiveState':'active' if self.worker_live else 'failed','SubState':'running' if self.worker_live else 'failed','ControlGroup':'','InvocationID':'original'}
+  return {'LoadState':'loaded','MainPID':'123' if self.worker_live else '0','ActiveState':'active' if self.worker_live else 'failed','SubState':'running' if self.worker_live else 'failed','ControlGroup':'/system.slice/'+name,'InvocationID':'original'}
  def unmounted(self,purpose):
   if self.mounted:raise RuntimeError('target_referenced')
   self.assertEqual(purpose,self.purpose)
@@ -260,6 +270,29 @@ class Retirement(unittest.TestCase):
    return original(name,allow_absent)
   with patch.object(self.host,'state_unit',side_effect=missing),self.assertRaisesRegex(RuntimeError,'worker_not_quiet'):self.retire.run('retire')
   self.assertFalse(r.HISTORY.exists())
+ def test_synthetic_missing_v1_and_wrong_type_cgroup_layouts_refused(self):
+  marker=self.cgroup/'cgroup.controllers';marker.unlink()
+  for layout in ['missing','v1','wrong-type']:
+   with self.subTest(layout=layout):
+    if layout=='v1':
+     (self.cgroup/'memory').mkdir();(self.cgroup/'memory/tasks').write_text('')
+    if layout=='wrong-type':marker.mkdir()
+    try:
+     self.assertEqual(r.Path('/sys/fs/cgroup/cgroup.controllers'),marker)
+     with self.assertRaisesRegex(RuntimeError,'cgroup_layout_unknown'):self.retire.run('inspect')
+     self.assertFalse(r.HISTORY.exists())
+    finally:
+     if marker.is_dir():marker.rmdir()
+  marker.write_text('cpu memory pids\n');self.assertTrue(self.retire.run('inspect')['eligible'])
+ def test_synthetic_populated_and_missing_population_refuse_both_worker_kinds(self):
+  for name in ['harbor-pg-storage-move-'+self.runid+'.service','harbor-pg-archive-copy.service']:
+   events=self.cgroup/'system.slice'/name/'cgroup.events'
+   for value in ['populated 1\nfrozen 0\n','frozen 0\n']:
+    with self.subTest(unit=name,events=value):
+     events.write_text(value)
+     with self.assertRaisesRegex(RuntimeError,'worker_descendants_alive'):self.retire.run('inspect')
+     self.assertFalse(r.HISTORY.exists());events.write_text('populated 0\nfrozen 0\n')
+  self.assertTrue(self.retire.run('inspect')['eligible'])
  def test_unexpected_global_worker_intent_is_not_ignored(self):
   path=self.disk/'.pg-storage-recover-source-launch-1234567890abcdef.json';path.write_text('{}')
   with self.assertRaisesRegex(RuntimeError,'unknown_worker_intent'):self.retire.run('retire')
