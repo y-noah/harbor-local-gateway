@@ -49,6 +49,8 @@ test('部门导出贯穿真实队列、正文与上下文，跨部门详情下�
  const f=await fixture(t),a=await f.enqueue(),b=await f.enqueue(f.scopes.b);await f.execute();await f.execute();
  const text=await f.download(a.id,f.scopes.a),rows=text.trim().split('\n').map(JSON.parse);assert.ok(rows.some(row=>row.kind==='context_object'));
  assert.ok(rows.every(row=>row.department_id===f.departmentRows.a.id));assert.ok(rows.filter(row=>row.kind==='request').every(row=>f.requests.a.includes(row.request_id)));assert.ok(!text.includes('部门b'));
+ const metadata=rows.filter(row=>row.kind==='request');assert.ok(metadata.every(row=>row.export_scope.view==='department'&&row.export_scope.department_id===f.departmentRows.a.id));
+ const detail=await f.backend.exports.status(a.id,{scope:f.scopes.a});assert.deepEqual(detail.export_scope,metadata[0].export_scope);assert.match(detail.filename,new RegExp('^harbor-department-'+f.departmentRows.a.id+'-[0-9]+-[0-9]+\\.jsonl$'));assert.ok(!detail.filename.includes('合成'));
  assert.equal((await f.backend.exports.list(new URLSearchParams(),{scope:f.scopes.a})).items.length,1);
  for(const action of [()=>f.backend.exports.status(a.id,{scope:f.scopes.b}),()=>f.download(a.id,f.scopes.b),()=>f.backend.exports.cancel(a.id,{scope:f.scopes.b})])await assert.rejects(action(),{code:'recording_export_not_found'});
  await assert.rejects(f.download(b.id,{...f.scopes.b}),{code:'department_scope_required'});
@@ -59,7 +61,8 @@ test('显式超管全局导出包含各部门标识，部门身份不能下载�
  const f=await fixture(t),global=await f.enqueue(f.scopes.global);await f.execute();const rows=(await f.download(global.id,f.scopes.global)).trim().split('\n').map(JSON.parse);
  assert.deepEqual(new Set(rows.filter(row=>row.kind==='request').map(row=>row.department_id)),new Set([f.departmentRows.a.id,f.departmentRows.b.id]));assert.ok(rows.every(row=>typeof row.department_id==='string'));
  await assert.rejects(f.download(global.id,f.scopes.a),{code:'recording_export_not_found'});
- const csv=await f.enqueue(f.scopes.global,false);await f.execute();const text=await f.download(csv.id,f.scopes.global);assert.match(text,/^"department_id",/);assert.ok(text.includes(f.departmentRows.a.id)&&text.includes(f.departmentRows.b.id));
+ const csv=await f.enqueue(f.scopes.global,false);await f.execute();const text=await f.download(csv.id,f.scopes.global);assert.match(text,/^"department_id",/);assert.ok(text.includes(f.departmentRows.a.id)&&text.includes(f.departmentRows.b.id));assert.ok(text.split('\r\n')[0].endsWith('"export_scope"'));assert.ok(text.includes('""view"":""global""'));
+ const list=await f.backend.exports.list(new URLSearchParams(),{scope:f.scopes.global});assert.ok(list.items.every(row=>row.export_scope));
  f.disableSuper();await assert.rejects(f.download(global.id,f.scopes.global),error=>error.status===403);
 });
 test('上下文临界大小计算包含部门字段，部门与全局导出分片均可重组且不超预算',integration,async t=>{
@@ -90,7 +93,7 @@ test('真实HTTP部门Cookie只读取本部门导出，退出后原下载授权�
  const adapter=createPostgresRecordingAdmin(f.backend,{adminAuthenticated:auth.authenticated,adminContext:async req=>{const scope=await auth.context(req);if(!scope)throw Object.assign(new Error('denied'),{status:401});return scope;},revalidateAdminScope:auth.revalidateScope});
  const server=http.createServer((req,res)=>{adapter.handle(req,res).then(handled=>{if(!handled){res.writeHead(404);res.end();}},error=>{if(res.headersSent){res.destroy();return;}res.writeHead(error.status??500);res.end(JSON.stringify({code:error.code}));});});
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await adapter.close({force:true});server.closeAllConnections();await new Promise(resolve=>server.close(resolve));});const origin='http://127.0.0.1:'+server.address().port,headers={cookie:response.cookie};
- const own=await fetch(origin+'/api/admin/recordings/exports/'+a.id+'/download',{headers});assert.equal(own.status,200);const body=await own.text();assert.ok(!body.includes('部门b'));
+ const own=await fetch(origin+'/api/admin/recordings/exports/'+a.id+'/download',{headers});assert.equal(own.status,200);assert.ok(own.headers.get('content-disposition').includes('harbor-department-'+f.departmentRows.a.id));const body=await own.text();assert.ok(!body.includes('部门b'));
  const foreign=await fetch(origin+'/api/admin/recordings/exports/'+b.id+'/download',{headers});assert.equal(foreign.status,404);await foreign.text();
  auth.logout({headers},{setHeader(){}});const denied=await fetch(origin+'/api/admin/recordings/exports/'+a.id+'/download',{headers});assert.equal(denied.status,401);await denied.text();
 });
@@ -166,4 +169,13 @@ test('停用部门积压及入队竞争不阻塞其他部门索引与全局清�
   await f.departments.updateDepartment(f.scopes.global,f.departmentRows.a.id,{enabled:true,expected_version:1});await f.backend.schedule();
   assert.ok((await f.store.all("SELECT id FROM harbor.background_jobs WHERE kind='recording.context.index' AND department_id=$1",f.departmentRows.a.id)).length>0);
  }
+});
+
+test('新导出固定结构化条件并导出全部匹配，旧任务保持原下载格式',integration,async t=>{
+ const f=await fixture(t),filters={model:'synthetic-model',member:'member-a',limit:'1'};
+ const created=(await f.call('/api/admin/recordings/exports','POST',{include_body:false,format:'csv',filters})).value;
+ await f.execute();const state=await f.backend.exports.status(created.id,{scope:f.scopes.a});
+ assert.equal(state.rows,2);assert.equal(state.export_scope.filters.model,filters.model);assert.equal(state.export_scope.filters.member,'member-a');assert.equal(state.export_scope.filters.limit,undefined);assert.ok(!state.filename.includes('member-a'));
+ const old=await f.enqueue(f.scopes.a,false);await f.store.run("UPDATE harbor.recording_exports SET options=options-'export_scope' WHERE id=$1",old.id);await f.execute();
+ const oldState=await f.backend.exports.status(old.id,{scope:f.scopes.a});assert.equal(oldState.filename,undefined);assert.equal(oldState.export_scope,undefined);assert.ok(!(await f.download(old.id,f.scopes.a)).includes('export_scope'));
 });
