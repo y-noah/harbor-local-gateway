@@ -11,9 +11,9 @@ import {observeRequestContextAsync,incompleteRequestContext} from './recording-c
 import {createPostgresLegacyConsumptionGuard} from './postgres-legacy-consumption-guard.mjs';
 
 const fail=(status,message,code)=>new AppError(status,message,code);
-export function createPostgresChatService({store,buffer,meteringRecovery,checkLimits,runChat,execution,cliProcesses,outputBudget,refreshQuotas=async()=>{},activity,deviceAccess,recordingEnabled=true,captureContext,recordingPolicy=()=>true,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock}),readBody=readJsonBody,reserveTokens=32000,maxRequests=16,maxQueued=5,waitMs=120000,timeoutMs=120000,maxConcurrent=120,maxPerMember=8}={}){
+export function createPostgresChatService({store,buffer,meteringRecovery,checkLimits,runChat,execution,cliProcesses,outputBudget,refreshQuotas=async()=>{},activity,deviceAccess,recordingEnabled=true,captureContext,recordingPolicy=()=>true,clock=Date.now,quotaSubjects,extraRuntime=createPostgresExtraRuntime(store,{clock}),readBody=readJsonBody,reserveTokens=32000,maxRequests=16,maxQueued=5,waitMs=120000,timeoutMs=120000,maxConcurrent=120,maxPerMember=8}={}){
   if(typeof runChat!=='function'||typeof refreshQuotas!=='function'||!activity||![maxRequests,maxQueued,waitMs,timeoutMs].every(Number.isSafeInteger)||maxRequests<1||maxRequests>64||maxQueued<1||maxQueued>64||waitMs<100||waitMs>3600000||timeoutMs<100||timeoutMs>86400000)throw fail(503,'文本执行资源配置无效','chat_configuration');
-  const state=createPostgresChatState(store,{checkLimits,clock,reserveTokens,extraRuntime}),queue=[],owners=new Set();let pumping,again=false;
+  const state=createPostgresChatState(store,{checkLimits,clock,reserveTokens,extraRuntime,quotaSubjects}),queue=[],owners=new Set();let pumping,again=false;
   const consumption=createPostgresLegacyConsumptionGuard(store,{clock});
   const releaseAccount=id=>{const count=activity.accounts.get(id)-1;if(count)activity.accounts.set(id,count);else activity.accounts.delete(id);void wake();};
   function remove(job){const index=queue.indexOf(job);if(index!==-1)queue.splice(index,1);clearTimeout(job.timer);job.signal.removeEventListener('abort',job.abort);}

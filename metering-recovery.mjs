@@ -17,10 +17,11 @@ function facts(command){
   const actualModel=typeof result.actualModel==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(result.actualModel)?result.actualModel:undefined;
   const upstreamRequestId=safeUpstreamRequestId(result.upstreamRequestId);
   const streamTiming=canonicalStreamTiming(result.streamTiming);
+  if(result.quotaSubjectDenial!==undefined&&typeof result.quotaSubjectDenial!=='boolean')throw new AppError(503,'供应方拒绝恢复事实无效','metering_recovery_invalid');
   const chat=canonicalChatFacts(result.chat);if(command.type==='settle-chat'&&chat===undefined)throw new AppError(503,'文本会话恢复游标缺失','metering_recovery_invalid');
   const consumptionAttempts=result.consumptionAttempts===undefined?undefined:normalizeConsumptionAttempts(result.consumptionAttempts);
   const consumptionSelection=canonicalConsumptionSelection(result.consumptionSelection,consumptionAttempts);if(consumptionSelection)assertConsumptionSelectionUsage(result);
-  return {type:'settle',requestId:command.requestId,at:command.at,result:{status,input,output,cached,usageKnown:!!usageKnown,...(streamTiming?{streamTiming}:{}),...(actualModel===undefined?{}:{actualModel}),...(upstreamRequestId?{upstreamRequestId}:{}),...(chat===undefined?{}:{chat}),...(consumptionAttempts===undefined?{}:{consumptionAttempts}),...(consumptionSelection===undefined?{}:{consumptionSelection})}};
+  return {type:'settle',requestId:command.requestId,at:command.at,result:{status,input,output,cached,usageKnown:!!usageKnown,...(result.quotaSubjectDenial===true?{quotaSubjectDenial:true}:{}),...(streamTiming?{streamTiming}:{}),...(actualModel===undefined?{}:{actualModel}),...(upstreamRequestId?{upstreamRequestId}:{}),...(chat===undefined?{}:{chat}),...(consumptionAttempts===undefined?{}:{consumptionAttempts}),...(consumptionSelection===undefined?{}:{consumptionSelection})}};
 }
 
 // Same bounded, fsynced spool mechanism, but a separate directory, encryption

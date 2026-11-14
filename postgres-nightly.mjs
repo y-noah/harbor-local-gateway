@@ -71,13 +71,13 @@ export function createPostgresNightly(store,{preparation,refreshQuotas,clock=Dat
       const ensure=()=>{alive();if(signal?.aborted)throw signal.reason;};ensure();
       if(moves.length&&!sessionHandoffs){release=preparation.reserve(owners);if(!release)throw new AppError(409,'员工仍在准备请求，本组不迁移','session_busy');}
       return store.transaction(async()=>{
-        ensure();const run=await lockedRun(plan);if(run?.plan_id!==plan.id||run.status!=='running')changed();
+        ensure();await lockPostgresRouting(store);const run=await lockedRun(plan);if(run?.plan_id!==plan.id||run.status!=='running')changed();
         if(await store.get('SELECT group_ordinal FROM '+resultSource(plan)+' AND group_ordinal=$2',runKey(plan),entry.ordinal))return;
         withinWindow(plan);
         if(!moves.length){await checkpoint(plan,entry.ordinal,'applied',null,0);return;}
         if(!plan.header.settings?.nightly)changed();
         const members=await store.all('SELECT '+(scope?'department_id,':'')+'id,enabled,removed_at FROM harbor.members WHERE id=ANY($1::text[]) ORDER BY id FOR SHARE',owners);ensure();for(const member of members)access.same(scope,member);if(members.length!==owners.length||members.some(m=>!m.enabled||m.removed_at!==null)||sessions.length!==moves.length)changed();
-        await lockPostgresRouting(store);ensure();
+        ensure();
         const config=await configuration(scope);if(!(await store.get('SELECT $1::jsonb=$2::jsonb equal',JSON.stringify(config),JSON.stringify(plan.header.configuration))).equal)changed();
         let currentAccounts=await createPostgresAccountPackages(store,{clock}).decorate(await store.all('SELECT '+(scope?'department_id,':'')+'id,kind,auth_mode,enabled,removed_at,state,route_block,route_epoch,quota_json FROM harbor.accounts WHERE id=ANY($1::text[]) ORDER BY id FOR SHARE',accounts));
         const oldAccounts=(await store.all("SELECT payload FROM harbor.routing_plan_items WHERE plan_id=$1 AND section='accounts' AND payload->>'id'=ANY($2::text[])",plan.id,accounts)).map(row=>row.payload),old=new Map(oldAccounts.map(a=>[a.id,a])),dispatchAware=oldAccounts.every(account=>account.dispatch_planning),scopeFacts=[],seenScopes=new Set(),packagePolicy=plan.header.configuration.account_package_policy??{enabled:false};if(dispatchAware){for(const account of oldAccounts)for(const model of account.dispatch_planning.models??[]){const group=planningAccountGroup(account,{at:plan.created,packagePolicy}).key,key=JSON.stringify([group,model]);if(seenScopes.has(key))continue;seenScopes.add(key);scopeFacts.push({account_id:account.id,protocol:'responses',contextProtocol:'responses',contextModel:model});}currentAccounts=await annotateExtraPlanning(store,{accounts:currentAccounts,workloads:scopeFacts,at:clock(),packagePolicy,requestBoundary:!!plan.header.requestBoundary});for(const account of currentAccounts)if(planningDispatchIdentity(account)!==planningDispatchIdentity(old.get(account.id)??{}))changed();}const current=new Map(currentAccounts.map(a=>[a.id,a]));

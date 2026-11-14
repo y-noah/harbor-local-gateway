@@ -6,6 +6,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {runnerEnv,codexAuthArgs} from './codex.mjs';
 import {normalizeCodexEntitlements,codexQuotaDenials} from './codex-entitlements.mjs';
+import {attachCodexQuotaSubject} from './quota-subject.mjs';
 export function readRateLimits(binary,home,{spawnProcess=spawn,timeoutMs=15000,closeTimeoutMs=5000,signal}={}){
   if(signal?.aborted)return Promise.reject(Error('额度查询已取消'));
   let sqliteHome;try{sqliteHome=mkdtempSync(join(tmpdir(),'harbor-quota-'));}catch{return Promise.reject(Error('无法准备额度查询隔离目录'));}
@@ -40,14 +41,15 @@ export function readRateLimits(binary,home,{spawnProcess=spawn,timeoutMs=15000,c
     send({method:'initialize',id:1,params:{clientInfo:{name:'harbor_local_gateway',title:'Harbor Local Gateway',version:'1.0.0'}}});
   }).finally(async()=>{if(cleanupAllowed)try{await rm(sqliteHome,{recursive:true,force:true});}catch{throw Error('额度查询缓存清理失败');}});
 }
-export function normalizeLimits(value,at=Date.now()){
-  const by=value?.rateLimitsByLimitId;const selected=by?(by.codex||Object.values(by).find(x=>x?.limitId==='codex')):value?.rateLimits;
+export function normalizeLimits(value,at=Date.now(),{subjectIdentity}={}){
+  const by=value?.rateLimitsByLimitId,entry=by?(by.codex?['codex',by.codex]:Object.entries(by).find(([,x])=>x?.limitId==='codex')):null;const selected=by?entry?.[1]:value?.rateLimits;
   const rate=selected||{};
   const windows=[rate.primary,rate.secondary].filter(w=>w&&Number.isFinite(w.usedPercent)).map(w=>({used:Math.max(0,Math.min(100,w.usedPercent)),minutes:w.windowDurationMins,reset:w.resetsAt? w.resetsAt*1000:null}));
   const entitlements=normalizeCodexEntitlements(value,rate,at);
   if(!windows.length&&!entitlements&&!rate.rateLimitReachedType&&typeof rate.spendControlReached!=='boolean')return null;
   const limitReachedType=['rate_limit_reached','workspace_owner_credits_depleted','workspace_member_credits_depleted','workspace_owner_usage_limit_reached','workspace_member_usage_limit_reached'].includes(rate.rateLimitReachedType)?rate.rateLimitReachedType:null;
-  return {windows,remaining:windows.length?Math.min(...windows.map(w=>100-w.used)):null,checked:at,plan:rate.planType||null,limitReached:!!rate.rateLimitReachedType,limitReachedType,ordinaryUsageAllowed:typeof value?.ordinaryUsageAllowed==='boolean'?value.ordinaryUsageAllowed:null,spendControlReached:typeof rate.spendControlReached==='boolean'?rate.spendControlReached:null,entitlements};
+  const result={windows,remaining:windows.length?Math.min(...windows.map(w=>100-w.used)):null,checked:at,plan:rate.planType||null,limitReached:!!rate.rateLimitReachedType,limitReachedType,ordinaryUsageAllowed:typeof value?.ordinaryUsageAllowed==='boolean'?value.ordinaryUsageAllowed:null,spendControlReached:typeof rate.spendControlReached==='boolean'?rate.spendControlReached:null,entitlements};
+  attachCodexQuotaSubject(result,value,{rate,bucketKey:entry?.[0],identity:subjectIdentity});return result;
 }
 export function accountCapacity(account,predictedTokens,pendingTokens=0,at=Date.now()){
   let snapshot=null;try{snapshot=JSON.parse(account.quota_json);}catch{}

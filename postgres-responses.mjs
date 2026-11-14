@@ -41,6 +41,9 @@ import {createOutputBudget,writeOutput} from './output-budget.mjs';
 import {createSessionRequestHandoff} from './session-request-handoff.mjs';
 import {createPostgresSessionHandoffs} from './postgres-session-handoffs.mjs';
 import {replayableResponsesInput,replayableResponsesEvent} from './responses-replay-context.mjs';
+import {createCodexQuotaSubjectIdentity} from './quota-subject.mjs';
+import {createPostgresQuotaSubjects} from './postgres-quota-subjects.mjs';
+import {createPostgresQuotaConfirmation} from './postgres-quota-confirmation.mjs';
 
 const json=(res,status,value)=>{const encoded=JSON.stringify(value);finishAdminRequestTiming(res,status,{authenticated:true});res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(encoded);};
 async function sse(res,event,signal,sessionId,output,timing,contentToken){
@@ -58,10 +61,13 @@ async function sse(res,event,signal,sessionId,output,timing,contentToken){
 // Composable asynchronous endpoint. Routing and shared-limit adapters are
 // mandatory: this must never silently replace an existing policy with LRU or
 // an unlimited default while the PostgreSQL migration is being developed.
-export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,consumptionRouting,sourceAccounts,consumptionPolicyReady,checkLimits,transportForAccount,adminAuthenticated,adminContext,revalidateAdminScope,departmentActors,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},pricingOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,captureContext,contextReader,contextIndexEnabled=false,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
+export function createPostgresResponsesHandler({store,queryStore=store,recordings,recordingReader=recordings,buffer,meteringRecovery,resolveRoute,consumptionRouting,sourceAccounts,consumptionPolicyReady,checkLimits,transportForAccount,adminAuthenticated,adminContext,adminActorContext,revalidateAdminScope,departmentActors,onRouteFailure,requestQueries,keyEncryptionKey,adminStateContext,accountAdmin,deviceIssuer,platformTransport,runChat,chatOptions={},cliProcesses,outputBudget=createOutputBudget(),executionOptions={},pricingOptions={},stageObserver,requestBodies=createRequestBodyBudget({stageObserver}),codexBinary='codex',recordingEnabled=true,captureContext,contextReader,contextIndexEnabled=false,recordingPolicy=()=>true,recordingBackend,recordingKey,recordingStoragePolicy,recordingBackendOptions={},recordingAdminOptions={},maxConcurrent=120,maxPerMember=8,maxPendingHandoffs=20000+64,clock=Date.now,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
+  const quotaSubjects=createPostgresQuotaSubjects(store,{identity:Buffer.isBuffer(keyEncryptionKey)&&keyEncryptionKey.length===32?createCodexQuotaSubjectIdentity(keyEncryptionKey,{schemaVersion:'0.167.2'}):undefined,clock});
+  if(adminActorContext!==undefined&&typeof adminActorContext!=='function')throw new AppError(503,'管理身份核对依赖无效','postgres_configuration');
   if(consumptionRouting!==undefined&&(!consumptionRouting||['read','resolve','fallback'].some(name=>typeof consumptionRouting[name]!=='function'))||sourceAccounts!==undefined&&typeof sourceAccounts!=='function'||consumptionPolicyReady!==undefined&&typeof consumptionPolicyReady!=='function')throw new AppError(503,'消耗来源请求依赖无效','postgres_configuration');
   if(typeof contextIndexEnabled!=='boolean'||captureContext!==undefined&&typeof captureContext!=='function'||contextReader!==undefined&&typeof contextReader?.read!=='function')throw new AppError(503,'上下文采集依赖无效','recording_configuration');
   if(!store||!recordings||!buffer||!meteringRecovery||['settle','flush','status','close'].some(name=>typeof meteringRecovery[name]!=='function')||[resolveRoute,checkLimits,transportForAccount,adminAuthenticated].some(fn=>typeof fn!=='function')||onRouteFailure!==undefined&&typeof onRouteFailure!=='function'||requestQueries!==undefined&&(!requestQueries||['read','close','status'].some(name=>typeof requestQueries[name]!=='function')||!requestQueries.queue||['run','close','status'].some(name=>typeof requestQueries.queue[name]!=='function'))||adminStateContext!==undefined&&typeof adminStateContext!=='function'||typeof recordingEnabled!=='boolean'||![maxConcurrent,maxPerMember].every(n=>Number.isInteger(n)&&n>=1))throw new AppError(503,'PostgreSQL请求处理依赖尚未配置完整','postgres_configuration');
+  const quotaConfirmation=createPostgresQuotaConfirmation(store,{clock});
   if(!meteringRecovery.directory||!buffer.directory||realpathSync(meteringRecovery.directory)===realpathSync(buffer.directory))throw new AppError(503,'计量与正文须使用独立恢复目录','metering_configuration');
   if(adminContext!==undefined&&typeof adminContext!=='function'||revalidateAdminScope!==undefined&&typeof revalidateAdminScope!=='function')throw new AppError(503,'部门请求鉴权未配置完整','postgres_configuration');
   const authorizeAdmin=async req=>{
@@ -105,7 +111,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const recordingJobs=recordingBackend??(recordingKey?createPostgresRecordingJobs(store,{...recordingBackendOptions,departmentActors,contextIndex:contextIndexEnabled,contextStorage:!!contextReader,recordingKey,clock,readStore:queryStore,queryQueue,storagePolicy:recordingStoragePolicy,devices:true}):null);
   const recordingAdmin=recordingJobs?createPostgresRecordingAdmin(recordingJobs,{...recordingAdminOptions,adminAuthenticated,adminContext,revalidateAdminScope,requestBodies}):null;
   const selfQuery=createPostgresSelfQuery(queryStore,{clock,queryQueue});
-  const chat=runChat?createPostgresChatService({...chatOptions,extraRuntime,execution,cliProcesses,outputBudget,readBody:requestBodies.read,store,buffer,meteringRecovery,checkLimits,runChat,deviceAccess,recordingEnabled,captureContext,recordingPolicy,clock,maxConcurrent,maxPerMember,refreshQuotas:()=>accountAdmin?.refreshQuotas?.()||Promise.resolve(),activity:{active,members,preparing,preparation,accounts,isStopping:()=>stopping}}):null;
+  const chat=runChat?createPostgresChatService({...chatOptions,quotaSubjects,extraRuntime,execution,cliProcesses,outputBudget,readBody:requestBodies.read,store,buffer,meteringRecovery,checkLimits,runChat,deviceAccess,recordingEnabled,captureContext,recordingPolicy,clock,maxConcurrent,maxPerMember,refreshQuotas:()=>accountAdmin?.refreshQuotas?.()||Promise.resolve(),activity:{active,members,preparing,preparation,accounts,isStopping:()=>stopping}}):null;
   const platform=platformTransport?createPostgresPlatformService({extraRuntime,execution,outputBudget,readBody:requestBodies.read,store,queryStore,queryQueue,buffer,meteringRecovery,checkLimits,transport:platformTransport,credential:(row,signal)=>accountAdmin.platformCredential(row,signal),deviceAccess,recordingEnabled,captureContext,recordingPolicy,clock,maxConcurrent,maxPerMember,activity:{active,members,preparing,preparation,accounts,isStopping:()=>stopping,wake:()=>void chat?.wake()}}):null;
   execution.onRelease(()=>void chat?.wake());cliProcesses?.onRelease(()=>void chat?.wake());
   async function handleRoute(req,res,bodySignal,stage,receipt){
@@ -201,10 +207,16 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         return {state:'unavailable',parts:[],next:{component:0,part:0},hasMore:false};
       },{signal:bodySignal}));return true;
     }
+    const confirmUpstream=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]{1,80})\/confirm-upstream-ended$/);
+    if(confirmUpstream&&req.method==='POST'){
+      const actor=async()=>{const scope=await authorizeAdmin(req);if(scope!==undefined)return scope;const identity=await adminActorContext?.(req);requireDepartmentScope(identity,{allowGlobal:true,roles:['super_admin']});return identity;};
+      const scope=await actor(),payload=await requestBodies.read(req,{owner:'admin',maxBytes:65536,signal:bodySignal});
+      json(res,200,await quotaConfirmation.confirm(confirmUpstream[1],payload,{scope,revalidateScope:original=>adminContext?refreshAdmin(req,original):actor()}));return true;
+    }
     const detail=path.match(/^\/api\/admin\/requests\/([a-zA-Z0-9-]{1,80})(\/recording)?$/);
     if(detail&&req.method==='GET'){
       let scope=await authorizeAdmin(req);
-      if(!detail[2]){json(res,200,await queryQueue.run(()=>postgresRequestObservation(queryStore,detail[1],clock(),{scope}),{signal:bodySignal}));return true;}
+      if(!detail[2]){const value=await queryQueue.run(()=>postgresRequestObservation(queryStore,detail[1],clock(),{scope}),{signal:bodySignal});if(scope===undefined&&!adminActorContext||scope!==undefined&&!revalidateAdminScope)value.can_confirm_upstream=false;json(res,200,value);return true;}
       for(const key of url.searchParams.keys())if(!['after','limit'].includes(key)||url.searchParams.getAll(key).length!==1)throw new AppError(400,'正文分页无效');
       const numeric=(name,fallback)=>url.searchParams.has(name)&&/^\d+$/.test(url.searchParams.get(name))?Number(url.searchParams.get(name)):url.searchParams.has(name)?NaN:fallback;
       json(res,200,await queryQueue.run(()=>recordingReader.read(detail[1],{after:numeric('after',0),limit:numeric('limit',32),scope}),{signal:bodySignal}));return true;
@@ -259,7 +271,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     };
     const settle=async result=>{
       settlementAttempted=true;await attemptPersistence;if(consumption?.schemaAvailable)result={...result,consumptionAttempts:consumptionSelection?[{...consumptionSelection.first_attempt}]:attemptSnapshot(),...(consumptionSelection?{consumptionSelection}:{})};const at=clock();
-      receipt.settlement={requestId,at,result:Object.fromEntries(['status','input','output','cached','usageKnown','actualModel','upstreamRequestId','consumptionAttempts','consumptionSelection'].filter(key=>result[key]!==undefined).map(key=>[key,result[key]]))};
+      receipt.settlement={requestId,at,result:Object.fromEntries(['status','input','output','cached','usageKnown','actualModel','upstreamRequestId','consumptionAttempts','consumptionSelection','quotaSubjectDenial'].filter(key=>result[key]!==undefined).map(key=>[key,result[key]]))};
       try{await store.finish(requestId,result,at);await extraBoundary?.settle();return true;}
       catch{
         if(!meteringRecovery.settle(requestId,result,at))throw new AppError(503,'用量结算暂存已满，需管理员核对本次请求','metering_unavailable');
@@ -299,6 +311,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       // This receipt changes observation only; routing and settlement stay intact.
       try{receipt.nested=!!store.context?.getStore?.();}catch{receipt.nested=true;}
       let route=await store.transaction(async()=>{
+        await lockPostgresRouting(store);
         const current=await store.authenticate(secret,{at:clock(),lock:true}),scope=authenticatedScope(current),device=await deviceAccess.authorize(current,req,{phase:'admission'});await store.checkModel(current,payload.model,payload.tools);
         await checkLimits(current,payload,{at:clock()});
         const route=await (consumptionRouting?consumptionRouting.resolve(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope}):resolveRoute(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope}));
@@ -317,13 +330,14 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         if(route.consumption?.schemaAvailable)await consumptionPolicies.recordAdmission(requestId,current.key_id,route.consumption);
         await store.run('UPDATE harbor.accounts SET last_used=$1 WHERE id=$2',clock(),account.id);
         const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:jsonPath?'images':'responses',scope}),fixed:!!identified.fixed};
+        await quotaSubjects.admit(requestId,account,{mode:extraAdmission.mode});
         receipt.callbackCompleted=true;return {requestId,account,session,extraAdmission,scope,...(route.consumption?{consumption:route.consumption}:{})};
       });
       receipt.timing?.preDispatch('admissionEnd');
       requestId=route.requestId;consumption=route.consumption;if(consumption?.schemaAvailable)sourceHeaders();if(receipt.nested)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:true,recordingExpected:captureEnabled});routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
       const createBoundary=()=>extraRuntime.boundary({requestId,scope:route.scope,protocol:jsonPath?'images':'responses',admittedExtra:route.extraAdmission.extraReserved,fixed:route.extraAdmission.fixed,packagePreference:route.scope?adminRouter.dispatchPreferenceFor(route.scope):adminRouter.dispatchPreference,
-        prepare:async request=>{ensureConnected();const current=await store.authenticate(secret,{at:clock(),lock:true});authenticatedScope(current);if(current.id!==request.member_id||current.key_id!==request.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});await lockPostgresRouting(store);return ensureConnected;},
-        validate:async(account,request)=>{const current=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 FOR SHARE",request.session_id);if(account.id!==route.account.id||account.route_epoch!==route.account.route_epoch||!current||current.id!==route.session.id||current.member_id!==member.id||!current.enabled||current.protocol!=='responses'||current.account_id!==account.id||current.route_version!==request.route_version)throw new AppError(409,'会话或账号身份已变化，请重新请求','session_route_conflict');if(jsonPath&&account.auth_mode==='openai_api')throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');ensureConnected();}
+        prepare:async request=>{ensureConnected();await lockPostgresRouting(store);const current=await store.authenticate(secret,{at:clock(),lock:true});authenticatedScope(current);if(current.id!==request.member_id||current.key_id!==request.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});return ensureConnected;},
+        validate:async(account,request)=>{const current=await store.get("SELECT * FROM harbor.sessions WHERE id=$1 FOR SHARE",request.session_id);if(account.id!==route.account.id||account.route_epoch!==route.account.route_epoch||!current||current.id!==route.session.id||current.member_id!==member.id||!current.enabled||current.protocol!=='responses'||current.account_id!==account.id||current.route_version!==request.route_version)throw new AppError(409,'会话或账号身份已变化，请重新请求','session_route_conflict');if(jsonPath&&account.auth_mode==='openai_api')throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');const selected=await extraRuntime.classify(account,{model:request.model,protocol:jsonPath?'images':'responses',scope:route.scope});await quotaSubjects.beforeDispatch(requestId,{mode:selected.mode});ensureConnected();}
       });
       extraBoundary=createBoundary();
       releasePreparation();releasePreparation=null;
@@ -366,6 +380,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         ensureConnected();let nextRelease,preparedRoute,preparedAt;const previousRoute=route;
         try{
           const next=await store.transaction(async()=>{
+            await lockPostgresRouting(store);
             const current=await store.authenticate(secret,{at:clock(),lock:true}),scope=authenticatedScope(current);if(current.id!==member.id||current.key_id!==member.key_id)throw new AppError(403,'请求访问身份已变化','request_identity_changed');
             await deviceAccess.authorize(current,req,{phase:'dispatch'});await store.checkModel(current,payload.model,payload.tools);await checkLimits(current,payload,{at:clock(),requestId});ensureConnected();
             const selected=await consumptionRouting.fallback({member:current,payload,headers:req.headers,options:{preparing,protocol:'responses',scope},requestId,route,error,attempts:0,outputStarted:false,contextReplayable});
@@ -375,7 +390,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
             nextRelease=execution.acquire({memberId:current.id,accountId:account.id});if(!nextRelease)throw new AppError(503,'备用账号执行容量已满','inference_capacity_busy');stage.emit('lease',{lease:'execution',action:'acquire'});
             const updated=await store.run("UPDATE harbor.requests SET account_id=$1,session_id=$2,route_version=$3,status='queued',business_status='running' WHERE id=$4 AND key_id=$5 AND account_id=$6 AND route_version=$7 AND status IN ('queued','running') AND ended IS NULL",account.id,session.id,session.route_version,requestId,current.key_id,previous.id,route.session.route_version);if(updated.changes!==1)throw new AppError(409,'备用派发的原请求已变化','consumption_fallback_conflict');
             await store.run('UPDATE harbor.accounts SET last_used=$1 WHERE id=$2',clock(),account.id);
-            const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:'responses',scope}),fixed:false};ensureConnected();
+            const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:'responses',scope}),fixed:false};await quotaSubjects.admit(requestId,account,{mode:extraAdmission.mode,replaceConfirmedUnused:true});ensureConnected();
             preparedAt=clock();preparedRoute={...selected,requestId,account,session,extraAdmission,scope};return preparedRoute;
           });
           route=next;consumption=next.consumption;releaseExecution=nextRelease;nextRelease=null;attemptIndex=-1;
@@ -420,7 +435,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         if(onRouteFailure&&routedAccount&&error.routeFailure){try{await onRouteFailure(routedAccount,error.routeFailure,{scope:requestScope});}catch{}}
         finishCapture();
         if(recordStarted&&!writeRecording('finish',requestId,{state:'partial',...recordingFinishReason(recordFailed?recordFailureReason??'capture_failed':controller.signal.reason?.code==='service_shutdown'?'process_interrupted':'upstream_interrupted')}))recordFailed=true;
-        if(!settlementAttempted)await settle({...error,status:controller.signal.reason?.code==='service_shutdown'?'interrupted':controller.signal.aborted?'cancelled':error.status&&error.status<500?'rejected':'failed',usageKnown:consumption?.schemaAvailable?!extraBoundary?.status().uncertain&&(!currentDispatched||error.usageKnown===true):!dispatched||!extraBoundary?.status().uncertain&&error.usageKnown===true}).catch(()=>{});
+        if(!settlementAttempted)await settle({...error,quotaSubjectDenial:currentReliable&&error.status===429&&error.code==='upstream_quota_exhausted'&&error.routeFailure==='quota_exhausted',status:controller.signal.reason?.code==='service_shutdown'?'interrupted':controller.signal.aborted?'cancelled':error.status&&error.status<500?'rejected':'failed',usageKnown:consumption?.schemaAvailable?!extraBoundary?.status().uncertain&&(!currentDispatched||error.usageKnown===true):!dispatched||!extraBoundary?.status().uncertain&&error.usageKnown===true}).catch(()=>{});
         await saveContext();
       }
       throw controller.signal.reason?.code==='service_shutdown'?controller.signal.reason:error;

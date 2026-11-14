@@ -264,6 +264,10 @@ def validate_image_proof(value,image,common):
     if 'department_isolation_contract' in value:
         if value['department_isolation_contract']!='harbor-department-isolation-v1' or type(value.get('department_isolation_installed')) is not bool:raise ValueError('Candidate department proof is invalid')
     elif 'department_isolation_installed' in value:raise ValueError('Candidate department contract is missing')
+    if 'quota_subject_contract' in value:
+        if value['quota_subject_contract']!='quota-subject-coordination-v1' or type(value.get('quota_subject_installed')) is not bool:raise ValueError('Candidate shared quota proof is invalid')
+        if value.get('department_isolation_installed') and not value['quota_subject_installed']:raise ValueError('Department shared quota contract is missing')
+    elif 'quota_subject_installed' in value:raise ValueError('Candidate shared quota contract is missing')
     requested={key:int(next(item.split('=',1)[1] for item in common if item.startswith(name+'='))) for key,name in SHUTDOWN_ENV.items()}
     if 'shutdown' not in value:raise ShutdownContractUnsupported('Validated legacy PostgreSQL image has no shutdown contract')
     shutdown=value['shutdown']
@@ -338,7 +342,7 @@ def prepare_source_image_preflights(api,sources,common):
             key=(instance.get('Config',{}).get('Image'),instance.get('Image'),tuple(requested))
             if bindings.get(instance.get('Id'))!=key or source_preflight_material_identity(api['STACK'])!=materials or (image_inspection(api,key[0],[]) or {}).get('Id')!=key[1]:raise ShutdownUnconfirmed('Prepared source preflight identity changed')
             fresh=running_source_image_proof(api,instance,requested)
-            if any(fresh.get(name)!=proofs[key].get(name) for name in ['contract','revision','source_digest','schema_digest','database_digest','device_ca_digest','shutdown','department_isolation_contract','department_isolation_installed']):raise ShutdownUnconfirmed('Source runtime proof changed')
+            if any(fresh.get(name)!=proofs[key].get(name) for name in ['contract','revision','source_digest','schema_digest','database_digest','device_ca_digest','shutdown','department_isolation_contract','department_isolation_installed','quota_subject_contract','quota_subject_installed']):raise ShutdownUnconfirmed('Source runtime proof changed')
             return fresh
         except Exception as error:raise SourcePreflightRejected('Source preflight rejected before composition change') from error
     return verified

@@ -10,6 +10,7 @@ import {verifyUsageRollupAvailability,usageRollupsReady,usageRollupMoneySql} fro
 import {createQueryDepartments,departmentPredicate} from './postgres-query-departments.mjs';
 import {createAdminDepartments} from './postgres-admin-departments.mjs';
 import {assertPostgresAuditScopes} from './postgres-audit.mjs';
+import {quotaSubjectScopeHints} from './postgres-quota-subjects.mjs';
 
 export function stateQuery(params){
   const value={sessionPage:1,sessionPageSize:25};
@@ -160,7 +161,8 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       }
       const accountArgs=[],accountDepartment=departmentPredicate(authorization,'accounts',accountArgs);
       const packages=createPostgresAccountPackages(store,{clock}),packagePolicy=await packages.policy(store,{scope:authorization??undefined}),accounts=await packages.decorate(await store.all('SELECT id,name,kind,auth_mode,route_epoch,platform_config,platform_models,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM harbor.accounts WHERE removed_at IS NULL AND '+accountDepartment+' ORDER BY id',...accountArgs));
-      const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,standard:usage(row.id)}));
+      const supplierScopes=await quotaSubjectScopeHints(store,accounts.map(row=>row.id));
+      const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,supplier_quota:supplierScopes.get(row.id),package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,standard:usage(row.id)}));
       if(view==='accounts'){
         const useRollups=accounts.length&&await usageRollupsReady(store);
         const args=[window.start,window.end,accounts.map(row=>row.id)],requestDepartment=departmentPredicate(authorization,'r',args);

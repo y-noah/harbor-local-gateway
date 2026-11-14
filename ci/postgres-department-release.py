@@ -10,6 +10,7 @@ import copy,importlib.util,json,re,selectors,subprocess,uuid
 _spec=importlib.util.spec_from_file_location('department_release_cascade_transport',Path(__file__).with_name('postgres-usage-cascade.py'))
 transport=importlib.util.module_from_spec(_spec);_spec.loader.exec_module(transport)
 CONTRACT='harbor-department-isolation-v1'
+QUOTA_CONTRACT='quota-subject-coordination-v1'
 
 def need(ok,code):
     if not ok:raise RuntimeError('department_release_'+code)
@@ -27,6 +28,12 @@ class DepartmentRelease(transport.UsageCascadeRelease):
         need(type(proof.get('department_isolation_installed')) is bool,'candidate_marker_state')
         need(isinstance(source_proofs,(list,tuple)) and len(source_proofs)==2,'source_proofs')
         self.source_contracts=[contract(p) for p in source_proofs]
+        quota=proof.get('quota_subject_contract');need(quota in [None,QUOTA_CONTRACT],'quota_contract_unknown')
+        self.source_quota_contracts=[p.get('quota_subject_contract') for p in source_proofs]
+        need(all(p in [None,QUOTA_CONTRACT] for p in self.source_quota_contracts),'source_quota_contract_unknown')
+        self.quota_supported=quota==QUOTA_CONTRACT
+        if self.quota_supported:need(type(proof.get('quota_subject_installed')) is bool,'quota_marker_state')
+        if activate or proof.get('quota_subject_installed',False):need(self.quota_supported and all(p==QUOTA_CONTRACT for p in self.source_quota_contracts),'quota_bridge_release_required')
         if activate or proof['department_isolation_installed']:need(all(p==CONTRACT for p in self.source_contracts),'bridge_release_required')
         self.activate=activate;self.api=api;self.entry=entry;self.ticket=copy.deepcopy(ticket);self.active=copy.deepcopy(active);self.sources=[transport.generation(gateway),transport.generation(worker)];self.image=image;self.image_id=api['inspect_image'](image)['Id'];self.record=record;self.path=path;self.receipt=None;self.plan=None;self.uncertain=False;self.install_attempted=False
         need(self.image_id in [ticket['to']['configDigest'],ticket['to']['manifestDigest']],'candidate_image')
@@ -40,6 +47,7 @@ class DepartmentRelease(transport.UsageCascadeRelease):
             expected={key:self.manifest[key] for key in ['owner','runtime','runtimeOid','databaseOid']}
             self.plan=self.command('plan',{'expected':expected,'runtimeWitness':witness})
             need(self.plan.get('contract')==CONTRACT and self.plan.get('installed') is proof['department_isolation_installed'],'marker_state_changed')
+            if self.quota_supported:need(self.plan.get('quota_subject_contract')==QUOTA_CONTRACT and self.plan.get('quota_subject_installed') is proof['quota_subject_installed'],'quota_marker_state_changed')
             self.check_sources(stopped=False);self.check_active()
         finally:
             if process is not None:
@@ -72,6 +80,8 @@ class DepartmentRelease(transport.UsageCascadeRelease):
     def status(self):
         result=self.command('status',{'binding':self.plan['binding']})
         need(result.get('contract')==CONTRACT and type(result.get('installed')) is bool,'status_unknown')
+        if self.quota_supported:need(result.get('quota_subject_contract')==QUOTA_CONTRACT and type(result.get('quota_subject_installed')) is bool,'quota_status_unknown')
+        if result.get('installed'):need(result.get('quota_subject_installed') is True,'quota_required_for_department')
         return result
 
     def install(self):
@@ -86,6 +96,7 @@ class DepartmentRelease(transport.UsageCascadeRelease):
         try:
             result=self.command('install',{'binding':self.plan['binding'],'activate':True})
             need(result.get('contract')==CONTRACT and result.get('installed') is True,'install_unconfirmed')
+            need(result.get('quota_subject_contract')==QUOTA_CONTRACT and result.get('quota_subject_installed') is True,'quota_install_unconfirmed')
             self.receipt=result;self.uncertain=False
         except Exception:
             status=self.status();self.uncertain=False
@@ -108,4 +119,5 @@ class DepartmentRelease(transport.UsageCascadeRelease):
                 if not state['Running']:need(state.get('Status')=='exited' and state.get('Pid')==0 and bool(state.get('FinishedAt')),'source_stop_unconfirmed')
         status=self.status()
         if status['installed']:need(all(value==CONTRACT for value in self.source_contracts),'rollback_source_unsupported')
+        if status.get('quota_subject_installed'):need(all(value==QUOTA_CONTRACT for value in self.source_quota_contracts),'quota_rollback_source_unsupported')
         self.record['departmentIsolation']['rollback']='compatible-source' if status['installed'] else 'legacy-source';self.save()

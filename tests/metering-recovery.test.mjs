@@ -64,3 +64,14 @@ test('optional stream summary survives encrypted outage replay while malformed t
  assert.equal(recovery.settle('synthetic-invalid',{input:2,streamTiming:{...summary,prompt:'NEVER-PERSIST'}},124),true);await recovery.flush();
  assert.equal(calls.length,2);assert.equal(calls[1][1].input,2);assert.equal(calls[1][1].streamTiming,undefined);
 });
+
+test('trusted quota rejection observation survives encrypted metering outage and replay',async t=>{
+  const root=await mkdtemp(join(tmpdir(),'harbor-denial-metering-')),key=randomBytes(32),calls=[];let unavailable=true;
+  const store={finish:async(...args)=>{if(unavailable)throw Error('synthetic outage');calls.push(args);}};
+  let recovery=await MeteringRecovery.create(store,{encryptionKey:key,directory:root,flushMs:10000});
+  t.after(async()=>{await recovery.close();await rm(root,{recursive:true,force:true});});
+  assert.equal(recovery.settle('synthetic-denial',{status:'rejected',usageKnown:true,quotaSubjectDenial:true,error:'NEVER-PERSIST'},123),true);await recovery.flush();
+  const file=(await readdir(root))[0],saved=recovery.buffer.repository.open(await readFile(join(root,file)),file);assert.equal(saved.result.quotaSubjectDenial,true);assert.equal(saved.result.error,undefined);
+  await recovery.close();unavailable=false;recovery=await MeteringRecovery.create(store,{encryptionKey:key,directory:root,flushMs:10000});await recovery.flush();assert.equal(calls.length,1);assert.equal(calls[0][1].quotaSubjectDenial,true);assert.equal(calls[0][1].usageKnown,true);
+  assert.throws(()=>recovery.settle('synthetic-invalid-denial',{quotaSubjectDenial:'untrusted'},124),{code:'metering_recovery_invalid'});
+});

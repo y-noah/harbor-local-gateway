@@ -413,6 +413,14 @@ def backup_configuration(config):
  # Operator configuration stays in a private snapshot, never in CLI output.
  return {key:copy.deepcopy(value) for key,value in config.items() if key!='postgres_retained_service_pairs'}
 
+QUOTA_SUBJECT_CONTRACT='quota-subject-coordination-v1'
+def quota_subject_contract(proof):
+ need(type(proof) is dict,'quota_subject_proof_unknown')
+ value=proof.get('quota_subject_contract')
+ if value is None:
+  need('quota_subject_installed' not in proof,'quota_subject_marker_without_contract');return None
+ need(value==QUOTA_SUBJECT_CONTRACT and type(proof.get('quota_subject_installed')) is bool,'quota_subject_proof_invalid');return value
+
 DEPARTMENT_CONTRACT='harbor-department-isolation-v1'
 def department_contract(proof):
  need(type(proof) is dict,'department_proof_unknown')
@@ -422,12 +430,16 @@ def department_contract(proof):
  need(value==DEPARTMENT_CONTRACT and type(proof.get('department_isolation_installed')) is bool,'department_proof_invalid');return value
 
 def department_upgrade_guard(pg,api,ticket,gateway,worker,common,target_proof):
- target=department_contract(target_proof);activate=ticket.get('activateDepartmentIsolation',False)
+ target=department_contract(target_proof);target_quota=quota_subject_contract(target_proof);activate=ticket.get('activateDepartmentIsolation',False)
  need(type(activate) is bool,'department_activation_flag')
- if activate:need(target==DEPARTMENT_CONTRACT,'department_activation_target_unsupported')
+ if activate:
+  need(target==DEPARTMENT_CONTRACT,'department_activation_target_unsupported')
+  need(target_quota==QUOTA_SUBJECT_CONTRACT,'quota_subject_activation_target_unsupported')
  original=api['source_image_preflight'];proofs=[]
  def guarded(instance,requested):
-  proof=original(instance,requested);source=department_contract(proof)
+  proof=original(instance,requested);source=department_contract(proof);source_quota=quota_subject_contract(proof)
+  if proof.get('quota_subject_installed',False):need(target_quota==QUOTA_SUBJECT_CONTRACT,'quota_subject_installed_requires_compatible_target')
+  if target_proof.get('quota_subject_installed',False) or activate:need(source_quota==QUOTA_SUBJECT_CONTRACT,'quota_subject_bridge_release_required')
   if proof.get('department_isolation_installed',False):need(target==DEPARTMENT_CONTRACT,'department_installed_requires_compatible_target')
   if activate:need(source==DEPARTMENT_CONTRACT,'department_bridge_release_required')
   return proof

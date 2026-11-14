@@ -13,6 +13,8 @@ import {createPostgresAccountQuotas} from './postgres-account-quotas.mjs';
 import {createPostgresAccountLogin} from './postgres-account-login.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 import {createPostgresPlatformAdmin} from './postgres-platform-admin.mjs';
+import {createCodexQuotaSubjectIdentity} from './quota-subject.mjs';
+import {invalidateQuotaSubjectIdentity} from './postgres-quota-subjects.mjs';
 
 export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,checkApi,checkSubscription,clock=Date.now,checks={},startLogin,reserveLogin,local=true,readQuota,platformTransport}={}){
   if(typeof runtime!=='string'||!runtime||!router||typeof router.disableAccount!=='function'||typeof router.block!=='function'||typeof checkApi!=='function'||typeof checkSubscription!=='function')throw new AppError(503,'账号管理依赖尚未配置完整','account_configuration');
@@ -20,7 +22,8 @@ export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,c
   const queue=createPostgresQueryQueue(checks),readContext=new AsyncLocalStorage(),readQueue={...queue,run:(operation,options)=>readContext.getStore()?operation():queue.run(()=>readContext.run(true,operation),options)},pending=new Map(),controllers=new Set();let stopping=false;
   const packages=createPostgresAccountPackages(store,{clock,queryQueue:readQueue,onChange:(_reason,options)=>router.syncWeights('package',clock(),options)});
   const subscriptionPrices=createPostgresSubscriptionPrices(store,{clock});
-  const quotas=readQuota?createPostgresAccountQuotas(store,{router,packages,queue,readQuota,clock,parallelism:checks.maxConcurrent??2}):null;
+  const subjectIdentity=Buffer.isBuffer(encryptionKey)&&encryptionKey.length===32?createCodexQuotaSubjectIdentity(encryptionKey,{schemaVersion:'0.167.2'}):undefined;
+  const quotas=readQuota?createPostgresAccountQuotas(store,{router,packages,queue,readQuota,clock,subjectIdentity,parallelism:checks.maxConcurrent??2}):null;
   const login=startLogin?createPostgresAccountLogin(store,{startLogin,reserveLogin,clock,local,onReady:(account,options)=>quotas?.refresh(account,{force:true,...options}),checkSubscription:(account,options)=>queue.run(()=>checkSubscription(account,options))}):null;
   const running=()=>{if(stopping)throw new AppError(503,'账号管理正在关闭','service_stopping');};
   const auditWriter=createPostgresAudit(store,{clock}),audit=(action,detail,scope,accountId=typeof detail==='string'?detail:detail.account)=>auditWriter.write(scope,{action,detail,subject:{kind:'account',id:accountId}});
@@ -107,7 +110,7 @@ export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,c
       const migration=payload.enabled===false?await router.disableAccount(current.id,{scope:trusted??undefined}):{moved:0,resetTextSessions:0};
       if(payload.enabled===false&&current.state==='login')await store.run("UPDATE harbor.accounts SET state='offline',last_error='登录已取消' WHERE id=$1",current.id);
       await store.run('UPDATE harbor.accounts SET enabled=$1,token_budget=$2,tokens_per_percent=$3,api_weight=$4 WHERE id=$5',enabled,budget,perPercent,share,current.id);
-      if(secret){await store.run("UPDATE harbor.accounts SET api_secret_cipher=$1,api_secret_digest=$2,route_epoch=route_epoch+1,state='offline',route_block=NULL,last_error=NULL WHERE id=$3",encrypted,hash(secret),current.id);await audit('account.api.key',current.id,trusted);}
+      if(secret){await invalidateQuotaSubjectIdentity(store,current.id);await store.run("UPDATE harbor.accounts SET api_secret_cipher=$1,api_secret_digest=$2,route_epoch=route_epoch+1,state='offline',route_block=NULL,last_error=NULL WHERE id=$3",encrypted,hash(secret),current.id);await audit('account.api.key',current.id,trusted);}
       if(api&&share!==current.api_weight)await audit('account.api.weight',{account:current.id,from:current.api_weight,to:share},trusted);await audit('account.update',current.id,trusted);return {ok:true,...migration};
     },{scope:trusted});if(payload.enabled===false){login?.cancel(match[1]);platform?.cancel(match[1]);}return {status:200,value};}
     if(method==='DELETE'){const value=await mutate(async()=>{

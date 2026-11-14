@@ -1,3 +1,4 @@
+import {lockPostgresRouting} from './postgres-routing.mjs';
 import {createExtraUsageDepartments} from './postgres-extra-departments.mjs';
 import {codexQuotaDenials} from './codex-entitlements.mjs';
 import {isDeepStrictEqual as equal} from 'node:util';
@@ -117,13 +118,14 @@ export function createPostgresAccountExtraUsage(store,{clock=Date.now,readEntitl
  async function authorizeHeld(state,previous,requestId){if(previous.state!=='reserved')return {allowed:false,reason:'extra_already_dispatched_or_terminal',state:previous.state};if(state.owner.route_epoch!==previous.identity_epoch)return {allowed:false,reason:'extra_identity_changed'};const request=await store.get('SELECT account_id,model,ended FROM harbor.requests WHERE id=$1',requestId);if(!request||request.account_id!==previous.account_id||request.model!==previous.model||request.ended!==null)return {allowed:false,reason:'extra_request_no_longer_dispatchable'};const selected=evaluate(state,previous.model,previous.protocol,previous.reserve_atoms);if(!selected.allowed)return selected;if(selected.basis!==previous.basis||selected.unit!==previous.unit||selected.reserve_atoms!==previous.reserve_atoms)return {allowed:false,reason:'extra_reservation_configuration_changed'};await store.run("UPDATE harbor.account_extra_holds SET state='dispatched',dispatched_at=$1,policy_version=$2,configuration_version=$3,entitlement_version=$4 WHERE request_id=$5",at(),selected.policy_version,selected.configuration_version,state.snapshot.version,requestId);return {...selected,state:'dispatched'};}
  async function authorizeDispatch(requestId){return top(()=>byHold(requestId,(state,previous)=>authorizeHeld(state,previous,requestId)));}
  const dispatchPermits=new WeakMap();
- // Own the outer transaction so identity locks precede account/budget locks,
+ // Own the outer transaction: routing precedes request/identity/account locks,
  // and no permission is exposed before COMMIT has actually returned.
  const validateDispatchConfiguration=(requestId,{prepare,assess}={})=>{if(!identifier(requestId)||typeof prepare!=='function'||typeof assess!=='function')fail(503,'extra_dispatch_configuration');};
  async function authorizeRequestDispatch(requestId,{prepare,assess,candidateAccountIds,allowExtraLedger=true}={}){
   validateDispatchConfiguration(requestId,{prepare,assess});let callbackCompleted=false;
   try{
    const grant=await top(async()=>{
+    await lockPostgresRouting(store);
     let request=await store.get('SELECT * FROM harbor.requests WHERE id=$1 FOR UPDATE',requestId);if(!request||request.ended!==null||request.status!=='queued')fail(409,'extra_request_no_longer_dispatchable');
     const finalCheck=await prepare(request);request=await store.get('SELECT * FROM harbor.requests WHERE id=$1',requestId);if(!request||request.ended!==null||!['queued','running'].includes(request.status))fail(409,'extra_request_no_longer_dispatchable');
     const global=allowExtraLedger||candidateAccountIds?await policy(true):null;let candidates=[];

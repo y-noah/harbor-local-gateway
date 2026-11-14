@@ -88,7 +88,7 @@ export function publicUsage(value){
     ...Object.fromEntries(fields.flatMap(k=>[[k,value[k+'Atoms']===null?null:Number(value[k+'Atoms'])/Number(scale)],[k+'_exact',value[k+'Atoms']===null?null:exactUsd(value[k+'Atoms'])]]))};
 }
 export function decorateReferenceRequest(row,standard,start){
-  const {input,output,cached,reserved,predicted,price_version,manual_cost_atoms,billing_model,query_sequence,inserted_xid,...meta}=row;
+  const {input,output,cached,reserved,predicted,price_version,manual_cost_atoms,billing_model,query_sequence,inserted_xid,quota_subject_ref,quota_subject_scope,quota_account_identity_epoch,quota_ordinary,quota_ordinary_denied,...meta}=row;
   return {...meta,has_legacy_reservation:Number(reserved)>0,can_reconcile:needsReferenceReconciliation(row,start),requested_model:row.model,model:billing_model||row.model,standard};
 }
 // A bounded accumulator shared by live and background queries. Amounts remain integers.

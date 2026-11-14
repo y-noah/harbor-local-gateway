@@ -4,6 +4,7 @@ import {createAccountDepartments} from './postgres-account-departments.mjs';
 import {AppError} from './store.mjs';
 import {sanitizeRecord} from './record-redaction.mjs';
 import {lockPostgresRouting} from './postgres-routing.mjs';
+import {invalidateQuotaSubjectIdentity} from './postgres-quota-subjects.mjs';
 
 // One official login at a time. No transaction is held while the CLI or the
 // authenticated browser waits for the user. Epochs reject all late results.
@@ -79,7 +80,7 @@ export function createPostgresAccountLogin(store,{startLogin,reserveLogin,checkS
         if(pending.has(accountId)){const existing=pending.get(accountId);if(existing.options.scope?.credential_id!==options.scope?.credential_id)throw new AppError(409,'另一个管理身份已发起该账号登录');return existing;}
         if(pending.size)throw new AppError(409,'另一个账号正在登录，请先完成该流程');
         if(await store.get("SELECT id FROM harbor.requests WHERE account_id=$1 AND status IN ('queued','running') LIMIT 1",accountId))throw new AppError(409,'账号正在使用，请稍后登录');
-        running();reserved=reserveLogin?.(current);await store.run("UPDATE harbor.accounts SET state='login',route_epoch=route_epoch+1,last_error=NULL,quota_json=NULL,quota_calibration=NULL,quota_error=NULL,since_check_tokens=0 WHERE id=$1",accountId);
+        running();reserved=reserveLogin?.(current);await invalidateQuotaSubjectIdentity(store,accountId);await store.run("UPDATE harbor.accounts SET state='login',route_epoch=route_epoch+1,last_error=NULL,quota_json=NULL,quota_calibration=NULL,quota_error=NULL,since_check_tokens=0 WHERE id=$1",accountId);
         await store.run("UPDATE harbor.sessions SET state='uncertain',route_version=route_version+1 WHERE account_id=$1",accountId);await audit('account.login',accountId,options.scope);
         let resolve,reject;const authorization=new Promise((yes,no)=>{resolve=yes;reject=no;});authorization.catch(()=>{});
         created={options:{...options},lease:reserved,account:{...current,route_epoch:current.route_epoch+1},expiresAt:clock()+600000,controller:new AbortController(),authorization,resolve,reject};pending.set(accountId,created);return created;

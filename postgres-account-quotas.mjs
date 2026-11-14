@@ -3,20 +3,25 @@ import {AppError} from './store.mjs';
 import {normalizeLimits} from './rates.mjs';
 import {retainCodexQuotaDenials} from './codex-entitlements.mjs';
 import {lockPostgresRouting} from './postgres-routing.mjs';
+import {codexQuotaSubject} from './quota-subject.mjs';
+import {createPostgresQuotaSubjects} from './postgres-quota-subjects.mjs';
 
-export function createPostgresAccountQuotas(store,{router,packages,queue,readQuota,clock=Date.now,parallelism=2}={}){
+export function createPostgresAccountQuotas(store,{router,packages,queue,readQuota,clock=Date.now,parallelism=2,subjectIdentity}={}){
   if(!store||!router||['recover','block','syncWeights'].some(key=>typeof router[key]!=='function')||!queue||typeof queue.run!=='function'||typeof readQuota!=='function'||typeof clock!=='function'||!Number.isInteger(parallelism)||parallelism<1||parallelism>8)throw new AppError(503,'额度刷新依赖或资源配置无效','quota_configuration');
   const access=createAccountDepartments(store,{quotaSystem:true,clock});
+  const subjects=createPostgresQuotaSubjects(store,{identity:subjectIdentity,clock});
   const pending=new Map(),controllers=new Set(),scans=new Map();let stopping=false;
   const running=()=>{if(stopping)throw new AppError(503,'额度刷新正在关闭','service_stopping');};
   const eligible=account=>account&&!account.removed_at&&account.enabled&&account.auth_mode==='subscription'&&['ready','degraded'].includes(account.state);
   const mutate=fn=>store.transaction(async()=>{await lockPostgresRouting(store);running();return fn();});
   async function load(accountId,options={}){const {row:account}=await access.account(accountId,options);if(!account)throw new AppError(404,'账号不存在或已移除');return account;}
   async function refresh(account,{force=false,signal:requestSignal,scope,revalidateScope}={}){
-    const identity={scope,revalidateScope};await access.account(account.id,identity,{write:true});
     if(requestSignal!==undefined&&(!requestSignal||typeof requestSignal.throwIfAborted!=='function'||typeof requestSignal.addEventListener!=='function'))throw new AppError(503,'额度刷新取消信号配置无效','quota_configuration');
-    requestSignal?.throwIfAborted();running();if(!eligible(account))return {skipped:true};
+    requestSignal?.throwIfAborted();
+    const identity={scope,revalidateScope};await access.account(account.id,identity,{write:true});
+    running();if(!eligible(account))return {skipped:true};
     const key=account.id+':'+account.route_epoch+':'+access.identity(identity);if(pending.has(key))return pending.get(key);
+    requestSignal?.throwIfAborted();
     const operation=queue.run(async()=>{
       requestSignal?.throwIfAborted();running();const before=await mutate(async()=>{
         const {row:current}=await access.account(account.id,identity,{write:true,lock:true});running();
@@ -31,7 +36,7 @@ export function createPostgresAccountQuotas(store,{router,packages,queue,readQuo
       const controller=new AbortController();controllers.add(controller);const signal=AbortSignal.any([controller.signal,AbortSignal.timeout(15000),requestSignal].filter(Boolean));
       try{
         await access.account(before.id,identity,{write:true});
-        const data=normalizeLimits(await readQuota(before,{signal}),clock());
+        const checkedFrom=clock(),data=normalizeLimits(await readQuota(before,{signal}),clock(),{subjectIdentity});
         signal.throwIfAborted();
         if(!data||data.plan!==null&&(typeof data.plan!=='string'||data.plan.length>128)||data.windows.some(w=>!Number.isFinite(w.minutes)||w.minutes<=0||w.reset!==null&&!Number.isSafeInteger(w.reset)))throw new AppError(502,'官方额度响应无效','quota_protocol');
         return await mutate(async()=>{
@@ -40,6 +45,7 @@ export function createPostgresAccountQuotas(store,{router,packages,queue,readQuo
           if(!eligible(current)||current.route_epoch!==before.route_epoch)return {skipped:true};
           let previousQuota=null;try{previousQuota=JSON.parse(current.quota_json);}catch{}
           Object.assign(data,retainCodexQuotaDenials(previousQuota,data));
+          await subjects.refresh(current,codexQuotaSubject(data),data,{checkedFrom});
           let perPercent=current.tokens_per_percent,baseline=null;try{baseline=JSON.parse(current.quota_calibration);}catch{}
           if(data.windows.length&&Number.isFinite(data.remaining)){
             const windowId=data.windows.map(w=>w.reset).join(',');

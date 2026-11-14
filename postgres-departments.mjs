@@ -1,5 +1,6 @@
 import {createPostgresAudit} from './postgres-audit.mjs';
 import {migrateRecordingRetention} from './recording-retention.mjs';
+import {migrateQuotaSubjects,verifyQuotaSubjectAvailability} from './postgres-quota-subjects.mjs';
 import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {AppError,id} from './store.mjs';
@@ -80,6 +81,7 @@ export async function verifyDepartmentIsolationAvailability(store){
  if(observed.marker===null){if(observed.present)fail();verified.set(store,{available:false,marker:null});return false;}
  if(!observed.present)fail('department_migration_conflict');
  const source=await bundle();marker(observed.marker,source.checksum);await structure(store,source.sql);
+ if(!await verifyQuotaSubjectAvailability(store))fail('department_quota_subject_required');
  verified.set(store,{available:true,marker:observed.marker});return true;
 }
 
@@ -114,6 +116,7 @@ export async function migrateDepartmentIsolation(store,{apply=false,runtimeRole}
    if(!role||Object.values(role).some(Boolean)||await store.get('SELECT 1 FROM pg_auth_members WHERE roleid=(SELECT oid FROM pg_roles WHERE rolname=$1) OR member=(SELECT oid FROM pg_roles WHERE rolname=$1)',runtime)||await store.get("SELECT 1 FROM pg_shdepend d WHERE refclassid='pg_authid'::regclass AND refobjid=(SELECT oid FROM pg_roles WHERE rolname=$1) AND deptype='o' AND NOT (d.dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND d.classid='pg_class'::regclass AND EXISTS(SELECT 1 FROM pg_class c WHERE c.oid=d.objid AND c.relpersistence='t')) LIMIT 1",runtime))fail('department_runtime_invalid');
   }
   await migrateRecordingRetention(store,{apply:true});
+  await migrateQuotaSubjects(store,{apply:true,runtimeRole:runtime});
   await store.query(source.sql);
   await store.run(`INSERT INTO harbor.department_settings(department_id,name,value,version)
    SELECT $1,name,value::jsonb,COALESCE((value::jsonb->>'version')::bigint,0) FROM harbor.gateway_settings WHERE name=ANY($2::text[])`,defaultDepartmentId,departmentSettingNames);

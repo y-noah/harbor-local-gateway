@@ -5,7 +5,7 @@ spec=importlib.util.spec_from_file_location('department_release',Path(__file__).
 
 class DepartmentReleaseTests(unittest.TestCase):
  def prepared(self,activate=False,installed=False):
-  value=object.__new__(release.DepartmentRelease);value.activate=activate;value.plan={'binding':{'synthetic':True},'installed':installed};value.source_contracts=[release.CONTRACT]*2;value.record={'departmentIsolation':{}};value.api={'NAME':'harbor','inspect_container':lambda name:None};value.check_active=Mock();value.check_sources=Mock();value.save=Mock();value.uncertain=False;value.install_attempted=True;value.receipt=None;value.command=Mock(return_value={'contract':release.CONTRACT,'installed':installed});return value
+  value=object.__new__(release.DepartmentRelease);value.activate=activate;value.plan={'binding':{'synthetic':True},'installed':installed};value.source_contracts=[release.CONTRACT]*2;value.source_quota_contracts=[release.QUOTA_CONTRACT]*2;value.quota_supported=True;value.record={'departmentIsolation':{}};value.api={'NAME':'harbor','inspect_container':lambda name:None};value.check_active=Mock();value.check_sources=Mock();value.save=Mock();value.uncertain=False;value.install_attempted=True;value.receipt=None;value.command=Mock(return_value={'contract':release.CONTRACT,'installed':installed,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':installed});return value
  def test_explicit_activation_rejects_old_sources_before_owner_access(self):
   for installed,activate in [(False,True),(True,False)]:
    with patch.object(release.transport,'owner_transport') as transport:
@@ -20,16 +20,16 @@ class DepartmentReleaseTests(unittest.TestCase):
  def test_installed_upgrade_only_verifies(self):
   value=self.prepared(installed=True);value.install();self.assertEqual([call.args[0] for call in value.command.call_args_list],['status']);self.assertEqual(value.record['departmentIsolation']['state'],'verified')
  def test_activation_after_stops_and_before_candidate(self):
-  value=self.prepared(activate=True);value.command.side_effect=[{'contract':release.CONTRACT,'installed':False},{'contract':release.CONTRACT,'installed':True}];value.install();self.assertEqual([call.args[0] for call in value.command.call_args_list],['status','install']);self.assertTrue(value.receipt['installed']);self.assertFalse(value.uncertain)
+  value=self.prepared(activate=True);value.command.side_effect=[{'contract':release.CONTRACT,'installed':False,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':False},{'contract':release.CONTRACT,'installed':True,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':True}];value.install();self.assertEqual([call.args[0] for call in value.command.call_args_list],['status','install']);self.assertTrue(value.receipt['installed']);self.assertFalse(value.uncertain)
   value=self.prepared(activate=True);value.api['inspect_container']=lambda name:{'id':'candidate'}
   with self.assertRaisesRegex(RuntimeError,'candidate_started_before_install'):value.install()
   value.command.assert_not_called()
  def test_unknown_commit_never_permits_blind_rollback(self):
-  value=self.prepared(activate=True);value.command.side_effect=[{'contract':release.CONTRACT,'installed':False},TimeoutError(),TimeoutError()]
+  value=self.prepared(activate=True);value.command.side_effect=[{'contract':release.CONTRACT,'installed':False,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':False},TimeoutError(),TimeoutError()]
   with self.assertRaises(TimeoutError):value.install()
   self.assertTrue(value.uncertain)
  def test_lost_ack_recovers_installed_marker_and_preserves_failure(self):
-  value=self.prepared(activate=True);value.command.side_effect=[{'contract':release.CONTRACT,'installed':False},TimeoutError(),{'contract':release.CONTRACT,'installed':True}]
+  value=self.prepared(activate=True);value.command.side_effect=[{'contract':release.CONTRACT,'installed':False,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':False},TimeoutError(),{'contract':release.CONTRACT,'installed':True,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':True}]
   with self.assertRaises(TimeoutError):value.install()
   self.assertFalse(value.uncertain);self.assertTrue(value.receipt['installed'])
  def test_rollback_never_removes_marker_and_blocks_unsupported_source(self):
@@ -49,8 +49,17 @@ class DepartmentReleaseTests(unittest.TestCase):
   with self.assertRaisesRegex(RuntimeError,'install_outcome_unknown'):value.rollback_guard()
   value.command.assert_not_called()
  def test_marker_drift_blocks_activation(self):
-  value=self.prepared(activate=True);value.command.return_value={'contract':release.CONTRACT,'installed':True}
+  value=self.prepared(activate=True);value.command.return_value={'contract':release.CONTRACT,'installed':True,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':True}
   with self.assertRaisesRegex(RuntimeError,'marker_state_changed'):value.install()
   self.assertEqual([call.args[0] for call in value.command.call_args_list],['status'])
+
+
+ def test_installed_quota_with_legacy_source_blocks_rollback_even_before_department_activation(self):
+  value=self.prepared();value.source_quota_contracts=[None,release.QUOTA_CONTRACT];value.command.return_value={'contract':release.CONTRACT,'installed':False,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':True}
+  with self.assertRaisesRegex(RuntimeError,'quota_rollback_source_unsupported'):value.rollback_guard()
+ def test_partial_install_cannot_claim_department_complete_without_quota(self):
+  value=self.prepared(activate=True);value.command.side_effect=[{'contract':release.CONTRACT,'installed':False,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':False},{'contract':release.CONTRACT,'installed':True,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':False},{'contract':release.CONTRACT,'installed':True,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':False}]
+  with self.assertRaisesRegex(RuntimeError,'quota_required_for_department'):value.install()
+  self.assertTrue(value.uncertain)
 
 if __name__=='__main__':unittest.main()

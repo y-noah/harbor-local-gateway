@@ -3,6 +3,8 @@ import {verifyDepartmentIsolationAvailability,assertDepartmentIsolationReadiness
 import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
 import {migrateUsageRollups} from './postgres-usage-rollups.mjs';
 import {migrateRecordingRetention} from './recording-retention.mjs';
+import {lockPostgresRouting} from './postgres-routing.mjs';
+import {migrateQuotaSubjects,recordQuotaSubjectDenial} from './postgres-quota-subjects.mjs';
 import pg from 'pg';
 import {requestParameters,safeUpstreamRequestId} from './request-parameters.mjs';
 import {AsyncLocalStorage} from 'node:async_hooks';
@@ -127,7 +129,7 @@ export class PostgresStore{
     finally{client.release(scope.connection.error??undefined);}
   }
   async migrate(options={}){
-    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(name=>!['recordingContext','recordingContextIndex','recordingRetentionUnlimited','usageHourRollups'].includes(name))||['recordingContext','recordingContextIndex','recordingRetentionUnlimited','usageHourRollups'].some(name=>options[name]!==undefined&&typeof options[name]!=='boolean')||options.recordingContext===false&&options.recordingContextIndex===true)throw new AppError(503,'数据库迁移选项无效','database_configuration');
+    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(name=>!['recordingContext','recordingContextIndex','recordingRetentionUnlimited','usageHourRollups','quotaSubjects'].includes(name))||['recordingContext','recordingContextIndex','recordingRetentionUnlimited','usageHourRollups','quotaSubjects'].some(name=>options[name]!==undefined&&typeof options[name]!=='boolean')||options.recordingContext===false&&options.recordingContextIndex===true)throw new AppError(503,'数据库迁移选项无效','database_configuration');
     return this.transaction(async()=>{
       // The bridge recognizes only the exact known additive migrations. It never enables
       // context storage by merely starting a gateway or calling migrate().
@@ -147,7 +149,8 @@ export class PostgresStore{
       }
       const retentionChanged=await migrateRecordingRetention(this,{apply:options.recordingRetentionUnlimited===true});
       const usageChanged=await migrateUsageRollups(this,{apply:options.usageHourRollups===true});
-      return {version,changed:changed||retentionChanged||usageChanged};
+      const subjectsChanged=await migrateQuotaSubjects(this,{apply:options.quotaSubjects===true});
+      return {version,changed:changed||retentionChanged||usageChanged||subjectsChanged};
     });
   }
   async verifySchema(){
@@ -160,6 +163,7 @@ export class PostgresStore{
     }
     await migrateRecordingRetention(this);
     await migrateUsageRollups(this);
+    await migrateQuotaSubjects(this);
     if(!await this.ready())throw new AppError(503,'数据库数据契约不兼容','database_contract_invalid');
     return true;
   }
@@ -261,6 +265,9 @@ export class PostgresStore{
   }
   async finish(requestId,result={},at=Date.now()){
     return this.transaction(async()=>{
+      // Quota refresh takes routing before subject/account locks. A trusted
+      // rejection must join that boundary before it locks the terminal row.
+      if(result.quotaSubjectDenial===true)await lockPostgresRouting(this);
       const row=await this.get('SELECT * FROM harbor.requests WHERE id=$1 FOR UPDATE',requestId);
       if(!row)throw new AppError(404,'请求不存在');
       if(result.consumptionAttempts!==undefined||result.consumptionSelection!==undefined){
@@ -273,6 +280,7 @@ export class PostgresStore{
         await createPostgresConsumptionPolicy(this).recordAttempts(requestId,row.key_id,attempts);
       }
       if(!['queued','running'].includes(row.status)||row.ended!==null){
+        if(result.quotaSubjectDenial===true)await recordQuotaSubjectDenial(this,row);
         // The HTTP finish callback arrives after billing. Its bounded summary
         // may be replayed, but must never repeat usage or change business facts.
         const timing=canonicalStreamTiming(result.streamTiming);let history;
@@ -305,6 +313,7 @@ export class PostgresStore{
       await this.run('UPDATE harbor.members SET used=used+$1 WHERE id=$2',total,row.member_id);
       await this.run('UPDATE harbor.keys SET used=used+$1,unmetered=unmetered+$2 WHERE id=$3',total,row.tracking_only&&!usageKnown?1:0,row.key_id);
       if(row.account_id)await this.run('UPDATE harbor.accounts SET budget_used=budget_used+$1,since_check_tokens=since_check_tokens+$1 WHERE id=$2',total,row.account_id);
+      if(result.quotaSubjectDenial===true)await recordQuotaSubjectDenial(this,settledRow);
       if(row.session_id&&(status==='ok'||!usageKnown))await this.run('UPDATE harbor.sessions SET state=$1,updated=GREATEST(updated,$2) WHERE id=$3 AND account_id=$4 AND route_version=$5',status==='ok'?'active':'uncertain',at,row.session_id,row.account_id,row.route_version);
       if(row.source_channel==='chat'){
         const facts=canonicalChatFacts(result.chat),current=await this.get("SELECT * FROM harbor.sessions WHERE id=$1 AND account_id=$2 AND route_version=$3 AND protocol='chat' FOR UPDATE",row.session_id,row.account_id,row.route_version);

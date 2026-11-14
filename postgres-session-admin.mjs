@@ -11,12 +11,12 @@ export function createPostgresSessionAdmin(store,{clock=Date.now,isPreparing=()=
   const running=()=>{if(isStopping())throw new AppError(503,'会话管理正在关闭','service_stopping');};
   const audit=(scope,action,detail,sessionId)=>createPostgresAudit(store,{clock}).write(scope,{action,detail,subject:{kind:'session',id:sessionId}});
   const member=async(memberId,missingStatus=404,scope=null)=>{await departments.current(scope,{lock:true,write:true});const row=await store.get('SELECT * FROM harbor.members WHERE id=$1 AND removed_at IS NULL FOR UPDATE',memberId);if(!row)throw new AppError(missingStatus,missingStatus===400?'请选择有效员工及已启用、检查通过的API账号':'会话或员工不存在');departments.same(scope,row);running();return row;};
-  const transaction=fn=>store.transaction(async()=>{running();const result=await fn();running();return result;});
+  const transaction=fn=>store.transaction(async()=>{running();await lockPostgresRouting(store);const result=await fn();running();return result;});
   async function handle(path,method,payload={},options={}){
     if(!(path==='/api/admin/sessions'&&method==='POST')&&!(/^\/api\/admin\/sessions\/[a-zA-Z0-9-]+$/.test(path)&&method==='PATCH'))return null;
     const scope=await departments.resolve(options.scope,{write:true,payload});
     if(path==='/api/admin/sessions'&&method==='POST')return {status:201,value:await transaction(async()=>{
-      const owner=await member(payload.member_id,400,scope);await lockPostgresRouting(store);running();
+      const owner=await member(payload.member_id,400,scope);running();
       const account=await store.get("SELECT * FROM harbor.accounts WHERE id=$1 AND auth_mode='openai_api' AND enabled=1 AND state='ready' AND route_block IS NULL AND removed_at IS NULL FOR SHARE",payload.account_id);
       if(account)departments.same(scope,account);
       if(!owner.enabled||!account)throw new AppError(400,'请选择有效员工及已启用、检查通过的API账号');
@@ -28,7 +28,7 @@ export function createPostgresSessionAdmin(store,{clock=Date.now,isPreparing=()=
     let releasePreparation;
     try{return {status:200,value:await transaction(async()=>{
       const identity=await store.get('SELECT member_id FROM harbor.sessions WHERE id=$1',match[1]);if(!identity)throw new AppError(404,'会话不存在');
-      const owner=await member(identity.member_id,404,scope);await lockPostgresRouting(store);running();
+      const owner=await member(identity.member_id,404,scope);running();
       const session=await store.get('SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 FOR UPDATE',match[1],owner.id);if(!session)throw new AppError(404,'会话不存在');departments.same(scope,session);
       const enabled=payload.enabled===undefined?session.enabled:bool(payload.enabled);
       let nightly=payload.nightly_enabled===undefined?(payload.account_id!==undefined?0:session.nightly_enabled):bool(payload.nightly_enabled);

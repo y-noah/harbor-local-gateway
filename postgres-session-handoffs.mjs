@@ -66,9 +66,9 @@ export function createPostgresSessionHandoffs(store,{gate,readStore=store,queryQ
   async function inspect(sessionId,{lock=false,scope:explicitScope}={}){
     const scope=await current({lock,scope:explicitScope});
     const identity=await store.get('SELECT member_id'+(scope?',department_id':'')+' FROM harbor.sessions WHERE id=$1',sessionId);if(identity)departments.same(scope,identity);if(!identity)throw new AppError(404,'会话不存在');
+    if(lock)await lockPostgresRouting(store);
     const member=await store.get('SELECT id,enabled,removed_at'+(scope?',department_id':'')+' FROM harbor.members WHERE id=$1'+(lock?' FOR UPDATE':''),identity.member_id);
     if(member)departments.same(scope,member);
-    if(lock)await lockPostgresRouting(store);
     const session=await store.get('SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2'+(lock?' FOR UPDATE':''),sessionId,identity.member_id);
     if(!session||!member?.enabled||member.removed_at!==null||!session.enabled)failure('session_disabled','会话或员工不可访问');
     if(session.protocol!=='responses')failure('session_route_unsupported','此通道不支持请求间平滑转移');

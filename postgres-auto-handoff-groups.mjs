@@ -47,10 +47,9 @@ export function createPostgresAutomaticHandoffs(store,{gate,contexts,clock=Date.
     const {plan,entry}=spec,at=clock(),expires=Math.min(plan.expires,at+pendingMs);
     if(expires<=at)failure('session_handoff_expired','自动交接已过期');
     await store.transaction(async()=>{
-      alive();await valid(plan,scope);await balance(plan.target,scope);const owners=[...new Set(rows.map(row=>row.member_id))].sort();
+      alive();await lockPostgresRouting(store);await valid(plan,scope);await balance(plan.target,scope);const owners=[...new Set(rows.map(row=>row.member_id))].sort();
       const members=await store.all('SELECT * FROM harbor.members WHERE id=ANY($1::text[]) ORDER BY id FOR SHARE',owners);for(const member of members)routing.same(scope,member);
       if(members.length!==owners.length||members.some(member=>!member.enabled||member.removed_at!==null))failure('session_disabled','会话员工已停用');
-      await lockPostgresRouting(store);
       const previous=await store.get('SELECT * FROM harbor.automatic_handoff_groups WHERE plan_id=$1 AND group_ordinal=$2 FOR UPDATE',plan.id,entry.ordinal);
       if(previous){if(previous.id!==groupId||previous.status!=='waiting')failure('nightly_plan_changed','自动组决定已结束或变化');await onSettled(plan.target,{scope:scope??undefined});return;}
       const sessions=await store.all('SELECT * FROM harbor.sessions WHERE id=ANY($1::text[]) ORDER BY id FOR UPDATE',rows.map(row=>row.session_id)),current=new Map(sessions.map(session=>[session.id,session]));

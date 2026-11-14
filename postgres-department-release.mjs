@@ -5,6 +5,7 @@ import {resolve} from 'node:path';
 import {PostgresStore} from './postgres-store.mjs';
 import {migrateDepartmentIsolation,verifyDepartmentIsolationAvailability,departmentIsolationContract} from './postgres-departments.mjs';
 import {readUsageCascadeInput} from './postgres-usage-rollups-cli.mjs';
+import {verifyQuotaSubjectAvailability,quotaSubjectContract} from './postgres-quota-subjects.mjs';
 
 const core=['accounts','members','keys','sessions','requests','gateway_settings'];
 const need=(ok,code)=>{if(!ok)throw Object.assign(new Error(code),{code:'department_release_'+code});};
@@ -42,7 +43,7 @@ export async function departmentReleaseOperation(store,action,input){
    await migrateDepartmentIsolation(store,{apply:true,runtimeRole:binding.runtime});
    need(await installed(store),'installation_unconfirmed');
   }
-  return {action,contract:departmentIsolationContract,binding,installed:action==='install'||before,changed:action==='install'&&!before};
+  return {action,contract:departmentIsolationContract,quota_subject_contract:quotaSubjectContract,quota_subject_installed:await verifyQuotaSubjectAvailability(store),binding,installed:action==='install'||before,changed:action==='install'&&!before};
  });
 }
 export async function runDepartmentRelease(action,database,input){const store=new PostgresStore({...database,poolSize:1,statementTimeoutMs:60000});try{await store.verifySchema();return await departmentReleaseOperation(store,action,input);}finally{await store.close();}}
