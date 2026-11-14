@@ -5,10 +5,13 @@ import {recordingLiteral} from './recording-literal.mjs';
 import {recordingTextMetadata,finalizeRecordingTokens} from './recording-text-metadata.mjs';
 
 const media=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
-const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','item_reference','compaction']);
+const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','item_reference','compaction']);
 const textTypes=new Set(['text','input_text','output_text','summary_text','refusal']);
 const scalarFields=new Set(['role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments']);
-const itemFields={additional_tools:['type','id','role','tools'],function_call:['type','id','call_id','name','namespace','arguments','status'],custom_tool_call:['type','id','call_id','name','namespace','input','status'],function_call_output:['type','id','call_id','name','namespace','output','status'],custom_tool_call_output:['type','id','call_id','name','namespace','output','status'],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
+const toolItems=new Set(['function_call','custom_tool_call','function_call_output','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
+const toolFacts=['status','error','duration_ms','elapsed_ms'];
+const itemFields={additional_tools:['type','id','role','tools'],function_call:['type','id','call_id','name','namespace','arguments',...toolFacts],custom_tool_call:['type','id','call_id','name','namespace','input',...toolFacts],function_call_output:['type','id','call_id','name','namespace','output',...toolFacts],custom_tool_call_output:['type','id','call_id','name','namespace','output',...toolFacts],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
+Object.assign(itemFields,{shell_call:['type','id','call_id','action',...toolFacts],shell_call_output:['type','id','call_id','output','max_output_length',...toolFacts],apply_patch_call:['type','id','call_id','operation',...toolFacts],apply_patch_call_output:['type','id','call_id','output',...toolFacts]});
 const schemaBranches=new Set(['allOf','anyOf','oneOf','not','items','prefixItems','contains','additionalProperties','unevaluatedProperties','unevaluatedItems','propertyNames','if','then','else','additionalItems','contentSchema']);
 export const requestContextReasons=Object.freeze(['invalid_payload','unsupported_tools','unsupported_input','unsupported_instructions','ambiguous_input','unsupported_content','unsupported_field','schema_name_collision','size_limit']);
 
@@ -71,6 +74,9 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       const nullableMetadata=['phase','namespace'].includes(key)&&value[key]===null;
       if(protocol&&slotFields&&['id','type','name','namespace','arguments','mode'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
       if(protocol&&(value.role!==undefined||itemTypes.has(value.type))&&scalarFields.has(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
+      if(protocol&&toolItems.has(value.type)&&['duration_ms','elapsed_ms'].includes(key)&&(!Number.isFinite(value[key])||value[key]<0)){reasons.add('unsupported_content');continue;}
+      if(protocol&&value.type==='shell_call_output'&&key==='max_output_length'&&(!Number.isSafeInteger(value[key])||value[key]<0)){reasons.add('unsupported_content');continue;}
+      if(protocol&&(value.type==='shell_call'&&key==='action'||value.type==='apply_patch_call'&&key==='operation')&&(!value[key]||typeof value[key]!=='object'||Array.isArray(value[key]))){reasons.add('unsupported_content');continue;}
       if(protocol&&key==='tool_calls'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
       if(protocol&&textTypes.has(value.type)&&!['type',value.type==='refusal'?'refusal':'text',...(value.type==='output_text'?['annotations','logprobs']:[])].includes(key)){reasons.add('unsupported_field');continue;}
       if(protocol&&value.type==='output_text'&&['annotations','logprobs'].includes(key)){
@@ -82,8 +88,8 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       if(protocol&&textTypes.has(value.type)&&['text','refusal'].includes(key)&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='refusal'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='content'&&value[key]!==null&&typeof value[key]!=='string'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
-      if(protocol&&(key==='output'&&['function_call_output','custom_tool_call_output'].includes(value.type)||key==='content'&&value.role==='tool')){
-        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key]),onTruncate:cut,onRedact,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
+      if(protocol&&(key==='output'&&toolItems.has(value.type)&&value.type.endsWith('_output')||key==='action'&&value.type==='shell_call'||key==='operation'&&value.type==='apply_patch_call'||key==='error'&&toolItems.has(value.type)||key==='content'&&value.role==='tool')){
+        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key])&&(key==='content'||key==='output'&&['function_call_output','custom_tool_call_output'].includes(value.type)),onTruncate:cut,onRedact,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
       }
       if(schema==='definition'&&['properties','patternProperties','$defs','definitions','dependentSchemas','dependentRequired','dependencies'].includes(key)&&value[key]&&typeof value[key]==='object'&&!Array.isArray(value[key])){
         const definitions={};

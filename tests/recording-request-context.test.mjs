@@ -4,6 +4,32 @@ import {captureRequestContext,captureRequestContextAsync} from '../recording-req
 import {RecordingStore} from '../recording-store.mjs';
 import {randomBytes} from 'node:crypto';
 
+test('shell与apply_patch历史保留可见命令补丁和结构化执行结果',async()=>{
+ const input=[{type:'shell_call',id:'shell',call_id:'shell-id',action:{commands:['echo synthetic'],timeout_ms:1000,max_output_length:1024},status:'completed'},
+ {type:'shell_call_output',call_id:'shell-id',max_output_length:1024,output:[{stdout:'合成输出',stderr:'',outcome:{type:'exit',exit_code:0}},{stdout:'',stderr:'合成超时',outcome:{type:'timeout'}}]},
+ {type:'apply_patch_call',call_id:'patch-id',operation:{type:'update_file',path:'synthetic.txt',diff:'@@\n-old\n+new'},status:'completed'},
+ {type:'apply_patch_call_output',call_id:'patch-id',status:'completed'}];
+ const view=captureRequestContext({input});assert.equal(view.state,'complete');assert.deepEqual(view.components.map(item=>item.content.value),input);assert.deepEqual(await captureRequestContextAsync({input}),view);
+ const filtered=captureRequestContext({input:[{type:'shell_call',action:{commands:['Authorization: Bearer private-shell-secret']}},{type:'apply_patch_call',operation:{type:'create_file',path:'synthetic.txt',diff:'Authorization: Bearer private-patch-secret'}}]});
+ assert.equal(filtered.state,'complete');assert.ok(!JSON.stringify(filtered).includes('private-shell-secret'));assert.ok(!JSON.stringify(filtered).includes('private-patch-secret'));
+ const malformed=captureRequestContext({input:[{type:'shell_call_output',output:[],max_output_length:-1}]});assert.equal(malformed.state,'incomplete');assert.ok(malformed.reasons.includes('unsupported_content'));
+ for(const [type,key] of [['shell_call','action'],['apply_patch_call','operation']])for(const value of [null,42,'invalid',[]]){
+  const payload={input:[{type,[key]:value}]},result=captureRequestContext(payload);assert.equal(result.state,'incomplete');assert.ok(result.reasons.includes('unsupported_content'));assert.equal(Object.hasOwn(result.components[0].content.value,key),false);assert.deepEqual(await captureRequestContextAsync(payload),result);
+ }
+});
+
+test('工具上下文保留显式状态错误及耗时，未知耗时不推算且错误沿用脱敏与预算',async()=>{
+ const input=['function_call','custom_tool_call','function_call_output','custom_tool_call_output'].map(type=>({type,call_id:'synthetic-call',status:'failed',error:{code:'synthetic-error',message:'Authorization: Bearer private-tool-secret'},duration_ms:12.5,elapsed_ms:0,...(type.endsWith('_output')?{output:'合成结果'}:type==='function_call'?{arguments:'{}'}:{input:'合成命令'})}));
+ const original=structuredClone(input),view=captureRequestContext({input});
+ assert.equal(view.state,'complete');assert.deepEqual(input,original);assert.ok(!JSON.stringify(view).includes('private-tool-secret'));
+ for(const component of view.components){const value=component.content.value;assert.equal(value.status,'failed');assert.equal(value.duration_ms,12.5);assert.equal(value.elapsed_ms,0);assert.equal(value.error.code,'synthetic-error');}
+ assert.deepEqual(await captureRequestContextAsync({input}),view);
+ const absent=captureRequestContext({input:[{type:'function_call',call_id:'synthetic',arguments:'{}'}]}).components[0].content.value;
+ assert.equal(Object.hasOwn(absent,'duration_ms'),false);assert.equal(Object.hasOwn(absent,'error'),false);
+ for(const duration of [-1,'12',null,NaN,Infinity,{},[]]){const result=captureRequestContext({input:[{type:'custom_tool_call',input:'合成命令',duration_ms:duration}]});assert.equal(result.state,'incomplete');assert.ok(result.reasons.includes('unsupported_content'));assert.equal(Object.hasOwn(result.components[0].content.value,'duration_ms'),false);}
+ const bounded=captureRequestContext({input:[{type:'function_call_output',output:'ok',error:{message:'x'.repeat(10000)}}]},{maxBytes:1024});assert.equal(bounded.state,'incomplete');assert.ok(bounded.reasons.includes('size_limit'));
+});
+
 test('协作与同步采集结构、脱敏及截断事实完全一致，并实际让出事件循环',async()=>{
  const payload={instructions:'合成说明',tools:[{type:'custom',name:'exec'}],input:[{role:'user',content:[{type:'input_text',text:'Authorization: Bearer '},{type:'input_text',text:'private-secret'}]},...Array.from({length:2000},()=>({role:'assistant',content:'合成历史'}))]};
  for(const options of [{},{maxNodes:80},{maxComponents:12},{maxBytes:1024}]){
