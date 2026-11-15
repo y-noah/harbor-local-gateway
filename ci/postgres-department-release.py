@@ -21,6 +21,12 @@ def contract(proof):
     need(value in [None,CONTRACT],'contract_unknown')
     return value
 
+def install_timeout_seconds(config):
+    need(isinstance(config,dict),'install_budget_configuration')
+    value=config.get('postgres_department_install_timeout_seconds',75)
+    need(type(value) is int and 75<=value<=300,'install_budget_configuration')
+    return value
+
 class DepartmentRelease(transport.UsageCascadeRelease):
     def __init__(self,*,api,entry,ticket,active,gateway,worker,image,proof,record,path,source_proofs):
         need(contract(proof)==CONTRACT,'candidate_contract')
@@ -35,6 +41,7 @@ class DepartmentRelease(transport.UsageCascadeRelease):
         if self.quota_supported:need(type(proof.get('quota_subject_installed')) is bool,'quota_marker_state')
         if activate or proof.get('quota_subject_installed',False):need(self.quota_supported and all(p==QUOTA_CONTRACT for p in self.source_quota_contracts),'quota_bridge_release_required')
         if activate or proof['department_isolation_installed']:need(all(p==CONTRACT for p in self.source_contracts),'bridge_release_required')
+        self.install_timeout_seconds=install_timeout_seconds(entry.private_json(Path('/etc/harbor-gateway-deploy.json')))
         self.activate=activate;self.api=api;self.entry=entry;self.ticket=copy.deepcopy(ticket);self.active=copy.deepcopy(active);self.sources=[transport.generation(gateway),transport.generation(worker)];self.image=image;self.image_id=api['inspect_image'](image)['Id'];self.record=record;self.path=path;self.receipt=None;self.plan=None;self.uncertain=False;self.install_attempted=False
         need(self.image_id in [ticket['to']['configDigest'],ticket['to']['manifestDigest']],'candidate_image')
         self.connection,self.manifest=transport.owner_transport(entry,ticket,gateway)
@@ -68,7 +75,8 @@ class DepartmentRelease(transport.UsageCascadeRelease):
             row=self.api['inspect_container'](cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
             self.maintenance_unconfirmed=True
             payload=json.dumps({'connection':self.connection,'cascade':cascade}).encode();need(len(payload)<=131072,'maintenance_input_budget')
-            result=subprocess.run(['/usr/bin/docker','start','--attach','--interactive',cid],input=payload,capture_output=True,timeout=75)
+            budget=getattr(self,'install_timeout_seconds',75) if action=='install' else 75
+            result=subprocess.run(['/usr/bin/docker','start','--attach','--interactive',cid],input=payload,capture_output=True,timeout=budget)
             need(len(result.stdout)<=131072 and len(result.stderr)<=16384,'maintenance_output_budget')
             if result.returncode!=0:
                 code=None

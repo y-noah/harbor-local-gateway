@@ -4,6 +4,32 @@ from unittest.mock import Mock,patch
 spec=importlib.util.spec_from_file_location('department_release',Path(__file__).parents[1]/'ci/postgres-department-release.py');release=importlib.util.module_from_spec(spec);spec.loader.exec_module(release)
 
 class DepartmentReleaseTests(unittest.TestCase):
+ def test_install_budget_defaults_and_explicit_boundaries(self):
+  self.assertEqual(release.install_timeout_seconds({}),75)
+  for value in [75,180,300]:self.assertEqual(release.install_timeout_seconds({'postgres_department_install_timeout_seconds':value}),value)
+  for value in [None,False,True,74,301,75.0,'300',{},[]]:
+   with self.subTest(value=value):
+    with self.assertRaisesRegex(RuntimeError,'install_budget_configuration'):release.install_timeout_seconds({'postgres_department_install_timeout_seconds':value})
+  with self.assertRaisesRegex(RuntimeError,'install_budget_configuration'):release.install_timeout_seconds(None)
+ def test_invalid_root_budget_fails_in_constructor_before_image_or_transport(self):
+  entry=types.SimpleNamespace(private_json=Mock(return_value={'postgres_department_install_timeout_seconds':'300'}));inspect=Mock()
+  proof={'department_isolation_contract':release.CONTRACT,'department_isolation_installed':False,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':False}
+  with patch.object(release.transport,'owner_transport') as transport:
+   with self.assertRaisesRegex(RuntimeError,'install_budget_configuration'):
+    release.DepartmentRelease(api={'inspect_image':inspect},entry=entry,ticket={'activateDepartmentIsolation':True,'postgres_department_install_timeout_seconds':300},active={},gateway={},worker={},image='synthetic',proof=proof,record={},path=None,source_proofs=[proof,proof])
+  entry.private_json.assert_called_once_with(Path('/etc/harbor-gateway-deploy.json'));inspect.assert_not_called();transport.assert_not_called()
+ def test_only_install_uses_protected_long_budget(self):
+  for action,expected in [('install',300),('status',75),('plan',75)]:
+   value=object.__new__(release.DepartmentRelease);value.image='synthetic';value.image_id='sha256:'+'b'*64;value.connection={};value.record={};value.save=Mock();value.install_timeout_seconds=300;cid='a'*64;observed=[]
+   row={'Id':cid,'Image':value.image_id,'Config':{'Labels':{'com.harbor.maintenance':'harbor-department-release-synthetic'},'User':'node'},'HostConfig':{'ReadonlyRootfs':True,'NetworkMode':'host'},'Mounts':[],'State':{'Running':False,'Pid':0,'Status':'exited'}}
+   inspections=iter([row,row,None]);value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:next(inspections)}
+   def command(args,**kwargs):
+    if args[1]=='create':return types.SimpleNamespace(returncode=0,stdout=cid.encode(),stderr=b'')
+    if args[1]=='start':observed.append(kwargs['timeout']);return types.SimpleNamespace(returncode=0,stdout=__import__('json').dumps({'action':action}).encode(),stderr=b'')
+    return types.SimpleNamespace(returncode=0,stdout=b'',stderr=b'')
+   with patch.object(release.uuid,'uuid4',return_value=types.SimpleNamespace(hex='synthetic')),patch.object(release.subprocess,'run',side_effect=command):self.assertEqual(value.command(action,{}),{'action':action})
+   self.assertEqual(observed,[expected]);self.assertFalse(value.maintenance_unconfirmed)
+
  def prepared(self,activate=False,installed=False):
   value=object.__new__(release.DepartmentRelease);value.activate=activate;value.plan={'binding':{'synthetic':True},'installed':installed};value.source_contracts=[release.CONTRACT]*2;value.source_quota_contracts=[release.QUOTA_CONTRACT]*2;value.quota_supported=True;value.record={'departmentIsolation':{}};value.api={'NAME':'harbor','inspect_container':lambda name:None};value.check_active=Mock();value.check_sources=Mock();value.save=Mock();value.uncertain=False;value.install_attempted=True;value.receipt=None;value.command=Mock(return_value={'contract':release.CONTRACT,'installed':installed,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':installed});return value
  def test_command_nonzero_reports_only_validated_stderr_code_and_still_cleans_container(self):
