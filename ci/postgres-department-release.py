@@ -5,7 +5,7 @@ both stopped source images and the candidate to support the same contract.
 No rollback ever removes department data or restores an unsupported source.
 """
 from pathlib import Path
-import copy,importlib.util,json,re,selectors,subprocess,uuid
+import copy,importlib.util,json,re,selectors,subprocess,time,uuid
 
 _spec=importlib.util.spec_from_file_location('department_release_cascade_transport',Path(__file__).with_name('postgres-usage-cascade.py'))
 transport=importlib.util.module_from_spec(_spec);_spec.loader.exec_module(transport)
@@ -59,12 +59,14 @@ class DepartmentRelease(transport.UsageCascadeRelease):
         self.record['departmentIsolation']={'plan':self.plan,'activate':activate,'state':'planned'};self.save()
 
     def command(self,action,cascade):
+        need(not getattr(self,'maintenance_unconfirmed',False),'maintenance_process_unconfirmed')
         name='harbor-department-release-'+uuid.uuid4().hex;cid=None;payload=b''
         try:
             need(self.api['inspect_image'](self.image).get('Id')==self.image_id,'candidate_image_changed')
             args=['/usr/bin/docker','create','--name',name,'--label','com.harbor.maintenance='+name,'--network','host','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--pids-limit','64','--memory','512m','--cpus','0.5','--no-healthcheck','--tmpfs','/tmp:rw,noexec,nosuid,size=16m','--interactive','--entrypoint','node',self.image_id,'/app/postgres-department-release.mjs',action]
             created=subprocess.run(args,capture_output=True,timeout=30);need(created.returncode==0,'maintenance_create_failed');cid=created.stdout.decode().strip();need(re.fullmatch('[a-f0-9]{64}',cid),'maintenance_container_id')
             row=self.api['inspect_container'](cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
+            self.maintenance_unconfirmed=True
             payload=json.dumps({'connection':self.connection,'cascade':cascade}).encode();need(len(payload)<=131072,'maintenance_input_budget')
             result=subprocess.run(['/usr/bin/docker','start','--attach','--interactive',cid],input=payload,capture_output=True,timeout=75)
             need(len(result.stdout)<=131072 and len(result.stderr)<=16384,'maintenance_output_budget')
@@ -74,14 +76,44 @@ class DepartmentRelease(transport.UsageCascadeRelease):
                     error=json.loads(result.stderr)
                     if isinstance(error,dict) and set(error)=={'ok','code'} and error['ok'] is False and isinstance(error['code'],str) and re.fullmatch('[A-Za-z0-9_]{1,80}',error['code']):code=error['code']
                 except (ValueError,UnicodeError):pass
-                raise RuntimeError('department_release_maintenance_'+action.replace('-','_')+'_failed'+('_'+code if code else ''))
+                error=RuntimeError('department_release_maintenance_'+action.replace('-','_')+'_failed'+('_'+code if code else ''));error.maintenance_code=code;raise error
             value=json.loads(result.stdout);need(isinstance(value,dict) and value.get('action')==action,'maintenance_result');return value
         finally:
             payload=b''
             row=self.api['inspect_container'](name)
-            if row is not None:
-                need(row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name,'maintenance_cleanup_identity')
-                done=subprocess.run(['/usr/bin/docker','rm','--force',cid],capture_output=True,timeout=30);need(done.returncode==0 and self.api['inspect_container'](name) is None,'maintenance_cleanup_failed')
+            if row is not None or cid is not None:
+                self.maintenance_unconfirmed=True
+                diagnostic={'action':action,'containerId':cid,'processExitConfirmed':False}
+                self.record.setdefault('departmentIsolation',{})['maintenance']=diagnostic;self.save()
+                def owned(value):
+                    need(value is not None and value['Id']==cid and value['Image']==self.image_id and value.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name,'maintenance_cleanup_identity')
+                    return value['State']
+                state=owned(row)
+                if state.get('Running') is True:
+                    # Cancel only this authenticated task. Docker CLI loss does
+                    # not prove that the container or its PG transaction exited.
+                    subprocess.run(['/usr/bin/docker','kill','--signal=SIGTERM',cid],capture_output=True,timeout=30)
+                    waited=subprocess.run(['/usr/bin/docker','wait',cid],capture_output=True,timeout=30)
+                    need(waited.returncode==0,'maintenance_exit_unconfirmed');state=owned(self.api['inspect_container'](cid))
+                need(state.get('Running') is False and state.get('Pid')==0 and state.get('Status')=='exited' and not any(state.get(k) for k in ['Paused','Restarting','Dead']),'maintenance_exit_unconfirmed')
+                diagnostic['processExitConfirmed']=True;self.save()
+                done=subprocess.run(['/usr/bin/docker','rm',cid],capture_output=True,timeout=30);need(done.returncode==0 and self.api['inspect_container'](name) is None,'maintenance_cleanup_failed')
+                self.maintenance_unconfirmed=False
+
+    def confirmed_status(self):
+        # status holds the same transaction advisory lock as install. A success
+        # proves the previous install transaction released its lock and reports
+        # its actual committed marker; container exit alone cannot prove this.
+        need(not getattr(self,'maintenance_unconfirmed',False),'maintenance_process_unconfirmed')
+        deadline=time.monotonic()+75
+        while True:
+            try:
+                result=self.status()
+                self.record.setdefault('departmentIsolation',{})['transactionEndConfirmed']=True;self.save();return result
+            except RuntimeError as error:
+                if getattr(error,'maintenance_code',None)!='55P03':raise
+                if time.monotonic()>=deadline:raise RuntimeError('department_release_transaction_end_unconfirmed') from None
+                time.sleep(0.5)
 
     def status(self):
         result=self.command('status',{'binding':self.plan['binding']})
@@ -105,7 +137,7 @@ class DepartmentRelease(transport.UsageCascadeRelease):
             need(result.get('quota_subject_contract')==QUOTA_CONTRACT and result.get('quota_subject_installed') is True,'quota_install_unconfirmed')
             self.receipt=result;self.uncertain=False
         except Exception:
-            status=self.status();self.uncertain=False
+            status=self.confirmed_status();self.uncertain=False
             if status['installed']:self.receipt=status
             self.record['departmentIsolation'].update(state='installed' if self.receipt else 'not-installed',receipt=self.receipt);self.save();raise
         self.record['departmentIsolation'].update(state='installed',receipt=self.receipt);self.save();self.check_sources(stopped=True);self.check_active()
