@@ -8,6 +8,24 @@ def load(path,name):
  s=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
 h=load(CI/'harbor-pg-storage-host.py','host');factory=load(CI/'postgres-deploy.py','factory')
 class Tests(unittest.TestCase):
+ def test_boot_unit_install_modes_ignore_restrictive_umask(self):
+  for mask in [0o022,0o077]:
+   with self.subTest(umask=oct(mask)),tempfile.TemporaryDirectory() as tmp:
+    target=Path(tmp);host=self.host();host.j={};host.config={'port':8092};host.save=lambda _:None;host.fence_docker_autostart=lambda:None
+    startup={'harbor-unit-'+str(i)+'.service':'[Service]\nType=oneshot\n' for i in range(7)}
+    host.core=types.SimpleNamespace(SOURCE_DB=Path('/original/db'),SOURCE_ARCHIVE=Path('/original/archive'),TARGET=Path('/target/postgres'),STORAGE_START='harbor-unit-0.service',STORAGE_ONLINE='harbor-unit-1.service',startup_units=lambda *args:startup)
+    host.entry=types.SimpleNamespace(private_json=lambda _:dict(host.config),save_json=lambda *args:None)
+    def mapped(value):
+     path=Path(value)
+     return target/path.relative_to('/etc/systemd/system') if path.is_relative_to('/etc/systemd/system') else path
+    def command(args,**kwargs):return (args[-1].strip('/').replace('/','-')+'.mount').encode() if args[0].endswith('systemd-escape') else b''
+    previous=os.umask(mask)
+    try:
+     with patch.object(h,'Path',side_effect=mapped),patch.object(h,'__file__','/usr/local/lib/harbor/harbor-pg-storage-host.py'),patch.object(h,'CORE',Path('/usr/local/lib/harbor/harbor-pg-storage-coordinator.py')),patch.object(h,'run',side_effect=command):host.install_instance_boot_guard()
+    finally:os.umask(previous)
+    self.assertEqual(len(host.j['installedUnitSha256']),9)
+    for name,digest in host.j['installedUnitSha256'].items():
+     path=target/name;self.assertEqual(path.stat().st_mode&0o777,0o644);self.assertEqual(h.sha(path.read_bytes()),digest)
  def test_factory_default_and_off_preserve_original_restart(self):
   for cfg in [{},{'postgres_storage_startup_guard':False}]:self.assertEqual(factory.storage_restart_policy(cfg),'unless-stopped')
  def test_factory_bad_boolean_or_missing_witness_never_selects_no(self):

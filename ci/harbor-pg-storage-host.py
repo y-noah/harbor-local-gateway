@@ -568,7 +568,7 @@ class Host:
    if path.exists():need(path.read_text()==text,'host_unit_foreign')
    else:
     path.parent.mkdir(mode=0o755,exist_ok=True);fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o644)
-    with os.fdopen(fd,'w') as f:f.write(text);f.flush();os.fsync(f.fileno())
+    with os.fdopen(fd,'w') as f:os.fchmod(f.fileno(),0o644);f.write(text);f.flush();os.fsync(f.fileno())
   self.j['installedUnitSha256']={name:sha(text.encode()) for name,text in units.items()};self.save(self.j)
   # Exactly the selected composition loses daemon auto-start. The instance
   # units own boot order and preserve the original policies in the journal.
