@@ -55,32 +55,42 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
     const targets=config.rules.map(rule=>effective(rule,at,book));
     if(!targets.length)return {...config,currency:'USD',observed_at:at,usage:[]};
     const start=Math.min(...targets.map(rule=>memberLimitWindow(rule.hours,at).start));
+    // Resolve historical aliases before narrowing the price lookup. Unknown
+    // models stay in the set because they can block every configured rule.
     const rows=await store.all(`WITH rules AS (
       SELECT * FROM jsonb_to_recordset($4::jsonb) AS x(position INTEGER,model TEXT,start_at BIGINT,inclusive BOOLEAN)
     ), source AS MATERIALIZED (
-      SELECT r.ended,r.started,r.status,r.usage_unknown,r.input,r.output,r.cached,r.manual_cost_atoms,r.price_version,
-        COALESCE(r.billing_model,r.model) chosen,p.total_atoms,p.revision,p.request_id projected
-      FROM harbor.requests r LEFT JOIN harbor.request_prices p ON p.request_id=r.id
+      SELECT r.id request_id,r.ended,r.started,r.status,r.usage_unknown,r.input,r.output,r.cached,r.manual_cost_atoms,r.price_version,
+        COALESCE(r.billing_model,r.model) chosen
+      FROM harbor.requests r
       WHERE r.member_id=$1 AND ((r.ended>=$2 AND r.ended<=$3) OR (r.ended IS NULL AND r.status IN ('queued','running')))
     ), books AS MATERIALIZED (
       SELECT id,book::jsonb book FROM harbor.pricing_versions WHERE id IN (SELECT DISTINCT price_version FROM source)
-    ), measured AS MATERIALIZED (
-      SELECT s.ended,s.status,CASE WHEN b.book->'rates' ? s.chosen THEN s.chosen
+    ), modeled AS MATERIALIZED (
+      SELECT s.*,(b.book IS NOT NULL) book_exists,CASE WHEN b.book->'rates' ? s.chosen THEN s.chosen
         WHEN a.target IS NOT NULL THEN a.target
         WHEN s.ended IS NULL THEN s.chosen
         WHEN $5::jsonb->'rates' ? s.chosen OR EXISTS(SELECT 1 FROM rules WHERE model=s.chosen) THEN s.chosen
-        ELSE NULL END model,
-      CASE WHEN s.ended IS NULL THEN NULL
-        WHEN s.status<>'reconciled' AND s.usage_unknown=0 AND s.input=0 AND s.output=0 AND s.cached=0 AND s.manual_cost_atoms IS NULL THEN 0::numeric
-        WHEN s.manual_cost_atoms ~ '^[0-9]+$' THEN s.manual_cost_atoms::numeric
-        WHEN b.book IS NOT NULL AND s.projected IS NOT NULL AND s.revision=s.price_version THEN s.total_atoms
-        ELSE NULL END atoms
+        ELSE NULL END model
       FROM source s LEFT JOIN books b ON b.id=s.price_version LEFT JOIN LATERAL (
         SELECT alias->>'target' target FROM jsonb_array_elements(COALESCE(b.book->'aliases','[]'::jsonb)) alias
         WHERE alias->>'name'=s.chosen AND s.started>=(alias->>'from')::bigint
           AND (alias->>'to' IS NULL OR s.started<(alias->>'to')::bigint)
           AND b.book->'rates' ? (alias->>'target') LIMIT 1
       ) a ON TRUE
+    ), relevant AS MATERIALIZED (
+      SELECT s.* FROM modeled s WHERE EXISTS(SELECT 1 FROM rules x
+        WHERE (s.model=x.model OR s.model IS NULL) AND
+          (s.ended>x.start_at OR (x.inclusive AND s.ended=x.start_at) OR
+            (s.ended IS NULL AND s.status IN ('queued','running'))))
+    ), measured AS MATERIALIZED (
+      SELECT s.ended,s.status,s.model,
+      CASE WHEN s.ended IS NULL THEN NULL
+        WHEN s.status<>'reconciled' AND s.usage_unknown=0 AND s.input=0 AND s.output=0 AND s.cached=0 AND s.manual_cost_atoms IS NULL THEN 0::numeric
+        WHEN s.manual_cost_atoms ~ '^[0-9]+$' THEN s.manual_cost_atoms::numeric
+        WHEN s.book_exists AND p.request_id IS NOT NULL AND p.revision=s.price_version THEN p.total_atoms
+        ELSE NULL END atoms
+      FROM relevant s LEFT JOIN harbor.request_prices p ON p.request_id=s.request_id
     ) SELECT x.position,
       COALESCE(SUM(m.atoms) FILTER(WHERE (m.ended>x.start_at OR (x.inclusive AND m.ended=x.start_at)) AND m.model=x.model),0)::text used,
       COUNT(*) FILTER(WHERE (m.ended>x.start_at OR (x.inclusive AND m.ended=x.start_at)) AND
