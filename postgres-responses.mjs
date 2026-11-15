@@ -420,7 +420,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(!jsonPath){contextComplete=true;if(!replayableResponsesEvent({type:'response.completed',response:result.response}))contextReplayable=false;}
       if(jsonPath)record(()=>{if(capture)captureCodexJsonOutput(capture,jsonPath,result.response);});
       const recordingResult=finishCapture(jsonPath?undefined:result.response);
-      if(recordStarted&&!writeRecording('finish',requestId,{state:recordFailed||recordingResult?.failed||recordingResult?.incomplete||incompleteRequestContext(requestContext)?'partial':recordingResult?.truncated?'truncated':'complete',...recordingFinishReason(recordFailed||recordingResult?.failed?recordFailureReason??'capture_failed':incompleteRequestContext(requestContext)?requestContext.reason??'capture_failed':recordingResult?.truncated?'size_limit':recordingResult?.incomplete?'capture_failed':null)}))recordFailed=true;
+      if(recordStarted&&!writeRecording('finish',requestId,{state:recordFailed||recordingResult?.failed||incompleteRequestContext(requestContext)?'partial':recordingResult?.truncated?'truncated':recordingResult?.incomplete?'partial':'complete',...recordingFinishReason(recordFailed||recordingResult?.failed?recordFailureReason??'capture_failed':incompleteRequestContext(requestContext)?requestContext.reason??'capture_failed':recordingResult?.truncated?'size_limit':recordingResult?.incomplete?'capture_failed':null)}))recordFailed=true;
       // A failure after dispatch must not cause a second model call.
       const settled=await settle(result);
       await deviceAccess.markVerified(requestId).catch(()=>{});
