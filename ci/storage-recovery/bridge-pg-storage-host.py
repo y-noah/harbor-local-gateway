@@ -68,7 +68,8 @@ def unit(name):
  value=dict(line.split('=',1) for line in raw.decode().splitlines() if '=' in line);need(value.get('LoadState')=='loaded','unit_unknown');return value
 
 def quiet(name):
- value=unit(name);need(value.get('MainPID')=='0' and value.get('ActiveState') in ['inactive','failed'],'unit_not_stopped')
+ value=unit(name);pid_quiet=value.get('MainPID')=='0' or name in WRITERS and name.endswith('.timer') and 'MainPID' not in value
+ need(pid_quiet and value.get('ActiveState') in ['inactive','failed'],'unit_not_stopped')
  group=value.get('ControlGroup','')
  if group:
   need(group.startswith('/system.slice/') and group==os.path.normpath(group),'unit_cgroup_unknown');events=Path('/sys/fs/cgroup')/group.lstrip('/')/'cgroup.events'

@@ -122,7 +122,8 @@ def quiescent(value):
     for unit in UNITS:
         result = run(['/usr/bin/systemctl', 'show', unit, '--property=ActiveState,MainPID'])
         prop = dict(line.split('=', 1) for line in result.decode().splitlines() if '=' in line)
-        g.need(prop.get('ActiveState') in ['inactive', 'failed'] and prop.get('MainPID', '0') == '0', 'backup_writer_active')
+        pid_quiet = prop.get('MainPID') == '0' or unit in UNITS and unit.endswith('.timer') and 'MainPID' not in prop
+        g.need(prop.get('ActiveState') in ['inactive', 'failed'] and pid_quiet, 'backup_writer_active')
     deploy = g.private_json(Path('/etc/harbor-gateway-deploy.json'))
     g.need(deploy.get('image_staging_enabled') is False, 'release_writer_active')
 

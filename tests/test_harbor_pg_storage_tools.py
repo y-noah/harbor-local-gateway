@@ -14,6 +14,21 @@ h=load('storage_tools_host',CI/'harbor-pg-storage-host.py')
 b=load('storage_host_bridge',CI/'storage-recovery/bridge-pg-storage-host.py')
 HOST_CLASS=h.Host
 
+class WriterUnitShapes(unittest.TestCase):
+ def test_timer_show_without_mainpid_is_quiet_but_services_and_unknown_pid_are_rejected(self):
+  timer=b.WRITERS[0]
+  # systemctl show .timer omits MainPID; service output includes it.
+  raw=b'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+  with patch.object(b,'command',return_value=raw):self.assertNotIn('MainPID',b.quiet(timer))
+  for name,pid,state in [(b.ONLINE,None,'inactive'),(b.WRITERS[1],None,'inactive'),('unknown.timer',None,'inactive'),(timer,'','inactive'),(timer,'unknown','inactive'),(timer,'9','inactive'),(timer,None,'active')]:
+   with self.subTest(name=name,pid=pid,state=state):
+    value=('LoadState=loaded\nActiveState='+state+'\nControlGroup=\n'+('MainPID='+pid+'\n' if pid is not None else '')).encode()
+    with patch.object(b,'command',return_value=value),self.assertRaisesRegex(RuntimeError,'unit_not_stopped'):b.quiet(name)
+  with patch.object(b,'command',return_value=raw+b'MainPID=0\n'):b.quiet(b.WRITERS[1])
+ def test_timer_without_pid_still_rejects_populated_cgroup(self):
+  raw=b'LoadState=loaded\nActiveState=inactive\nControlGroup=/system.slice/harbor-postgres-maintain-base.timer\n'
+  with patch.object(b,'command',return_value=raw),patch.object(Path,'exists',return_value=True),patch.object(Path,'read_text',return_value='populated 1\n'),self.assertRaisesRegex(RuntimeError,'unit_descendants_active'):b.quiet(b.WRITERS[0])
+
 class Tools(unittest.TestCase):
  def fixture(self):
   self.plan={'scope':'harbor-pg-storage-move-v1','runId':'a'*32,'systemId':'123','materialsDirectory':'/materials','containers':{h.PG:{'id':'p'}},'toolSha256':{str(Path(h.__file__)):'a'*64,str(h.MATERIAL):h.sha(b'material')}}
@@ -209,7 +224,7 @@ class BridgeLifecycle(unittest.TestCase):
   p={'scope':'harbor-pg-storage-move-v1','approved':True,'runId':'a'*32,'toolSha256':{str(self.host):self.approval['oldHostSha256']}};self.plan.write_text(json.dumps(p));self.approval['planSha256']=b.sha(self.plan.read_bytes());self.plan_bytes=self.plan.read_bytes()
   self.state.write_text(json.dumps({'scope':p['scope'],'runId':p['runId'],'phase':'complete','oldDataRollbackForbidden':True,'targetBootAuthorized':True}))
   self.online={'LoadState':'loaded','ActiveState':'active','SubState':'running','MainPID':'999999999','InvocationID':'original','ControlGroup':'/system.slice/'+b.ONLINE,'ExecStart':str(self.host),'processStartTicks':'123'}
-  self.states={b.ONLINE:dict(self.online),**{name:{'LoadState':'loaded','ActiveState':'active' if name.endswith('.timer') else 'inactive','MainPID':'0','ControlGroup':''} for name in b.WRITERS}};self.fail_start=False;self.generation=0
+  self.states={b.ONLINE:dict(self.online),**{name:{'LoadState':'loaded','ActiveState':'active' if name.endswith('.timer') else 'inactive',**({'SubState':'waiting'} if name.endswith('.timer') else {'MainPID':'0','ControlGroup':''})} for name in b.WRITERS}};self.fail_start=False;self.generation=0
   self.patches=[patch.object(b,'HOST',self.host),patch.object(b,'PLAN',self.plan),patch.object(b,'STATE',self.state),patch.object(b,'RECEIPT',self.receipt),patch.object(b,'ROOT',self.bridge_root),patch.object(b,'read_approval',return_value=(self.approval,'d'*64)),patch.object(b,'read',side_effect=self.read),patch.object(b,'locks',return_value=__import__('contextlib').nullcontext()),patch.object(b,'bridge_roots',return_value={'db':[1,2]}),patch.object(b,'original_host',return_value=types.SimpleNamespace(Host=self.current_host,verify_factory_guard=self.factory_guard)),patch.object(b,'source_identity',return_value='active'),patch.object(h,'code_bytes',return_value=b'approved-host'),patch.object(b,'supervisor',side_effect=lambda:dict(self.states[b.ONLINE])),patch.object(b,'unit',side_effect=lambda name:dict(self.states[name])),patch.object(b,'command',side_effect=self.command),patch.object(os,'geteuid',return_value=0),patch.dict(os.environ,dict(os.environ))]
   for p in self.patches:p.start()
  def current_host(self):
@@ -228,11 +243,14 @@ class BridgeLifecycle(unittest.TestCase):
   return path.read_bytes()
  def command(self,args,**kwargs):
   if args[1]=='stop':
-   for name in self.states:self.states[name].update(ActiveState='inactive',MainPID='0',ControlGroup='')
+   for name in self.states:
+    self.states[name].update(ActiveState='inactive')
+    if not name.endswith('.timer'):self.states[name].update(MainPID='0',ControlGroup='')
   elif args[1]=='start':
    if self.fail_start:raise RuntimeError('host_bridge_unit_command_failed')
    name=args[-1];self.generation+=1
-   self.states[name].update(ActiveState='active',SubState='running',MainPID='999999998' if name==b.ONLINE else '0',InvocationID='new-'+str(self.generation))
+   self.states[name].update(ActiveState='active',SubState='waiting' if name.endswith('.timer') else 'running',InvocationID='new-'+str(self.generation))
+   if not name.endswith('.timer'):self.states[name]['MainPID']='999999998' if name==b.ONLINE else '0'
    if name==b.ONLINE:
     state=json.loads(self.state.read_bytes());state['supervisorTools']={'files':{'/approved-tool':'digest'},'hostSha256':h.sha(b'approved-host'),'pid':int(self.states[name]['MainPID']),'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip()};self.state.write_text(json.dumps(state))
   return b''

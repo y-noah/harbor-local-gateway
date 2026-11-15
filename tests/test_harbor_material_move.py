@@ -16,6 +16,20 @@ spec.loader.exec_module(m)
 
 
 class Tests(unittest.TestCase):
+    def test_quiescent_uses_real_timer_shape_but_rejects_missing_or_invalid_service_pid(self):
+        value={'containers':{name:'synthetic-'+name for name in m.APPS}}
+        def check(states):
+            def run(args,**kwargs):
+                if args[0]=='/usr/bin/docker':return json.dumps([value['containers'][args[-1]],False,False,False,'no']).encode()
+                return states[args[2]]
+            with patch.object(m,'run',side_effect=run),patch.object(m.g,'private_json',return_value={'image_staging_enabled':False}):m.quiescent(value)
+        states={name:b'ActiveState=inactive\n'+(b'' if name.endswith('.timer') else b'MainPID=0\n') for name in m.UNITS}
+        check(states)
+        for name,pid,state in [(m.UNITS[0],None,'inactive'),(m.UNITS[1],None,'inactive'),(m.UNITS[0],'unknown','inactive'),(m.UNITS[0],'9','inactive'),(m.UNITS[2],'','inactive'),(m.UNITS[2],'unknown','inactive'),(m.UNITS[2],None,'active')]:
+            with self.subTest(name=name,pid=pid,state=state):
+                modified={**states,name:('ActiveState='+state+'\n'+('MainPID='+pid+'\n' if pid is not None else '')).encode()}
+                with self.assertRaisesRegex(ValueError,'backup_writer_active'):check(modified)
+
     def test_real_cold_copy_preserves_bytes_modes_and_original_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             source, target = Path(directory) / 'source', Path(directory) / 'target'

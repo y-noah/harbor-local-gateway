@@ -86,6 +86,78 @@ class Retirement(unittest.TestCase):
   fresh=object.__new__(r.Retirement);fresh.__dict__.update(self.retire.__dict__);fresh.plan=json.loads(fresh.evidence(r.PLAN));fresh.state=json.loads(fresh.evidence(r.STATE));fresh.journal=json.loads(local_read(fresh.intent,True)) if fresh.intent.exists() else None
   if fresh.journal is not None:self.assertEqual(fresh.journal['binding'],fresh.binding())
   self.retire=fresh;return fresh
+ def source_restored_after_gate(self):
+  core=load('retirement_fixed_writer_core',CI/'harbor-pg-storage-coordinator.py');self.core.WRITERS=core.WRITERS
+  self.writer_states={name:{'LoadState':'loaded','ActiveState':'active' if name.endswith('.timer') or 'schedule' in name else 'inactive','SubState':'waiting' if name.endswith('.timer') else 'running' if 'schedule' in name else 'dead','InvocationID':'restored-'+name,'Result':'success','UnitFileState':'enabled'} for name in core.WRITERS}
+  for name,row in self.writer_states.items():
+   if name.endswith('.service'):row.update(MainPID='321' if 'schedule' in name else '0',ExecMainStatus='0',ControlGroup='/system.slice/'+name if 'schedule' in name else '')
+  schedule=core.WRITERS[2];group=self.cgroup/'system.slice'/schedule;group.mkdir();(group/'cgroup.events').write_text('populated 1\nfrozen 0\n')
+  original=copy.deepcopy(self.writer_states);original[schedule]['MainPID']='123';original[schedule]['InvocationID']='original-schedule'
+  self.state.update(phase='source-restored',writersPauseStarted=True,writers=original,gate={'owned':'snapshot'},gateIntent={'state':'removed','bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'runId':self.runid,'activeIdentityDigest':self.plan['activeIdentityDigest']})
+  original_unit=self.unit;self.host.state_unit=lambda name,allow_absent=False:copy.deepcopy(self.writer_states[name]) if name in self.writer_states else original_unit(name,allow_absent)
+  original_group=self.host.entry.process_cgroup;self.host.entry.process_cgroup=lambda pid:'/system.slice/'+schedule if pid==321 else original_group(pid)
+  self.host.verify_original_roots=Mock()
+  r.STATE.write_bytes(r.canonical(self.state));self.a['files'][str(r.STATE)]=r.sha(r.STATE.read_bytes());self.raws[r.STATE]=r.STATE.read_bytes()
+ def test_gated_source_restored_retires_without_changing_old_evidence(self):
+  self.source_restored_after_gate();self.assertTrue(self.retire.run('inspect')['eligible']);self.host.verify_original_roots.assert_called()
+  self.assertTrue(self.retire.run('retire')['retired']);self.assertEqual(self.retire.archive_new.stat().st_ino,self.archive_inode)
+  for source,target in self.retire.destinations.items():self.assertEqual(target.read_bytes(),self.raws[source]);self.assertEqual(target.stat().st_ino,self.inodes[source])
+  self.assertIn('restoredWriters',self.retire.journal['before']);self.assertTrue(self.restart().run('retire')['retired'])
+ def test_gated_recovery_refuses_other_touches_missing_witness_or_foreign_gate(self):
+  self.source_restored_after_gate()
+  faults=[(key,True) for key in r.TOUCHED-{'gate','gateIntent','writersPauseStarted'}]+[('phase','recovering-source'),('writersPauseStarted',False),('writers',{}),('gate',None)]
+  for key,value in faults:
+   with self.subTest(field=key):
+    saved=copy.deepcopy(self.state);self.state[key]=value
+    try:
+     with self.assertRaises(RuntimeError):self.retire.run('retire')
+     self.assertFalse(r.HISTORY.exists())
+    finally:self.state.clear();self.state.update(saved)
+  for key in ['sourceRecoveryProcesses','sourceRecoveryNetwork','workerGeneration','applicationsStartEpochMs','gateIntent']:
+   value=self.state.pop(key)
+   try:
+    with self.assertRaises(RuntimeError):self.retire.run('inspect')
+   finally:self.state[key]=value
+  for key in ['state','bootId','runId','activeIdentityDigest']:
+   value=self.state['gateIntent'][key];self.state['gateIntent'][key]='foreign'
+   try:
+    with self.assertRaisesRegex(RuntimeError,'gate_recovery_binding_changed'):self.retire.run('inspect')
+   finally:self.state['gateIntent'][key]=value
+ def test_gated_recovery_refuses_roots_gate_and_unrestored_writer(self):
+  self.source_restored_after_gate()
+  with patch.object(self.host,'verify_original_roots',side_effect=RuntimeError('host_original_root_changed')),self.assertRaisesRegex(RuntimeError,'host_original_root_changed'):self.retire.run('inspect')
+  with patch.object(self.host.entry,'execute',return_value=b'{"nftables":[{"table":{"name":"gate"}}]}'),self.assertRaisesRegex(RuntimeError,'gate_present'):self.retire.run('inspect')
+  timer,base,schedule=self.core.WRITERS
+  faults=[(timer,'MainPID','8'),(timer,'SubState','running'),(base,'MainPID',None),(base,'MainPID','9'),(base,'ActiveState','active'),(base,'Result','exit-code'),(schedule,'MainPID','0'),(schedule,'ActiveState','inactive'),(schedule,'Result','exit-code'),(schedule,'ControlGroup','')]
+  for name,key,value in faults:
+   with self.subTest(unit=name,field=key):
+    saved=copy.deepcopy(self.writer_states[name])
+    if value is None:self.writer_states[name].pop(key,None)
+    else:self.writer_states[name][key]=value
+    try:
+     with self.assertRaises(RuntimeError):self.retire.run('inspect')
+     self.assertFalse(r.HISTORY.exists())
+    finally:self.writer_states[name]=saved
+  self.writer_states[base]['ControlGroup']='/system.slice/'+base;group=self.cgroup/'system.slice'/base;group.mkdir();(group/'cgroup.events').write_text('populated 1\n')
+  with self.assertRaisesRegex(RuntimeError,'writer_descendants_alive'):self.retire.run('inspect')
+ def test_gated_recovery_writer_restart_during_move_is_not_ignored(self):
+  self.source_restored_after_gate();move=self.retire.move
+  def changed(source,target):move(source,target);self.writer_states[self.core.WRITERS[2]]['InvocationID']='replaced'
+  with patch.object(self.retire,'move',side_effect=changed),self.assertRaisesRegex(RuntimeError,'external_state_changed'):self.retire.run('retire')
+  self.assertTrue(self.retire.intent.exists());self.assertTrue(r.STATE.exists());self.assertEqual(self.retire.archive_new.stat().st_ino,self.archive_inode)
+ def test_gated_recovery_each_atomic_move_ack_loss_resumes_same_inodes(self):
+  for index in range(2+len(self.retire.destinations)):
+   with self.subTest(index=index):
+    case=Retirement('test_gated_source_restored_retires_without_changing_old_evidence');case.setUp()
+    try:
+     case.source_restored_after_gate();moves=[case.retire.archive_new,case.retire.shell]+sorted(case.retire.destinations.values());selected=moves[index];rename=old.rename_noreplace
+     def fail(source,target):
+      rename(source,target)
+      if target==selected:raise OSError('lost rename acknowledgement')
+     with patch.object(old,'rename_noreplace',side_effect=fail),self.assertRaises(OSError):case.retire.run('retire')
+     self.assertTrue(case.restart().run('retire')['retired']);self.assertEqual(case.retire.archive_new.stat().st_ino,case.archive_inode)
+     for source,target in case.retire.destinations.items():self.assertEqual(target.read_bytes(),case.raws[source]);self.assertEqual(target.stat().st_ino,case.inodes[source])
+    finally:case.tearDown()
  def test_constructor_reloads_archived_controls_after_retirement(self):
   hostfile=self.etc/'frozen-host.py';hostfile.write_bytes(b'# approved frozen test adapter\n');paths={str(hostfile),str(hostfile.with_name('harbor-pg-storage-coordinator.py')),'/usr/local/bin/harbor-gateway-deploy',*[str(hostfile.with_name(name)) for name in ['gateway-entry-controller.py','postgres-upgrade-deploy.py','postgres-deploy.py','entry-runtime.py','harbor-material-storage.py','harbor-material-move.py']]};tool_bytes={name:(b'# fixed '+name.encode()) for name in paths};tool_bytes[str(hostfile)]=hostfile.read_bytes();self.plan.update(toolSha256={name:r.sha(raw) for name,raw in tool_bytes.items()},materialMove={'approvalSha256':self.a['files'][str(r.MATERIAL)],'nonce':'approved'})
   r.PLAN.write_bytes(r.canonical(self.plan));self.plan_sha=r.sha(r.PLAN.read_bytes());self.host.planSha256=self.plan_sha;self.state['sourceRecoveryBaseline']['planSha256']=self.plan_sha;self.state['archiveAdopt']['planSha256']=self.plan_sha;r.STATE.write_bytes(r.canonical(self.state))

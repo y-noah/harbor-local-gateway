@@ -462,7 +462,10 @@ class Host:
   original=self.j['writers']
   for name in self.core.WRITERS:run(['/usr/bin/systemctl','stop',name],timeout=600)
   for name in self.core.WRITERS:
-   row=self.state_unit(name);need(row.get('ActiveState') in ['inactive','failed'] and row.get('MainPID')=='0','host_writer_not_stopped')
+   row=self.state_unit(name)
+   # Timer units do not expose MainPID; services must still explicitly report zero.
+   no_process=row.get('MainPID')=='0' or name.endswith('.timer') and 'MainPID' not in row
+   need(row.get('ActiveState') in ['inactive','failed'] and no_process,'host_writer_not_stopped')
    group=row.get('ControlGroup','')
    if group:
     need(group.startswith('/') and group==os.path.normpath(group) and group!='/','host_writer_cgroup_invalid');path=Path('/sys/fs/cgroup')/group.lstrip('/')

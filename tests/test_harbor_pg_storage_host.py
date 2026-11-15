@@ -89,6 +89,40 @@ class Tests(unittest.TestCase):
   before=copy.deepcopy(host.j['writers'])
   with patch.object(h,'run',side_effect=run):host.pause_writers()
   self.assertEqual(host.j['writers'],before)
+ def paused_writer_host(self,override=None):
+  host=self.host();host.core=load(CI/'harbor-pg-storage-coordinator.py','pause_writer_core');host.j={};host.save=lambda _:None
+  states={name:{'LoadState':'loaded','ActiveState':'inactive','SubState':'dead',**({} if name.endswith('.timer') else {'MainPID':'0','ControlGroup':''})} for name in host.core.WRITERS}
+  if override:
+   name,values=override;states[name]=values
+  # Exercise systemctl field parsing too: real timers omit MainPID and ControlGroup.
+  def show(args,**kwargs):return types.SimpleNamespace(returncode=0,stdout=''.join(k+'='+v+'\n' for k,v in states[args[2]].items()).encode())
+  return host,show
+ def test_pause_real_timer_shape_without_pid_or_cgroup_is_stopped(self):
+  host,show=self.paused_writer_host()
+  with patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'run',side_effect=show):original=host.pause_writers()
+  timer=host.core.WRITERS[0];self.assertNotIn('MainPID',original[timer]);self.assertNotIn('ControlGroup',original[timer]);self.assertTrue(host.j['writersPauseStarted'])
+ def test_pause_services_require_explicit_zero_and_timer_rejects_nonzero(self):
+  for name in ['harbor-postgres-maintain-base.service','harbor-postgres-backup-schedule.service','harbor-postgres-maintain-base.timer']:
+   values=[None,'','27'] if name.endswith('.service') else ['','27']
+   for pid in values:
+    with self.subTest(name=name,pid=pid):
+     row={'LoadState':'loaded','ActiveState':'inactive','SubState':'dead'}
+     if pid is not None:row['MainPID']=pid
+     host,show=self.paused_writer_host((name,row))
+     with patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'run',side_effect=show):
+      with self.assertRaisesRegex(RuntimeError,'host_writer_not_stopped'):host.pause_writers()
+ def test_pause_timer_active_state_is_not_accepted_without_pid(self):
+  for active in ['active','activating','deactivating']:
+   host,show=self.paused_writer_host(('harbor-postgres-maintain-base.timer',{'LoadState':'loaded','ActiveState':active}))
+   with self.subTest(active=active),patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'run',side_effect=show):
+    with self.assertRaisesRegex(RuntimeError,'host_writer_not_stopped'):host.pause_writers()
+ def test_pause_still_rejects_live_cgroup_for_timer_and_service(self):
+  for name in ['harbor-postgres-maintain-base.timer','harbor-postgres-maintain-base.service']:
+   row={'LoadState':'loaded','ActiveState':'inactive','ControlGroup':'/system.slice/'+name}
+   if name.endswith('.service'):row['MainPID']='0'
+   host,show=self.paused_writer_host((name,row))
+   with self.subTest(name=name),patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'run',side_effect=show),patch.object(Path,'exists',return_value=True),patch.object(Path,'read_text',return_value='populated 1\nfrozen 0\n'):
+    with self.assertRaisesRegex(RuntimeError,'host_writer_descendants_active'):host.pause_writers()
  def test_cold_db_rejects_replaced_created_root_before_any_write(self):
   core=load(CI/'harbor-pg-storage-coordinator.py','created_core');host=self.host();host.core=core;host.target_disk=lambda:None;host.require_docker_restart_disabled=lambda:self.fail('must validate root before docker/copy');host.j={}
   with tempfile.TemporaryDirectory(prefix='harbor-created-') as directory:

@@ -137,11 +137,47 @@ class Retirement:
   units=p['writerUnits'];need(isinstance(units,list) and units and len(set(units))==len(units) and all(isinstance(name,str) and re.fullmatch(r'harbor-pg-archive-[a-z0-9-]+\.service',name) for name in units),'archive_writer_inventory_invalid')
   for name in units:self.quiet(name,archive_writer=True)
 
+ def restored_writers(self):
+  """Observe the fixed writers after explicit source recovery; never restart them."""
+  expected=self.state['writers'];need(type(expected) is dict and set(expected)==set(self.host.core.WRITERS),'writer_snapshot_incomplete');result={}
+  for name in self.host.core.WRITERS:
+   original=expected[name];need(isinstance(original,dict) and original.get('LoadState')=='loaded' and original.get('ActiveState') in ['active','inactive','failed'],'writer_snapshot_invalid')
+   current=self.host.state_unit(name);need(current.get('LoadState')=='loaded','writer_not_restored');active=original['ActiveState']=='active';timer=name.endswith('.timer')
+   need(current.get('ActiveState')=='active' if active else current.get('ActiveState') in ['inactive','failed'],'writer_not_restored')
+   pid=current.get('MainPID');group=current.get('ControlGroup','' if timer else None)
+   need(isinstance(group,str),'writer_cgroup_unknown');need(Path('/sys/fs/cgroup/cgroup.controllers').is_file(),'cgroup_layout_unknown')
+   if timer:
+    need('MainPID' not in current or pid=='0','writer_pid_invalid')
+    if active:need(current.get('SubState')=='waiting','writer_not_restored')
+   else:
+    need(isinstance(pid,str) and re.fullmatch('[0-9]+',pid) and (int(pid)>0 if active else pid=='0'),'writer_pid_invalid')
+    need(isinstance(current.get('Result'),str) and isinstance(current.get('ExecMainStatus'),str),'writer_result_unknown')
+    if active:need(current.get('SubState')=='running' and current['Result']=='success' and current['ExecMainStatus']=='0','writer_not_restored')
+    else:need(current['Result']==original.get('Result') and current['ExecMainStatus']==original.get('ExecMainStatus'),'writer_result_changed')
+   if group:
+    need(group.startswith('/') and group!='/' and group==os.path.normpath(group),'writer_cgroup_unknown');events=Path('/sys/fs/cgroup')/group.lstrip('/')/'cgroup.events'
+    if active and not timer:need(events.is_file() and dict(line.split() for line in events.read_text().splitlines()).get('populated')=='1' and self.host.entry.process_cgroup(int(pid))==group,'writer_process_changed')
+    elif events.exists():need(dict(line.split() for line in events.read_text().splitlines()).get('populated')=='0','writer_descendants_alive')
+   else:need(not active or timer,'writer_cgroup_unknown')
+   projection={k:current.get(k) for k in ['LoadState','ActiveState','SubState','MainPID','ControlGroup','InvocationID','Result','ExecMainStatus','UnitFileState']}
+   if active and not timer:projection['processTicks']=self.host.entry.process_ticks(int(pid))
+   result[name]=projection
+  return result
+
  def qualify(self,full=False):
   for path in self.destinations:self.evidence(path)
   if self.journal is not None:need(self.journal['binding']==self.binding(),'retirement_binding_changed')
-  j=self.state;need(j.get('phase') in ['holding-intent','held','recovering-source','source-restored'] and j.get('failure',{}).get('oldDataRollbackAllowedForExplicitRecovery') is True and j.get('failure',{}).get('automaticOldDataRollback') is False and j.get('oldDataRollbackForbidden',False) is False and j.get('targetBootAuthorized',False) is False and not any(k in j for k in TOUCHED),'source_was_touched')
-  need(type(j.get('writers',{})) is dict and not j.get('writers',{}),'writers_were_paused')
+  j=self.state;restored=j.get('phase')=='source-restored' and j.get('writersPauseStarted') is True
+  need(j.get('phase') in ['holding-intent','held','recovering-source','source-restored'] and j.get('failure',{}).get('oldDataRollbackAllowedForExplicitRecovery') is True and j.get('failure',{}).get('automaticOldDataRollback') is False and j.get('oldDataRollbackForbidden',False) is False and j.get('targetBootAuthorized',False) is False,'source_was_touched')
+  writer_states=None
+  if restored:
+   need(TOUCHED&set(j)=={'gate','gateIntent','writersPauseStarted'} and j.get('gate') is not None,'source_was_touched')
+   need(j.get('gateIntent')=={'state':'removed','bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'runId':self.a['runId'],'activeIdentityDigest':self.plan['activeIdentityDigest']},'gate_recovery_binding_changed')
+   need({'sourceRecoveryProcesses','sourceRecoveryNetwork','workerGeneration','applicationsStartEpochMs'}<=set(j),'source_recovery_witness_changed')
+   self.host.verify_original_roots();writer_states=self.restored_writers()
+  else:
+   need(not any(k in j for k in TOUCHED),'source_was_touched')
+   need(type(j.get('writers',{})) is dict and not j.get('writers',{}),'writers_were_paused')
   need(not any(os.path.lexists(p) for p in ABSENT),'material_or_cold_state_present')
   h=self.host;h.target_disk();h.load_current_durable_active();need(self.old.sha(canonical(h.upgrade.active_identity(h.active)))==self.plan['activeIdentityDigest'],'active_changed');h.verify_source_recovery_materials()
   for line in Path('/proc/self/mountinfo').read_text().splitlines():
@@ -170,7 +206,9 @@ class Retirement:
   profile=h.entry.validate(h.entry.private_json(h.entry.PROFILE));need(h.entry.process_cgroup(pid)==profile['entryCgroup'],'entry_cgroup_changed')
   tables=json.loads(h.entry.execute(['/usr/sbin/nft','--json','list','tables']));need(not any(row.get('table',{}).get('name')==h.upgrade.GATE for row in tables.get('nftables',[])),'gate_present')
   worker_states=self.workers();self.archive(full)
-  return {'processes':processes,'activeIdentityDigest':self.plan['activeIdentityDigest'],'entry':{'id':runtime['Id'],'pid':pid,'startedAt':runtime['State']['StartedAt'],'ticks':h.entry.process_ticks(pid),'cgroup':h.entry.process_cgroup(pid),'epoch':control['epoch']},'workers':worker_states}
+  result={'processes':processes,'activeIdentityDigest':self.plan['activeIdentityDigest'],'entry':{'id':runtime['Id'],'pid':pid,'startedAt':runtime['State']['StartedAt'],'ticks':h.entry.process_ticks(pid),'cgroup':h.entry.process_cgroup(pid),'epoch':control['epoch']},'workers':worker_states}
+  if restored:result['restoredWriters']=writer_states
+  return result
 
  def save(self,value):
   raw=canonical(value)
