@@ -109,6 +109,27 @@ def process_cgroup(pid):
  rows=Path('/proc/'+str(pid)+'/cgroup').read_text().splitlines();require(len(rows)==1 and rows[0].startswith('0::'),'cgroup_v2_required');return rows[0][3:]
 
 
+def live_deploy_anchor(config,digest):
+ # The immutable profile authorizes a service scope and executable, not an
+ # arbitrary replacement PID. systemd supplies the current root service owner.
+ require(any(v['cgroup']==DEPLOY_CGROUP and v['executableSha256']==digest for v in config['bypassProcesses']),'dedicated_probe_cgroup_not_bound')
+ properties='Id,LoadState,ActiveState,SubState,MainPID,ControlGroup,InvocationID,FragmentPath,DropInPaths'
+ def observe():
+  raw=execute(['/usr/bin/systemctl','show','harbor-entry-deploy.service','--property='+properties]);lines=[line.split('=',1) for line in raw.splitlines() if '=' in line];row=dict(lines)
+  require(len(lines)==len(row) and set(row)==set(properties.split(',')),'probe_service_unknown')
+  require(row['Id']=='harbor-entry-deploy.service' and row['LoadState']=='loaded' and row['ActiveState']=='active' and row['SubState']=='running' and row['ControlGroup']==DEPLOY_CGROUP and re.fullmatch('[1-9][0-9]*',row['MainPID']) and int(row['MainPID'])>1 and re.fullmatch('[a-f0-9]{32}',row['InvocationID']),'probe_service_not_running')
+  for name in [row['FragmentPath'],*row['DropInPaths'].split()]:
+   path=Path(name);require(path.is_absolute(),'probe_service_unit_untrusted');trusted_parents(path);info=path.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'probe_service_unit_untrusted')
+  return row
+ before=observe();pid=int(before['MainPID']);ticks=process_ticks(pid)
+ require(process_cgroup(pid)==DEPLOY_CGROUP,'probe_anchor_cgroup_changed')
+ status=Path('/proc',str(pid),'status').read_text();uids=[line.split()[1:] for line in status.splitlines() if line.startswith('Uid:')];require(uids==[['0','0','0','0']],'probe_anchor_uid')
+ require(hashlib.sha256(Path('/proc',str(pid),'exe').read_bytes()).hexdigest()==digest,'probe_anchor_executable_changed')
+ group=Path('/sys/fs/cgroup')/DEPLOY_CGROUP.lstrip('/');trusted_parents(group);info=group.lstat();require(stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'probe_scope_untrusted')
+ require(observe()==before and process_ticks(pid)==ticks and process_cgroup(pid)==DEPLOY_CGROUP,'probe_anchor_generation_changed')
+ return {'pid':pid,'startTicks':ticks,'cgroup':DEPLOY_CGROUP,'executableSha256':digest,'cgroupInode':info.st_ino,'invocationId':before['InvocationID']}
+
+
 def inspect_container(cid):
  rows=json.loads(execute(['/usr/bin/docker','container','inspect',cid]));require(len(rows)==1 and rows[0]['Id']==cid,'container_identity');return rows[0]
 
@@ -665,14 +686,12 @@ class EntryDeployment:
  def enter_probe_worker(self):
   current=process_cgroup(os.getpid());digest=hashlib.sha256(Path('/proc/self/exe').read_bytes()).hexdigest()
   if any(v['cgroup']==current and v['executableSha256']==digest for v in self.config['bypassProcesses']):return
-  declared=[v for v in self.config['bypassProcesses'] if v['cgroup']==DEPLOY_CGROUP and v['executableSha256']==digest]
-  require(declared,'dedicated_probe_cgroup_not_bound')
-  # The root-owned idle service keeps this one cgroup alive. Only after all
-  # release/fence/network checks pass do we move this root worker itself, never
-  # its SSH parent or another process, into the already approved kernel scope.
-  anchor=declared[0];require(process_ticks(anchor['pid'])==str(anchor['startTicks']) and process_cgroup(anchor['pid'])==DEPLOY_CGROUP,'probe_anchor_changed')
+  anchor=live_deploy_anchor(self.config,digest)
+  # Move only this worker into the approved service scope. A service restart
+  # refreshes the live anchor without rewriting the root authorization profile.
   target=Path('/sys/fs/cgroup')/DEPLOY_CGROUP.lstrip('/')/'cgroup.procs';trusted_parents(target);info=target.lstat();require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022,'probe_scope_untrusted')
-  target.write_text(str(os.getpid()));require(process_cgroup(os.getpid())==DEPLOY_CGROUP,'probe_scope_not_entered')
+  require(target.parent.stat().st_ino==anchor['cgroupInode'] and live_deploy_anchor(self.config,digest)==anchor,'probe_anchor_generation_changed')
+  target.write_text(str(os.getpid()));require(process_cgroup(os.getpid())==DEPLOY_CGROUP and live_deploy_anchor(self.config,digest)==anchor,'probe_scope_not_entered')
 
  def probe(self,port,path,headers=None):
   self.check();require(self.candidate is not None and port==self.config['source']['port'] and path in ['/health','/ready','/api/admin/state'],'probe_target')
