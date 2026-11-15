@@ -25,6 +25,22 @@ async function identity(store,expected){
  need((await store.get("SELECT pg_has_role(current_user,$1::oid,'SET') ok",owner.oid)).ok,'owner_authorization');return value;
 }
 async function installed(store){return verifyDepartmentIsolationAvailability(store);}
+async function migrateAsOwner(store,binding){
+ const quote=value=>'"'+value.replaceAll('"','""')+'"';
+ const original=(await store.get('SELECT current_user name')).name,owner=quote(binding.owner);
+ const privileges=()=>store.get("SELECT has_schema_privilege($1,'harbor_operator','USAGE') schema_read,has_table_privilege($1,'harbor_operator.activation','SELECT') activation_read",binding.owner);
+ const before=await privileges();
+ // These grants stay inside the enclosing migration transaction. On failure,
+ // its rollback restores both the role and privileges with all migrated data.
+ if(!before.schema_read)await store.query('GRANT USAGE ON SCHEMA harbor_operator TO '+owner);
+ if(!before.activation_read)await store.query('GRANT SELECT ON harbor_operator.activation TO '+owner);
+ await store.query('SET LOCAL ROLE '+owner);
+ await migrateDepartmentIsolation(store,{apply:true,runtimeRole:binding.runtime});
+ await store.query('SET LOCAL ROLE '+quote(original));
+ if(!before.activation_read)await store.query('REVOKE SELECT ON harbor_operator.activation FROM '+owner);
+ if(!before.schema_read)await store.query('REVOKE USAGE ON SCHEMA harbor_operator FROM '+owner);
+ need(isDeepStrictEqual(await privileges(),before),'activation_privileges_changed');
+}
 export async function departmentReleaseOperation(store,action,input){
  need(['plan','status','install'].includes(action)&&input&&typeof input==='object'&&!Array.isArray(input),'arguments');
  return store.transaction(async()=>{
@@ -39,8 +55,7 @@ export async function departmentReleaseOperation(store,action,input){
   if(action==='install'){
    need(input.activate===true,'activation_required');await store.query('SELECT pg_stat_clear_snapshot()');
    need((await store.get('SELECT COUNT(*) n FROM pg_stat_activity WHERE datname=current_database() AND usesysid=ANY($1::oid[]) AND pid<>pg_backend_pid()',[binding.runtimeOid,binding.runtimeSessionRoleOid])).n===0,'runtime_not_drained');
-   await store.query('SET LOCAL ROLE "'+binding.owner+'"');
-   await migrateDepartmentIsolation(store,{apply:true,runtimeRole:binding.runtime});
+   await migrateAsOwner(store,binding);
    need(await installed(store),'installation_unconfirmed');
   }
   return {action,contract:departmentIsolationContract,quota_subject_contract:quotaSubjectContract,quota_subject_installed:await verifyQuotaSubjectAvailability(store),binding,installed:action==='install'||before,changed:action==='install'&&!before};

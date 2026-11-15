@@ -1,4 +1,4 @@
-import importlib.util,unittest
+import importlib.util,unittest,types
 from pathlib import Path
 from unittest.mock import Mock,patch
 spec=importlib.util.spec_from_file_location('department_release',Path(__file__).parents[1]/'ci/postgres-department-release.py');release=importlib.util.module_from_spec(spec);spec.loader.exec_module(release)
@@ -6,6 +6,20 @@ spec=importlib.util.spec_from_file_location('department_release',Path(__file__).
 class DepartmentReleaseTests(unittest.TestCase):
  def prepared(self,activate=False,installed=False):
   value=object.__new__(release.DepartmentRelease);value.activate=activate;value.plan={'binding':{'synthetic':True},'installed':installed};value.source_contracts=[release.CONTRACT]*2;value.source_quota_contracts=[release.QUOTA_CONTRACT]*2;value.quota_supported=True;value.record={'departmentIsolation':{}};value.api={'NAME':'harbor','inspect_container':lambda name:None};value.check_active=Mock();value.check_sources=Mock();value.save=Mock();value.uncertain=False;value.install_attempted=True;value.receipt=None;value.command=Mock(return_value={'contract':release.CONTRACT,'installed':installed,'quota_subject_contract':release.QUOTA_CONTRACT,'quota_subject_installed':installed});return value
+ def test_command_nonzero_reports_only_validated_stderr_code_and_still_cleans_container(self):
+  cases=[(b'{"ok":false,"code":"42501"}','_42501'),(b'{"ok":false,"code":"department_release_runtime_not_drained"}','_department_release_runtime_not_drained'),(b'raw SQL and credentials',''),(b'{"ok":false,"code":"permission denied: SELECT secret"}',''),(b'{"ok":true,"code":"42501"}',''),(b'{"ok":false,"code":"42501","sql":"secret"}',''),(b'{"ok":false,"code":123}',''),(b'\xff','')]
+  for stderr,suffix in cases:
+   with self.subTest(stderr=stderr):
+    value=object.__new__(release.DepartmentRelease);value.image='synthetic';value.image_id='sha256:'+'b'*64;value.connection={};removed=[];cid='a'*64
+    row={'Id':cid,'Image':value.image_id,'Config':{'Labels':{'com.harbor.maintenance':'harbor-department-release-synthetic'},'User':'node'},'HostConfig':{'ReadonlyRootfs':True,'NetworkMode':'host'},'Mounts':[]}
+    value.api={'inspect_image':lambda image:{'Id':value.image_id},'inspect_container':lambda name:None if removed else row}
+    def command(args,**kwargs):
+     if args[1]=='create':return types.SimpleNamespace(returncode=0,stdout=(cid+'\n').encode())
+     if args[1]=='start':return types.SimpleNamespace(returncode=1,stdout=b'',stderr=stderr)
+     self.assertEqual(args[1:3],['rm','--force']);removed.append(args[-1]);return types.SimpleNamespace(returncode=0)
+    with patch.object(release.uuid,'uuid4',return_value=types.SimpleNamespace(hex='synthetic')),patch.object(release.subprocess,'run',side_effect=command):
+     with self.assertRaises(RuntimeError) as failure:value.command('install',{})
+    self.assertEqual(str(failure.exception),'department_release_maintenance_install_failed'+suffix);self.assertEqual(removed,[cid])
  def test_explicit_activation_rejects_old_sources_before_owner_access(self):
   for installed,activate in [(False,True),(True,False)]:
    with patch.object(release.transport,'owner_transport') as transport:

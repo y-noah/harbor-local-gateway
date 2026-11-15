@@ -68,7 +68,13 @@ class DepartmentRelease(transport.UsageCascadeRelease):
             payload=json.dumps({'connection':self.connection,'cascade':cascade}).encode();need(len(payload)<=131072,'maintenance_input_budget')
             result=subprocess.run(['/usr/bin/docker','start','--attach','--interactive',cid],input=payload,capture_output=True,timeout=75)
             need(len(result.stdout)<=131072 and len(result.stderr)<=16384,'maintenance_output_budget')
-            if result.returncode!=0:raise RuntimeError('department_release_maintenance_'+action.replace('-','_')+'_failed')
+            if result.returncode!=0:
+                code=None
+                try:
+                    error=json.loads(result.stderr)
+                    if isinstance(error,dict) and set(error)=={'ok','code'} and error['ok'] is False and isinstance(error['code'],str) and re.fullmatch('[A-Za-z0-9_]{1,80}',error['code']):code=error['code']
+                except (ValueError,UnicodeError):pass
+                raise RuntimeError('department_release_maintenance_'+action.replace('-','_')+'_failed'+('_'+code if code else ''))
             value=json.loads(result.stdout);need(isinstance(value,dict) and value.get('action')==action,'maintenance_result');return value
         finally:
             payload=b''
