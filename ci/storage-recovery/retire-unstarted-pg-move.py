@@ -15,6 +15,7 @@ PROOF=ROOT/'.pg-storage-archive-proof.json'
 MATERIAL=Path('/etc/harbor-material-move.json')
 HOST=Path('/usr/local/lib/harbor/harbor-pg-storage-host.py')
 APPROVAL=Path('/etc/harbor-pg-storage-retirement.json')
+CODE_APPROVAL=Path('/etc/harbor-pg-storage-retirement-code.json')
 HISTORY=ROOT/'.pg-storage-retired'
 ETC_HISTORY=Path('/etc/harbor-pg-storage-retired')
 ENV={'PATH':'/usr/bin:/bin','LANG':'C','HOME':'/nonexistent','DOCKER_CONFIG':'/nonexistent','DOCKER_HOST':'unix:///run/docker.sock'}
@@ -52,7 +53,14 @@ def approval():
  paths=set(map(Path,value['files']));need(MANDATORY<=paths,'required_evidence_missing')
  for path in paths-MANDATORY:
   need(path.parent==ROOT and (re.fullmatch(r'\.pg-storage-(?:switch|recover-source)-launch(?:-[a-f0-9]{16})?\.json',path.name) or re.fullmatch(r'\.pg-storage-'+value['runId']+r'(?:-recover-source-[a-f0-9]{16})?\.log',path.name)),'unapproved_path')
- need(sha(read(Path(__file__)))==value['installerSha256'],'installer_unapproved')
+ current_sha=sha(read(Path(__file__)))
+ if current_sha!=value['installerSha256']:
+  # Opt-in code replacement preserves the original scope and journal authority.
+  code=json.loads(read(CODE_APPROVAL,True))
+  keys={'version','approved','approvalSha256','approvalId','runId','oldInstallerSha256','newCodeSha256','revision','pipeline','artifactJob'}
+  need(isinstance(code,dict) and set(code)==keys and type(code['version']) is int and code['version']==1 and code['approved'] is True,'code_approval_invalid')
+  need(all(isinstance(code[k],str) and re.fullmatch('[a-f0-9]{64}',code[k]) for k in ['approvalSha256','oldInstallerSha256','newCodeSha256']) and isinstance(code['revision'],str) and re.fullmatch('[a-f0-9]{40}',code['revision']) and all(type(code[k]) is int and code[k]>0 for k in ['pipeline','artifactJob']),'code_approval_identity_invalid')
+  need(code['approvalSha256']==sha(raw) and code['approvalId']==value['id'] and code['runId']==value['runId'] and code['oldInstallerSha256']==value['installerSha256'] and code['newCodeSha256']==current_sha,'code_approval_binding_changed')
  return value,sha(raw)
 
 class Retirement:
@@ -255,9 +263,24 @@ class Retirement:
   finally:os.close(fd)
   for path in paths:self.host.core.sync_dir(path)
 
+ def same_before(self,current,before):
+  if current==before:return True
+  # A trusted writer that was and remains stopped may complete another
+  # successful invocation. Running writers retain their complete identity.
+  if self.state.get('phase')!='source-restored' or self.state.get('writersPauseStarted') is not True:return False
+  projections=[{**snapshot,'restoredWriters':dict(snapshot.get('restoredWriters',{}))} for snapshot in [current,before]]
+  for name in self.host.core.WRITERS:
+   if not name.endswith('.service') or self.state.get('writers',{}).get(name,{}).get('ActiveState')!='inactive':continue
+   rows=[projection['restoredWriters'].get(name,{}) for projection in projections]
+   if not all(all(row.get(k)==v for k,v in {'LoadState':'loaded','ActiveState':'inactive','MainPID':'0','Result':'success','ExecMainStatus':'0'}.items()) and isinstance(row.get('ControlGroup'),str) and isinstance(row.get('InvocationID'),str) for row in rows):continue
+   # qualify() already verifies no live descendants. Do not change either
+   # snapshot or normalize configuration, cgroup, result, or other unit fields.
+   for projection,row in zip(projections,rows):projection['restoredWriters'][name]={k:v for k,v in row.items() if k!='InvocationID'}
+  return projections[0]==projections[1]
+
  def run(self,action):
   before=self.qualify(full=True)
-  if self.journal is not None:need(before==self.journal['before'],'external_state_changed')
+  if self.journal is not None:need(self.same_before(before,self.journal['before']),'external_state_changed')
   if action=='inspect':return {'readOnly':True,'eligible':True,'retired':self.journal is not None and self.journal['phase']=='retired-source-untouched','archiveRecopyAllowed':False}
   if self.journal is None:
    for path in [HISTORY,self.history,ETC_HISTORY,self.etc]:
@@ -268,8 +291,8 @@ class Retirement:
   self.durable_before_moves()
   moves=[(self.archive_old,self.archive_new),(self.target,self.shell)]+[(path,self.destinations[path]) for path in sorted(self.destinations,key=lambda p:(p in [STATE,PLAN],str(p)))]
   for source,target in moves:
-   need(self.qualify()==before,'external_state_changed');self.move(source,target);need(self.qualify()==before,'external_state_changed')
-  need(all(not os.path.lexists(p) for p in self.destinations) and not os.path.lexists(self.target),'canonical_names_not_free');need(self.qualify(full=True)==before,'external_state_changed')
+   need(self.same_before(self.qualify(),before),'external_state_changed');self.move(source,target);need(self.same_before(self.qualify(),before),'external_state_changed')
+  need(all(not os.path.lexists(p) for p in self.destinations) and not os.path.lexists(self.target),'canonical_names_not_free');need(self.same_before(self.qualify(full=True),before),'external_state_changed')
   self.save(dict(self.journal,phase='retired-source-untouched'))
   return {'retired':True,'sourceUnchanged':True,'entryUnchanged':True,'originalEvidencePreserved':True,'archiveSameInode':True,'archiveRecopied':False,'oldRunCompleted':False,'canonicalNamesFree':True}
 

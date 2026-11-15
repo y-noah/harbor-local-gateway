@@ -140,11 +140,50 @@ class Retirement(unittest.TestCase):
     finally:self.writer_states[name]=saved
   self.writer_states[base]['ControlGroup']='/system.slice/'+base;group=self.cgroup/'system.slice'/base;group.mkdir();(group/'cgroup.events').write_text('populated 1\n')
   with self.assertRaisesRegex(RuntimeError,'writer_descendants_alive'):self.retire.run('inspect')
- def test_gated_recovery_writer_restart_during_move_is_not_ignored(self):
+ def test_gated_recovery_live_schedule_restart_during_move_is_not_ignored(self):
   self.source_restored_after_gate();move=self.retire.move
   def changed(source,target):move(source,target);self.writer_states[self.core.WRITERS[2]]['InvocationID']='replaced'
   with patch.object(self.retire,'move',side_effect=changed),self.assertRaisesRegex(RuntimeError,'external_state_changed'):self.retire.run('retire')
   self.assertTrue(self.retire.intent.exists());self.assertTrue(r.STATE.exists());self.assertEqual(self.retire.archive_new.stat().st_ino,self.archive_inode)
+ def freeze_gated_after_shell(self):
+  self.source_restored_after_gate();move=self.retire.move
+  def pause(source,target):
+   move(source,target)
+   if source==self.target:raise OSError('ack lost after archive and target shell moves')
+  with patch.object(self.retire,'move',side_effect=pause),self.assertRaises(OSError):self.retire.run('retire')
+  self.assertTrue(self.retire.shell.exists());self.assertTrue(self.retire.archive_new.exists());self.assertTrue(r.STATE.exists())
+  return copy.deepcopy(self.retire.journal['before']),r.STATE.read_bytes()
+ def test_completed_maintenance_invocation_resumes_original_moving_before(self):
+  before,raw=self.freeze_gated_after_shell();name='harbor-postgres-maintain-base.service';self.writer_states[name]['InvocationID']='completed-next-invocation'
+  self.assertTrue(self.restart().run('retire')['retired']);self.assertEqual(self.retire.journal['before'],before);self.assertEqual(self.retire.evidence(r.STATE),raw);self.assertEqual(self.retire.archive_new.stat().st_ino,self.archive_inode)
+ def test_completed_maintenance_invocations_between_moves_preserve_original_before(self):
+  self.source_restored_after_gate();move=self.retire.move;changes=[]
+  def complete(source,target):
+   move(source,target);changes.append(target);self.writer_states['harbor-postgres-maintain-base.service']['InvocationID']='completed-'+str(len(changes))
+  with patch.object(self.retire,'move',side_effect=complete):self.assertTrue(self.retire.run('retire')['retired'])
+  self.assertEqual(self.retire.journal['before']['restoredWriters']['harbor-postgres-maintain-base.service']['InvocationID'],'restored-harbor-postgres-maintain-base.service');self.assertEqual(self.retire.evidence(r.STATE),self.raws[r.STATE])
+ def test_maintenance_comparison_never_normalizes_live_failed_or_other_fields(self):
+  before,raw=self.freeze_gated_after_shell();name='harbor-postgres-maintain-base.service';self.writer_states[name]['InvocationID']='completed-next-invocation';original=copy.deepcopy(self.writer_states[name])
+  for key,value in [('MainPID','55'),('ActiveState','active'),('Result','exit-code'),('ExecMainStatus','1'),('UnitFileState','disabled'),('SubState','different')]:
+   with self.subTest(field=key):
+    self.writer_states[name][key]=value
+    try:
+     with self.assertRaises(RuntimeError):self.restart().run('retire')
+     self.assertEqual(self.retire.journal['before'],before);self.assertEqual(r.STATE.read_bytes(),raw)
+    finally:self.writer_states[name]=copy.deepcopy(original)
+  self.writer_states[name]['ControlGroup']='/system.slice/'+name;group=self.cgroup/'system.slice'/name;group.mkdir();(group/'cgroup.events').write_text('populated 1\n')
+  with self.assertRaisesRegex(RuntimeError,'writer_descendants_alive'):self.restart().run('retire')
+ def test_maintenance_comparison_keeps_timer_schedule_and_core_identity_exact(self):
+  self.source_restored_after_gate();before=self.retire.qualify();current=copy.deepcopy(before);current['restoredWriters']['harbor-postgres-maintain-base.service']['InvocationID']='next'
+  self.assertTrue(self.retire.same_before(current,before));self.assertEqual(before['restoredWriters']['harbor-postgres-maintain-base.service']['InvocationID'],'restored-harbor-postgres-maintain-base.service')
+  variants=[('timer',lambda x:x['restoredWriters'][self.core.WRITERS[0]].update(InvocationID='restarted')),('schedule',lambda x:x['restoredWriters'][self.core.WRITERS[2]].update(InvocationID='restarted')),('schedule-pid',lambda x:x['restoredWriters'][self.core.WRITERS[2]].update(MainPID='999')),('schedule-ticks',lambda x:x['restoredWriters'][self.core.WRITERS[2]].update(processTicks='new')),('entry',lambda x:x['entry'].update(epoch=9)),('source',lambda x:x['processes'][old.PG].update(pid=99)),('migration-worker',lambda x:next(iter(x['workers'].values())).update(InvocationID='restarted'))]
+  for name,change in variants:
+   candidate=copy.deepcopy(current);change(candidate)
+   with self.subTest(change=name):self.assertFalse(self.retire.same_before(candidate,before))
+ def test_completed_invocation_comparison_uses_trusted_stopped_service_semantics(self):
+  self.source_restored_after_gate();before=self.retire.qualify();name=self.core.WRITERS[2];self.state['writers'][name]['ActiveState']='inactive';before['restoredWriters'][name].update(ActiveState='inactive',MainPID='0',SubState='dead',ControlGroup='');before['restoredWriters'][name].pop('processTicks',None);current=copy.deepcopy(before);current['restoredWriters'][name]['InvocationID']='completed-next'
+  self.assertTrue(self.retire.same_before(current,before));self.state['writers'][name]['ActiveState']='active';self.assertFalse(self.retire.same_before(current,before))
+  self.state['writers'][name]['ActiveState']='inactive';self.core.WRITERS=self.core.WRITERS[:2];self.assertFalse(self.retire.same_before(current,before))
  def test_gated_recovery_each_atomic_move_ack_loss_resumes_same_inodes(self):
   for index in range(2+len(self.retire.destinations)):
    with self.subTest(index=index):
@@ -378,5 +417,63 @@ class Retirement(unittest.TestCase):
   (self.purpose/'archive').mkdir()
   with self.assertRaisesRegex(RuntimeError,'archive_ambiguous'):self.retire.run('retire')
   self.assertTrue(r.PLAN.exists());self.assertEqual((self.target/'archive').stat().st_ino,self.archive_inode)
+
+class CodeApproval(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(prefix='retirement-code-approval-');self.root=Path(self.tmp.name);self.code=self.root/'retirer.py';self.approval=self.root/'approval.json';self.supplement=self.root/'code.json';self.code.write_bytes(b'new reviewed code');self.old_sha=r.sha(b'old reviewed code')
+  self.value={'version':1,'approved':True,'id':'11111111-2222-4333-8444-555555555555','runId':'a'*32,'files':{str(path):'b'*64 for path in r.MANDATORY},'installerSha256':self.old_sha,'revision':'c'*40,'pipeline':1,'artifactJob':2};self.raw=r.canonical(self.value);self.approval.write_bytes(self.raw);self.approval.chmod(0o600)
+  self.permission={'version':1,'approved':True,'approvalSha256':r.sha(self.raw),'approvalId':self.value['id'],'runId':self.value['runId'],'oldInstallerSha256':self.old_sha,'newCodeSha256':r.sha(self.code.read_bytes()),'revision':'d'*40,'pipeline':3,'artifactJob':4};self.save_permission()
+  # Use actual bounded reads, O_NOFOLLOW and real file permissions. Only map
+  # ownership/private temporary-directory parents to the root-owned deployment.
+  lstat=Path.lstat;fstat=os.fstat;self.untrusted_owner=False
+  def trusted(info,directory=False):
+   values={k:getattr(info,k) for k in dir(info) if k.startswith('st_')};values['st_uid']=0
+   if directory:values['st_mode']&=~0o022
+   return types.SimpleNamespace(**values)
+  def path_stat(path):
+   value=lstat(path);return trusted(value,stat.S_ISDIR(value.st_mode))
+  def descriptor_stat(fd):
+   value=trusted(fstat(fd))
+   if self.untrusted_owner and self.supplement.exists() and value.st_ino==lstat(self.supplement).st_ino:value.st_uid=1000
+   return value
+  self.patches=[patch.object(r,'APPROVAL',self.approval),patch.object(r,'CODE_APPROVAL',self.supplement),patch.object(r,'__file__',str(self.code)),patch.object(Path,'lstat',path_stat),patch.object(os,'fstat',descriptor_stat)]
+  for p in self.patches:p.start()
+ def tearDown(self):
+  for p in reversed(self.patches):p.stop()
+  self.tmp.cleanup()
+ def save_permission(self):self.supplement.write_bytes(r.canonical(self.permission));self.supplement.chmod(0o600)
+ def test_direct_code_match_never_reads_supplement(self):
+  self.code.write_bytes(b'old reviewed code');self.supplement.unlink();self.supplement.symlink_to(self.root/'missing')
+  value,digest=r.approval();self.assertEqual(value,self.value);self.assertEqual(digest,r.sha(self.raw))
+ def test_supplement_preserves_original_authority_and_bytes(self):
+  value,digest=r.approval();self.assertEqual(value,self.value);self.assertEqual(digest,r.sha(self.raw));self.assertEqual(self.approval.read_bytes(),self.raw)
+ def test_supplement_missing_disabled_or_changed_binding_refuses(self):
+  self.supplement.unlink()
+  with self.assertRaises(FileNotFoundError):r.approval()
+  self.save_permission()
+  faults={'approved':False,'approvalSha256':'e'*64,'approvalId':'99999999-2222-4333-8444-555555555555','runId':'e'*32,'oldInstallerSha256':'e'*64,'newCodeSha256':'e'*64,'revision':'bad','pipeline':True,'artifactJob':0,'version':True}
+  for name,value in faults.items():
+   with self.subTest(field=name):
+    old_value=self.permission[name];self.permission[name]=value;self.save_permission()
+    try:
+     with self.assertRaises(RuntimeError):r.approval()
+    finally:self.permission[name]=old_value;self.save_permission()
+  self.permission['files']={};self.save_permission()
+  with self.assertRaisesRegex(RuntimeError,'code_approval_invalid'):r.approval()
+ def test_supplement_real_mode_symlink_and_owner_refuse(self):
+  self.supplement.chmod(0o644)
+  with self.assertRaisesRegex(RuntimeError,'untrusted_file'):r.approval()
+  self.supplement.chmod(0o600);self.untrusted_owner=True
+  with self.assertRaisesRegex(RuntimeError,'untrusted_file'):r.approval()
+  self.untrusted_owner=False;target=self.root/'permission-target';self.supplement.rename(target);self.supplement.symlink_to(target)
+  with self.assertRaises(OSError):r.approval()
+ def test_stale_supplement_cannot_authorize_different_original_bytes(self):
+  self.approval.write_bytes(self.raw+b'\n')
+  with self.assertRaisesRegex(RuntimeError,'code_approval_binding_changed'):r.approval()
+ def test_valid_code_permission_preserves_existing_moving_authority(self):
+  value,digest=r.approval();case=Retirement('test_completed_maintenance_invocation_resumes_original_moving_before');case.setUp()
+  try:
+   case.retire.approval_sha=digest;before,raw=case.freeze_gated_after_shell();case.writer_states['harbor-postgres-maintain-base.service']['InvocationID']='next-completed';self.assertTrue(case.restart().run('retire')['retired']);self.assertEqual(case.retire.journal['approvalSha256'],digest);self.assertEqual(case.retire.journal['before'],before);self.assertEqual(case.retire.evidence(r.STATE),raw);self.assertEqual(self.approval.read_bytes(),self.raw)
+  finally:case.tearDown()
 
 if __name__=='__main__':unittest.main()
