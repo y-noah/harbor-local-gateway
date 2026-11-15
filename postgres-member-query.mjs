@@ -42,14 +42,22 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
     const useRollups=await usageRollupsReady(store);
     const identityMeasures=profile==='list'?'MAX(r.started) last_seen':`COUNT(DISTINCT r.ip) ips,COUNT(DISTINCT r.device_id) used_devices,
         COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(r.started) last_seen`;
-    const rollupSql=`WITH identity AS (
-      SELECT r.${scope}_id owner_id,${identityMeasures}
-      FROM harbor.requests r WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3 GROUP BY r.${scope}_id
-    ),money AS (${usageRollupMoneySql(scope)}) SELECT i.*,m.* FROM identity i JOIN money m USING(owner_id)`;
-    const rows=await store.all(useRollups?rollupSql:`WITH identity AS (
-      SELECT r.${scope}_id owner_id,${identityMeasures}
-      FROM harbor.requests r WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3 GROUP BY r.${scope}_id
-    ), priced AS (
+    // An owner's latest started request is an exact upper bound. It is usable
+    // only when its usage falls in the window; otherwise aggregate that whole
+    // window, including late completions and ties, without a sampled prefix.
+    const identitySql=profile==='list'?`SELECT owners.owner_id,CASE WHEN latest.in_window THEN latest.started ELSE fallback.last_seen END last_seen
+      FROM (SELECT DISTINCT unnest($1::text[]) owner_id) owners
+      LEFT JOIN LATERAL (
+        SELECT r.started,(r.usage_at>=$2 AND r.usage_at<$3) in_window FROM harbor.requests r
+        WHERE r.${scope}_id=owners.owner_id ORDER BY r.started DESC,r.id DESC LIMIT 1
+      ) latest ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT MAX(r.started) last_seen,COUNT(*) n FROM harbor.requests r
+        WHERE latest.in_window IS NOT TRUE AND r.${scope}_id=owners.owner_id AND r.usage_at>=$2 AND r.usage_at<$3
+      ) fallback ON TRUE WHERE latest.in_window OR fallback.n>0`:`SELECT r.${scope}_id owner_id,${identityMeasures}
+      FROM harbor.requests r WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3 GROUP BY r.${scope}_id`;
+    const rollupSql=`WITH identity AS (${identitySql}),money AS (${usageRollupMoneySql(scope)}) SELECT i.*,m.* FROM identity i JOIN money m USING(owner_id)`;
+    const rows=await store.all(useRollups?rollupSql:`WITH identity AS (${identitySql}), priced AS (
       SELECT r.${scope}_id owner_id,(r.usage_at>=$4 AND r.usage_at<$5) recent,r.price_version revision,
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
         ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}

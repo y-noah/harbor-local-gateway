@@ -23,6 +23,45 @@ test('employee usage profile is opt-in and rejected for Key queries or invalid v
  assert.throws(()=>memberQuery(new URLSearchParams('usage_profile=list'),{keys:true}),{status:400});
 });
 
+test('employee list last seen uses an exact latest bound and preserves late, tied and out-of-window requests',{
+ skip:!url&&!socket?'需隔离真实PG':false,timeout:120000
+},async()=>{
+ const admin=new PostgresStore(options()),database='harbor_test_'+randomUUID().replaceAll('-','');let store,runtime;
+ try{
+  await admin.query('CREATE DATABASE '+database);store=new PostgresStore(options(database));await store.migrate();await store.initializePricing();
+  const at=Date.parse('2026-11-08T10:00:00+08:00'),window=usageWindow(at),ids=Array.from({length:9},()=>randomUUID());
+  for(const [index,id] of ids.entries())await store.run('INSERT INTO harbor.members(id,name,created) VALUES($1,$2,$3)',id,'合成上界员工'+index,at-index);
+  const request=async(owner,started,ended,id=randomUUID())=>store.run("INSERT INTO harbor.requests(id,member_id,started,ended,status,ip,model) VALUES($1,$2,$3,$4,'ok','synthetic','synthetic')",id,ids[owner],started,ended);
+  await request(1,at-200,null);await request(1,at-100,at);
+  await request(2,at-500,at-1);await request(2,at+100,window.end);
+  await request(3,window.start-5000,window.start);await request(3,window.start-100,window.start-1);
+  await request(4,window.end+1000,at);
+  await request(5,at-10,at,'10000000-0000-4000-8000-000000000001');
+  await request(5,at-10,window.end,'10000000-0000-4000-8000-000000000002');
+  await request(6,window.start-100,window.start-1);
+  await store.run(`INSERT INTO harbor.requests(id,member_id,started,ended,status,ip,model)
+   SELECT $1||n::text,$2,$3::bigint-n,$3::bigint-n,'ok','synthetic','synthetic' FROM generate_series(1,5000) n`,randomUUID(),ids[7],at);
+  await request(8,window.start-1000,at);
+  await store.run(`INSERT INTO harbor.requests(id,member_id,started,ended,status,ip,model)
+   SELECT $1||n::text,$2,$3::bigint+n,$3::bigint+n,'ok','synthetic','synthetic' FROM generate_series(1,2000) n`,randomUUID(),ids[8],window.end);
+  const expected=[null,at-100,at-500,window.start-5000,window.end+1000,at-10,null,at-1,window.start-1000];
+  const compare=async()=>{
+   const reader=createPostgresMemberQueries(store,{clock:()=>at}),full=await reader.list(memberQuery(new URLSearchParams())),compact=await reader.list(memberQuery(new URLSearchParams('usage_profile=list')));
+   for(const [index,id] of ids.entries()){
+    const baseline=full.rows.find(row=>row.id===id),actual=compact.rows.find(row=>row.id===id);
+    assert.equal(actual.last_seen,expected[index]);assert.equal(actual.last_seen,baseline.last_seen);
+    assert.deepEqual(actual.standard,baseline.standard);assert.deepEqual(actual.standard_12h,baseline.standard_12h);
+   }
+  };
+  await compare();
+  runtime=await createUsageRollupRuntime(store);await migrateUsageRollups(store,{apply:true});
+  const pages=Math.ceil((await store.get('SELECT COUNT(*) n FROM harbor.requests')).n/1000)+1;let batch;
+  for(let page=0;page<pages;page++){batch=await backfillUsageRollups(store,{batchSize:1000});if(batch.exhausted||batch.complete)break;}
+  assert.ok(batch.exhausted||batch.complete);
+  assert.equal((await reconcileUsageRollups(store,{publishReady:true})).ready,true);await compare();
+ }finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+database);if(runtime)await admin.query('DROP ROLE '+runtime);await admin.close();}
+});
+
 test('shared-window employee and grouped statistics preserve empty periods, boundary requests, exact USD and weighted duration',{
   skip:!url&&!socket?'需隔离PG；CI test_postgres执行真实链路':false
 },async()=>{
