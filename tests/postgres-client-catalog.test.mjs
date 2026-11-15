@@ -80,3 +80,15 @@ test('C2 mixed cancellation retains request and provider slots until all admitte
 test('C3 a paused client retains its response-byte request slot until network output closes',integration,async t=>{
  const f=await fixture(t,{options:{maxResponseBytes:16777216,maxConcurrent:1,maxQueued:0,timeoutMs:5000}});await f.account({models:async()=>[{slug:'large-model',note:'x'.repeat(15*1024*1024)}]});let response,request;try{response=await new Promise((resolve,reject)=>{request=http.get(f.origin+'/v1/codex/models',{headers:{authorization:'Bearer '+f.member.secret}},res=>{res.pause();resolve(res);});request.on('error',reject);});assert.equal(response.statusCode,200);assert.equal(f.backend.status().requests.active,1);const competing=await f.call('/v1/codex/image-mcp.mjs');assert.equal(competing.status,503);}finally{response?.destroy();request?.destroy();await condition(()=>f.backend.status().requests.active===0);}
 });
+
+test('catalog deadline rejects a response when final encoding crosses the deadline before the timer callback runs',integration,async t=>{
+ const timeoutMs=500,f=await fixture(t,{options:{timeoutMs}});let encodings=0;
+ await f.account({models:async()=>[{slug:'synthetic-deadline-model',toJSON(){
+  // Deliberately stall the event loop during final response encoding. Unlike
+  // an async provider wait, the timeout callback cannot run until this returns.
+  if(++encodings===2)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,timeoutMs+100);
+  return {slug:'synthetic-deadline-model'};
+ }}]});
+ const response=await f.call('/v1/codex/models');assert.equal(encodings,2);assert.equal(response.status,504);assert.equal((await response.json()).code,'client_catalog_timeout');
+ await condition(()=>f.backend.status().requests.active===0&&f.backend.status().providers.active===0);
+});
