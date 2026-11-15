@@ -440,6 +440,7 @@ class Host:
   need(resumed.get('slot')=='candidate' and resumed.get('phase')=='active' and resumed.get('epoch')==receipt['holdingEpoch']+1,'host_early_resume_unconfirmed')
   return {'sourceRestored':True,'holdOnly':True,'servicesRestarted':False}
  def hold_drain(self):
+  if self.source_low_recovery_selected():self.prepare_low_source_stop()
   diagnostic_stage('hold_ticket');expected=self.plan.get('interruptTicketSha256')
   if expected is None:
    self.capture_early_hold();return self.drain_with_early_receipt()
@@ -471,7 +472,43 @@ class Host:
     need(group.startswith('/') and group==os.path.normpath(group) and group!='/','host_writer_cgroup_invalid');path=Path('/sys/fs/cgroup')/group.lstrip('/')
     if path.exists():need(dict(v.split() for v in (path/'cgroup.events').read_text().splitlines()).get('populated')=='0','host_writer_descendants_active')
   return original
+ def low_source_stop_facts(self,remaining,*,fenced):
+  self.verify_source_recovery_materials()
+  active=self.entry.private_json(self.entry.ACTIVE);need(self.upgrade.digest(self.upgrade.active_identity(active))==self.plan['activeIdentityDigest'],'host_low_stop_active_changed')
+  processes={}
+  for name in [PG,GW,WORKER]:
+   row=self.immutable(name);state=row['State'];original=self.j['sourceRecoveryBaseline']['originalProcesses'].get(name)
+   expected_policy={'Name':'no','MaximumRetryCount':0} if fenced else self.plan['containers'][name]['restartPolicy']
+   need(row['HostConfig']['RestartPolicy']==expected_policy,'host_low_stop_restart_policy_changed')
+   need(not any(state.get(k) for k in ['Paused','Restarting','Dead','OOMKilled','Error']) and type(row.get('RestartCount')) is int and row['RestartCount']>=0,'host_low_stop_process_unknown')
+   if name==PG or name in remaining:
+    need(state.get('Running') is True and type(state.get('Pid')) is int and state['Pid']>0 and isinstance(state.get('StartedAt'),str) and state['StartedAt'],'host_low_stop_process_not_running')
+    witness={'id':row['Id'],'signature':sig(row),'pid':state['Pid'],'startedAt':state['StartedAt'],'restarts':row['RestartCount'],'networkDigest':container_generation(row)['networkDigest']}
+    if original is not None:need(witness==original,'host_low_stop_original_changed')
+    processes[name]=witness
+   else:
+    need(original is not None and state.get('Running') is False and state.get('Pid')==0 and state.get('Status')=='exited' and type(state.get('ExitCode')) is int and state['ExitCode'] in ([0,2] if name==GW else [0]) and state.get('StartedAt')==original['startedAt'] and row['RestartCount']==original['restarts'],'host_low_stop_exit_unknown')
+  return processes
+ def prepare_low_source_stop(self):
+  need(self.source_low_recovery_selected(),'host_low_stop_baseline_missing')
+  before=self.low_source_stop_facts([GW,WORKER],fenced=False);network=self.source_recovery_network()
+  for name,role in [(GW,'gateway'),(WORKER,'worker')]:need(self.pg.container_shutdown(self.api,self.immutable(name),role) is not None,'host_low_stop_contract_missing')
+  need(self.low_source_stop_facts([GW,WORKER],fenced=False)==before and self.source_recovery_network()==network,'host_low_stop_generation_changed');self.low_source_stop_original=before;self.low_source_stop_network=network
+ def stop_low_source_applications(self):
+  need(self.source_low_recovery_selected(),'host_low_stop_baseline_missing');original=getattr(self,'low_source_stop_original',None)
+  need(isinstance(original,dict) and set(original)=={PG,GW,WORKER},'host_low_stop_prehold_missing')
+  def verify(remaining):
+   actual=self.low_source_stop_facts(remaining,fenced=True)
+   need(actual=={name:original[name] for name in [PG,*remaining]},'host_low_stop_generation_changed')
+  verify([GW,WORKER]);need(self.source_recovery_network()==self.low_source_stop_network,'host_low_stop_network_changed')
+  self.probe_source_storage_low(self.immutable(GW),self.immutable(WORKER));verify([GW,WORKER]);need(self.source_recovery_network()==self.low_source_stop_network,'host_low_stop_network_changed')
+  remaining=[GW,WORKER]
+  for name,role in [(GW,'gateway'),(WORKER,'worker')]:
+   verify(remaining);self.pg.stop_confirmed(self.api,name,self.immutable(name),role,[]);remaining.remove(name);verify(remaining)
  def stop_applications(self):
+  # This branch qualifies only the original, observed low-water source. It is
+  # not a fallback for failed full proofs or permission to boot a target.
+  if self.source_low_recovery_selected():return self.stop_low_source_applications()
   common,_=self.pg.configuration(self.config,self.api['STACK']);self.api['source_image_preflight']=self.pg.prepare_source_image_preflights(self.api,[(self.gw,'gateway'),(self.worker,'worker')],common)
   for name,row,role in [(GW,self.gw,'gateway'),(WORKER,self.worker,'worker')]:self.pg.stop_confirmed(self.api,name,row,role,[])
  def stop_postgres_clean(self):
