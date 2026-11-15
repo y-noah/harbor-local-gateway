@@ -77,6 +77,20 @@ test('quota reads isolate SQLite from account state and settle only after gracef
   assert.equal(existsSync(sqliteHome),false);assert.equal(readFileSync(state,'utf8'),'existing CLI context');
 });
 
+test('quota uses its configured runtime root without falling back to system temporary storage',async t=>{
+  const runtime=mkdtempSync(join(scratch,'quota-runtime-')),home=join(runtime,'account');mkdirSync(home);
+  t.after(()=>rmSync(runtime,{recursive:true,force:true}));let sqliteHome;
+  const result=await readRateLimits('unused',home,{temporaryRoot:runtime,spawnProcess:(_,args,options)=>{
+    sqliteHome=options.env.CODEX_SQLITE_HOME;assert.equal(options.env.CODEX_HOME,home);
+    assert.ok(resolve(sqliteHome).startsWith(resolve(runtime)+'/harbor-quota-'));assert.ok(!resolve(sqliteHome).startsWith(resolve(home)+'/'));
+    assert.equal(statSync(sqliteHome).mode&0o777,0o700);return spawn(process.execPath,[childFile,'rates','cache'],options);
+  }});
+  assert.equal(result.rateLimits.primary.usedPercent,25);assert.equal(existsSync(sqliteHome),false);
+  for(const temporaryRoot of [join(runtime,'missing'),'relative-root',null]){
+    let spawned=false;await assert.rejects(readRateLimits('unused',home,{temporaryRoot,spawnProcess:()=>{spawned=true;}}),/目录/);assert.equal(spawned,false);
+  }
+});
+
 test('quota spawn errors and cancellation clean their private cache after the real process exits',async()=>{
   let sqliteHome;
   await assert.rejects(readRateLimits('unused',scratch,{spawnProcess:(_,args,options)=>{sqliteHome=options.env.CODEX_SQLITE_HOME;throw Error('private spawn diagnostic');}}),/无法启动/);

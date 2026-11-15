@@ -3,13 +3,14 @@ import {StringDecoder} from 'node:string_decoder';
 import {mkdtempSync} from 'node:fs';
 import {rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join,isAbsolute} from 'node:path';
 import {runnerEnv,codexAuthArgs} from './codex.mjs';
 import {normalizeCodexEntitlements,codexQuotaDenials} from './codex-entitlements.mjs';
 import {attachCodexQuotaSubject} from './quota-subject.mjs';
-export function readRateLimits(binary,home,{spawnProcess=spawn,timeoutMs=15000,closeTimeoutMs=5000,signal}={}){
+export function readRateLimits(binary,home,{spawnProcess=spawn,timeoutMs=15000,closeTimeoutMs=5000,signal,temporaryRoot=tmpdir()}={}){
   if(signal?.aborted)return Promise.reject(Error('额度查询已取消'));
-  let sqliteHome;try{sqliteHome=mkdtempSync(join(tmpdir(),'harbor-quota-'));}catch{return Promise.reject(Error('无法准备额度查询隔离目录'));}
+  if(typeof temporaryRoot!=='string'||!isAbsolute(temporaryRoot))return Promise.reject(Error('额度查询临时目录无效'));
+  let sqliteHome;try{sqliteHome=mkdtempSync(join(temporaryRoot,'harbor-quota-'));}catch{return Promise.reject(Error('无法准备额度查询隔离目录'));}
   let cleanupAllowed=true;
   return new Promise((resolve,reject)=>{
     let child;try{child=spawnProcess(binary,['app-server','--listen','stdio://','--disable','plugins','--disable','apps',...codexAuthArgs()],{env:{...runnerEnv(home),CODEX_SQLITE_HOME:sqliteHome},windowsHide:true});}catch{return reject(Error('无法启动额度查询'));}
