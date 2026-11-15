@@ -132,13 +132,19 @@ const rawMeasures=[`COUNT(*) requests`,`COUNT(p.total_atoms) known`,...['pending
 export function usageRollupMoneySql(scope){
  if(!['member','key','account'].includes(scope))throw new TypeError('usage_rollup_scope_invalid');
  const valid='s.revision=s.projected_revision AND v.id IS NOT NULL';
+ // Keep boundary bounds as parameter expressions, not a join to a dynamic range
+ // CTE: PostgreSQL otherwise estimates large ranges and scans all price rows.
+ const boundarySql=[[false,2,3],[true,4,5]].flatMap(([recent,fromIndex,toIndex])=>{
+  const from=`$${fromIndex}::bigint`,to=`$${toIndex}::bigint`,first=`ceil(${from}::numeric/3600000)::bigint*3600000`,last=`floor(${to}::numeric/3600000)::bigint*3600000`;
+  return [[from,`LEAST(${to},${first})`],[`GREATEST(${from},${first},${last})`,to]].map(([lower,upper])=>`SELECT r.${scope}_id owner_id,r.price_version revision,p.revision projected_revision,${recent} recent,${rawMeasures}
+   FROM harbor.requests r LEFT JOIN harbor.request_prices p ON p.request_id=r.id WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=${lower} AND r.usage_at<${upper} GROUP BY r.${scope}_id,r.price_version,p.revision`);
+ }).join(' UNION ALL ');
  return `WITH windows AS (SELECT false recent,$2::bigint from_at,$3::bigint to_at UNION ALL SELECT true,$4::bigint,$5::bigint),
  aligned AS (SELECT *,ceil(from_at::numeric/3600000)::bigint*3600000 first_hour,floor(to_at::numeric/3600000)::bigint*3600000 last_hour FROM windows WHERE from_at<to_at),
- edges AS (SELECT w.recent,e.from_at,e.to_at FROM aligned w CROSS JOIN LATERAL (VALUES(w.from_at,LEAST(w.to_at,w.first_hour)),(GREATEST(w.from_at,w.first_hour,w.last_hour),w.to_at)) e(from_at,to_at) WHERE e.from_at<e.to_at),
  raw AS (
  SELECT b.owner_id,b.revision,b.projected_revision,w.recent,${measures.map(field=>'b.'+field).join(',')} FROM aligned w JOIN harbor.usage_hour_buckets b ON b.scope='${scope}' AND b.owner_id=ANY($1::text[]) AND b.hour_at>=w.first_hour AND b.hour_at<w.last_hour
  UNION ALL
- SELECT r.${scope}_id owner_id,r.price_version revision,p.revision projected_revision,w.recent,${rawMeasures} FROM edges w JOIN harbor.requests r ON r.usage_at>=w.from_at AND r.usage_at<w.to_at LEFT JOIN harbor.request_prices p ON p.request_id=r.id WHERE r.${scope}_id=ANY($1::text[]) GROUP BY r.${scope}_id,r.price_version,p.revision,w.recent
+ ${boundarySql}
  ), partial AS (
  SELECT s.owner_id,s.revision,s.recent,s.requests,CASE WHEN ${valid} THEN s.known ELSE 0 END known,
  ${['pending','expired','unmetered'].map(field=>`CASE WHEN ${valid} THEN s.${field} ELSE 0 END ${field}`).join(',')},CASE WHEN ${valid} THEN s.unpriced ELSE s.requests END unpriced,
