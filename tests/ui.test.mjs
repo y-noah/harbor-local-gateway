@@ -125,7 +125,7 @@ test('会话自动刷新失败显示旧结果提示，相同数据恢复也解�
 test('会话快照可在轻总览刷新后恢复展示，保留其他页面需要完整状态的标记',async()=>{
  const base={...handoffSnapshot(),capabilities:{sessionFilters:true,pagedMembers:true},sessionsPagination:{page:2,pageSize:25,total:26,totalPages:2}},compact={...base,view:'overview',sessions:[]};delete compact.sessionsPagination;let reads=0;
  const page=await ui(()=>++reads===1?response(base):reads===2?response(compact):response({error:{message:'合成返回失败'}},503));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsPage=2;sessionsFilters={q:"Alice",type:"",account:"",status:""};');await page.run('refresh()');page.run('setTab("overview")');await page.run('refresh()');page.run('setTab("sessions")');await new Promise(setImmediate);
- assert.equal(page.run('state.view'),'overview');assert.equal(page.run('sessionsFilters.q'),'Alice');assert.equal(page.run('sessionsPage'),2);assert.match(page.node('#content').innerHTML,/id="session-filter-form"/);assert.match(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.doesNotMatch(page.node('#content').innerHTML,/id="state-page-results"/);page.run('tab="accounts";render()');assert.match(page.node('#content').innerHTML,/synthetic-client/);assert.doesNotMatch(page.node('#content').innerHTML,/正在读取|loading-mask/);
+ assert.equal(page.run('state.view'),'overview');assert.equal(page.run('sessionsFilters.q'),'Alice');assert.equal(page.run('sessionsPage'),2);assert.match(page.node('#content').innerHTML,/id="session-filter-form"/);assert.match(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.doesNotMatch(page.node('#content').innerHTML,/id="state-page-results"/);page.run('tab="accounts";render()');assert.match(page.node('#content').innerHTML,/synthetic-client/);assert.doesNotMatch(page.node('#content').innerHTML,/正在读取/);
 });
 test('已筛选账号从账号池移除后选项仍保留，避免界面误显示为全部账号',async()=>{
  const base={...handoffSnapshot(),capabilities:{sessionFilters:true},accounts:[],sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};const page=await ui(()=>response(base));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsFilters={q:"",type:"",account:"removed-account",status:""};');await page.run('refresh()');assert.match(page.node('#content').innerHTML,/value="removed-account" selected>已选账号/);assert.equal(page.run('sessionsConfirmedFilters.account'),'removed-account');
@@ -1217,6 +1217,13 @@ test('账号异常使用可聚焦摘要，完整错误保留且不再展示重�
 });
 
 
+test('自动刷新恢复相同数据后清除独立错误提示且保留原页面',async()=>{
+ let failed=true;const value=snapshot(),page=await ui(()=>failed?response({error:{message:'合成恢复错误'}},503):response(value));
+ page.run('admin=true;state='+JSON.stringify(value)+';tab="overview";render()');
+ await page.run('refresh()');assert.equal(page.node('#page-read-feedback').hidden,false);assert.match(page.node('#page-read-feedback').innerHTML,/合成恢复错误/);
+ const html=page.node('#content').innerHTML;failed=false;await page.run('refresh(true,"state:overview")');
+ assert.equal(page.node('#page-read-feedback').hidden,true);assert.doesNotMatch(page.node('#page-read-feedback').innerHTML,/合成恢复错误|retry-workspace/);assert.equal(page.node('#content').innerHTML,html);assert.equal(page.run('pageReadError'),'');
+});
 test('首屏持续503时定时刷新保留错误及手动重试，连续失败后仍能成功恢复',async()=>{
  let attempts=0;const page=await ui(path=>path==='/api/auth/login'?response({ok:true}):++attempts<3?response({error:{message:'合成持续503'}},503):response(snapshot()));await page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});
  const tick=page.intervals.find(timer=>timer.delay===12000);assert.ok(tick);for(let i=0;i<2;i++){tick.fn();await new Promise(setImmediate);assert.match(page.node('#content').innerHTML,/data-action="retry-workspace"/);assert.doesNotMatch(page.node('#content').innerHTML,/aria-busy="true"/);}assert.equal(attempts,1);
@@ -1679,10 +1686,10 @@ test('employee page has no duplicate refresh button and usage search shares navi
 });
 
 
-test('data pages refresh without white overlays while retaining busy protection',async()=>{
+test('data pages retain existing rows with local loading feedback and busy protection',async()=>{
  const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(snapshot()));
- for(const tab of ['members','accounts','sessions','requests']){page.run('tab='+JSON.stringify(tab));const html=page.run('loadingRegion("saved rows",true,"正在读取", "test-results")');assert.match(html,/data-refresh-region/);assert.match(html,/aria-busy="true"/);assert.match(html,/inert/);assert.match(html,/saved rows/);assert.doesNotMatch(html,/loading-mask|正在读取/);}
- page.run('tab="overview"');assert.doesNotMatch(page.run('loadingRegion("",true)'),/loading-mask|loading-placeholder|正在读取/);
+ for(const tab of ['members','accounts','sessions','requests']){page.run('tab='+JSON.stringify(tab));const html=page.run('loadingRegion("saved rows",true,"正在读取", "test-results")');assert.match(html,/data-refresh-region/);assert.match(html,/aria-busy="true"/);assert.match(html,/inert/);assert.match(html,/saved rows/);assert.match(html,/data-loading-mask/);}
+ page.run('tab="overview"');assert.match(page.run('loadingRegion("",true)'),/data-loading-mask/);
 });
 
 
@@ -1698,7 +1705,7 @@ test('refresh preserves request DOM and updates busy protection in place',async(
  let release;const data={summary:{requests:1,success:1,active:0,average_ms:1,standard:{}},pagination:{page:1,pageSize:20,total:1,totalPages:1},rows:[{id:'preserved-row',started:1,ended:2,status:'ok'}],models:[],members:[],byModel:[],byMember:[]};
  const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response({...data,summary:{...data.summary,requests:2}}));}));page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="requests";recordView="requests";requestsData='+JSON.stringify(data)+';render()');
  const html=page.node('#content').innerHTML,states=[],inert=[];page.node('#requests-results').setAttribute=(name,value)=>states.push([name,value]);page.node('#requests-results').querySelector=selector=>selector==='.loading-region-content'?{toggleAttribute:(name,value)=>inert.push([name,value])}:null;
- const pending=page.run('loadRequests()');assert.equal(page.node('#content').innerHTML,html);assert.deepEqual(states.at(-1),['aria-busy','true']);assert.deepEqual(inert.at(-1),['inert',true]);release();await pending;assert.deepEqual(states.at(-1),['aria-busy','false']);assert.deepEqual(inert.at(-1),['inert',false]);assert.equal(page.run('requestsData.summary.requests'),2);assert.doesNotMatch(page.node('#content').innerHTML,/loading-mask|page-refresh-note/);
+ const pending=page.run('loadRequests()');assert.equal(page.node('#content').innerHTML,html);assert.deepEqual(states.at(-1),['aria-busy','true']);assert.deepEqual(inert.at(-1),['inert',true]);release();await pending;assert.deepEqual(states.at(-1),['aria-busy','false']);assert.deepEqual(inert.at(-1),['inert',false]);assert.equal(page.run('requestsData.summary.requests'),2);assert.match(page.node('#content').innerHTML,/data-loading-mask/);
 });
 
 const memberRefreshPage=(id='member-one',total='42.50',patch={})=>{const value=memberPage(id,{pagination:{page:1,pageSize:20,total:2,totalPages:2},...patch});value.rows[0].standard={total};value.rows[0].standard_12h={total:'4.25'};value.rows[0].access_version=1;return value;};
@@ -1773,7 +1780,7 @@ test('总览刷新在请求数不变时重新读取结算及人工核对金额�
  page.run('admin=true;state='+JSON.stringify(data)+';tab="overview";render();');await new Promise(setImmediate);assert.equal(reads,1);assert.match(page.node('#overview-cost-chart').innerHTML,/含待核对记录/);
  await page.run('refresh()');await new Promise(setImmediate);assert.equal(reads,2);assert.match(page.node('#overview-cost-chart').innerHTML,/\$2\.00/);
  await page.run('refresh(true,"state:overview")');await new Promise(setImmediate);assert.equal(reads,3);assert.match(page.node('#overview-cost-chart').innerHTML,/\$3\.00/);
- assert.match(source,/bar\.style\.height=bar\.dataset\.height\+'px'/);assert.doesNotMatch(source,/bar\.style\.height=bar\.dataset\.height\+'%'/);
+ assert.match(source,/bar\.style\.height=bar\.dataset\.height\+'%'/);assert.doesNotMatch(source,/bar\.style\.height=bar\.dataset\.height\+'px'/);
 });
 
 
@@ -1796,25 +1803,38 @@ test('员工有在途请求删除失败时保留员工与确认界面',async()=>
  const member={id:'busy-member',name:'合成在途员工',enabled:1},page=await ui(()=>response({error:{message:'该员工仍有请求正在处理'}},409));page.run('admin=true;state='+JSON.stringify({...snapshot(),members:[member],keys:[]}));await page.click('remove-member',member.id);await page.click('confirm-remove-member',member.id);assert.equal(page.run('state.members.length'),1);assert.equal(page.node('#modal').open,true);assert.match(page.node('#modal-content').innerHTML,/确认删除/);assert.match(page.node('#toast').textContent,/仍有请求/);
 });
 
-test('员工详情应用类型默认覆盖例外，批量仍保留，并且仅生成预览不执行',async()=>{
- for(const single of [true,false]){
+test('显式应用类型默认覆盖个人及Key例外，保留例外须明确选择，所有入口仅生成预览',async()=>{
+ for(const mode of ['single','selected','type','preserve']){
   const writes=[],page=await ui((path,options)=>{
    if(options.method==='POST'){writes.push({path,body:JSON.parse(options.body)});return response({id:'synthetic-batch'});}
    return response(path==='/api/admin/member-types'?typeCatalog():batchRecord());
   });
   page.node('#dialog-form').querySelector=()=>({textContent:''});
   page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{memberTypes:true},members:[{id:'synthetic-member',usage_type_id:'usage-a'}]}));
-  if(single)await page.click('member-batch-settings','synthetic-member');
+  if(mode==='single')await page.click('member-batch-settings','synthetic-member');
+  else if(mode==='type')await page.click('apply-member-type','usage-a');
   else await page.run('configureMemberBatch({member_ids:["synthetic-member"]},"usage-a")');
   const html=page.node('#modal-content').innerHTML;
-  assert.match(html,single?/<option value="overwrite" selected>/ : /<option value="keep" selected>保留个人/);
+  assert.match(html,/<option value="overwrite" selected>应用目标默认/);
+  assert.match(html,/保留个人及Key例外，这些项目不应用目标默认/);
   assert.equal(writes.length,0);
-  useSyntheticForm(page,{batch_type:'usage-a',batch_models:'apply',batch_limits:'apply',batch_classify:'keep',batch_overwrite:single?'overwrite':'keep'});
+  useSyntheticForm(page,{batch_type:'usage-a',batch_models:'apply',batch_limits:'apply',batch_classify:'keep',batch_overwrite:mode==='preserve'?'keep':'overwrite'});
   await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
   assert.equal(writes.length,1);assert.equal(writes[0].path,'/api/admin/member-config-batches/preview');
-  assert.equal(writes[0].body.overwrite_exceptions,single);assert.equal(writes[0].body.models,true);assert.equal(writes[0].body.limits,true);assert.equal(writes[0].body.classify,false);
-  assert.deepEqual(writes[0].body.scope,{member_ids:['synthetic-member']});
+  assert.equal(writes[0].body.overwrite_exceptions,mode!=='preserve');assert.equal(writes[0].body.models,true);assert.equal(writes[0].body.limits,true);assert.equal(writes[0].body.classify,false);
+  assert.deepEqual(writes[0].body.scope,mode==='type'?{type_id:'usage-a'}:{member_ids:['synthetic-member']});
  }
+});
+
+
+test('新应用默认不重算已保存的保留例外预览，读取旧快照不提交执行',async()=>{
+ const old=batchRecord({operation:{overwrite_exceptions:false,models:true,limits:true}}),before=old.items[0].before_config;
+ before.keys=[{id:'synthetic-key',allowed_models:null,model_source:{kind:'legacy'}}];
+ old.items[0].desired_config=structuredClone(before);old.items[0].exceptions=[{component:'models',source:'retained',action:'preserved'},{component:'limits',source:'legacy',action:'preserved'},{component:'key',key_id:'synthetic-key',source:'legacy',action:'preserved'}];
+ const calls=[],page=await ui((path,options)=>{calls.push({path,method:options.method});return response(old);});page.run('admin=true;state='+JSON.stringify(snapshot()));await page.click('member-batch-open','synthetic-batch');
+ assert.equal(calls.length,1);assert.equal(calls[0].method,'GET');
+ const html=page.node('#member-batch-content').innerHTML;assert.match(html,/员工共享限额：明确不限额 → 明确不限额/);assert.match(html,/固定 1 个 Key；将更新 0 个/);assert.match(html,/个人／Key例外 3 项/);
+ assert.equal(page.run('memberBatchView.record.operation.overwrite_exceptions'),false);assert.equal(JSON.parse(page.run('JSON.stringify(memberBatchView.record.items[0].desired_config)')).keys[0].model_source.kind,'legacy');
 });
 
 
@@ -1838,7 +1858,7 @@ test('state成功而必要请求或历史失败时保留失败状态，重试列
  for(const view of ['requests','history'])for(const cold of [false,true]){
   let failing=true;const base={...snapshot(),keys:[]},request={summary:{requests:19,active:0},rows:[],models:[],members:[],byModel:[],byMember:[],pagination:{page:1,pageSize:20,total:19,totalPages:1}},history={accounts:[],rows:[],pagination:{page:1,pageSize:20,total:17,totalPages:1}},page=await ui(path=>path.startsWith('/api/admin/state')?response(base):failing?response({error:{message:'合成必要列表失败'}},503):response(view==='history'?history:request));
   page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";render();tab='+JSON.stringify(view)+';recordView="requests";');if(!cold)page.run(view==='history'?'historyData='+JSON.stringify(history)+';render()':'requestsData='+JSON.stringify(request)+';render()');const before=page.node('#content').innerHTML;
-  await page.run('refresh()');assert.match(page.run('pageReadError'),/合成必要列表失败/);assert.match(page.node('#connection').textContent,/失败|异常/);assert.equal(page.node('#content').innerHTML.replace(/aria-busy="(?:true|false)"|\binert\b/g,''),before.replace(/aria-busy="(?:true|false)"|\binert\b/g,''));assert.doesNotMatch(page.node('#content').innerHTML,/正在读取|loading-mask/);failing=false;assert.equal(await page.run('refresh()'),true);assert.equal(page.run('pageReadError'),'');assert.equal(page.node('#connection').textContent,'服务在线');assert.match(page.node('#content').innerHTML,view==='history'?/系统操作历史/:/19/);
+  await page.run('refresh()');assert.match(page.run('pageReadError'),/合成必要列表失败/);assert.match(page.node('#connection').textContent,/失败|异常/);assert.equal(page.node('#content').innerHTML.replace(/aria-busy="(?:true|false)"|\binert\b/g,''),before.replace(/aria-busy="(?:true|false)"|\binert\b/g,''));assert.doesNotMatch(page.node('#content').innerHTML,/正在读取/);failing=false;assert.equal(await page.run('refresh()'),true);assert.equal(page.run('pageReadError'),'');assert.equal(page.node('#connection').textContent,'服务在线');assert.match(page.node('#content').innerHTML,view==='history'?/系统操作历史/:/19/);
  }
 });
 
@@ -1934,4 +1954,26 @@ test('同页切到非分页Key用量时注销已退出来源，保留有效state
  let reads=0;const page=await ui(()=>{reads++;return response({});}),base={...snapshot(),keys:[],sessions:[],capabilities:{pagedMembers:false}};
  page.run('admin=true;state='+JSON.stringify(base)+';tab="requests";recordView="requests";failPageRead(Error("retired-key-usage"),"key-usage","requests:usage");failPageRead(Error("valid-state-error"),"state","requests:usage")');await page.click('record-view','usage');
  assert.equal(reads,0);assert.equal(page.run('pageReadErrors.has(pageReadKey("key-usage"))'),false);assert.match(page.run('pageReadError'),/valid-state-error/);assert.doesNotMatch(page.run('pageReadError'),/retired-key-usage/);
+});
+
+test('功能401核验管理会话后保留有效登录，权限和网络错误不登出',async()=>{
+ for(const status of [401,403,503]){
+  let checks=0;const page=await ui(path=>path==='/api/auth/session'?response({authenticated:++checks>1}):response({error:{message:'合成功能错误'}},status),{restore:true});
+  page.run('admin=true;state={preserved:true};');await assert.rejects(page.run("api('/api/admin/example')"),/合成功能错误/);
+  assert.equal(page.run('admin'),true);assert.equal(page.run('state.preserved'),true);assert.equal(checks,status===401?2:1);
+ }
+});
+test('会话核验网络失败不登出，迟到的失效核验不能撤销新登录',async()=>{
+ let checks=0,release;const page=await ui(path=>path==='/api/auth/session'?++checks===1?response({authenticated:false}):new Promise(resolve=>release=()=>resolve(response({authenticated:false}))):response({error:{message:'expired'}},401),{restore:true});page.run('admin=true;state={};');const pending=page.run("api('/api/admin/example')");await new Promise(setImmediate);page.run('authEpoch++;state={newLogin:true};');release();await assert.rejects(pending,/expired/);assert.equal(page.run('admin'),true);assert.equal(page.run('state.newLogin'),true);
+ let count=0;const failed=await ui(path=>{if(path==='/api/auth/session'){if(++count===1)return response({authenticated:false});throw Error('network');}return response({error:{message:'expired'}},401);},{restore:true});failed.run('admin=true;state={};');await assert.rejects(failed.run("api('/api/admin/example')"),/expired/);assert.equal(failed.run('admin'),true);
+});
+test('管理读取超时保留会话并给出可重试错误，写请求不添加读取超时',async()=>{
+ const page=await ui((_path,options)=>new Promise((_resolve,reject)=>options.signal?.addEventListener('abort',()=>reject(Object.assign(Error('aborted'),{name:'AbortError'})))));page.run('admin=true;state={};');const pending=page.run("api('/api/admin/example')");const assertion=assert.rejects(pending,/读取超时/);page.timers.find(timer=>timer.delay===30000&&timer.active).fn();await assertion;assert.equal(page.run('admin'),true);
+});
+test('切换页面读取时不禁用整个内容容器，失败提供独立重试入口',async()=>{
+ const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(snapshot())+';renderedPageScope="overview:";tab="requests";recordView="requests";preservePageWhileReading();');assert.equal(page.node('#content').inert,false);assert.match(page.node('#page-read-feedback').innerHTML,/正在加载/);page.run('failPageRead(Error("合成超时"),"requests")');assert.match(page.node('#page-read-feedback').innerHTML,/重试/);
+});
+
+test('账号列表展示已保存月费，额度共享范围只在账号管理显示',async()=>{
+ const page=await ui(()=>response({}));const base={...snapshot(),capabilities:{accountPackages:true},accounts:[{id:'a',name:'合成订阅',kind:'codex',auth_mode:'subscription',enabled:1,state:'ready',subscription_monthly_usd:200}]};page.run('admin=true;state='+JSON.stringify(base)+';tab="accounts";render()');assert.match(page.node('#content').innerHTML,/订阅 \$200\.00\/月/);assert.doesNotMatch(page.node('#content').innerHTML,/额度共享范围|供应方额度/);page.run('openAccountManagement("a")');assert.match(page.node('#modal-content').innerHTML,/额度共享范围/);
 });
