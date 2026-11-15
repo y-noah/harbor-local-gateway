@@ -74,23 +74,73 @@ async function structure(store,sql){
  if(!captureTriggers.some(row=>row.tgname==='recording_capture_retention'&&row.tgtype===7&&row.attributes==='')||!captureTriggers.some(row=>row.tgname==='recording_update_retention'&&row.tgtype===19&&row.attributes===String(expiry?.attnum)))fail('department_migration_conflict');
 }
 
+// Structural evidence belongs to one store only. Authorization and runtime SQL
+// privileges are read again for every query; neither is part of this cache.
+const queryInitializations=new WeakMap(),transactionVerifications=new WeakMap();
+function currentVerification(store){
+ // SAVEPOINT children inherit the nearest verified ancestor. Explicit null
+ // stops inheritance; child evidence is never published back to its parent.
+ for(let context=store.context?.getStore();context;context=context.parent){
+  const local=transactionVerifications.get(context);if(local?.has(store))return local.get(store);
+ }
+ return verified.get(store);
+}
+function recordVerification(store,value){
+ const context=store.context?.getStore();
+ if(!context){if(value===null)verified.delete(store);else verified.set(store,value);return;}
+ let local=transactionVerifications.get(context);if(!local){local=new WeakMap();transactionVerifications.set(context,local);}
+ local.set(store,value);
+}
+async function queryIdentity(store){
+ return store.get(`SELECT current_database() database_name,
+  (SELECT oid::text FROM pg_database WHERE datname=current_database()) database_oid,
+  (SELECT oid::text FROM pg_roles WHERE rolname=current_user) role_oid,
+  (SELECT oid::text FROM pg_roles WHERE rolname=session_user) session_role_oid,
+  (SELECT value FROM harbor.gateway_settings WHERE name='schema.quota-subject-coordination') quota_marker,
+  (SELECT count(*)=3 AND bool_and(relkind='r' AND relpersistence='p' AND NOT relrowsecurity
+   AND has_table_privilege(current_user,oid,'SELECT') AND has_table_privilege(current_user,oid,'INSERT')
+   AND (relname='quota_subject_confirmations' OR has_table_privilege(current_user,oid,'UPDATE')))
+   FROM pg_class WHERE oid IN (to_regclass('harbor.quota_subjects'),to_regclass('harbor.quota_subject_accounts'),to_regclass('harbor.quota_subject_confirmations'))) quota_permitted`);
+}
+function sameQueryIdentity(current,prior){
+ return current?.quota_permitted===true&&typeof current.quota_marker==='string'
+  &&['database_name','database_oid','role_oid','session_role_oid','quota_marker'].every(key=>typeof current[key]==='string'&&current[key]===prior?.[key]);
+}
+export async function initializeQueryDepartmentIsolation(store){
+ // A transaction may still roll back or fail COMMIT. Its evidence and pending
+ // verification must never initialize readers outside that transaction.
+ if(store.context?.getStore())return verifyDepartmentIsolationAvailability(store);
+ const prior=verified.get(store);if(prior?.available)return true;
+ let pending=queryInitializations.get(store);
+ if(!pending){pending=verifyDepartmentIsolationAvailability(store);queryInitializations.set(store,pending);}
+ try{return await pending;}finally{if(queryInitializations.get(store)===pending)queryInitializations.delete(store);}
+}
+export async function assertQueryDepartmentIdentity(store,installed){
+ if(!installed)return;
+ const prior=currentVerification(store);
+ if(!prior?.available||!sameQueryIdentity(await queryIdentity(store),prior.queryIdentity))fail('department_restart_required');
+}
+
 // False means a confirmed never-installed database. Partial DDL and unknown
 // marker versions must never turn a scoped caller back into legacy global SQL.
 export async function verifyDepartmentIsolationAvailability(store){
+ recordVerification(store,null);
  const observed=await presence(store);
- if(observed.marker===null){if(observed.present)fail();verified.set(store,{available:false,marker:null});return false;}
+ if(observed.marker===null){if(observed.present)fail();recordVerification(store,{available:false,marker:null});return false;}
  if(!observed.present)fail('department_migration_conflict');
  const source=await bundle();marker(observed.marker,source.checksum);await structure(store,source.sql);
+ const identityBefore=await queryIdentity(store);
  if(!await verifyQuotaSubjectAvailability(store))fail('department_quota_subject_required');
- verified.set(store,{available:true,marker:observed.marker});return true;
+ const identity=await queryIdentity(store);if(!sameQueryIdentity(identity,identityBefore))fail('department_quota_subject_required');
+ recordVerification(store,{available:true,marker:observed.marker,queryIdentity:identity});return true;
 }
 
 export async function assertDepartmentIsolationReadiness(store,initialAvailability){
  if(typeof initialAvailability!=='boolean')fail();
  const observed=await presence(store);
  if(!initialAvailability){if(observed.present||observed.marker!==null)fail('department_restart_required');return false;}
- let prior=verified.get(store);
- if(!prior?.available){if(!await verifyDepartmentIsolationAvailability(store))fail('department_restart_required');prior=verified.get(store);}
+ let prior=currentVerification(store);
+ if(!prior?.available){if(!await verifyDepartmentIsolationAvailability(store))fail('department_restart_required');prior=currentVerification(store);}
  if(!observed.present||observed.marker===null||observed.marker!==prior.marker)fail('department_restart_required');
  return true;
 }

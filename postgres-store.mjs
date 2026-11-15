@@ -113,7 +113,7 @@ export class PostgresStore{
     const existing=this.context.getStore();
     if(existing){
       return this.enqueue(existing,async()=>{
-        const client=existing.client,name='harbor_sp_'+(++this.savepoint),child={client,connection:existing.connection,tail:Promise.resolve(),open:true};
+        const client=existing.client,name='harbor_sp_'+(++this.savepoint),child={client,connection:existing.connection,parent:existing,tail:Promise.resolve(),open:true};
         await client.query('SAVEPOINT '+name);
         try{const value=await this.context.run(child,()=>operation(this));child.open=false;await child.tail;this.#assertConnection(child);await client.query('RELEASE SAVEPOINT '+name);return value;}
         catch(e){child.open=false;await child.tail;await client.query('ROLLBACK TO SAVEPOINT '+name).catch(()=>{});await client.query('RELEASE SAVEPOINT '+name).catch(()=>{});throw e;}

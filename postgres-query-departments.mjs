@@ -1,6 +1,6 @@
 import {AppError} from './store.mjs';
 import {requireDepartmentScope} from './department-access.mjs';
-import {verifyDepartmentIsolationAvailability,assertDepartmentIsolationReadiness} from './postgres-departments.mjs';
+import {initializeQueryDepartmentIsolation,assertDepartmentIsolationReadiness,assertQueryDepartmentIdentity} from './postgres-departments.mjs';
 
 const authorize=scope=>requireDepartmentScope(scope,{allowGlobal:true});
 const retryableInitialization=error=>typeof error?.code==='string'&&(/^(08|53)[0-9A-Z]{3}$/.test(error.code)||['57014','57P01','57P02','57P03','ECONNRESET','ECONNREFUSED','ETIMEDOUT','EPIPE'].includes(error.code));
@@ -15,10 +15,11 @@ export function createQueryDepartments(store,{systemReadPurposes=[]}={}){
  };
  let initialization;
  return {async resolve(scope){
-  const pending=initialization??=verifyDepartmentIsolationAvailability(store);let installed;
+  const pending=initialization??=initializeQueryDepartmentIsolation(store);let installed;
   try{installed=await pending;}catch(error){if(initialization===pending&&retryableInitialization(error))initialization=undefined;throw error;}
   // An old reader cannot acquire new authority from a live schema installation.
   await assertDepartmentIsolationReadiness(store,installed);
+  await assertQueryDepartmentIdentity(store,installed);
   if(installed)return authorizeRead(scope);
   if(scope!==undefined&&authorize(scope).view!=='global')throw new AppError(503,'部门隔离尚未启用','department_unavailable');
   return null;
