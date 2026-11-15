@@ -126,29 +126,50 @@ export async function reconcileUsageRollups(store,{publishReady=false,statementT
 export async function disableUsageRollups(store){await verifyUsageRollups(store);await store.run("UPDATE harbor.usage_rollup_state SET state='disabled' WHERE singleton");}
 export {measures as usageRollupMeasures};
 
-const rawMeasures=[`COUNT(*) requests`,`COUNT(p.total_atoms) known`,...['pending','expired'].map(state=>`COUNT(*) FILTER(WHERE p.total_atoms IS NULL AND p.state='${state}') ${state}`),`COUNT(*) FILTER(WHERE p.total_atoms IS NULL AND (p.state='unpriced' OR p.state IS NULL)) unpriced`,`COUNT(*) FILTER(WHERE p.total_atoms IS NULL AND p.state NOT IN ('pending','expired','unpriced')) unmetered`,...fields.map(field=>`COALESCE(SUM(p.${field}_atoms),0) ${field}`)].join(',');
+const rawTerms=[['COUNT(*)','requests'],['COUNT(p.total_atoms)','known'],...['pending','expired'].map(state=>[`COUNT(*) FILTER(WHERE p.total_atoms IS NULL AND p.state='${state}')`,state]),["COUNT(*) FILTER(WHERE p.total_atoms IS NULL AND (p.state='unpriced' OR p.state IS NULL))",'unpriced'],["COUNT(*) FILTER(WHERE p.total_atoms IS NULL AND p.state NOT IN ('pending','expired','unpriced'))",'unmetered'],...fields.map(field=>[`COALESCE(SUM(p.${field}_atoms),0)`,field])];
+const rawMeasures=negative=>rawTerms.map(([sql,name])=>`${negative?'-('+sql+')':sql} ${name}`).join(',');
 // Arguments: owner IDs, primary window [from,to), recent window [from,to).
-// Boundary ranges never overlap, including sub-hour and negative-epoch windows.
+// A partial hour uses either its selected rows or its exact bucket minus the
+// excluded rows, whichever needs fewer price lookups in this same snapshot.
 export function usageRollupMoneySql(scope){
  if(!['member','key','account'].includes(scope))throw new TypeError('usage_rollup_scope_invalid');
- const valid='s.revision=s.projected_revision AND v.id IS NOT NULL';
- // Keep boundary bounds as parameter expressions, not a join to a dynamic range
- // CTE: PostgreSQL otherwise estimates large ranges and scans all price rows.
- const boundarySql=[[false,2,3],[true,4,5]].flatMap(([recent,fromIndex,toIndex])=>{
+ const valid='s.revision=s.projected_revision AND v.id IS NOT NULL',boundaries=[];
+ for(const [recent,fromIndex,toIndex] of [[false,2,3],[true,4,5]]){
   const from=`$${fromIndex}::bigint`,to=`$${toIndex}::bigint`,first=`ceil(${from}::numeric/3600000)::bigint*3600000`,last=`floor(${to}::numeric/3600000)::bigint*3600000`;
-  return [[from,`LEAST(${to},${first})`],[`GREATEST(${from},${first},${last})`,to]].map(([lower,upper])=>`SELECT r.${scope}_id owner_id,r.price_version revision,p.revision projected_revision,${recent} recent,${rawMeasures}
-   FROM harbor.requests r LEFT JOIN harbor.request_prices p ON p.request_id=r.id WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=${lower} AND r.usage_at<${upper} GROUP BY r.${scope}_id,r.price_version,p.revision`);
+  for(const [edge,[lower,upper]] of [[from,`LEAST(${to},${first})`],[`GREATEST(${from},${first},${last})`,to]].entries()){
+   const hour=`floor((${lower})::numeric/3600000)::bigint*3600000`,hourEnd=`(${hour}+3600000)`,owner=`r.${scope}_id=ANY($1::text[])`;
+   boundaries.push({recent,edge,lower,upper,hour,hourEnd,owner});
+  }
+ }
+ // Keep request/price bounds as parameter expressions. A dynamic range join
+ // can make PostgreSQL estimate broad scans of the entire price table.
+ const counts=boundaries.map(({recent,edge,lower,upper,hour,hourEnd,owner})=>`SELECT ${recent} recent,${edge} edge,${hour} hour_at,
+  (SELECT COUNT(*) FROM harbor.requests r WHERE ${owner} AND r.usage_at>=${lower} AND r.usage_at<${upper}) inside,
+  (SELECT COUNT(*) FROM harbor.requests r WHERE ${owner} AND r.usage_at>=${hour} AND r.usage_at<${hourEnd}) whole,
+  (SELECT COALESCE(SUM(b.requests),0) FROM harbor.usage_hour_buckets b WHERE b.scope='${scope}' AND b.owner_id=ANY($1::text[]) AND b.hour_at=${hour}) bucket_requests
+  WHERE ${lower}<${upper}`).join(' UNION ALL ');
+ const boundarySql=boundaries.flatMap(({recent,edge,lower,upper,hour,hourEnd,owner})=>{
+  const selected=`SELECT inside<=whole-inside OR bucket_requests<>whole FROM boundary_counts WHERE recent=${recent} AND edge=${edge}`;
+  return [false,true].map(negative=>`SELECT r.${scope}_id owner_id,r.price_version revision,p.revision projected_revision,${recent} recent,${rawMeasures(negative)}
+   FROM harbor.requests r LEFT JOIN harbor.request_prices p ON p.request_id=r.id
+   WHERE ${owner} AND ${negative?`r.usage_at>=${hour} AND r.usage_at<${hourEnd} AND (r.usage_at<${lower} OR r.usage_at>=${upper})`:`r.usage_at>=${lower} AND r.usage_at<${upper}`} AND ${negative?'NOT ':''}(${selected})
+   GROUP BY r.${scope}_id,r.price_version,p.revision`);
  }).join(' UNION ALL ');
  return `WITH windows AS (SELECT false recent,$2::bigint from_at,$3::bigint to_at UNION ALL SELECT true,$4::bigint,$5::bigint),
  aligned AS (SELECT *,ceil(from_at::numeric/3600000)::bigint*3600000 first_hour,floor(to_at::numeric/3600000)::bigint*3600000 last_hour FROM windows WHERE from_at<to_at),
+ boundary_counts AS MATERIALIZED (${counts}),
  raw AS (
  SELECT b.owner_id,b.revision,b.projected_revision,w.recent,${measures.map(field=>'b.'+field).join(',')} FROM aligned w JOIN harbor.usage_hour_buckets b ON b.scope='${scope}' AND b.owner_id=ANY($1::text[]) AND b.hour_at>=w.first_hour AND b.hour_at<w.last_hour
  UNION ALL
+ SELECT b.owner_id,b.revision,b.projected_revision,c.recent,${measures.map(field=>'b.'+field).join(',')} FROM boundary_counts c JOIN harbor.usage_hour_buckets b ON b.scope='${scope}' AND b.owner_id=ANY($1::text[]) AND b.hour_at=c.hour_at WHERE c.inside>c.whole-c.inside AND c.bucket_requests=c.whole
+ UNION ALL
  ${boundarySql}
+ ), combined AS (
+ SELECT owner_id,revision,projected_revision,recent,${measures.map(field=>`SUM(${field}) ${field}`).join(',')} FROM raw GROUP BY owner_id,revision,projected_revision,recent HAVING SUM(requests)>0
  ), partial AS (
  SELECT s.owner_id,s.revision,s.recent,s.requests,CASE WHEN ${valid} THEN s.known ELSE 0 END known,
  ${['pending','expired','unmetered'].map(field=>`CASE WHEN ${valid} THEN s.${field} ELSE 0 END ${field}`).join(',')},CASE WHEN ${valid} THEN s.unpriced ELSE s.requests END unpriced,
- ${fields.map(field=>`CASE WHEN ${valid} THEN s.${field} END ${field}`).join(',')} FROM raw s LEFT JOIN harbor.pricing_versions v ON v.id=s.revision
+ ${fields.map(field=>`CASE WHEN ${valid} THEN s.${field} END ${field}`).join(',')} FROM combined s LEFT JOIN harbor.pricing_versions v ON v.id=s.revision
  ) SELECT owner_id,${referenceRollupAggregateSql({standardOnly:true,condition:'NOT recent'})},${referenceRollupAggregateSql({standardOnly:true,condition:'recent',prefix:'recent_'})} FROM partial GROUP BY owner_id`;
 }
 

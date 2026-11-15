@@ -97,3 +97,31 @@ test('PG默认迁移不安装扩展，显式扩展保留22且verify拒绝篡改'
  try{await admin.query('CREATE DATABASE '+name);store=new PostgresStore(options(name));assert.deepEqual(await store.migrate(),{version:22,changed:true});assert.equal((await store.get("SELECT to_regclass('harbor.usage_hour_buckets') name")).name,null);assert.equal(await usageRollupsReady(store),false);await createUsageRollupRuntime(store);assert.deepEqual(await store.migrate({usageHourRollups:true}),{version:22,changed:true});assert.equal(await store.verifySchema(),true);assert.deepEqual(await store.migrate(),{version:22,changed:false});await store.query('ALTER TABLE harbor.requests DISABLE TRIGGER usage_requests_stage');await assert.rejects(store.verifySchema(),e=>e.code==='database_migration_conflict');}
  finally{await store?.close();await admin.query('DROP DATABASE IF EXISTS '+name);await admin.query('DROP ROLE IF EXISTS '+name+'_runtime');await admin.close();}
 });
+
+test('PG边界补集保留精确口径、零版本消除、迟到写入与缺桶回退',integration,()=>fixture(async({store,other,request,price})=>{
+ await store.run("INSERT INTO harbor.pricing_versions(id,created,book) VALUES('revision',0,'{}'),('other',0,'{}'),('excluded-only',0,'{}')");
+ for(let i=0;i<40;i++){
+  await request('edge-'+i,i*80000);
+  if(i%7!==0){await price('edge-'+i,String(900719925474099312345n+BigInt(i)));if(i%5===0)await store.run("UPDATE harbor.request_prices SET total_atoms=NULL,state=$1 WHERE request_id=$2",['pending','expired','unknown','unpriced'][i%4],'edge-'+i);if(i%3===0)await store.run("UPDATE harbor.request_prices SET revision='other',adjustment_atoms=-17 WHERE request_id=$1",'edge-'+i);}
+ }
+ await request('excluded',0);await price('excluded','123');await store.run("UPDATE harbor.requests SET price_version='excluded-only' WHERE id='excluded'");await store.run("UPDATE harbor.request_prices SET revision='excluded-only' WHERE request_id='excluded'");
+ await request('future',3550000);await price('future','987');
+ await store.run("UPDATE harbor.requests SET member_id='n',key_id='l',account_id='b' WHERE id='edge-1'");
+ const baseline=scope=>`WITH windows AS (SELECT false recent,$2::bigint from_at,$3::bigint to_at UNION ALL SELECT true,$4::bigint,$5::bigint),priced AS (SELECT r.${scope}_id owner_id,w.recent,r.price_version revision,CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms END ${f}`).join(',')} FROM windows w JOIN harbor.requests r ON r.usage_at>=w.from_at AND r.usage_at<w.to_at ${joins} WHERE r.${scope}_id=ANY($1::text[])),partial AS (SELECT owner_id,revision,recent,${referencePartialAggregateSql({standardOnly:true})} FROM priced GROUP BY owner_id,revision,recent) SELECT owner_id,${referenceRollupAggregateSql({standardOnly:true,condition:'NOT recent'})},${referenceRollupAggregateSql({standardOnly:true,condition:'recent',prefix:'recent_'})} FROM partial GROUP BY owner_id`;
+ const canonical=rows=>rows.map(r=>({...r,revisions:r.revisions?.sort()??null,recent_revisions:r.recent_revisions?.sort()??null})).sort((a,b)=>a.owner_id.localeCompare(b.owner_id));
+ const windows=[[80000,3600000,100,3500000],[3300000,3400000,3300000,3400000],[0,100,100,200]];
+ for(const scope of ['member','key','account'])for(const ids of [scope==='member'?['m']:scope==='key'?['k']:['a'],scope==='member'?['m','n']:scope==='key'?['k','l']:['a','b']])for(const window of windows)assert.deepEqual(canonical(await store.all(usageRollupMoneySql(scope),ids,...window)),canonical(await store.all(baseline(scope),ids,...window)));
+ const args=[['m'],80000,3600000,100,3500000];
+ assert.ok(!(await store.all(usageRollupMoneySql('member'),...args))[0].revisions.includes('excluded-only'));
+ await reconcileUsageRollups(store,{publishReady:true});
+ await store.transaction(async()=>{
+  const before=canonical(await store.all(usageRollupMoneySql('member'),...args));
+  await other.transaction(async()=>{await other.run("INSERT INTO harbor.requests(id,member_id,key_id,account_id,started,status,ip,price_version) VALUES('late','m','k','a',500000,'ok','synthetic','revision')");await other.run("INSERT INTO harbor.request_prices(request_id,state,revision,input_atoms,total_atoms,measured_at) VALUES('late','priced','revision',99,99,0)");});
+  assert.deepEqual(canonical(await store.all(usageRollupMoneySql('member'),...args)),before);
+ },{level:'REPEATABLE READ',readOnly:true});
+ assert.deepEqual(canonical(await store.all(usageRollupMoneySql('member'),...args)),canonical(await store.all(baseline('member'),...args)));
+ // A missing partial-hour bucket must select the direct query, never subtract
+ // a contribution from an absent whole and silently lose that employee's usage.
+ await store.run("DELETE FROM harbor.usage_hour_buckets WHERE scope='member' AND owner_id='m' AND hour_at=0");
+ assert.deepEqual(canonical(await store.all(usageRollupMoneySql('member'),...args)),canonical(await store.all(baseline('member'),...args)));
+}));
