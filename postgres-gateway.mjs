@@ -8,6 +8,7 @@ import {postgresShutdownConfiguration,installPostgresGatewayShutdown} from './po
 import {createPostgresExtraRuntime} from './postgres-extra-runtime.mjs';
 import {RecordingContextStore} from './recording-context-store.mjs';
 import {createRequestContextCapture} from './recording-context-capture.mjs';
+import {recordingInputDiagnosticsConfiguration,createRecordingInputDiagnostics} from './recording-input-diagnostics.mjs';
 import {createPostgresExtraUsageAdmin} from './postgres-extra-usage-admin.mjs';
 import {createPostgresExtraUsageBatches} from './postgres-extra-usage-batches.mjs';
 import {createPostgresAccountExtraUsage} from './postgres-account-extra-usage.mjs';
@@ -112,7 +113,7 @@ export async function createPostgresGateway(options={}){
   const requestBodies=createRequestBodyBudget({...options.requestBodies,parse:jsonParser.parse,stageObserver:options.stageObserver});
   const drainTimeoutMs=options.drainTimeoutMs??300000;
   if(!Number.isInteger(drainTimeoutMs)||drainTimeoutMs<100||drainTimeoutMs>3600000)throw new AppError(503,'排空等待配置无效','gateway_configuration');
-  let workspaceLock,guardStore,guardClient,store,queryStore,recordingStore,buffer,meteringRecovery,handler,accountAdmin,extraUsageAdmin,nightly,server,deviceTls,deviceSettings,ownedDeviceIssuer,config,closing=false,releasingOwnership=false,lostOwnership=false,closePromise,quotaTimer,nightlyTimer,recordingTimer,pricingTimer,recordingMonitor,recordingProbeStore;
+  let workspaceLock,guardStore,guardClient,store,queryStore,recordingStore,buffer,meteringRecovery,handler,accountAdmin,extraUsageAdmin,nightly,server,deviceTls,deviceSettings,ownedDeviceIssuer,config,closing=false,releasingOwnership=false,lostOwnership=false,closePromise,quotaTimer,nightlyTimer,recordingTimer,pricingTimer,recordingMonitor,recordingProbeStore,inputDiagnostics;
   const inflight=new Set(),loop=monitorEventLoopDelay({resolution:20}),ownership=new AbortController();
   const requireOwnership=()=>{if(lostOwnership)throw new AppError(503,'数据库单实例锁已丢失','gateway_ownership_lost');};
   const loseOwnership=()=>{
@@ -121,6 +122,7 @@ export async function createPostgresGateway(options={}){
     ownership.abort();
   };
   const cleanup=async()=>{
+    inputDiagnostics?.close();
     clearInterval(pricingTimer);clearInterval(quotaTimer);clearInterval(recordingTimer);
     await deviceTls?.close({force:true});
     ownedDeviceIssuer?.close();
@@ -176,7 +178,9 @@ export async function createPostgresGateway(options={}){
     recordingMonitor=createRecordingStorageMonitor(recordingProbeStore,{...recordingStorageConfiguration(options.recording?.storage,env),appPaths:[data,join(data,'recording-spool')],clock});await recordingMonitor.refresh();
     if(env.HARBOR_RECORDING_ENABLED!==undefined&&!['0','1'].includes(env.HARBOR_RECORDING_ENABLED))throw new AppError(503,'正文采集开关须为0或1','recording_configuration');
     const recordingEnabled=options.recording?.enabled??env.HARBOR_RECORDING_ENABLED!=='0',captureBuffer=recordingPolicyBuffer(buffer,recordingMonitor);
-    const captureContext=contextEnabled?createRequestContextCapture(buffer,{policyBuffer:captureBuffer,cooperative:true}):undefined;
+    const inputDiagnosticsConfig=recordingInputDiagnosticsConfiguration({env,configuration:options.recording?.inputDiagnostics});
+    inputDiagnostics=createRecordingInputDiagnostics({...inputDiagnosticsConfig,enabled:inputDiagnosticsConfig.enabled&&contextEnabled&&recordingEnabled,clock});
+    const captureContext=contextEnabled?createRequestContextCapture(buffer,{policyBuffer:captureBuffer,cooperative:true,inputDiagnostics}):undefined;
     meteringRecovery=await MeteringRecovery.create(store,{...options.meteringBuffer,encryptionKey:key,directory:join(data,'metering-spool')});
     // Recovery order matters: persisted successful billing must win before stale
     // running rows are marked interrupted. A corrupt critical spool fails closed.
@@ -215,7 +219,7 @@ export async function createPostgresGateway(options={}){
     const extraReader=createPostgresAccountExtraUsage(queryStore,{clock}),extraBatches=createPostgresExtraUsageBatches(store,{readStore:queryStore,service:extraUsage,jobs:createPostgresJobs(store,{departmentActors:departments,scopedKinds:['account.extra.configure']}),clock});extraUsageAdmin=createPostgresExtraUsageAdmin({service:extraUsage,reader:extraReader,policyPreviews:extraBatches.policyPreviews,batches:extraBatches,refreshSubscriptionQuota:(id,options)=>accountAdmin.refreshQuota(id,options),adminAuthenticated:auth.authenticated,adminSession:departmentInstalled?auth.managementSessionReference:auth.sessionReference,...(departmentInstalled?{adminContext:departmentHttp.context,revalidateAdminScope:departmentHttp.revalidate}:{}),acceptsAdminRequest:req=>acceptsRequest(req.headers,network),requestBodies,clock,refreshSupported:typeof options.extraUsage?.readEntitlement==='function'});
     const files=new Map(await Promise.all(['index.html','app.js','style.css'].map(async name=>[name,await readFile(join(root,'public',name))])));
     handler=createPostgresResponsesHandler({extraRuntime,runChat:({account,processLease,output,session,messages,model,signal,timeoutMs,onText})=>(account.kind==='claude'?(options.claudeExecutor||runClaude):(options.executor||runCodex))({binary:account.kind==='claude'?(config.claudeBinary||join(root,'runtime','claude-cli','node_modules','@anthropic-ai','claude-code','bin','claude.exe')):config.codexBinary,home:account.home,workspace:join(runtime,'jobs',session.id),messages,model,sessionId:session.upstream_id,previousUsage:{input:session.cum_input,output:session.cum_output,cached:session.cum_cached},signal,timeoutMs,onText,output,spawnProcess:processLease?.spawn||spawnFor(account.home,{kind:'model',signal})}),cliProcesses,outputBudget,requestBodies,stageObserver:options.stageObserver,executionOptions:options.execution,pricingOptions:options.pricing,chatOptions:{reserveTokens:config.reserveTokens??32000,...options.chat},store,queryStore,recordings,recordingReader,buffer:captureBuffer,meteringRecovery,accountAdmin,deviceIssuer:deviceSettings?.issuer,platformTransport,keyEncryptionKey:key,clock,codexBinary:config.codexBinary,
-      maxPendingHandoffs:options.handoffs?.maxPending,recordingEnabled,captureContext,contextReader,contextIndexEnabled:contextSchemaVersion===postgresContextSchemaVersions.index,recordingPolicy:recordingMonitor.snapshot,recordingKey:recordKey,recordingStoragePolicy:recordingMonitor.policy,recordingBackendOptions:options.recording?.backend,recordingAdminOptions:options.recording?.http,maxConcurrent:options.maxConcurrent??120,maxPerMember:options.maxPerMember??8,
+      maxPendingHandoffs:options.handoffs?.maxPending,recordingEnabled,captureContext,contextReader,contextIndexEnabled:contextSchemaVersion===postgresContextSchemaVersions.index,recordingPolicy:recordingMonitor.snapshot,recordingKey:recordKey,recordingStoragePolicy:recordingMonitor.policy,recordingBackendOptions:{...options.recording?.backend,inputDiagnosticsStatus:()=>inputDiagnostics.status()},recordingAdminOptions:options.recording?.http,maxConcurrent:options.maxConcurrent??120,maxPerMember:options.maxPerMember??8,
       resolveRoute:consumptionRouting.resolve,consumptionRouting,consumptionPolicyReady:consumptionFeatureReady,sourceAccounts:options=>readConsumptionRouting.catalogCandidates(options),onRouteFailure:router.block,checkLimits:(m,p,o)=>limits.check(m.id,p.model,{...o,tools:p.tools}),adminAuthenticated:auth.authenticated,adminActorContext:auth.context,adminContext:departmentInstalled?departmentHttp.context:undefined,revalidateAdminScope:departmentInstalled?departmentHttp.revalidate:undefined,departmentActors:departments,
       transportForAccount:async account=>{if(account.kind!=='codex')throw new AppError(503,'此开发入口尚未接通该平台通道','platform_unavailable');return account.auth_mode==='openai_api'?apiResponses:responses;},
       adminStateContext:()=>({endpoint:(network.origins[0]||'http://'+(network.listenHost==='::1'?'[::1]':network.listenHost)+':'+(server?.address()?.port||network.port||config.port))+'/v1',mode:'PostgreSQL · 开发验证',capabilities:{overviewCost:true,accountStateView:true,extraUsage:true,accountPackages:true,asyncPlanning:true,pagedHistory:true,sessionHandoffs:true,memberTypes:true,pagedMembers:true,memberListMetadata:true,requestPageSummary:true,sessionFilters:true,sessionStateView:true,deviceAccess:true,memberActions:true,typeStatistics:true,recordingHistory:true,consumptionPolicy:consumptionFeatureReady(),recordingContext:contextAvailable,recordingContextSearch:contextSchemaVersion===postgresContextSchemaVersions.index}})});

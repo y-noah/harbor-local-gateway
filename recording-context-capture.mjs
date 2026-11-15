@@ -4,7 +4,7 @@ import {recordingBufferWrite} from './postgres-recording-storage.mjs';
 import {sanitizeRecord,recordRedactionSummary,recordRedactionCategories} from './record-redaction.mjs';
 
 const finishReasons=new Set(['capture_failed','queue_limit','size_limit','storage_low','storage_unknown']);
-export function createRequestContextCapture(buffer,{policyBuffer=buffer,cooperative=false}={}){
+export function createRequestContextCapture(buffer,{policyBuffer=buffer,cooperative=false,inputDiagnostics}={}){
  if(!buffer?.repository?.contextRepository||!Number.isSafeInteger(buffer.maxMemoryBytes)||typeof policyBuffer.contextSnapshot!=='function'||typeof cooperative!=='boolean')throw new AppError(503,'上下文缓冲未配置','recording_configuration');
  return (requestId,payload,{signal}={})=>{
   // Reserve the actual command envelope, including the largest possible fixed
@@ -12,7 +12,8 @@ export function createRequestContextCapture(buffer,{policyBuffer=buffer,cooperat
   const envelope=Buffer.byteLength(JSON.stringify({type:'context',requestId,components:[],coverage:{state:'incomplete',reasons:requestContextReasons,opaqueReasoningExcluded:Number.MAX_SAFE_INTEGER,redaction:recordRedactionSummary(recordRedactionCategories)}}))-2;
   const maxBytes=Math.min(buffer.repository.maxBytes,buffer.maxMemoryBytes,buffer.repository.contextRepository.maxSnapshotBytes)-envelope;
   if(maxBytes<256)return {accepted:false,state:'incomplete',reason:'size_limit'};
-  const options={maxBytes,maxComponents:buffer.repository.contextRepository.maxComponents,attachmentFingerprint:typeof buffer.repository.contextRepository.attachmentFingerprint==='function'?bytes=>buffer.repository.contextRepository.attachmentFingerprint(requestId,bytes):undefined};
+  let onUnsupportedInputShape;try{onUnsupportedInputShape=inputDiagnostics?.beginRequest();}catch{}
+  const options={onUnsupportedInputShape,maxBytes,maxComponents:buffer.repository.contextRepository.maxComponents,attachmentFingerprint:typeof buffer.repository.contextRepository.attachmentFingerprint==='function'?bytes=>buffer.repository.contextRepository.attachmentFingerprint(requestId,bytes):undefined};
   const finish=view=>{
   signal?.throwIfAborted();const coverage={state:view.state,reasons:view.reasons,opaqueReasoningExcluded:view.opaqueReasoningExcluded,redaction:view.redaction};
   // Contents already carry filtered provenance. Validate and mark the aggregate

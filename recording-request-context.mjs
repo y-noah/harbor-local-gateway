@@ -1,3 +1,4 @@
+import {recordingInputProtocolTypes,observeRecordingInputShape} from './recording-input-diagnostics.mjs';
 import {sanitizeRecord,recordRedactionSummary,redactRecordParts,restoreAuthenticatedRecord,sensitiveRecordField,boundedRecordText} from './record-redaction.mjs';
 import {safeToolOutput} from './conversation-capture.mjs';
 import {recordingAttachment} from './recording-attachment.mjs';
@@ -5,7 +6,7 @@ import {recordingLiteral} from './recording-literal.mjs';
 import {recordingTextMetadata,finalizeRecordingTokens} from './recording-text-metadata.mjs';
 
 const media=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
-const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output','item_reference','compaction']);
+const itemTypes=new Set(recordingInputProtocolTypes.filter(type=>type!=='reasoning'));
 const textTypes=new Set(['text','input_text','output_text','summary_text','refusal']);
 const scalarFields=new Set(['role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments','code','container_id','server_label','approval_request_id','reason']);
 const toolItems=new Set(['function_call','custom_tool_call','function_call_output','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output']);
@@ -31,7 +32,7 @@ export const requestContextReasons=Object.freeze(['invalid_payload','unsupported
 
 // This view describes the received context, not a claim about the current turn
 // or local execution. Authentication and scope come from the recording store.
-function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=65536,attachmentFingerprint}={}){
+function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=65536,attachmentFingerprint,onUnsupportedInputShape}={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxComponents)||maxComponents<1||!Number.isSafeInteger(maxNodes)||maxNodes<1)throw TypeError('Invalid request context budget');
   const redactions=new Set(),onRedact=category=>redactions.add(category);
   const components=[],reasons=new Set();let bytes=2,nodes=maxNodes,opaqueReasoningExcluded=0;
@@ -219,18 +220,18 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
   else if(payload.instructions!==undefined&&payload.instructions!==null)reasons.add('unsupported_instructions');
   if(Array.isArray(payload.tools))for(let index=0;index<payload.tools.length;index++){if(nodes<=0){cut();break;}const tool=payload.tools[index];if(!tool||typeof tool!=='object'||Array.isArray(tool)){nodes--;reasons.add('unsupported_tools');yield;continue;}if(!add('tool_schema',{source:'tools',index,value:tool}))break;yield;}
   else if(payload.tools!==undefined)reasons.add('unsupported_tools');
-  const input=payload.input??payload.messages,source=payload.input===undefined?'messages':'input';
+  const input=payload.input??payload.messages,source=payload.input===undefined?'messages':'input',diagnosticSource=payload.input==null?'messages':'input';
   if(payload.input!==undefined&&payload.messages!==undefined)reasons.add('ambiguous_input');
   if(typeof input==='string'){add('context',{source,value:input});yield;}
   else if(Array.isArray(input)){
     for(let index=0;index<input.length;index++){
       if(--nodes<0){cut();break;}
       const item=input[index];
-      if(!item||typeof item!=='object'||Array.isArray(item)||!(itemTypes.has(item.type)||item.type==='reasoning'||['user','assistant','system','developer','tool'].includes(item.role))){reasons.add('unsupported_input');yield;continue;}
+      if(!item||typeof item!=='object'||Array.isArray(item)||!(itemTypes.has(item.type)||item.type==='reasoning'||['user','assistant','system','developer','tool'].includes(item.role))){reasons.add('unsupported_input');observeRecordingInputShape(onUnsupportedInputShape,item,diagnosticSource,'array_item');yield;continue;}
       if(!add(item.type==='additional_tools'?'tool_schema':['system','developer'].includes(item.role)?'instruction':'context',{source,index,value:item}))break;
       yield;
     }
-  }else if(input!==undefined)reasons.add('unsupported_input');
+  }else if(input!==undefined){reasons.add('unsupported_input');observeRecordingInputShape(onUnsupportedInputShape,input,diagnosticSource,'top_level');}
   // Relationships are protocol evidence only; no inference about ancestry.
   for(const key of ['previous_response_id','conversation','tool_choice','parallel_tool_calls','truncation'])if(payload[key]!==undefined){
     const value=payload[key],valid=value===null||key==='parallel_tool_calls'&&typeof value==='boolean'||key!=='parallel_tool_calls'&&typeof value==='string'||['conversation','tool_choice'].includes(key)&&typeof value==='object'&&!Array.isArray(value);
