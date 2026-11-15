@@ -272,20 +272,43 @@ class RecoveryRegressionTests(unittest.TestCase):
                 self.assertEqual(args[0], '/usr/bin/rsync')
                 scratch = Path(next(arg.split('=', 1)[1] for arg in args if arg.startswith('--temp-dir=')))
                 process = subprocess.Popen([*args[:1], '--bwlimit=128', *args[1:]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                transfer = None
                 try:
                     deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline and not any(path.stat().st_size > 0 for path in scratch.iterdir()):
-                        time.sleep(0.01)
-                    self.assertTrue(any(scratch.iterdir()), 'rsync must actually create its transfer file')
+                    while time.monotonic() < deadline and transfer is None:
+                        # Small files can finish and leave scratch between checks.
+                        # Pin this rate-limited payload's partial transfer instead.
+                        for path in scratch.glob(payload.name + '.*'):
+                            try:
+                                opened = path.open('rb')
+                            except FileNotFoundError:
+                                continue
+                            info = os.fstat(opened.fileno())
+                            if 0 < info.st_size < payload.stat().st_size:
+                                transfer = (path, opened, info)
+                                break
+                            opened.close()
+                        if transfer is None:
+                            time.sleep(0.01)
+                    self.assertIsNotNone(transfer, 'rsync must actually be transferring the large payload')
+                    self.assertIsNone(process.poll(), 'rsync must still be running when killed')
+                    self.assertEqual(transfer[0].stat().st_ino, transfer[2].st_ino)
+                    self.assertLess(os.fstat(transfer[1].fileno()).st_size, payload.stat().st_size)
                 finally:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=5)
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        self.assertEqual(process.wait(timeout=5), -signal.SIGKILL)
+                    finally:
+                        if transfer is not None:
+                            transfer[1].close()
+                self.assertEqual(transfer[0].stat().st_ino, transfer[2].st_ino)
                 raise ValueError('synthetic killed rsync')
             with patch.object(m, 'run', side_effect=interrupted), self.assertRaisesRegex(ValueError, 'killed rsync'):
                 m.prepare(value, [row])
             state = json.loads(m.STATE.read_text())
             scratch = Path(state['rows'][0]['scratch']['path'])
-            self.assertTrue(any(scratch.iterdir()))
+            self.assertTrue(any(scratch.glob(payload.name + '.*')))
+            self.assertEqual(m.scan(source, os.getuid(), digest=True), before)
             self.assertEqual(m.prepare(value, [row])['phase'], 'copied')
             self.assertFalse(any(scratch.iterdir()))
             self.assertEqual(m.scan(source, os.getuid(), digest=True), before)
