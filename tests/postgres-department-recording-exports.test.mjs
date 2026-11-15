@@ -45,6 +45,23 @@ async function fixture(t){
  return {store,issuer,departments,scopes,keys,departmentRows,requests,recordings,contexts,jobs,backend,call,enqueue,execute,download,disableSuper:()=>{superEnabled=false;}};
 }
 
+test('部门正文待处理状态保留全局与各部门的独立计数',integration,async t=>{
+ const f=await fixture(t);
+ const state=async name=>(await f.call('/api/admin/recordings/status','GET',undefined,f.scopes[name])).value;
+ const global=await state('global'),a=await state('a'),b=await state('b');
+ assert.equal(global.index_pending,4);assert.equal(global.context_index_pending,4);
+ for(const value of [a,b]){assert.equal(value.index_pending,2);assert.equal(value.context_index_pending,2);assert.equal(value.index_failed,0);assert.equal(value.context_index_failed,0);}
+ await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',at,f.requests.a[0]);
+ await f.store.run("UPDATE harbor.recording_work SET last_error='synthetic_failure' WHERE request_id=$1",f.requests.a[0]);
+ assert.equal((await state('a')).context_index_pending,1);assert.equal((await state('b')).context_index_pending,2);
+ assert.equal((await state('global')).context_index_pending,3);
+ assert.equal((await state('a')).index_failed,1);assert.equal((await state('b')).index_failed,0);
+ await f.store.run('UPDATE harbor.recording_work SET indexed_revision=revision WHERE request_id=$1',f.requests.a[0]);
+ assert.equal((await state('global')).index_pending,3);assert.equal((await state('a')).index_pending,1);
+ const forged={...f.scopes.a,department_id:f.departmentRows.b.id};
+ await assert.rejects(f.call('/api/admin/recordings/status','GET',undefined,forged),{status:403,code:'department_scope_required'});
+});
+
 test('部门导出贯穿真实队列、正文与上下文，跨部门详情下载取消和游标均拒绝',integration,async t=>{
  const f=await fixture(t),a=await f.enqueue(),b=await f.enqueue(f.scopes.b);await f.execute();await f.execute();
  const text=await f.download(a.id,f.scopes.a),rows=text.trim().split('\n').map(JSON.parse);assert.ok(rows.some(row=>row.kind==='context_object'));

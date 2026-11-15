@@ -31,6 +31,37 @@ async function fixture(t,{indexBatch=32,schemaIndex=true}={}){
  return {store,jobs,contexts,recordings,backend,key,clock,advance:ms=>{now+=ms;},request,run,document,crypto,connection:connection(name)};
 }
 
+test('真实PG：待处理状态只按有有效来源的对象计数，保持旧查询结果',integration,async t=>{
+ const f=await fixture(t),first=await f.request('共享对象',10000),second=await f.request('共享对象',20000),expired=await f.request('已过期对象',10000);
+ await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock()-1,expired);
+ const object=(await f.store.get('SELECT object_id FROM harbor.recording_context_references WHERE request_id=$1',first)).object_id;
+ assert.equal((await f.store.get('SELECT object_id FROM harbor.recording_context_references WHERE request_id=$1',second)).object_id,object);
+ await f.store.run("UPDATE harbor.recording_context_work SET last_error='synthetic_failure' WHERE object_id=$1",object);
+ const compare=async()=>{
+  const expected=await f.store.get(`SELECT COUNT(*) pending,COUNT(*) FILTER(WHERE w.last_error IS NOT NULL) failed,MIN(w.changed) oldest
+   FROM harbor.recording_context_work w JOIN harbor.recording_context_objects o ON o.id=w.object_id WHERE w.revision>w.indexed_revision AND EXISTS(
+    SELECT 1 FROM harbor.recording_context_references ref JOIN harbor.recording_context_snapshots s ON s.request_id=ref.request_id
+    JOIN harbor.recordings c ON c.request_id=s.request_id JOIN harbor.requests r ON r.id=s.request_id
+    LEFT JOIN harbor.sessions session ON session.id=r.session_id
+    WHERE ref.object_id=o.id AND s.scope_digest=o.scope_digest AND s.key_version=o.key_version
+    AND s.member_id=r.member_id AND s.session_id IS NOT DISTINCT FROM r.session_id
+    AND r.recording_state<>'expired' AND LEAST(s.expires_at,c.expires_at)>$1
+    AND (r.session_id IS NULL OR session.member_id=r.member_id))`,f.clock());
+  const actual=await f.backend.status();assert.deepEqual({pending:actual.context_index_pending,failed:actual.context_index_failed,oldest:actual.context_oldest_pending_at},expected);return actual;
+ };
+ assert.equal((await compare()).context_index_pending,1);assert.equal((await compare()).context_index_failed,1);
+ await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock(),first);
+ assert.equal((await compare()).context_index_pending,1);
+ await f.store.run("UPDATE harbor.requests SET recording_state='expired' WHERE id=$1",second);
+ assert.equal((await compare()).context_index_pending,0);
+ await f.store.run('UPDATE harbor.recordings SET expires_at=$1 WHERE request_id=$2',f.clock()+10000,first);
+ assert.equal((await compare()).context_index_pending,1);
+ await f.store.run('UPDATE harbor.recording_context_snapshots SET key_version=$1 WHERE request_id=$2','synthetic-other-key',first);
+ assert.equal((await compare()).context_index_pending,0);
+ await f.store.run('UPDATE harbor.recording_context_work SET indexed_revision=revision');
+ assert.equal((await compare()).context_index_pending,0);assert.ok(expired);
+});
+
 test('真实PG：无限期保留同步保护上下文来源，改回按天后可正常清理',integration,async t=>{
  const f=await fixture(t),content={text:'无限期上下文检索'},id=await f.request(content,10000);
  const preview=await f.backend.retentionPreview(null);await f.backend.retentionApply({id:preview.id,expected_version:0,confirm:true});let job=await f.jobs.claim(['recording.retention']);await f.jobs.complete(job,await f.backend.handlers['recording.retention'](job));

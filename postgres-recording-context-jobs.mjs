@@ -87,6 +87,18 @@ export function createPostgresRecordingContextJobs(store,{jobs,recordingKey,cryp
  }
  async function handler(job,context){try{return await organize(job,context);}catch(error){if(['recording_index_capacity','recording_context_scope','recording_context_capacity','recording_context_incomplete','recording_context_unreadable'].includes(error.code))await jobs.owned(job,()=>store.run('UPDATE harbor.recording_context_work SET last_error=$1 WHERE object_id=$2 AND revision=$3',error.code,job.target,job.payload.revision));throw error;}}
  async function rebuild(requestId,{scope}={}){const authorization=await writeDepartments.resolve(scope,{write:true});if(authorization&&(authorization.view!=='department'||!await store.get('SELECT id FROM harbor.requests WHERE id=$1 AND department_id=$2',requestId,authorization.department_id)))throw new AppError(404,'请求正文不存在','recording_not_found');await store.run(`UPDATE harbor.recording_context_work SET revision=revision+1,last_error=NULL,changed=$1 WHERE object_id IN (SELECT object_id FROM harbor.recording_context_references WHERE request_id=$2)`,clock(),requestId);}
- async function status({scope}={}){const authorization=await departments.resolve(scope),args=[clock()],predicate=departmentPredicate(authorization,'r',args),visible=`EXISTS(${liveSource('harbor.recording_context_references',predicate)})`;const row=await store.get(`SELECT COUNT(*) pending,COUNT(*) FILTER(WHERE w.last_error IS NOT NULL) failed,MIN(w.changed) oldest FROM harbor.recording_context_work w JOIN harbor.recording_context_objects o ON o.id=w.object_id WHERE w.revision>w.indexed_revision AND ${visible}`,...args);return {context_index_pending:row.pending,context_index_failed:row.failed,context_oldest_pending_at:row.oldest};}
+ async function status({scope}={}){
+  const authorization=await departments.resolve(scope),args=[clock()],predicate=departmentPredicate(authorization,'r',args);
+  // Resolve live sources only for pending objects. A single eligible source is
+  // enough; shared references must not multiply an object's backlog count.
+  const row=await store.get(`WITH pending AS MATERIALIZED (
+   SELECT w.object_id,w.last_error,w.changed FROM harbor.recording_context_work w
+   WHERE w.revision>w.indexed_revision
+  ) SELECT COUNT(*) pending,COUNT(*) FILTER(WHERE w.last_error IS NOT NULL) failed,MIN(w.changed) oldest
+  FROM pending w JOIN LATERAL (
+   SELECT id,scope_digest,key_version FROM harbor.recording_context_objects WHERE id=w.object_id LIMIT 1
+  ) o ON TRUE JOIN LATERAL (${liveSource('harbor.recording_context_references',predicate)} LIMIT 1) source ON TRUE`,...args);
+  return {context_index_pending:row.pending,context_index_failed:row.failed,context_oldest_pending_at:row.oldest};
+ }
  return {schedule,refill,rebuild,status,gc:options=>contexts.gc(options),handlers:{[kind]:handler}};
 }
