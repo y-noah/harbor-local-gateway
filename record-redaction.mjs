@@ -3,6 +3,7 @@ export const recordRedactionCategories=Object.freeze(['credential','sensitive_fi
 export function recordRedactionSummary(categories){return {version:1,policy:'credentials-v1',categories:[...categories].sort()};}
 export function validRecordRedaction(value){return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===3&&Object.keys(value).every(key=>['version','policy','categories'].includes(key))&&value.version===1&&value.policy==='credentials-v1'&&Array.isArray(value.categories)&&value.categories.length<=recordRedactionCategories.length&&new Set(value.categories).size===value.categories.length&&value.categories.every(category=>recordRedactionCategories.includes(category));}
 const safeRecords=new WeakSet();
+export const isFilteredRecord=value=>!!value&&typeof value==='object'&&safeRecords.has(value);
 // This provenance lives only in process memory; no request-supplied flag can
 // opt out of filtering. Authenticated decryption is the only restore boundary.
 export function restoreAuthenticatedRecord(value){
@@ -224,7 +225,8 @@ export function sanitizeRecord(value,{maxDepth=24,maxBytes=128*1024,maxNodes=409
       const result=[],parts=[],positions=[];
       for(const child of item){
         if(nodes<=0||remaining<=0){result.push(cut());break;}
-        if(child?.type==='text'&&typeof child.text==='string'){
+        if(isFilteredRecord(child))result.push(visit(child,depth+1));
+        else if(child?.type==='text'&&typeof child.text==='string'){
           nodes-=3;const prefix=boundedRecordText(child.text,remaining);remaining-=Buffer.byteLength(prefix);if(prefix.length!==child.text.length)onTruncate();
           positions.push(result.length);parts.push(prefix);result.push({type:'text',text:''});
         }else result.push(visit(child,depth+1));

@@ -4,6 +4,20 @@ import {captureRequestContext,captureRequestContextAsync} from '../recording-req
 import {RecordingStore} from '../recording-store.mjs';
 import {randomBytes} from 'node:crypto';
 
+test('工具错误的普通业务字段不按协议片段裁掉，跨片凭据和附件仍过滤',async()=>{
+ const payload={input:[{type:'mcp_call',id:'synthetic-error',name:'exec',server_label:'synthetic',arguments:'{}',output:null,error:{type:'mcp_tool_execution_error',content:[{type:'text',text:'Authorization: Bearer ',severity:'fatal',exit_code:2},{type:'text',text:'private-error-secret',detail:'visible'},{type:'image',url:'https://private.example/image'}]}}]},view=captureRequestContext(payload);
+ assert.equal(view.state,'complete');assert.deepEqual(view.reasons,[]);const content=view.components[0].content.value.error.content;assert.equal(content[0].severity,'fatal');assert.equal(content[0].exit_code,2);assert.equal(content[1].detail,'visible');assert.match(content[2].content,/附件数据已省略/);assert.ok(!JSON.stringify(view).includes('private-error-secret'));assert.ok(!JSON.stringify(view).includes('private.example'));assert.deepEqual(await captureRequestContextAsync(payload),view);
+});
+
+test('内部节点消耗可供工具适配器共享预算且截断时不超过批准额度',async()=>{
+ const payload={input:[{type:'web_search_call',id:'synthetic-search',status:'completed',action:{type:'search',queries:['合成问题一','合成问题二']}}]};
+ for(const maxNodes of [1,8,16,64,2048]){
+  const view=captureRequestContext(payload,{maxNodes});assert.ok(Number.isSafeInteger(view.nodesConsumed));assert.ok(view.nodesConsumed>0&&view.nodesConsumed<=maxNodes);assert.deepEqual(await captureRequestContextAsync(payload,{maxNodes}),view);
+  if(view.reasons.includes('size_limit'))assert.equal(view.nodesConsumed,maxNodes);
+ }
+ const invalid=captureRequestContext(null);assert.equal(invalid.nodesConsumed,0);assert.deepEqual(await captureRequestContextAsync(null),invalid);
+});
+
 test('代码解释器与MCP历史保留可见执行信息且不要求虚构call_id',async()=>{
  const input=[{type:'code_interpreter_call',id:'synthetic-code',code:'print("synthetic")',container_id:'synthetic-container',outputs:[{type:'logs',logs:'合成日志'},{type:'image',url:'https://private.example/image.png'}],status:'completed'},
  {type:'mcp_call',id:'synthetic-mcp',name:'lookup',server_label:'synthetic',arguments:'{"query":"合成输入","api_key":"private-mcp-secret"}',approval_request_id:null,output:'合成输出',error:null,status:'completed'}];

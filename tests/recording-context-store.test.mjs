@@ -33,6 +33,12 @@ async function fixture(run,configuration={}){
 }
 const components=[{kind:'instruction',content:{text:'合成系统说明'}},{kind:'tool_schema',content:{name:'synthetic_tool',parameters:{type:'object',properties:{path:{type:'string'}}}}},{kind:'history',content:{role:'user',text:'合成历史问题'}}];
 
+test('真实PG：MCP错误业务诊断加密重启后完整保留，内部预算与凭据不落库',integration,()=>fixture(async({store,key,clock,context,request,read})=>{
+ const captured=captureRequestContext({input:[{type:'mcp_call',id:'synthetic-error',name:'exec',server_label:'synthetic',arguments:'{}',output:null,error:{type:'mcp_tool_execution_error',content:[{type:'text',text:'合成诊断',severity:'fatal',exit_code:2,api_key:'private-error-secret'}]}}]});assert.equal(captured.state,'complete');assert.ok(captured.nodesConsumed>0);
+ const id=await request();await context.writeSnapshot(id,captured.components);const restarted=new RecordingContextStore(store,{encryptionKey:key,clock:()=>clock.now}),restored=await read(id,restarted),diagnostic=restored.components[0].content.value.error.content[0];assert.equal(diagnostic.text,'合成诊断');assert.equal(diagnostic.severity,'fatal');assert.equal(diagnostic.exit_code,2);assert.ok(!JSON.stringify(restored).includes('private-error-secret'));assert.ok(!JSON.stringify(restored).includes('nodesConsumed'));assert.deepEqual(restored.components.map(({kind,content})=>({kind,content})),captured.components);
+ for(const row of await store.all('SELECT content_cipher FROM harbor.recording_context_parts'))assert.ok(!row.content_cipher.includes(Buffer.from('合成诊断')));
+}));
+
 test('真实PG：请求上下文过滤后加密持久化，重启读回顺序、重复问题及附件元数据',integration,()=>fixture(async({store,key,context,request,read,clock})=>{
  const payload={instructions:'合成说明',tools:[{type:'function',name:'read',parameters:{type:'object'}}],input:[{role:'user',content:[{type:'input_text',text:'Authorization: Bearer '},{type:'input_text',text:'synthetic-context-secret'}]},{role:'user',content:'重复提问'},{role:'user',content:'重复提问'},{role:'user',content:[{type:'input_file',filename:'synthetic.txt',file_data:'synthetic-private-binary'}]}]};
  const captured=captureRequestContext(payload);assert.equal(captured.state,'complete');

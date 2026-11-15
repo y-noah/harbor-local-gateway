@@ -17,11 +17,78 @@ import {JsonRecordRedactor} from '../record-json.mjs';
 
 function capture(options){const events=[],collector=new ConversationCapture({...options,emit:event=>events.push(event)});return {events,collector};}
 function output(events){const fields=new Map();for(const {kind,content:c} of events)if(c.field&&kind!=='user')fields.set(c.field,c.mode==='replace'?c.text:(fields.get(c.field)||'')+c.text);return [...fields.values()].join('');}
+test('工具终态事实贯穿流式合并和正文整理，耗时只保留显式原字段',async()=>{
+  const {assembleRecording}=await import('../recording-search-index.mjs'),{events,collector}=capture();
+  const initial={type:'custom_tool_call',id:'exec',call_id:'call',name:'exec',input:'printf visible',status:'in_progress'};
+  collector.event({type:'response.output_item.added',output_index:0,item:initial});
+  const terminal={...initial,status:'failed',duration_ms:12.5,error:{code:'execution_failed',message:'Authorization: Bearer opaque-fixture-secret\nvisible failure',attachment:{type:'input_file',file_data:'PRIVATE_BINARY'}}};
+  collector.event({type:'response.output_item.done',output_index:0,item:terminal});
+  const result=collector.finish({output:[terminal]});
+  const [assembled]=assembleRecording(events.map((event,index)=>({...event,sequence:index+1})));
+  assert.equal(assembled.text,initial.input);assert.equal(assembled.metadata.status,'failed');assert.equal(assembled.metadata.duration_ms,12.5);assert.equal(assembled.metadata.error.code,'execution_failed');assert.ok(assembled.metadata.error.message.includes('visible failure'));
+  assert.equal(Object.hasOwn(assembled.metadata,'elapsed_ms'),false);assert.equal(result.incomplete,false);assert.equal(result.coverage.seen.toolCalls,1);
+  assert.ok(!JSON.stringify(events).includes('opaque-fixture-secret'));assert.ok(!JSON.stringify(events).includes('PRIVATE_BINARY'));assert.equal(terminal.error.attachment.file_data,'PRIVATE_BINARY');
+});
+test('客户端工具结果和上游结果保留独立状态错误及显式耗时',async()=>{
+  const {assembleRecording}=await import('../recording-search-index.mjs'),{events,collector}=capture();
+  collector.input({input:[{type:'function_call_output',call_id:'client',output:'visible client result',status:'failed',elapsed_ms:0,error:{code:'client_error',message:'visible failure'}}]});
+  collector.finish({output:[{type:'custom_tool_call_output',id:'upstream',call_id:'upstream',output:'visible upstream result',status:'completed',duration_ms:42,error:null}]});
+  const assembled=assembleRecording(events.map((event,index)=>({...event,sequence:index+1})));
+  assert.deepEqual(assembled.map(item=>item.provenance),['client','upstream']);assert.equal(assembled[0].metadata.elapsed_ms,0);assert.equal(assembled[0].metadata.error.code,'client_error');assert.equal(assembled[1].metadata.duration_ms,42);assert.equal(assembled[1].metadata.error,null);assert.equal(Object.hasOwn(assembled[1].metadata,'elapsed_ms'),false);
+});
+test('非法工具事实明确不完整，缺失耗时不伪装为零',()=>{
+  for(const duration of [-1,Infinity,'12']){
+    const {events,collector}=capture(),result=collector.finish({output:[{type:'function_call',id:'tool',call_id:'call',name:'exec',arguments:'{}',status:5,duration_ms:duration}]});
+    assert.equal(result.incomplete,true);assert.ok(result.coverage.reasons.includes('malformed_tool_item'));assert.ok(events.every(event=>!Object.hasOwn(event.content,'duration_ms')&&!Object.hasOwn(event.content,'status')));
+  }
+  const {events,collector}=capture();collector.finish({output:[{type:'function_call',id:'tool',call_id:'call',name:'exec',arguments:'{}'}]});assert.ok(events.every(event=>!Object.hasOwn(event.content,'duration_ms')&&!Object.hasOwn(event.content,'elapsed_ms')));
+});
+test('内置shell和apply_patch的命令补丁及结果贯穿末轮采集和正文整理',async()=>{
+  const {assembleRecording}=await import('../recording-search-index.mjs'),{events,collector}=capture();
+  const shell={type:'shell_call',id:'shell',call_id:'shell-call',status:'completed',action:{commands:['printf visible','printf second'],timeout_ms:1000,max_output_length:4096}};
+  const patch={type:'apply_patch_call',id:'patch',call_id:'patch-call',status:'completed',operation:{type:'update_file',path:'visible.txt',diff:'@@\n-before\n+after\n'}};
+  for(const [index,item] of [shell,patch].entries()){
+    collector.event({type:'response.output_item.added',output_index:index,item:{...item,status:'in_progress'}});
+    collector.event({type:'response.output_item.done',output_index:index,item});
+  }
+  const summary=collector.finish({output:[shell,patch]});
+  const assembled=assembleRecording(events.map((event,index)=>({...event,sequence:index+1})));
+  assert.equal(assembled.length,4);assert.deepEqual(assembled.filter(item=>item.metadata.representation==='command').map(item=>item.text),shell.action.commands);assert.deepEqual(JSON.parse(assembled.find(item=>item.metadata.representation==='call_metadata').text),{timeout_ms:1000,max_output_length:4096});assert.deepEqual(JSON.parse(assembled.find(item=>item.metadata.toolType==='apply_patch_call').text),patch.operation);assert.equal(assembled[0].metadata.name,'shell');assert.equal(assembled[0].metadata.status,'completed');assert.equal(summary.incomplete,false);assert.equal(summary.coverage.seen.toolCalls,2);
+  const returned=capture(),shellOutput=[{stdout:'visible stdout',stderr:'visible stderr',outcome:{type:'exit',exit_code:2}},{stdout:'partial output',stderr:'',outcome:{type:'timeout'}}];
+  returned.collector.input({input:[{role:'user',content:'old question'},shell,{type:'shell_call_output',call_id:'shell-call',output:shellOutput,max_output_length:4096},{type:'apply_patch_call_output',call_id:'patch-call',status:'failed'}]});
+  const result=returned.collector.finish();assert.equal(result.incomplete,false);assert.equal(returned.events.length,3);assert.deepEqual(returned.events.slice(0,2).map(event=>event.content.output),shellOutput);assert.equal(returned.events[0].content.toolType,'shell_call');assert.equal(returned.events[0].content.max_output_length,4096);assert.deepEqual(returned.events.slice(0,2).map(event=>event.content.output_position),[0,1]);assert.ok(returned.events.slice(0,2).every(event=>event.content.association_state==='unavailable'));assert.equal(returned.events[2].content.output,'');assert.equal(returned.events[2].content.status,'failed');assert.equal(result.coverage.captured.toolResults,2);assert.ok(returned.events.every(event=>event.provenance==='client'));
+});
+test('内置工具仍遵守脱敏和容量预算，未支持类型保持明确缺失',()=>{
+  const {events,collector}=capture();const original={type:'shell_call',id:'shell',call_id:'call',action:{commands:['Authorization: Bearer opaque-fixture-secret\nprintf visible']}};
+  const result=collector.finish({output:[original,{type:'future_tool_call',id:'future',input:'PRIVATE_UNSUPPORTED'}]});assert.ok(!JSON.stringify(events).includes('opaque-fixture-secret'));assert.ok(JSON.stringify(events).includes('printf visible'));assert.ok(!JSON.stringify(events).includes('PRIVATE_UNSUPPORTED'));assert.ok(result.coverage.reasons.includes('unsupported_item'));assert.equal(original.action.commands[0].includes('opaque-fixture-secret'),true);
+  const small=capture({maxBytes:256});assert.equal(small.collector.finish({output:[{...original,action:{commands:['x'.repeat(10000)]}}]}).truncated,true);assert.ok(small.collector.bytes<=256);
+  const nodes=capture({maxNodes:8});assert.equal(nodes.collector.finish({output:[{...original,action:{commands:Array(50).fill('visible')}}]}).truncated,true);
+});
+test('补丁结果added后中断仍保留省略output的合法状态和关联',()=>{
+  const {events,collector}=capture();collector.event({type:'response.output_item.added',output_index:0,item:{type:'apply_patch_call_output',id:'patch-result',call_id:'call',status:'completed'}});
+  const result=collector.finish();assert.equal(events.length,1);assert.equal(events[0].content.output,'');assert.equal(events[0].content.callId,'call');assert.equal(events[0].content.status,'completed');assert.equal(result.incomplete,false);assert.equal(result.coverage.captured.toolResults,1);
+});
+test('终态显式null清除工具旧错误，缺失字段和关联占位保持原语义',async()=>{
+  const {assembleRecording}=await import('../recording-search-index.mjs');
+  for(const type of ['function_call','custom_tool_call','function_call_output','custom_tool_call_output']){
+    const {events,collector}=capture(),base={type,id:'tool',call_id:'call',name:'exec',status:'failed',error:{code:'old_failure'},...(type.endsWith('_output')?{output:'visible'}:type==='function_call'?{arguments:'{}'}:{input:'visible'})};
+    collector.event({type:'response.output_item.done',output_index:0,item:base});collector.finish({output:[{...base,status:'completed',error:null}]});
+    const [assembled]=assembleRecording(events.map((event,index)=>({...event,sequence:index+1})));assert.equal(assembled.metadata.error,null,type);assert.equal(assembled.metadata.status,'completed');assert.equal(assembled.metadata.callId,'call');assert.equal(events.at(-1).content.mode,'append');
+  }
+});
+test('官方nullable状态和shell输出长度在客户端及上游不误报malformed',()=>{
+  const c=capture();c.collector.input({input:[{type:'function_call_output',call_id:'function',output:'visible',status:null},{type:'shell_call_output',call_id:'shell',output:[],status:null,max_output_length:null}]});
+  c.collector.event({type:'response.output_item.added',output_index:0,item:{type:'shell_call_output',id:'shell-result',call_id:'upstream-shell',output:[],status:null,max_output_length:null}});
+  c.collector.event({type:'response.output_item.done',output_index:0,item:{type:'shell_call_output',id:'shell-result',call_id:'upstream-shell',output:[],status:null,max_output_length:null}});
+  const summary=c.collector.finish({output:[{type:'shell_call',id:'shell-call',call_id:'call',status:null,action:{commands:['printf visible']}}]});
+  assert.equal(summary.incomplete,false);assert.equal(c.events[0].content.status,null);assert.equal(c.events[1].content.max_output_length,null);assert.equal(c.events[2].content.max_output_length,null);
+  for(const key of ['duration_ms','elapsed_ms']){const invalid=capture();assert.equal(invalid.collector.finish({output:[{type:'function_call',id:'bad',call_id:'call',name:'exec',arguments:'{}',[key]:null}]}).incomplete,true);}
+});
 test('current turn excludes previous context, instructions, schemas, reasoning and attachment contents',()=>{
   const payload={instructions:'private-background',tools:[{description:'private-schema'}],input:[{role:'system',content:'private-system'},{role:'user',content:'old-question'},{role:'assistant',content:'old-answer'},{role:'user',content:[{type:'input_text',text:'本轮问题'},{type:'input_image',image_url:'data:image/png;base64,PRIVATE'}]}]};
   const result=currentInput(payload);assert.equal(result.state,'uncertain');assert.equal(result.events.length,2);assert.ok(!JSON.stringify(result).includes('private'));assert.ok(!JSON.stringify(result).includes('old-'));assert.ok(!JSON.stringify(result).includes('PRIVATE'));
   assert.equal(currentInput({input:'重复问题'}).state,'known');
-  assert.deepEqual(currentInput({input:[{role:'user',content:'previous'},{type:'function_call',arguments:'previous'},{type:'function_call_output',call_id:'call-1',output:'当前工具结果'}]}).events,[{kind:'tool_result',content:{callId:'call-1',output:'当前工具结果'}}]);
+  assert.deepEqual(currentInput({input:[{role:'user',content:'previous'},{type:'function_call',arguments:'previous'},{type:'function_call_output',call_id:'call-1',output:'当前工具结果'}]}).events,[{kind:'tool_result',content:{callId:'call-1',output:'当前工具结果',association_state:'provided'}}]);
 });
 test('delta, item done and final response merge into one output without mutating protocol data',()=>{
   const {events,collector}=capture();collector.input({input:'重复问题'});

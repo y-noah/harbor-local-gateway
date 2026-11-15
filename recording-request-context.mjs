@@ -177,7 +177,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       if(protocol&&value.role!==undefined&&key==='refusal'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='content'&&value[key]!==null&&typeof value[key]!=='string'&&!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}
       if(protocol&&(key==='output'&&toolItems.has(value.type)&&value.type.endsWith('_output')||key==='action'&&value.type==='shell_call'||key==='operation'&&value.type==='apply_patch_call'||value.type==='code_interpreter_call'&&key==='code'||['mcp_call','mcp_approval_request'].includes(value.type)&&['arguments','output'].includes(key)||value.type==='mcp_approval_response'&&key==='reason'||key==='error'&&toolItems.has(value.type)||key==='content'&&value.role==='tool')){
-        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),contentParts:Array.isArray(value[key])&&(key==='content'||key==='output'&&['function_call_output','custom_tool_call_output'].includes(value.type)),onTruncate:cut,onRedact,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
+        Object.defineProperty(result,key,{value:safeToolOutput(value[key],{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),protocolContent:key!=='error',contentParts:Array.isArray(value[key])&&(key==='content'||key==='output'&&['function_call_output','custom_tool_call_output'].includes(value.type)),onTruncate:cut,onRedact,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment}),enumerable:true});continue;
       }
       if(schema==='definition'&&['properties','patternProperties','$defs','definitions','dependentSchemas','dependentRequired','dependencies'].includes(key)&&value[key]&&typeof value[key]==='object'&&!Array.isArray(value[key])){
         const definitions={};
@@ -214,7 +214,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     }
     if(bytes+size>maxBytes){cut();return false;}components.push(component);bytes+=size;return true;
   };
-  if(!payload||typeof payload!=='object'||Array.isArray(payload))return {state:'incomplete',components,bytes,reasons:['invalid_payload'],opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
+  if(!payload||typeof payload!=='object'||Array.isArray(payload))return {state:'incomplete',components,bytes,nodesConsumed:0,reasons:['invalid_payload'],opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
   if(typeof payload.instructions==='string'){add('instruction',{source:'instructions',value:payload.instructions});yield;}
   else if(payload.instructions!==undefined&&payload.instructions!==null)reasons.add('unsupported_instructions');
   if(Array.isArray(payload.tools))for(let index=0;index<payload.tools.length;index++){if(nodes<=0){cut();break;}const tool=payload.tools[index];if(!tool||typeof tool!=='object'||Array.isArray(tool)){nodes--;reasons.add('unsupported_tools');yield;continue;}if(!add('tool_schema',{source:'tools',index,value:tool}))break;yield;}
@@ -236,7 +236,9 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     const value=payload[key],valid=value===null||key==='parallel_tool_calls'&&typeof value==='boolean'||key!=='parallel_tool_calls'&&typeof value==='string'||['conversation','tool_choice'].includes(key)&&typeof value==='object'&&!Array.isArray(value);
     if(!valid){reasons.add('unsupported_content');continue;}add('context',{source:key,value});yield;
   }
-  return {state:reasons.size?'incomplete':'complete',components,bytes,reasons:[...reasons].sort(),opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
+  // Internal accounting lets event adapters share one request-wide budget.
+  // Persistence explicitly selects components/coverage and excludes this field.
+  return {state:reasons.size?'incomplete':'complete',components,bytes,nodesConsumed:Math.min(maxNodes,Math.max(0,maxNodes-nodes)),reasons:[...reasons].sort(),opaqueReasoningExcluded,redaction:recordRedactionSummary(redactions)};
 }
 
 // Both entry points consume the same filtering and budget state machine.

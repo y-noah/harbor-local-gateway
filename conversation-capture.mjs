@@ -1,13 +1,21 @@
 import {createHash} from 'node:crypto';
-import {RecordRedactor,recordRedactionSummary,sanitizeRecord,sanitizeToolRecord,boundedRecordText,redactRecordParts,filteredRecordField} from './record-redaction.mjs';
+import {RecordRedactor,recordRedactionSummary,sanitizeRecord,sanitizeToolRecord,boundedRecordText,redactRecordParts,filteredRecordField,restoreAuthenticatedRecord,isFilteredRecord} from './record-redaction.mjs';
 import {JsonRecordRedactor} from './record-json.mjs';
+import {hostedToolProtocols,captureHostedItem,captureHostedEvent} from './recording-hosted-tools.mjs';
+import {visibleToolProtocols,captureVisibleItem,captureVisibleEvent,captureToolAssociations} from './recording-visible-tools.mjs';
+import {captureShellItem,captureShellEvent} from './recording-shell-stream.mjs';
 
 const digest=text=>createHash('sha256').update(text).digest('hex');
 const textOf=content=>typeof content==='string'?[{type:'text',text:content}]:Array.isArray(content)?content:[];
-const resultTypes=new Set(['function_call_output','custom_tool_call_output']);
+const structuredCalls={shell_call:{name:'shell',field:'action'},apply_patch_call:{name:'apply_patch',field:'operation'}};
+const resultCalls={function_call_output:'function_call',custom_tool_call_output:'custom_tool_call',shell_call_output:'shell_call',apply_patch_call_output:'apply_patch_call'};
+const resultTypes=new Set(Object.keys(resultCalls));
+const nullableToolIds=new Set(['function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','mcp_approval_response','computer_call_output']);
 const mediaTypes=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
 const unknownToolResult=item=>item?.role==='tool'||typeof item?.type==='string'&&/_call_output$/.test(item.type.slice(0,256));
-const currentItem=item=>item?.role==='user'||resultTypes.has(item?.type)||unknownToolResult(item);
+const visibleClientItem=item=>Object.hasOwn(visibleToolProtocols,item?.type)&&visibleToolProtocols[item.type].client;
+const currentItem=item=>item?.role==='user'||resultTypes.has(item?.type)||visibleClientItem(item)||unknownToolResult(item);
+const receivedToolFacts=item=>Object.fromEntries(['status','error','duration_ms','elapsed_ms','caller','environment','async'].filter(key=>Object.hasOwn(item,key)).map(key=>[key,item[key]]));
 
 // The boundary is deliberately conservative when a client submits complete history.
 // It never persists system instructions, tool schemas, reasoning or preceding turns.
@@ -17,8 +25,9 @@ export function currentInput(payload,{maxEvents=256,maxNodes=1024}={}){
   while(start>0&&nodes<maxNodes&&input.length-start<maxEvents){nodes++;if(!currentItem(input[start-1]))break;start--;if(input[start].role==='user')break;}
   const events=[];let unsupportedItems=0,unsupportedContentParts=0,truncated=start>0&&input.length-start===maxEvents||nodes>=maxNodes;
   outer:for(let itemIndex=start;itemIndex<input.length;itemIndex++){const item=input[itemIndex];
+    if(visibleClientItem(item)||item?.type==='shell_call_output'){events.push({kind:'protocol_item',content:item});continue;}
     if(resultTypes.has(item?.type)){
-      events.push({kind:'tool_result',content:{callId:item.call_id||null,output:item.output,...(item.type==='custom_tool_call_output'?{toolType:'custom_tool_call'}:{}),...(typeof item.name==='string'?{name:item.name}:{}),...(typeof item.namespace==='string'?{namespace:item.namespace}:{})}});continue;
+      events.push({kind:'tool_result',content:{callId:item.call_id||null,output:item.type==='apply_patch_call_output'&&item.output===undefined?'':item.output,...receivedToolFacts(item),...(item.type!=='function_call_output'?{toolType:resultCalls[item.type]}:{}),...(Object.hasOwn(item,'id')?{item:item.id}:{}),...(item.type==='function_call_output'&&Object.hasOwn(item,'call_id')&&(item.call_id===null||typeof item.call_id==='string'&&item.call_id.length)?{association_state:item.call_id===null?'unavailable':'provided'}:{}),...(Object.hasOwn(item,'max_output_length')?{max_output_length:item.max_output_length}:{}),...(typeof item.name==='string'||item.type==='function_call_output'&&item.name===null?{name:item.name}:{}),...(typeof item.namespace==='string'?{namespace:item.namespace}:{})}});continue;
     }
     if(unknownToolResult(item)){unsupportedItems++;continue;}
     for(const part of textOf(item.content)){
@@ -75,7 +84,8 @@ function redactToolJson(raw,{maxBytes,maxNodes,onTruncate,onNodes,attachmentMeta
   for(const edit of edits.sort((a,b)=>a.start-b.start||b.end-a.end)){if(edit.start<position)continue;parts.push(raw.slice(position,edit.start),edit.replacement);position=edit.end;}parts.push(raw.slice(position));
   const filter=new JsonRecordRedactor({onTruncate,onRedact});return filter.push(parts.join(''))+filter.finish();
 }
-export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,onTruncate,onUnsupported=()=>{},onNodes,attachmentMetadata,onRedact}){
+export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,logParts=false,protocolContent=true,onTruncate,onUnsupported=()=>{},onNodes,attachmentMetadata,onRedact}){
+  if(isFilteredRecord(value))return sanitizeRecord(value,{maxBytes,maxNodes,onTruncate,onRedact});
   if(typeof value==='string'){
     const prefix=boundedRecordText(value,maxBytes);
     if(/^[\[{]/.test(prefix.trimStart())){
@@ -96,22 +106,28 @@ export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,
       const result=[],parts=[],positions=[];
       for(const child of item){if(nodes<=0||remaining<=0){result.push(cut());break;}
         if(fragment&&(!child||!['text','input_text','output_text',...mediaTypes].includes(child.type)||['text','input_text','output_text'].includes(child.type)&&typeof child.text!=='string')){if(onNodes?.(1)===false){result.push(cut());break;}onUnsupported();result.push({content:'[未支持的工具内容片段已省略]'});nodes--;continue;}
-        if(['text','input_text','output_text'].includes(child?.type)&&typeof child.text==='string'){
+        const textField=logParts&&child?.type==='logs'?'logs':'text';
+        if((['text','input_text','output_text'].includes(child?.type)||logParts&&child?.type==='logs')&&typeof child[textField]==='string'){
           if(onNodes?.(3)===false){result.push(cut());break;}
-          nodes-=3;positions.push([result.length,child.type]);parts.push(text(child.text));result.push(null);
-          for(const key in child)if(Object.hasOwn(child,key)&&!['type','text'].includes(key)){onUnsupported();break;}
+          nodes-=3;let metadata={type:child.type};
+          if(!protocolContent){
+            const extra=Object.create(null);let keys=0;
+            for(const name in child){if(!Object.hasOwn(child,name)||name===textField)continue;if(keys++>=nodes){onTruncate();break;}Object.defineProperty(extra,name,{value:child[name],enumerable:true});}
+            metadata=visit(extra,depth+1);
+          }else for(const key in child)if(Object.hasOwn(child,key)&&!['type',textField].includes(key)){onUnsupported();break;}
+          positions.push([result.length,child.type,textField,metadata]);parts.push(text(child[textField]));result.push(null);
         }
         else result.push(visit(child,depth+1));
       }
       const safe=redactRecordParts(parts,{maxBytes,maxParts:maxNodes,onTruncate,onRedact}).parts;
-      for(let i=0;i<safe.length;i++)result[positions[i][0]]=filteredRecordField({type:positions[i][1]},'text',safe[i]);return result;
+      for(let i=0;i<safe.length;i++)result[positions[i][0]]=positions[i][2]==='logs'?restoreAuthenticatedRecord({type:'logs',logs:safe[i]}):filteredRecordField(positions[i][3],'text',safe[i]);return result;
     }
     if(item&&typeof item==='object'){
       if(mediaTypes.has(item.type)){onRedact?.('attachment_data');return attachmentMetadata?attachmentMetadata(item):{type:item.type,
         ...(Number.isSafeInteger(item.size??item.bytes)&&(item.size??item.bytes)>=0?{bytes:item.size??item.bytes}:{}),
         ...(Number.isSafeInteger(item.position)&&item.position>=0?{position:item.position}:{}),...(['low','high','auto'].includes(item.detail)?{detail:item.detail}:{}),content:'[附件数据已省略]'};}
       const result=Object.create(null);for(const key in item){if(!Object.hasOwn(item,key))continue;if(onNodes?.(1)===false||nodes<=0||remaining<=0){result.recording_truncated=cut();break;}
-        const name=boundedRecordText(key,Math.min(remaining,256));remaining-=Buffer.byteLength(name);if(name.length!==key.length){onTruncate();result[name]='[已脱敏]';}else result[name]=visit(item[key],depth+1,key==='content'&&Array.isArray(item[key]));
+        const name=boundedRecordText(key,Math.min(remaining,256));remaining-=Buffer.byteLength(name);if(name.length!==key.length){onTruncate();result[name]='[已脱敏]';}else result[name]=visit(item[key],depth+1,protocolContent&&key==='content'&&Array.isArray(item[key]));
       }return result;
     }return item;
   };
@@ -163,8 +179,13 @@ export class ConversationCapture{
       if(this.truncated)break;
       if(event.kind==='user'){
         const text=filtered.parts[userIndex++]||'';if(text)this.sendText('user',{field:'input:'+(event.group??'0')+':'+position,position,mode:'append'},text,'client');
+      }else if(event.kind==='protocol_item'){
+        const options={provenance:'client',inputKey:'input-visible:'+(++this.inputSequence)};
+        if(!captureShellItem(this,event.content,position,options))captureVisibleItem(this,event.content,position,options);
       }else if(event.kind==='tool_result'){
-        this.result('input-tool:'+(++this.inputSequence),{callId:event.content.callId,toolType:event.content.toolType||'function_call',...(typeof event.content.name==='string'?{name:event.content.name}:{}),...(typeof event.content.namespace==='string'?{namespace:event.content.namespace}:{})},event.content.output,'client');
+        const type=event.content.toolType||'function_call',metadata={...this.toolFacts(event.content,type+'_output'),callId:event.content.callId,toolType:type,...(['provided','unavailable'].includes(event.content.association_state)?{association_state:event.content.association_state}:{}),...(typeof event.content.name==='string'||type==='function_call'&&event.content.name===null?{name:event.content.name}:{}),...(typeof event.content.namespace==='string'?{namespace:event.content.namespace}:{})};
+        if(Object.hasOwn(event.content,'item')){if(typeof event.content.item==='string'||event.content.item===null)metadata.item=event.content.item;else this.incompleteReasons.add('malformed_tool_item');}
+        this.result('input-tool:'+(++this.inputSequence),metadata,event.content.output,'client');
       }else this.send(event.kind,{...event.content,position},'client');
     }
     for(const [field,category] of [['unsupportedItems','items'],['unsupportedContentParts','contentParts']])for(let i=0;i<Math.min(this.maxFields,current[field]||0);i++)this.unsupportedItem(category,'input:'+i);
@@ -184,7 +205,7 @@ export class ConversationCapture{
     if(!state&&!this.truncated){
       if(this.fields.size>=this.maxFields){this.truncated=true;return null;}
       const safe=sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}});if(this.truncated)return null;
-      state={key,kind,metadata:safe,filter:kind==='tool_call'&&metadata.toolType!=='custom_tool_call'?new JsonRecordRedactor({onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}}):new RecordRedactor({onRedact:this.onRedact}),hash:createHash('sha256'),closed:false};this.fields.set(key,state);
+      state={key,kind,metadata:safe,filter:kind==='tool_call'&&!['custom_tool_call','shell_call'].includes(metadata.toolType)&&!hostedToolProtocols[metadata.toolType]?.raw?new JsonRecordRedactor({onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}}):new RecordRedactor({onRedact:this.onRedact}),hash:createHash('sha256'),closed:false};this.fields.set(key,state);
     }
     return state;
   }
@@ -203,20 +224,20 @@ export class ConversationCapture{
     const field=this.field(key,kind,metadata);if(!field)return;
     const finalHash=digest(text),same=field.closed?field.finalHash===finalHash:field.hash.copy().digest('hex')===finalHash;
     const safeMetadata=sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;}});if(this.truncated)return;
-    const updates=Object.fromEntries(Object.entries(safeMetadata).filter(([name,value])=>value!==null||field.metadata[name]==null)),changed=Object.entries(updates).some(([name,value])=>field.metadata[name]!==value);field.metadata={...field.metadata,...updates};
+    const updates=Object.fromEntries(Object.entries(safeMetadata).filter(([name,value])=>name==='error'||value!==null||field.metadata[name]==null)),changed=Object.entries(updates).some(([name,value])=>field.metadata[name]!==value);field.metadata={...field.metadata,...updates};
     const tail=field.closed?'':field.filter.finish();
     if(same){if(!field.closed||tail||changed)this.sendText(kind,{...field.metadata,field:key,mode:'append'},tail);}
     else{
       let clipped=false;const options={maxBytes:Math.max(0,this.maxBytes-this.bytes),onRedact:this.onRedact,onTruncate:()=>{clipped=true;}};
-      const safe=kind==='tool_call'&&field.metadata.toolType!=='custom_tool_call'?sanitizeToolRecord(text,options):sanitizeRecord(text,options);this.sendText(kind,{...field.metadata,field:key,mode:'replace'},safe);if(clipped)this.truncated=true;
+      const safe=kind==='tool_call'&&!['custom_tool_call','shell_call'].includes(field.metadata.toolType)&&!hostedToolProtocols[field.metadata.toolType]?.raw?sanitizeToolRecord(text,options):sanitizeRecord(text,options);this.sendText(kind,{...field.metadata,field:key,mode:'replace'},safe);if(clipped)this.truncated=true;
     }
     field.closed=true;field.hash=null;field.finalHash=finalHash;
   }
   result(key,metadata,value,provenance='upstream'){
     const field=this.field(key,'tool_result',metadata);if(!field)return;
     if(value===undefined){this.incompleteReasons.add('malformed_tool_item');return;}
-    let clipped=false,unsupported=0;const output=safeToolOutput(value,{maxBytes:this.maxBytes,maxNodes:Math.max(1,this.remainingNodes),contentParts:metadata.toolType==='custom_tool_call'&&Array.isArray(value),onRedact:this.onRedact,onTruncate:()=>{clipped=true;},onUnsupported:()=>this.unsupportedItem('contentParts',key+':output:'+(unsupported++))}),encoded=JSON.stringify(output),hash=digest(encoded??'');
-    const safeMetadata=sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{clipped=true;}}),updates=Object.fromEntries(Object.entries(safeMetadata).filter(([name,value])=>value!==null||field.metadata[name]==null)),changed=Object.entries(updates).some(([name,value])=>field.metadata[name]!==value);field.metadata={...field.metadata,...updates};
+    let clipped=false,unsupported=0;const output=safeToolOutput(value,{maxBytes:this.maxBytes,maxNodes:Math.max(1,this.remainingNodes),contentParts:metadata.toolType==='custom_tool_call'&&Array.isArray(value),logParts:metadata.toolType==='code_interpreter_call',onRedact:this.onRedact,onTruncate:()=>{clipped=true;},onUnsupported:()=>this.unsupportedItem('contentParts',key+':output:'+(unsupported++))}),encoded=JSON.stringify(output),hash=digest(encoded??'');
+    const safeMetadata=sanitizeRecord(metadata,{maxBytes:8192,onRedact:this.onRedact,onTruncate:()=>{clipped=true;}}),explicitNullable=safeMetadata.toolType==='function_call'&&['provided','unavailable'].includes(safeMetadata.association_state),updates=Object.fromEntries(Object.entries(safeMetadata).filter(([name,value])=>name==='error'||explicitNullable&&['callId','name','item'].includes(name)||value!==null||field.metadata[name]==null)),changed=Object.entries(updates).some(([name,value])=>field.metadata[name]!==value);field.metadata={...field.metadata,...updates};
     if(hash!==field.resultHash){
       const details={...field.metadata,field:key,mode:'replace'};
       if(Buffer.byteLength(encoded)>32*1024)this.sendField('tool_result',{...details,output_format:typeof output==='string'?'string':'json'},'output',typeof output==='string'?output:encoded,provenance);
@@ -224,13 +245,37 @@ export class ConversationCapture{
     }else if(changed)this.send('tool_result',filteredRecordField({...field.metadata,field:key,mode:'append'},'output',''),provenance);
     field.resultHash=hash;field.closed=true;field.hash=null;if(clipped)this.truncated=true;
   }
+  toolFacts(item,type=item.type){
+    const facts=captureToolAssociations(this,item,type);
+    if(Object.hasOwn(item,'status')){if(typeof item.status==='string'||item.status===null)facts.status=item.status;else this.incompleteReasons.add('malformed_tool_item');}
+    for(const key of ['duration_ms','elapsed_ms','max_output_length'])if(Object.hasOwn(item,key)){
+      if(key==='max_output_length'&&item[key]===null||typeof item[key]==='number'&&Number.isFinite(item[key])&&item[key]>=0)facts[key]=item[key];else this.incompleteReasons.add('malformed_tool_item');
+    }
+    if(Object.hasOwn(item,'error'))facts.error=safeToolOutput(item.error,{maxBytes:8192,maxNodes:Math.max(1,this.remainingNodes),protocolContent:false,onNodes:count=>{this.remainingNodes-=count;return this.remainingNodes>=0;},onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;},onUnsupported:()=>this.incompleteReasons.add('unsupported_content')});
+    return facts;
+  }
   toolMetadata(item,id,type){
-    return {item:id,toolType:type,callId:typeof item.call_id==='string'?item.call_id:null,...(typeof item.name==='string'?{name:item.name}:{}),...(typeof item.namespace==='string'?{namespace:item.namespace}:{})};
+    if(Object.hasOwn(item,'id')&&typeof item.id!=='string'&&!(item.id===null&&nullableToolIds.has(item.type)))this.incompleteReasons.add('malformed_tool_item');
+    if(Object.hasOwn(item,'name')&&typeof item.name!=='string'&&!(item.type==='function_call_output'&&item.name===null))this.incompleteReasons.add('malformed_tool_item');
+    if(Object.hasOwn(item,'call_id')&&typeof item.call_id!=='string'&&!(item.type==='function_call_output'&&item.call_id===null))this.incompleteReasons.add('malformed_tool_item');
+    return {item:Object.hasOwn(item,'id')&&item.id===null?null:id,toolType:type,callId:typeof item.call_id==='string'?item.call_id:null,...this.toolFacts(item),...(item.type==='function_call_output'&&Object.hasOwn(item,'call_id')&&(item.call_id===null||typeof item.call_id==='string'&&item.call_id.length)?{association_state:item.call_id===null?'unavailable':'provided'}:{}),...(typeof item.name==='string'||item.type==='function_call_output'&&item.name===null?{name:item.name}:Object.hasOwn(structuredCalls,type)?{name:structuredCalls[type].name}:{}),...(typeof item.namespace==='string'?{namespace:item.namespace}:{})};
+  }
+  structuredTool(item,index,partial=false){
+    const protocol=structuredCalls[item.type],key=this.identity(index,item.id),metadata=this.toolMetadata(item,item.id||String(index),item.type),field=key+':'+protocol.field;
+    this.observe(field,'tool_call',metadata);
+    if(partial&&item[protocol.field]===undefined){this.field(field,'tool_call',metadata);this.sendText('tool_call',{...metadata,field,mode:'append'},'');return;}
+    if(!item[protocol.field]||typeof item[protocol.field]!=='object'||Array.isArray(item[protocol.field])){this.incompleteReasons.add('malformed_tool_item');return;}
+    const value=safeToolOutput(item[protocol.field],{maxBytes:this.maxBytes,maxNodes:Math.max(1,this.remainingNodes),onNodes:count=>{this.remainingNodes-=count;return this.remainingNodes>=0;},onRedact:this.onRedact,onTruncate:()=>{this.truncated=true;},onUnsupported:()=>this.incompleteReasons.add('unsupported_content')});
+    this.complete(field,'tool_call',metadata,JSON.stringify(value));
   }
   item(item,index){
     if(this.closed||this.truncated)return;if(this.remainingNodes--<=0){this.truncated=true;return;}
     if(!item||typeof item!=='object'){this.unsupportedItem('items','invalid:'+index);return;}
     const id=item.id||String(index),key=this.identity(index,item.id);
+    if(captureShellItem(this,item,index))return;
+    if(captureHostedItem(this,item,index))return;
+    if(captureVisibleItem(this,item,index))return;
+    if(Object.hasOwn(structuredCalls,item.type)){this.structuredTool(item,index);return;}
     if(item.type==='function_call'||item.type==='custom_tool_call'){
       const custom=item.type==='custom_tool_call',metadata=this.toolMetadata(item,id,item.type),value=custom?item.input:item.arguments,field=key+(custom?':input':':arguments');
       this.observe(field,'tool_call',metadata);
@@ -238,7 +283,7 @@ export class ConversationCapture{
       this.complete(field,'tool_call',metadata,value);return;
     }
     if(resultTypes.has(item.type)){
-      this.result(key+':output',this.toolMetadata(item,id,item.type==='custom_tool_call_output'?'custom_tool_call':'function_call'),item.output);return;
+      this.result(key+':output',this.toolMetadata(item,id,resultCalls[item.type]),item.type==='apply_patch_call_output'&&item.output===undefined?'':item.output);return;
     }
     if(item.type==='reasoning'){
       if(Object.hasOwn(item,'encrypted_content')||Object.hasOwn(item,'content')){
@@ -265,6 +310,10 @@ export class ConversationCapture{
     if(this.closed||this.truncated)return;
     const key=this.identity(event.output_index,event.item_id||event.item?.id),id=event.item_id||event.item?.id||String(event.output_index??0),index=event.content_index??0,type=typeof event.type==='string'?event.type.slice(0,256):'';
     if(type==='response.output_item.added'){
+      if(captureShellItem(this,event.item,event.output_index,{partial:true}))return;
+      if(captureHostedItem(this,event.item,event.output_index,{partial:true}))return;
+      if(captureVisibleItem(this,event.item,event.output_index,{partial:true}))return;
+      if(Object.hasOwn(structuredCalls,event.item?.type)){this.structuredTool(event.item,event.output_index,true);return;}
       if(event.item?.type==='function_call'||event.item?.type==='custom_tool_call'){
         const custom=event.item.type==='custom_tool_call',metadata=this.toolMetadata(event.item,id,event.item.type),field=key+(custom?':input':':arguments');
         this.observe(field,'tool_call',metadata);
@@ -274,10 +323,13 @@ export class ConversationCapture{
         const value=custom?event.item.input:event.item.arguments;if(typeof value==='string'&&value.length)this.delta(field,'tool_call',this.itemMetadata.get(key),value);return;
       }
       if(resultTypes.has(event.item?.type)){
-        const metadata=this.toolMetadata(event.item,id,event.item.type==='custom_tool_call_output'?'custom_tool_call':'function_call');
-        if(event.item.output!==undefined)this.result(key+':output',metadata,event.item.output);else this.field(key+':output','tool_result',metadata);
+        const metadata=this.toolMetadata(event.item,id,resultCalls[event.item.type]);
+        if(event.item.output!==undefined||event.item.type==='apply_patch_call_output')this.result(key+':output',metadata,event.item.output===undefined?'':event.item.output);else this.field(key+':output','tool_result',metadata);
       }else if(!['message','reasoning'].includes(event.item?.type))this.unsupportedItem('items',key);return;
     }
+    if(captureHostedEvent(this,event,key,id,type))return;
+    if(captureVisibleEvent(this,event,key,id,type))return;
+    if(captureShellEvent(this,event,key,id,type))return;
     const tool=(custom=false)=>({...this.itemMetadata.get(key),item:id,toolType:custom?'custom_tool_call':'function_call'});
     if(type==='response.output_text.delta')this.delta(key+':'+index+':text','assistant',{item:id},event.delta);
     else if(type==='response.output_text.done')this.complete(key+':'+index+':text','assistant',{item:id},event.text);
@@ -308,9 +360,11 @@ export class ConversationCapture{
     const output=Array.isArray(response?.output)?response.output:[];
     for(let i=0;i<output.length&&!this.truncated;i++){if(this.remainingNodes<=0){this.truncated=true;break;}this.item(output[i],i);}
     for(const field of this.fields.values()){
+      if(field.metadata.item_pending===true)this.incompleteReasons.add('malformed_tool_item');
       if(!field.closed){const text=field.filter.finish();if(text)this.sendText(field.kind,{...field.metadata,field:field.key,mode:'append'},text);if(field.kind==='tool_call'||field.kind==='tool_result')this.incompleteReasons.add('malformed_tool_item');}
       if(field.kind==='tool_call'||field.kind==='tool_result'){
-        if(typeof field.metadata.callId!=='string'||!field.metadata.callId.length||field.metadata.callId.length>512||field.kind==='tool_call'&&(typeof field.metadata.name!=='string'||!field.metadata.name.length))this.incompleteReasons.add('malformed_tool_item');
+        const type=field.metadata.toolType,usesItemId=Object.hasOwn(hostedToolProtocols,type)||Object.hasOwn(visibleToolProtocols,type)&&!visibleToolProtocols[type].callId||field.kind==='tool_result'&&type==='function_call'&&field.metadata.association_state==='unavailable';
+        if(!usesItemId&&(typeof field.metadata.callId!=='string'||!field.metadata.callId.length||field.metadata.callId.length>512)||field.kind==='tool_call'&&(typeof field.metadata.name!=='string'||!field.metadata.name.length))this.incompleteReasons.add('malformed_tool_item');
       }
     }
     const seen={toolCalls:0,toolResults:0,reasoningSummaries:0},captured={...seen},unique=new Map();
