@@ -9,9 +9,10 @@ import {verifyConsumptionPolicyAvailability} from './postgres-consumption-policy
 
 const fail=(status,message,code='member_query_invalid')=>{throw new AppError(status,message,code);};
 export function memberQuery(params,{keys=false}={}){
-  const allowed=keys?['page','page_size','q','member_id']:['page','page_size','q','type_id','status','view'];
+  const allowed=keys?['page','page_size','q','member_id']:['page','page_size','q','type_id','status','view','usage_profile'];
   if([...params.keys()].some(key=>!allowed.includes(key)||params.getAll(key).length!==1))fail(400,'员工查询参数无效');
   const value={page:1,pageSize:20,q:params.get('q')??'',typeId:params.get('type_id')??'',status:params.get('status')??'',memberId:params.get('member_id')??''};
+  if(params.has('usage_profile')){if(!['full','list'].includes(params.get('usage_profile')))fail(400,'员工用量视图无效');value.usageProfile=params.get('usage_profile');}
   if(params.has('view')){if(params.get('view')!=='list')fail(400,'员工查询视图无效');value.view='list';}
   for(const [key,field] of [['page','page'],['page_size','pageSize']])if(params.has(key)){if(!/^[1-9]\d*$/.test(params.get(key))||!Number.isSafeInteger(Number(params.get(key))))fail(400,'员工分页参数无效');value[field]=Number(params.get(key));}
   if(value.pageSize>100||value.q.length>100||value.q.includes('\0')||!['','enabled','disabled'].includes(value.status)||value.typeId&&!/^(?:unclassified|[a-zA-Z0-9-]{1,80})$/.test(value.typeId)||value.memberId&&!/^[a-f0-9-]{36}$/.test(value.memberId))fail(400,'员工查询参数无效');
@@ -36,17 +37,17 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
   const consumptionView=row=>{if(!consumptionAvailable)return {};try{return readConsumptionPolicy(row,{allowLegacy:false});}catch{fail(503,'Key消耗来源配置无效','consumption_policy_invalid');}};
   if(!Number.isSafeInteger(pageBytes)||pageBytes<1024||pageBytes>2097152||!Number.isSafeInteger(maxSelection)||maxSelection<1||maxSelection>10000)fail(503,'员工页面字节预算无效','member_query_configuration');
   const empty=aggregate({requests:0,known:0,success:0,active:0,unmetered:0,unpriced:0,pending:0,expired:0,...Object.fromEntries(fields.map(field=>[field,'0']))}).standard;
-  async function usage(scope,ids,at){
+  async function usage(scope,ids,at,{profile='full'}={}){
     if(!ids.length)return new Map();const window=usageWindow(at);
     const useRollups=await usageRollupsReady(store);
+    const identityMeasures=profile==='list'?'MAX(r.started) last_seen':`COUNT(DISTINCT r.ip) ips,COUNT(DISTINCT r.device_id) used_devices,
+        COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(r.started) last_seen`;
     const rollupSql=`WITH identity AS (
-      SELECT r.${scope}_id owner_id,COUNT(DISTINCT r.ip) ips,COUNT(DISTINCT r.device_id) used_devices,
-        COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(r.started) last_seen
+      SELECT r.${scope}_id owner_id,${identityMeasures}
       FROM harbor.requests r WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3 GROUP BY r.${scope}_id
     ),money AS (${usageRollupMoneySql(scope)}) SELECT i.*,m.* FROM identity i JOIN money m USING(owner_id)`;
     const rows=await store.all(useRollups?rollupSql:`WITH identity AS (
-      SELECT r.${scope}_id owner_id,COUNT(DISTINCT r.ip) ips,COUNT(DISTINCT r.device_id) used_devices,
-        COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests,MAX(r.started) last_seen
+      SELECT r.${scope}_id owner_id,${identityMeasures}
       FROM harbor.requests r WHERE r.${scope}_id=ANY($1::text[]) AND r.usage_at>=$2 AND r.usage_at<$3 GROUP BY r.${scope}_id
     ), priced AS (
       SELECT r.${scope}_id owner_id,(r.usage_at>=$4 AND r.usage_at<$5) recent,r.price_version revision,
@@ -59,11 +60,11 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
       SELECT owner_id,${referenceRollupAggregateSql({standardOnly:true})},${referenceRollupAggregateSql({standardOnly:true,condition:'recent',prefix:'recent_'})} FROM partial GROUP BY owner_id
     ) SELECT i.*,m.* FROM identity i JOIN money m USING(owner_id)`,ids,window.start,window.end,at-12*3600000,at);
     return new Map(rows.flatMap(row=>[
-      [row.owner_id+':false',{standard:aggregate(row).standard,ips:row.ips,used_devices:row.used_devices,unverified_requests:row.unverified_requests,last_seen:row.last_seen}],
+      [row.owner_id+':false',{standard:aggregate(row).standard,...(profile==='full'?{ips:row.ips,used_devices:row.used_devices,unverified_requests:row.unverified_requests}:{}),last_seen:row.last_seen}],
       [row.owner_id+':true',{standard:aggregate(Object.fromEntries(Object.entries(row).filter(([key])=>key.startsWith('recent_')).map(([key,value])=>[key.slice(7),value]))).standard}]
     ]));
   }
-  const used=(data,id)=>({standard:data.get(id+':false')?.standard??empty,standard_12h:data.get(id+':true')?.standard??empty,ips:data.get(id+':false')?.ips??0,used_devices:data.get(id+':false')?.used_devices??0,unverified_requests:data.get(id+':false')?.unverified_requests??0,last_seen:data.get(id+':false')?.last_seen??null});
+  const used=(data,id,{profile='full'}={})=>({standard:data.get(id+':false')?.standard??empty,standard_12h:data.get(id+':true')?.standard??empty,...(profile==='full'?{ips:data.get(id+':false')?.ips??0,used_devices:data.get(id+':false')?.used_devices??0,unverified_requests:data.get(id+':false')?.unverified_requests??0}:{}),last_seen:data.get(id+':false')?.last_seen??null});
   async function registered(scope,ids){
     if(!ids.length)return new Map();
     const rows=scope==='member'?await store.all('SELECT member_id owner_id,COUNT(*) total FROM harbor.employee_devices WHERE member_id=ANY($1::text[]) GROUP BY member_id',ids):await store.all(`SELECT k.id owner_id,COUNT(d.id) total FROM harbor.keys k LEFT JOIN harbor.employee_devices d ON d.member_id=k.member_id AND (d.allowed_key_ids IS NULL OR d.allowed_key_ids ? k.id) AND (k.device_ids IS NULL OR k.device_ids ? d.id) WHERE k.id=ANY($1::text[]) GROUP BY k.id`,ids);
@@ -79,9 +80,9 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
       FROM harbor.keys WHERE member_id=ANY($1::text[]) AND removed_at IS NULL GROUP BY member_id`,ids,at);
     return new Map(rows.map(({member_id,...value})=>[member_id,value]));
   }
-  async function member(row,data,at,deviceCounts,{metadata=false}={}){
+  async function member(row,data,at,deviceCounts,{metadata=false,usageProfile='full'}={}){
     const {default_models,usage_limits,usage_limits_version,...view}=row,configuration=postgresMemberLimitConfiguration({usage_limits,usage_limits_version});
-    return {...view,default_models:storedModelAllowlist(default_models),usage_limits:configuration,...(metadata?{}:{limit_usage:configuration.enabled?(await limits.status(row.id,at)).usage:[],...used(data,row.id)}),registered_devices:(deviceCounts??await registered('member',[row.id])).get(row.id)??0};
+    return {...view,default_models:storedModelAllowlist(default_models),usage_limits:configuration,...(metadata?{}:{limit_usage:configuration.enabled?(await limits.status(row.id,at)).usage:[],...used(data,row.id,{profile:usageProfile})}),registered_devices:(deviceCounts??await registered('member',[row.id])).get(row.id)??0};
   }
   const budget=value=>{if(Buffer.byteLength(JSON.stringify(value))>pageBytes)fail(503,'完整员工页超过字节预算，请减小页大小','member_query_capacity');return value;};
   async function list(query,{signal,scope}={}){return read(async()=>{
@@ -93,7 +94,7 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL) key_count,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL AND k.model_source->>'kind'='custom') key_exceptions
       FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE ${condition.where} ORDER BY m.created DESC,m.id DESC LIMIT $${n+1} OFFSET $${n+2}`,...condition.values,query.pageSize,(page-1)*query.pageSize);
-    const metadata=query.view==='list',ids=rows.map(row=>row.id),data=metadata?null:await usage('member',ids,at),deviceCounts=await registered('member',ids),expirations=await keyExpirations(ids,at),items=[];for(const row of rows)items.push(await member({...row,key_expiration:expirations.get(row.id)??{permanent:0,expired:0,next:null,last_expired:null}},data,at,deviceCounts,{metadata}));
+    const metadata=query.view==='list',ids=rows.map(row=>row.id),data=metadata?null:await usage('member',ids,at,{profile:query.usageProfile??'full'}),deviceCounts=await registered('member',ids),expirations=await keyExpirations(ids,at),items=[];for(const row of rows)items.push(await member({...row,key_expiration:expirations.get(row.id)??{permanent:0,expired:0,next:null,last_expired:null}},data,at,deviceCounts,{metadata,usageProfile:query.usageProfile??'full'}));
     return budget({rows:items,types,pagination:{page,pageSize:query.pageSize,total,totalPages},filters:query,observedAt:at,...(metadata?{usagePending:items.length>0}:{})});
   },{signal});}
   async function detail(memberId,{signal,scope}={}){return read(async()=>{

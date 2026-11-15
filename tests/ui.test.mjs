@@ -1977,3 +1977,27 @@ test('切换页面读取时不禁用整个内容容器，失败提供独立重�
 test('账号列表展示已保存月费，额度共享范围只在账号管理显示',async()=>{
  const page=await ui(()=>response({}));const base={...snapshot(),capabilities:{accountPackages:true},accounts:[{id:'a',name:'合成订阅',kind:'codex',auth_mode:'subscription',enabled:1,state:'ready',subscription_monthly_usd:200}]};page.run('admin=true;state='+JSON.stringify(base)+';tab="accounts";render()');assert.match(page.node('#content').innerHTML,/订阅 \$200\.00\/月/);assert.doesNotMatch(page.node('#content').innerHTML,/额度共享范围|供应方额度/);page.run('openAccountManagement("a")');assert.match(page.node('#modal-content').innerHTML,/额度共享范围/);
 });
+
+test('首次进入使用数据立即提供分类导航，请求明细不等待会话查询且隔离迟到回包',async()=>{
+ let releaseSession,sessionSignal;const reads=[];
+ const light={...snapshot(),view:'overview',keys:[],sessions:[],capabilities:{pagedMembers:true,sessionStateView:true,sessionFilters:true}};
+ const rows={summary:{requests:1,success:1,active:0,average_ms:1,standard:{}},pagination:{page:1,pageSize:20,total:1,totalPages:1},rows:[{id:'target-request',started:1,ended:2,status:'ok'}],models:[],members:[],byModel:[],byMember:[]};
+ const page=await ui((path,options)=>{reads.push(path);if(path.startsWith('/api/admin/state')){sessionSignal=options.signal;return new Promise(resolve=>releaseSession=()=>resolve(response({...light,view:'sessions',sessions:[{id:'late-session'}]})));}return response(rows);});
+ page.run('admin=true;state='+JSON.stringify(light)+';tab="overview";render()');
+ const content=page.node('#content');let navigation=null;content.querySelector=selector=>selector==='.record-navigation'?navigation:null;const insert=content.insertAdjacentHTML.bind(content);content.insertAdjacentHTML=(position,html)=>{insert(position,html);navigation={dataset:{pageScope:'sessions:'},children:[]};};
+ page.run('setTab("usage")');assert.match(content.innerHTML,/data-action="record-view"[^>]+data-id="requests"/);assert.equal(content.inert,false);assert.equal(page.run('tab'),'sessions');assert.equal(reads.length,1);
+ page.run('pageReadErrors.set(pageReadKey("state","sessions:"),{scope:"sessions:",source:"state",message:"旧会话错误"})');
+ await page.click('record-view','requests');await new Promise(setImmediate);assert.equal(sessionSignal.aborted,true);assert.ok(reads.some(path=>path.startsWith('/api/admin/requests')));assert.ok(!reads.some(path=>path.startsWith('/api/admin/keys')));assert.equal(page.run('recordView'),'requests');assert.equal(page.run('requestsData.rows[0].id'),'target-request');assert.equal(page.run('pageReadError'),'');
+ releaseSession();await new Promise(setImmediate);assert.equal(page.run('tab'),'requests');assert.equal(page.run('state.view'),'overview');assert.match(content.innerHTML,/target-request/);assert.doesNotMatch(content.innerHTML,/late-session/);
+});
+
+test('员工列表独立用量使用list profile，元数据和缓存筛选范围保持原口径',async()=>{
+ for(const metadata of [false,true]){
+  const paths=[],page=await ui(path=>{paths.push(path);return response(memberPage('member-one',path.includes('view=list')?{usagePending:true}:{}));});
+  const base=pagedSnapshot();base.capabilities.memberListMetadata=metadata;page.run('admin=true;state='+JSON.stringify(base)+';tab="members";memberFilters.q="synthetic";');await page.run('loadMembers()');await new Promise(setImmediate);
+  const queries=paths.filter(path=>path.startsWith('/api/admin/members?')).map(path=>new URL(path,'http://test').searchParams);
+  assert.equal(queries.filter(p=>p.get('view')==='list').length,metadata?1:0);assert.ok(queries.filter(p=>!p.has('view')).every(p=>p.get('usage_profile')==='list'));assert.ok(queries.filter(p=>p.has('view')).every(p=>!p.has('usage_profile')));assert.ok(queries.every(p=>p.get('q')==='synthetic'));
+  assert.equal(page.run('memberDataScopes.get(membersData).includes("usage_profile")'),false);
+  if(metadata){await page.run('loadMembersUsage(membersData,memberParams().toString(),authEpoch)');assert.equal(new URL(paths.at(-1),'http://test').searchParams.get('usage_profile'),'list');}
+ }
+});

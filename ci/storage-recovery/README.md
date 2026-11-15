@@ -388,3 +388,11 @@ Host 在暂停前持久化原入口 epoch、进程代次、三容器、原数据
 发布或启动失败保留 journal、原 Host 和原计划；用 `rollback` 显式恢复原 Host 与 receipt 缺省状态，前提是其他工具仍匹配原计划，不能用旧 Host 回滚已经换代的四件工具。首次安装资格与已有受信完成见证的恢复资格分别校验：已发布的同一桥接允许在明确的 boot/runtime 恢复阶段回退 Host，但仍保留原计划、PG/材料根、永久禁旧库及无其他 plannedOperation 等约束。若 supervisor 尚在恢复或暂停，返回 `recoveryPending:true/writersRestored:false` 并保持 writers 保护；原守卫恢复到 complete/running 后，再调用同一 `install/refresh/rollback` 操作完成核验和原活动 writer 恢复，不重复停止这个已验证的新 supervisor。中断状态保全拒绝盲目重装，可在固定批准与已知文件摘要下回退；不回滚数据库、不删除原 PLAN/approval、旧 intent 或未知文件。固定 generation receipt 只由安装器在验证过的完成态产生，新 Host 不自签。后续新 Host/CORE 升级不包含在这个一次桥接范围内。
 
 当前仅本机实现和定向验证，未执行正式主机的 installer、服务重启或工具换代。正式发布仍须对应批准 CI 与主机验收。
+
+### 员工列表最近使用索引
+
+`member-last-seen-index.sql` 沿用上述管理员自动提交、逐 `statement-boundary` 核验及并发建索引流程，只增加 `request_member_last_seen_cover(member_id,usage_at) INCLUDE(started)`。安装前核对当前实例与表所有者、磁盘和现有建索引任务；不在业务启动或 migration 事务中自动执行。首尾检查同名索引的精确字段与有效状态，冲突或失败保留现场，不自动删除重试。该索引只覆盖员工、计量时间与开始时间，不含正文或 Key；增加请求插入及相关字段更新的索引、磁盘和 WAL 开销，必须以当前实例实际计划与资源情况验收。
+
+员工列表显式使用 `usage_profile=list` 时只计算列表需要的 `last_seen` 与原口径参考消耗，不计算或返回 `ips`、`used_devices`、`unverified_requests`；未指定或指定 `full` 维持原完整契约，员工详情及 Key 查询不变。`last_seen` 仍为近7天 `usage_at` 范围内的最大非空 `started`，不把开始时间当成计量窗口，不跳过迟到请求。不安装索引仍结果正确，但可能较慢。
+
+回退前端调用即可恢复默认完整响应，或回滚本次查询代码；保留索引不会改变业务结果。需要撤销索引时，核对其定义、有效性和非约束属性，并确认无其他维护占用，再单独执行 `DROP INDEX CONCURRENTLY harbor.request_member_last_seen_cover`，不删除其他索引或业务数据。
