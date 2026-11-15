@@ -1,3 +1,4 @@
+import {initializeQueryDepartmentIsolation,assertQueryDepartmentIdentity} from './postgres-departments.mjs';
 import {requireDepartmentScope} from './department-access.mjs';
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {AppError,usageWindow,storedModelAllowlist} from './store.mjs';
@@ -9,9 +10,13 @@ import {verifyUsageRollupAvailability,usageRollupsReady,usageRollupMoneySql} fro
 export function createPostgresSelfQuery(store,{queryQueue,clock=Date.now}={}){
   const access=createRoutingDepartments(store,{clock}),limits=createPostgresMemberLimits(store,{clock}),consumption=createPostgresConsumptionPolicy(store,{clock});let consumptionInitialization,rollupInitialization;
   return (secret,{scope,signal}={})=>queryQueue.run(async()=>{
+   // Establish committed structural evidence before our read snapshot. When
+   // called inside an existing transaction, initialization remains local to it.
+   await initializeQueryDepartmentIsolation(store);
    const initialized=await (consumptionInitialization??=verifyConsumptionPolicyAvailability(store).then(available=>({available}),error=>{consumptionInitialization=undefined;throw error;}));
    return store.transaction(async()=>{
     const at=clock(),member=await store.authenticate(secret,{at}),currentScope=store.departmentScope?.(member),department=await access.resolve(currentScope,{member,employeeOnly:true}),window=usageWindow(at);
+    await assertQueryDepartmentIdentity(store,department!==null);
     if(scope!==undefined){const initial=requireDepartmentScope(scope,{roles:['employee']});if(!department||['department_id','member_id','credential_id','credential_version','member_version','department_version'].some(field=>initial[field]!==department[field]))throw new AppError(403,'员工或部门授权已变化','department_forbidden');}
     const policy=initialized.available?await consumption.read(member.key_id,{memberId:member.id}):null;
     if(department)await (rollupInitialization??=verifyUsageRollupAvailability(store).catch(error=>{rollupInitialization=undefined;throw error;}));

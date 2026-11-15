@@ -82,9 +82,36 @@ test('api/me小时汇总与原始查询完整DTO一致，受限角色下隔离�
  assert.equal(raw[0].consumption_policy,'api_only');assert.equal(raw[0].consumption_policy_version,1);assert.equal(raw[1].consumption_policy,'subscription_only');
  assert.equal((await reconcileUsageRollups(f.store,{publishReady:true})).ready,true);
  const sqls=[],original=restricted.query.bind(restricted);restricted.query=(sql,args)=>{sqls.push(sql);return original(sql,args);};
- const ready=[await self(secrets[0])];assert.ok(sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));assert.ok(sqls.some(sql=>sql.includes('pg_constraint')),'cold client initializes its own schema attestation');sqls.length=0;
- for(const secret of secrets.slice(1))ready.push(await self(secret));assert.deepEqual(ready,raw);assert.ok(sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));assert.ok(!sqls.some(sql=>/pg_proc|pg_constraint/.test(sql)),'warm client does not repeat full schema attestation');
+ const ready=[await self(secrets[0])];assert.ok(sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));assert.ok(sqls.some(sql=>sql.includes('pg_constraint')),'cold client initializes its own schema attestation');const coldSql={total:sqls.length,departmentFull:sqls.filter(sql=>sql.startsWith('SELECT c.relname,a.attname,a.attnotnull')).length,metadata:sqls.filter(sql=>/pg_proc|pg_constraint/.test(sql)).length};sqls.length=0;
+ for(const secret of secrets.slice(1))ready.push(await self(secret));assert.deepEqual(ready,raw);assert.ok(sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));assert.ok(!sqls.some(sql=>/pg_proc|pg_constraint/.test(sql)),'warm client does not repeat full schema attestation');console.log(JSON.stringify({diagnostic:'self-committed-initialization',cold:coldSql,warmRequests:secrets.length-1,warm:{total:sqls.length,departmentFull:sqls.filter(sql=>sql.startsWith('SELECT c.relname,a.attname,a.attnotnull')).length,metadata:sqls.filter(sql=>/pg_proc|pg_constraint/.test(sql)).length}}));
  const a=await restricted.authenticate(f.ma.secret,{at:f.at}),b=await restricted.authenticate(f.mb.secret,{at:f.at});await assert.rejects(self(f.ma.secret,{scope:restricted.departmentScope(b)}),{code:'department_forbidden'});assert.equal((await self(f.ma.secret,{scope:restricted.departmentScope(a)})).department_id,f.a.id);
  await disableUsageRollups(f.store);sqls.length=0;assert.deepEqual(await self(f.ma.secret),raw[0]);assert.ok(!sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));
  }finally{await queue.close();await restricted.close();}
+});
+
+test('api/me外层事务初始化不冒充已提交证明，回滚后建立独立outside证明并保持warm鉴权',integration,async t=>{
+ const f=await fixture(t),{database}=await f.store.get('SELECT current_database() database'),role=database+'_runtime',restricted=new PostgresStore({...options(database),connection:{options:'-c role='+role},poolSize:1}),queue=createPostgresQueryQueue();
+ try{
+  const self=createPostgresSelfQuery(restricted,{clock:()=>f.at,queryQueue:queue}),sqls=[],original=restricted.query.bind(restricted);restricted.query=(sql,args)=>{sqls.push({sql,inTransaction:!!restricted.context.getStore()});return original(sql,args);};let transactional;
+  await assert.rejects(restricted.transaction(async()=>{transactional=await self(f.ma.secret);throw Error('synthetic self rollback');}),/synthetic self rollback/);
+  const full=row=>row.sql.startsWith('SELECT c.relname,a.attname,a.attnotnull');assert.ok(sqls.some(full));assert.ok(sqls.filter(full).every(row=>row.inTransaction));sqls.length=0;
+  assert.deepEqual(await self(f.ma.secret),transactional);assert.ok(sqls.some(row=>full(row)&&!row.inTransaction),'outer transaction proof must not initialize the standalone reader');sqls.length=0;
+  assert.deepEqual(await self(f.ma.secret),transactional);assert.ok(!sqls.some(row=>/pg_proc|pg_constraint/.test(row.sql)));
+  await f.store.run('UPDATE harbor.keys SET enabled=0 WHERE id=$1',f.ma.keyId);await assert.rejects(self(f.ma.secret),{code:'key_disabled'});
+ }finally{await queue.close();await restricted.close();}
+});
+for(const drift of ['quota-marker','quota-permission','runtime-role'])test('api/me warm动态复验拒绝漂移并可恢复且不重跑全结构：'+drift,integration,async t=>{
+ const f=await fixture(t),{database}=await f.store.get('SELECT current_database() database'),role=database+'_runtime',restricted=new PostgresStore({...options(database),connection:{options:'-c role='+role},poolSize:1}),queue=createPostgresQueryQueue();let restore;
+ try{
+  const self=createPostgresSelfQuery(restricted,{clock:()=>f.at,queryQueue:queue}),expected=await self(f.ma.secret),sqls=[],original=restricted.query.bind(restricted);restricted.query=(sql,args)=>{sqls.push(sql);return original(sql,args);};assert.deepEqual(await self(f.ma.secret),expected);sqls.length=0;
+  if(drift==='quota-marker'){
+   const saved=await f.store.get("SELECT value FROM harbor.gateway_settings WHERE name='schema.quota-subject-coordination'");restore=()=>f.store.run("UPDATE harbor.gateway_settings SET value=$1 WHERE name='schema.quota-subject-coordination'",saved.value);await f.store.run("UPDATE harbor.gateway_settings SET value='{}' WHERE name='schema.quota-subject-coordination'");
+  }else if(drift==='quota-permission'){
+   restore=()=>f.store.query('GRANT UPDATE ON harbor.quota_subjects TO '+role);await f.store.query('REVOKE UPDATE ON harbor.quota_subjects FROM '+role);
+  }else{
+   const other='self_role_'+randomUUID().replaceAll('-','');await f.store.query('CREATE ROLE '+other+' NOLOGIN');restore=async()=>{await restricted.query('SET ROLE '+role);await f.store.query('DROP OWNED BY '+other);await f.store.query('DROP ROLE '+other);};await f.store.query('GRANT USAGE ON SCHEMA harbor TO '+other);await f.store.query('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA harbor TO '+other);await restricted.query('SET ROLE '+other);
+  }
+  await assert.rejects(self(f.ma.secret),{code:'department_restart_required'});assert.ok(!sqls.some(sql=>/pg_proc|pg_constraint/.test(sql)),'drift rejection must use live guards rather than full attestation');await restore();restore=null;sqls.length=0;
+  assert.deepEqual(await self(f.ma.secret),expected);assert.ok(!sqls.some(sql=>/pg_proc|pg_constraint/.test(sql)),'restored access must retain the warm path');
+ }finally{await restore?.();await queue.close();await restricted.close();}
 });
