@@ -17,9 +17,19 @@ export function verifyConnectionEnvironment(text,expectedDigest){
  need(typeof text==='string'&&/^[a-f0-9]{64}$/.test(expectedDigest??''),'connection_material_changed');
  const lines=text.match(/[^\n]*\n|[^\n]+$/g)||[],key='HARBOR_RECORDING_CONTEXT_ENABLED=',flags=lines.filter(line=>line.startsWith(key));
  need(flags.length<=1&&flags.every(line=>/^HARBOR_RECORDING_CONTEXT_ENABLED=[01]\n?$/.test(line)),'connection_context_flag');
- // The original encrypted state binds the database URL and storage mode bytes.
- // Admit only the new server-owned switch without rewriting that old witness.
- need(hash(text)===expectedDigest||hash(lines.filter(line=>!line.startsWith(key)).join(''))===expectedDigest,'connection_material_changed');
+ // This helper is installed standalone, without the application's new modules.
+ // Keep the fixed diagnostic env contract aligned through the cross-layer tests.
+ const prefix='HARBOR_RECORDING_INPUT_DIAGNOSTICS',budgets={MAX_REQUESTS:10000,MAX_GROUPS:256,MAX_ITEMS_PER_REQUEST:4096,TTL_MS:3600000},optional=new Set([prefix,...Object.keys(budgets).map(name=>prefix+'_'+name)]),seen=new Set();
+ for(const line of lines){
+  const equal=line.indexOf('='),name=equal<0?line.replace(/\n$/,''):line.slice(0,equal);if(!optional.has(name))continue;
+  need(!seen.has(name),'connection_diagnostics_flag');seen.add(name);
+  const raw=line.slice(equal+1).replace(/\n$/,'');
+  if(name===prefix)need(raw==='0'||raw==='1','connection_diagnostics_flag');
+  else{const maximum=budgets[name.slice(prefix.length+1)];need(/^[0-9]+$/.test(raw)&&Number.isSafeInteger(Number(raw))&&Number(raw)>=1&&Number(raw)<=maximum,'connection_diagnostics_budget');}
+ }
+ // The original encrypted witness still binds every non-optional byte, including
+ // the URL and storage mode. Never rewrite state.enc to enable diagnostics.
+ need(hash(text)===expectedDigest||hash(lines.filter(line=>!line.startsWith(key)&&!optional.has(line.slice(0,line.indexOf('=')))).join(''))===expectedDigest,'connection_material_changed');
  return flags.length?flags[0].slice(key.length).trim():undefined;
 }
 async function privateFile(path){const f=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);try{const s=await f.stat();need(s.isFile()&&s.uid===0&&(s.mode&0o777)===0o600&&s.nlink===1&&s.size<=1048576,'private_file');return await f.readFile();}finally{await f.close();}}

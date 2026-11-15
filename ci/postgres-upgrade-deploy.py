@@ -452,6 +452,14 @@ def department_upgrade_guard(pg,api,ticket,gateway,worker,common,target_proof):
    proofs.append(guarded(instance,requested))
  return proofs
 
+def backup_input_diagnostics_required(common,row):
+ # These are the already validated fixed composition arguments, not request data.
+ lines=list(row.get('Config',{}).get('Env',[]))
+ for index,item in enumerate(common[:-1]):
+  if item=='--env-file':lines.extend(Path(common[index+1]).read_text().splitlines())
+  elif item=='--env':lines.append(common[index+1])
+ return 'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1' in lines
+
 def qualify_backup(pg,api,config,ticket,active,gateway,worker,common,target_proof):
  report=verify_retention_qualification(config,ticket)
  if report is None:return None
@@ -460,7 +468,12 @@ def qualify_backup(pg,api,config,ticket,active,gateway,worker,common,target_proo
   values=pg.container_shutdown(api,row,role)
   requested=[next((label+'='+str(values[key]) for key,label in pg.SHUTDOWN_ENV.items() if item.startswith(label+'=')),item) for item in common]
   source=api['source_image_preflight'](row,requested)
-  contracts={key for key in source.keys()|target_proof.keys() if key.endswith('_contract')}|{'contract','schema_digest','database_digest','device_ca_digest'}
+  diagnostic_key='input_shape_diagnostics_contract'
+  need(all(value in (None,'v1') for value in [source.get(diagnostic_key),target_proof.get(diagnostic_key)]),'backup input diagnostics contract invalid')
+  if backup_input_diagnostics_required(common,row):need(source.get(diagnostic_key)==target_proof.get(diagnostic_key)=='v1','backup enabled input diagnostics contract incompatible')
+  # A read-only optional diagnostic capability is not a persisted data contract.
+  # All other source/data/recording contracts retain the existing exact equality.
+  contracts={key for key in source.keys()|target_proof.keys() if key.endswith('_contract') and key!=diagnostic_key}|{'contract','schema_digest','database_digest','device_ca_digest'}
   need(all(source.get(key)==target_proof.get(key) for key in contracts),'backup code/data/recording contracts are incompatible')
   need(pg.rollback_environment_matches(row,ticket['materialsDirectory'],source.get('context_capture_guard_contract')=='v1'),'backup original environment is incompatible')
   proofs.append(source)
@@ -645,13 +658,17 @@ def run_upgrade(image,config,api,ticket,entry):
     if control['phase']!='active':entry.entry_state('resume',control['epoch'])
     record.update(phase='rolled-back-pg',errorCategory='source_preflight_rejected' if gate_attempted else 'before_composition');entry.save_json(path/'release.json',record)
     raise
+   check_storage(ticket)
    old_approval=active['approval'];pg.verify_started_composition({**pg_api,'http_code':lambda port,p,headers=None:probe(entry,ticket,old_gateway,port,p,headers)},ticket['from']['image'],config,int(time.time()*1000),old_approval)
    # Restarted PG containers have new veths. Rebind only the exact approved
    # restored pair and infrastructure before the existing guarded rebuild.
    restored=entry.private_json(entry.ACTIVE);restored['networkSnapshot']={**restored.get('networkSnapshot',{}),**network_snapshot(ticket,entry,old_gateway,old_worker)};entry.save_json(entry.ACTIVE,restored)
    entry.refresh_active()
    if gate is not None:gate_remove(entry,gate)
-   record['phase']='rolled-back-pg';entry.save_json(path/'release.json',record)
+   record['phase']='rolled-back-pg'
+   diagnostic_restart=pg_api.get('input_diagnostics_restart')
+   if diagnostic_restart is not None:record['inputDiagnosticsRollback']=copy.deepcopy(diagnostic_restart)
+   entry.save_json(path/'release.json',record)
   raise
 
 

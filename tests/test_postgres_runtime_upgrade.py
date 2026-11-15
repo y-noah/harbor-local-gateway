@@ -1,4 +1,4 @@
-import copy,importlib.util,json,os,stat,tempfile,unittest
+import copy,importlib.util,json,os,stat,tempfile,unittest,subprocess
 from contextlib import nullcontext,contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -408,10 +408,36 @@ class RetainedBackupTests(unittest.TestCase):
     with self.subTest(key=key),self.assertRaises(RuntimeError):upgrade.qualify_backup(composition,api,CONFIG,t,active(),{},{},[],{**proof,key:'changed'})
    composition.rollback_environment_matches.return_value=False
    with self.assertRaises(RuntimeError):upgrade.qualify_backup(composition,api,CONFIG,t,active(),{},{},[],proof)
+ def test_optional_input_diagnostics_qualification_uses_real_env_and_only_exempts_its_exact_contract(self):
+  proof={'contract':pg.CONTRACT,'schema_digest':'4'*64,'database_digest':'3'*64,'device_ca_digest':'5'*64,'consumption_policy_contract':'v1','department_isolation_contract':upgrade.DEPARTMENT_CONTRACT,'quota_subject_contract':upgrade.QUOTA_SUBJECT_CONTRACT}
+  for enabled in [False,True]:
+   for source_has,target_has in [(False,False),(False,True),(True,False),(True,True)]:
+    with self.subTest(enabled=enabled,source=source_has,target=target_has),tempfile.TemporaryDirectory() as directory:
+     materials=Path(directory);(materials/'secrets').mkdir();env=materials/'secrets/postgres.env';env.write_text('HARBOR_DATABASE_URL=synthetic-connection\nHARBOR_RECORDING_STORAGE_MODE=report\n'+('HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\n' if enabled else ''))
+     t=ticket();t['materialsDirectory']=directory;source={**proof,**({'input_shape_diagnostics_contract':'v1'} if source_has else {})};target_proof={**proof,**({'input_shape_diagnostics_contract':'v1'} if target_has else {})};row={'Config':{'Env':env.read_text().splitlines()}};common=['--env-file',str(env)];api={'source_image_preflight':Mock(return_value=source),'inspect_image':Mock(return_value={'Id':t['from']['imageId']})}
+     report={'contract':upgrade.BACKUP_CONTRACT,'hostToolsRevision':t['hostToolsRevision'],'evidenceDigest':'a'*64,'checks':{key:True for key in ['pair_rotation','reverse_publication','entry_rebind','restore_failure_preserves_source','ordinary_cleanup']}}
+     with patch.object(upgrade,'private_json',return_value=report),patch.object(pg,'container_shutdown',return_value={}):
+      if enabled and not (source_has and target_has):
+       with self.assertRaisesRegex(RuntimeError,'enabled input diagnostics'):upgrade.qualify_backup(pg,api,{**CONFIG,'postgres_retained_service_pairs':1},t,active(),row,row,common,target_proof)
+      else:
+       result=upgrade.qualify_backup(pg,api,{**CONFIG,'postgres_retained_service_pairs':1},t,active(),row,row,common,target_proof);self.assertEqual(len(result['sourceProofs']),2);self.assertEqual(api['source_image_preflight'].call_count,2)
+       for key in ['schema_digest','database_digest','device_ca_digest','consumption_policy_contract','department_isolation_contract','quota_subject_contract','future_recording_contract']:
+        with self.subTest(contract=key),self.assertRaisesRegex(RuntimeError,'contracts are incompatible'):upgrade.qualify_backup(pg,api,{**CONFIG,'postgres_retained_service_pairs':1},t,active(),row,row,common,{**target_proof,key:'changed'})
+       with self.assertRaisesRegex(RuntimeError,'input diagnostics contract invalid'):upgrade.qualify_backup(pg,api,{**CONFIG,'postgres_retained_service_pairs':1},t,active(),row,row,common,{**target_proof,'input_shape_diagnostics_contract':'future'})
  def test_reverse_ticket_is_built_from_retained_binding_and_current_source(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(upgrade,'RELEASES',Path(directory)),patch.object(upgrade,'verify_retention_qualification',return_value={}),patch.object(upgrade,'check_storage'),patch.object(upgrade,'network_snapshot'):
    rows,calls,entry,api,record=self.fixture(directory);self.backup(directory,entry,record);config={**CONFIG,'postgres_retained_service_pairs':1};upgrade.finish_retired_cleanup(config,api,entry,record,Path(directory)/record['ticket']['deploymentId']);t=ticket();current={**active(),'image':IMAGE,'approval':upgrade.approval_binding(upgrade.approval(t)),'candidate':{'containerId':'c'*64,'imageId':t['to']['configDigest'],'port':8092},'networkSnapshot':{'candidateNetworkContainerIds':['c'*64,'d'*64]}};entry.save_json(entry.ACTIVE,current);rows[NAME]=target(t);rows[NAME+'-worker']=target(t,'worker');api['inspect_image']=Mock(return_value={'Id':t['from']['imageId']})
    with patch.object(upgrade,'private_json',return_value=t):reverse=upgrade.retained_restore_ticket(config,api,entry,t['deploymentId'])
+   # Exercise the actual retained reverse ticket through fresh backup qualification.
+   with tempfile.TemporaryDirectory() as material_dir:
+    root=Path(material_dir);(root/'secrets').mkdir();env=root/'secrets/postgres.env';env.write_text('HARBOR_DATABASE_URL=synthetic-connection\nHARBOR_RECORDING_STORAGE_MODE=report\n');reverse['materialsDirectory']=material_dir
+    for row in [rows[NAME],rows[NAME+'-worker']]:row['Config']['Env']=env.read_text().splitlines()
+    base={'contract':pg.CONTRACT,'schema_digest':t['schemaDigest'],'database_digest':t['databaseDigest'],'device_ca_digest':t['deviceCaDigest'],'consumption_policy_contract':'v1'}
+    qualified={**api,'source_image_preflight':Mock(return_value={**base,'input_shape_diagnostics_contract':'v1'}),'inspect_image':Mock(return_value={'Id':reverse['from']['imageId']})}
+    with patch.object(pg,'container_shutdown',return_value={}):
+     restored=upgrade.qualify_backup(pg,qualified,config,reverse,current,rows[NAME],rows[NAME+'-worker'],['--env-file',str(env)],base)
+    self.assertEqual(restored['image'],IMAGE);self.assertEqual(qualified['source_image_preflight'].call_count,2)
+    reverse['materialsDirectory']=t['materialsDirectory']
    self.assertEqual(reverse['from']['containerId'],'c'*64);self.assertEqual(reverse['from']['workerId'],'d'*64);self.assertEqual(reverse['to']['image'],OLD);self.assertEqual(reverse['to']['configDigest'],'sha256:'+'b'*64);self.assertNotEqual(reverse['deploymentId'],t['deploymentId']);self.assertEqual(reverse['hostToolsRevision'],t['hostToolsRevision']);self.assertEqual(reverse['restoreBackupRelease'],t['deploymentId'])
    with patch.object(upgrade,'private_json',return_value=reverse):retry=upgrade.retained_restore_ticket(config,api,entry,t['deploymentId'])
    self.assertNotEqual(retry['deploymentId'],reverse['deploymentId'])
@@ -459,3 +485,83 @@ class RetainedBackupTests(unittest.TestCase):
     helper.deployment_begin.assert_called_once_with(config,OLD,123);helper.deployment_finish.assert_called_once_with(config,'synthetic-planned',not fails,123)
 
 if __name__=='__main__':unittest.main()
+
+class RuntimeDiagnosticMaterialEnvironmentTests(unittest.TestCase):
+ def test_check_storage_reaches_standalone_helper_without_rewriting_connection_witness(self):
+  local=module('diagnostic_local_helper','ci/local-assurance-deploy.py')
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);(root/'secrets').mkdir();env=root/'secrets/postgres.env';base='HARBOR_DATABASE_URL=postgresql://synthetic@database.test/owned\nHARBOR_RECORDING_STORAGE_MODE=report\n';witness=upgrade.hashlib.sha256(base.encode()).hexdigest();t=ticket();t['materialsDirectory']=directory
+   marker={'contract':'postgres-conversation-v2','database_digest':t['databaseDigest']};t['storageMarkerDigest']=upgrade.digest(marker)
+   facts={'contract':'harbor-local-assurance-migration-v1','releaseId':local.RELEASE,'offhostVerified':False,'deploymentAllowed':False,'identityAndDataVerified':True,'database':t['database'],'materialsDirectory':directory,'connectionEnvFile':str(env)}
+   program="import {verifyConnectionEnvironment} from "+json.dumps((ROOT/'ci/local-assurance-migrate.mjs').as_uri())+";import {readFileSync} from 'node:fs';const input=JSON.parse(process.argv[1]);verifyConnectionEnvironment(readFileSync(input.path,'utf8'),input.digest);console.log(JSON.stringify(input.facts));"
+   calls=[];run=subprocess.run
+   def invoke(args,**options):
+    self.assertEqual(args,['/opt/harbor-storage-tools/node/bin/node','/usr/local/lib/harbor/local-assurance-migrate.mjs','check']);self.assertEqual(options['timeout'],180);calls.append('check')
+    return run([os.environ.get('HARBOR_TEST_NODE_BINARY','node'),'--input-type=module','-e',program,json.dumps({'path':str(env),'digest':witness,'facts':facts})],capture_output=True,timeout=5)
+   bridge=SimpleNamespace(run=invoke,TimeoutExpired=subprocess.TimeoutExpired)
+   with patch.object(upgrade,'load',return_value=local),patch.object(local,'subprocess',bridge),patch.object(upgrade,'private_json',return_value=marker):
+    for addition in ['', 'HARBOR_RECORDING_INPUT_DIAGNOSTICS=0\n', 'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\nHARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_GROUPS=1\n']:
+     env.write_text(base+addition);self.assertEqual(upgrade.check_storage(t)['connectionEnvFile'],str(env));self.assertEqual(upgrade.hashlib.sha256(base.encode()).hexdigest(),witness)
+    for content in [base.replace('database.test','other.test'),base.replace('MODE=report','MODE=local'),base+'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\nOTHER=1\n',base+'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\nHARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_GROUPS=0\n']:
+     env.write_text(content)
+     with self.assertRaises(local.LocalHelperExited):upgrade.check_storage(t)
+    env.write_text(base);facts['connectionEnvFile']='/opt/product-development/harbor-local-gateway/secrets/postgres.env'
+    with self.assertRaisesRegex(RuntimeError,'same database and runtime materials'):upgrade.check_storage(t)
+   self.assertEqual(len(calls),8)
+
+class DiagnosticImmediateOuterRecoveryTests(unittest.TestCase):
+ def test_actual_composition_failure_flows_through_outer_source_auth_storage_and_entry_recovery(self):
+  base=module('diagnostic_composition_fixture','tests/test_deploy_postgres.py');base.pg=pg
+  for requested in ['off','removed','budget']:
+   for failure in ['run','ready']:
+    with self.subTest(requested=requested,failure=failure),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+     path=base.PostgreSQLDeploymentTests.prepare(self,directory);base.PostgreSQLDeploymentTests.source_materials(self,directory);env=path/'secrets/postgres.env';core=env.read_text();context='HARBOR_RECORDING_CONTEXT_ENABLED=1\n';env.write_text(core+context+'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\n')
+     api,calls,rows=base.PostgreSQLDeploymentTests.api(self,directory,fail=failure=='run');api['proofs'][base.IMAGE]['input_shape_diagnostics_contract']='v1';api['proofs'][base.OLD]['input_shape_diagnostics_contract']='v1';api['proofs'][base.OLD]['consumption_policy_contract']='v1';api['proofs'][base.IMAGE]['consumption_policy_contract']='v1'
+     env.write_text(core+context+{'off':'HARBOR_RECORDING_INPUT_DIAGNOSTICS=0\n','removed':'','budget':'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\nHARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_REQUESTS=1\n'}[requested])
+     t=ticket();old=active();old['image']=base.OLD;old['mounts']=[{**item,'source':directory+('/pg-data' if item['destination']=='/app/data' else '/runtime')} for item in old['mounts']]
+     t.update(materialsDirectory=directory,databaseDigest=base.PROOF['database_digest'],schemaDigest=base.PROOF['schema_digest'],deviceCaDigest=base.PROOF['device_ca_digest']);marker={'contract':pg.CONTRACT,'database_digest':t['databaseDigest']};t['storageMarkerDigest']=old['storageMarkerDigest']=upgrade.digest(marker)
+     t['from'].update(image=base.OLD,activeIdentityDigest=upgrade.digest(upgrade.active_identity(old)));t['to']['image']=base.IMAGE
+     for name,identifier in [(NAME,t['from']['containerId']),(NAME+'-worker',t['from']['workerId'])]:rows[name]['Id']=identifier
+     originals={name:copy.deepcopy(rows[name]) for name in [NAME,NAME+'-worker']}
+     entry=Mock();entry.ACTIVE=path/'active.json';entry.STATE=path/'entry-state.json';entry.ENTRY_CONFIG=path/'entry-config.json';entry.CANDIDATE_PROFILE=path/'candidate-profile.json'
+     data={str(entry.ACTIVE):old,str(entry.STATE):{'phase':'activated','candidate':old['candidate'],'activeRuntimeConfig':{'bridge':{'address':'192.0.2.1'}}},str(entry.ENTRY_CONFIG):{'drainTimeoutMs':1000},str(entry.CANDIDATE_PROFILE):{'socketPath':'/run/harbor-entry/candidate.sock'}}
+     entry.private_json.side_effect=lambda name:copy.deepcopy(data[str(name)]);entry.save_json.side_effect=lambda name,value:data.__setitem__(str(name),copy.deepcopy(value));entry.active_record.side_effect=lambda:(copy.deepcopy(data[str(entry.ACTIVE)]),{},rows[NAME])
+     control={'slot':'candidate','phase':'active','epoch':0,'inflight':0}
+     def state(command=None,epoch=None,slot=None,**options):
+      if command:
+       self.assertEqual(epoch,control['epoch']);control['epoch']+=1;control['phase']={'hold':'holding','drain':'drained','resume':'active'}[command]
+      return dict(control)
+     entry.entry_state.side_effect=state;entry.fingerprint=upgrade.digest
+     config={**base.CONFIG,**CONFIG,'image_prefix':base.IMAGE.rsplit(':',1)[0],'origin':'http://gateway.test:8092','device_origin':'https://gateway.test:8093'}
+     real_verify=pg.verify_started_composition;checked=[];probes=[];storage_calls=[];local=module('diagnostic_r5_local','ci/local-assurance-deploy.py');real_run=subprocess.run
+     facts={'contract':'harbor-local-assurance-migration-v1','releaseId':local.RELEASE,'offhostVerified':False,'deploymentAllowed':False,'identityAndDataVerified':True,'database':t['database'],'materialsDirectory':directory,'connectionEnvFile':str(env)}
+     program="import {verifyConnectionEnvironment} from "+json.dumps((ROOT/'ci/local-assurance-migrate.mjs').as_uri())+";import {readFileSync} from 'node:fs';const v=JSON.parse(process.argv[1]);verifyConnectionEnvironment(readFileSync(v.path,'utf8'),v.digest);console.log(JSON.stringify(v.facts));"
+     def helper_run(args,**options):
+      self.assertEqual(args[-1],'check');storage_calls.append('check')
+      return real_run([os.environ.get('HARBOR_TEST_NODE_BINARY','node'),'--input-type=module','-e',program,json.dumps({'path':str(env),'digest':upgrade.hashlib.sha256(core.encode()).hexdigest(),'facts':facts})],capture_output=True,timeout=5)
+     bridge=SimpleNamespace(run=helper_run,TimeoutExpired=subprocess.TimeoutExpired)
+     def load(name,label):return local if Path(name)==upgrade.LOCAL else pg
+     def probe(entry_arg,ticket_arg,row,port,target,headers=None):
+      probes.append((row['Config']['Image'],target,bool(headers)))
+      if headers:return 403
+      if target=='/api/admin/state':return 401
+      if failure=='ready' and row['Config']['Image']==base.IMAGE and target=='/ready':return 503
+      return 200
+     def verify(*args):
+      checked.append(args[1])
+      if args[1]==base.IMAGE:
+       # Exercise the actual readiness timeout branch, then use real checks for
+       # the restored source. This controls only the timeout being tested.
+       with patch.object(pg.time,'monotonic',side_effect=[0,0,91]),patch.object(pg.time,'sleep'):return real_verify(*args)
+      return real_verify(*args)
+     def refresh():
+      self.assertEqual(control['phase'],'drained');upgrade.verify_source(t,data[str(entry.ACTIVE)],rows[NAME],rows[NAME+'-worker']);upgrade.check_storage(t)
+      self.assertIn((base.OLD,'/api/admin/state',False),probes);self.assertIn((base.OLD,'/health',True),probes);control['phase']='active'
+     entry.refresh_active.side_effect=refresh
+     def remove_gate(*args):self.assertEqual(control['phase'],'active')
+     with patch.object(upgrade,'RELEASES',path/'releases'),patch.object(upgrade,'load',side_effect=load),patch.object(local,'subprocess',bridge),patch.object(upgrade,'private_json',side_effect=lambda name:t if Path(name)==upgrade.TICKET else marker),patch.object(upgrade,'network_snapshot',return_value={'candidateNetworkIdentity':{'id':'6'*64}}),patch.object(upgrade,'gate_install',return_value={'owned':True}),patch.object(upgrade,'gate_remove',side_effect=remove_gate) as remove,patch.object(upgrade,'verify_installed_tools'),patch.object(upgrade,'probe',side_effect=probe),patch.object(pg,'verify_started_composition',side_effect=verify):
+      with self.assertRaises((RuntimeError,subprocess.CalledProcessError)) as failed:upgrade.run_upgrade(base.IMAGE,config,api,t,entry)
+     self.assertEqual(control['phase'],'active');self.assertTrue(any(call[0]=='start' for call in calls),str(failed.exception));self.assertEqual(remove.call_count,1,str(failed.exception));entry.refresh_active.assert_called_once();self.assertEqual(storage_calls,['check','check','check']);self.assertIn(base.OLD,checked)
+     for name,original in originals.items():
+      self.assertEqual(rows[name]['Id'],original['Id']);self.assertEqual(rows[name]['Config']['Env'],original['Config']['Env']);self.assertTrue(rows[name]['State']['Running']);self.assertIn(('start',name),calls)
+     record=data[str(path/'releases'/t['deploymentId']/'release.json')];self.assertEqual(record['phase'],'rolled-back-pg');self.assertEqual(record['inputDiagnosticsRollback'],{'requestedConfigurationApplied':False,'originalSettingsRestored':True,'memoryCountersAndTtlRestarted':True})

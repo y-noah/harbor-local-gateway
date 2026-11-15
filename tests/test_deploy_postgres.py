@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import os
@@ -198,6 +199,83 @@ class PostgreSQLDeploymentTests(unittest.TestCase):
     with self.assertRaises(ValueError):pg.configuration(CONFIG,directory)
    (path/'secrets/postgres.env').write_text(original+'HARBOR_RECORDING_CONTEXT_ENABLED=0\nHARBOR_RECORDING_CONTEXT_ENABLED=1\n')
    with self.assertRaises(ValueError):pg.configuration(CONFIG,directory)
+ def test_diagnostic_environment_accepts_only_fixed_flag_and_bounded_budgets(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   path=self.prepare(directory);env=path/'secrets/postgres.env';base=env.read_text();baseline=pg.configuration(CONFIG,directory)
+   self.assertEqual(pg.input_diagnostics_configuration({})[pg.INPUT_DIAGNOSTICS_FLAG],'0')
+   self.assertEqual(pg.input_diagnostics_configuration({'HARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_REQUESTS':'0'*5000+'1'})['HARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_REQUESTS'],1)
+   for key,values in [(pg.INPUT_DIAGNOSTICS_FLAG,['0','1'])]+[(key,['1',str(maximum)]) for key,(_,maximum) in pg.INPUT_DIAGNOSTICS_BUDGETS.items()]:
+    for value in values:
+     env.write_text(base+key+'='+value+'\n');self.assertEqual(pg.configuration(CONFIG,directory),baseline)
+   for key in pg.INPUT_DIAGNOSTICS_ENV:
+    values=['','true','-1','1.5',' 1','1 ','١']+(['01','2'] if key==pg.INPUT_DIAGNOSTICS_FLAG else ['0',str(pg.INPUT_DIAGNOSTICS_BUDGETS[key][1]+1)])
+    for value in values:
+     with self.subTest(key=key,value=value):
+      env.write_text(base+key+'='+value+'\n')
+      with self.assertRaises(ValueError):pg.configuration(CONFIG,directory)
+    env.write_text(base+key+'=1\n'+key+'=1\n')
+    with self.assertRaises(ValueError):pg.configuration(CONFIG,directory)
+   for key in ['HARBOR_RECORDING_INPUT_DIAGNOSTICS_EXTRA','NODE_OPTIONS','HARBOR_DATA_DIR']:
+    env.write_text(base+key+'=1\n')
+    with self.assertRaises(ValueError):pg.configuration(CONFIG,directory)
+ def test_source_preflight_clears_removed_diagnostic_variables_without_credentials_in_argv(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   self.prepare(directory);api,calls,state=self.api(directory);common,_=pg.configuration(CONFIG,directory);row=state[NAME]
+   row['Config']['Env'] += [key+'=1' for key in pg.INPUT_DIAGNOSTICS_ENV]
+   pg.running_source_image_proof(api,row,common)
+   command=next(args for args in calls if args[0]=='exec' and '--input-type=module' in args);overrides=json.loads(command[-1])
+   self.assertTrue(all(overrides[key] is None for key in pg.INPUT_DIAGNOSTICS_ENV));self.assertNotIn('HARBOR_DATABASE_URL',overrides);self.assertNotIn('synthetic:synthetic',str(command))
+ def test_diagnostic_resume_and_rollback_follow_immutable_container_environment(self):
+  with tempfile.TemporaryDirectory() as directory:
+   path=self.prepare(directory);env=path/'secrets/postgres.env';base=env.read_text();off={'Config':{'Env':base.splitlines()}}
+   self.assertTrue(pg.input_diagnostics_environment_matches(off,directory))
+   self.assertTrue(pg.rollback_environment_matches(off,directory))
+   env.write_text(base+pg.INPUT_DIAGNOSTICS_FLAG+'=1\n');on={'Config':{'Env':env.read_text().splitlines()}}
+   self.assertFalse(pg.input_diagnostics_environment_matches(off,directory));self.assertTrue(pg.input_diagnostics_environment_matches(on,directory));self.assertTrue(pg.rollback_environment_matches(off,directory));self.assertTrue(pg.rollback_environment_matches(on,directory))
+   env.write_text(base+pg.INPUT_DIAGNOSTICS_FLAG+'=1\nHARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_REQUESTS=1\n')
+   self.assertFalse(pg.input_diagnostics_environment_matches(on,directory));self.assertFalse(pg.rollback_environment_matches(on,directory))
+   env.write_text(base);self.assertFalse(pg.rollback_environment_matches(on,directory));self.assertFalse(pg.input_diagnostics_environment_matches(on,directory))
+   for values in [[pg.INPUT_DIAGNOSTICS_FLAG+'=1']*2,['HARBOR_RECORDING_INPUT_DIAGNOSTICS_TTL_MS=0']]:
+    self.assertFalse(pg.input_diagnostics_environment_matches({'Config':{'Env':values}},directory))
+ def test_enabled_diagnostics_requires_candidate_contract_before_stopping_source(self):
+  for supported in [False,True]:
+   with self.subTest(supported=supported),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    path=self.prepare(directory);api,calls,state=self.api(directory);env=path/'secrets/postgres.env';env.write_text(env.read_text()+pg.INPUT_DIAGNOSTICS_FLAG+'=1\n')
+    if supported:api['proofs'][IMAGE]['input_shape_diagnostics_contract']='v1'
+    if supported:pg.deploy(IMAGE,CONFIG,None,api)
+    else:
+     with self.assertRaisesRegex(ValueError,'diagnostics contract'):pg.deploy(IMAGE,CONFIG,None,api)
+     self.assertFalse(any(args[0] in ['stop','rename','start'] for args in calls));self.assertNotIn('consume',api['activation_calls'])
+ def test_confirmed_candidate_failure_restores_original_legal_diagnostics_only_for_immediate_rollback(self):
+  for requested in ['off','removed','budget']:
+   for failure in ['run','ready']:
+    with self.subTest(requested=requested,failure=failure),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+     path=self.prepare(directory);env=path/'secrets/postgres.env';base=env.read_text()+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n';env.write_text(base+'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\n');api,calls,state=self.api(directory,fail=failure=='run');api['proofs'][IMAGE]['input_shape_diagnostics_contract']='v1';api['proofs'][OLD]['input_shape_diagnostics_contract']='v1';original={name:copy.deepcopy(state[name]) for name in [NAME,NAME+'-worker']}
+     env.write_text(base+{'off':'HARBOR_RECORDING_INPUT_DIAGNOSTICS=0\n','removed':'','budget':'HARBOR_RECORDING_INPUT_DIAGNOSTICS=1\nHARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_REQUESTS=1\n'}[requested])
+     verify=pg.verify_started_composition
+     def check(*args):
+      if args[1]==IMAGE:raise RuntimeError('synthetic candidate readiness failure')
+      return verify(*args)
+     with patch.object(pg,'verify_started_composition',side_effect=check),self.assertRaises((RuntimeError,subprocess.CalledProcessError)):pg.deploy(IMAGE,CONFIG,None,api)
+     for name,row in original.items():
+      self.assertEqual(state[name]['Id'],row['Id']);self.assertEqual(state[name]['Config']['Env'],row['Config']['Env']);self.assertTrue(state[name]['State']['Running']);self.assertIn(('start',name),calls)
+      self.assertFalse(pg.rollback_environment_matches(state[name],directory));self.assertTrue(pg.rollback_environment_matches(state[name],directory,restore_original_diagnostics=True));self.assertFalse(pg.context_environment_matches(state[name],directory))
+     self.assertEqual(api['input_diagnostics_restart'],{'requestedConfigurationApplied':False,'originalSettingsRestored':True,'memoryCountersAndTtlRestarted':True})
+ def test_illegal_old_diagnostics_are_refused_before_stop_even_in_immediate_recovery_mode(self):
+  for value in ['HARBOR_RECORDING_INPUT_DIAGNOSTICS=true','HARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_GROUPS=0']:
+   with self.subTest(value=value),tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+    self.prepare(directory);api,calls,state=self.api(directory);state[NAME]['Config']['Env'].append(value)
+    self.assertFalse(pg.rollback_environment_matches(state[NAME],directory,restore_original_diagnostics=True))
+    with self.assertRaises(pg.SourcePreflightRejected):pg.deploy(IMAGE,CONFIG,None,api)
+    self.assertFalse(any(args[0] in ['stop','rename','start'] for args in calls));self.assertTrue(state[NAME]['State']['Running']);self.assertTrue(state[NAME+'-worker']['State']['Running'])
+ def test_resumed_diagnostics_cannot_bypass_candidate_capability_check(self):
+  with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
+   path=self.prepare(directory);api,calls,state=self.api(directory);pg.deploy(IMAGE,CONFIG,None,api)
+   env=path/'secrets/postgres.env';env.write_text(env.read_text()+pg.INPUT_DIAGNOSTICS_FLAG+'=1\n')
+   for target in [NAME,NAME+'-worker']:state[target]['Config']['Env'].append(pg.INPUT_DIAGNOSTICS_FLAG+'=1')
+   calls.clear();api['activation_calls'].clear()
+   with self.assertRaisesRegex(ValueError,'diagnostics contract'):pg.deploy(IMAGE,CONFIG,None,api)
+   self.assertFalse(any(args[0] in ['stop','rename','start'] for args in calls));self.assertNotIn('consume',api['activation_calls'])
  def test_fixed_environment_and_resources_do_not_accept_process_mount_or_tls_overrides(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
    path=self.prepare(directory);common,budgets=pg.configuration(CONFIG,directory)

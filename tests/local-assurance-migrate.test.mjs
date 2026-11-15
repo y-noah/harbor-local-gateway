@@ -14,6 +14,13 @@ test('既有连接摘要只允许追加单个上下文0/1开关，不放宽数�
  for(const text of [base+'HARBOR_RECORDING_CONTEXT_ENABLED=0\nHARBOR_RECORDING_CONTEXT_ENABLED=1\n',base.replace('database.test','other.test')+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n',base.replace('MODE=report','MODE=local'),base+'OTHER=value\n',base+'\n',base.slice(0,-1)+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n'])assert.throws(()=>verifyConnectionEnvironment(text,digest),/local_assurance_connection_/);
  assert.throws(()=>verifyConnectionEnvironment(base,'invalid'),/local_assurance_connection_material_changed/);
 });
+test('独立helper只豁免五个合法诊断键，保留原连接字节和加密见证，不依赖未安装模块',()=>{
+ const base='HARBOR_DATABASE_URL=postgresql://synthetic@database.test/owned\nHARBOR_RECORDING_STORAGE_MODE=report\n',digest=createHash('sha256').update(base).digest('hex'),prefix='HARBOR_RECORDING_INPUT_DIAGNOSTICS';
+ const additions=prefix+'=1\n'+prefix+'_MAX_REQUESTS=100\n'+prefix+'_MAX_GROUPS=64\n'+prefix+'_MAX_ITEMS_PER_REQUEST=256\n'+prefix+'_TTL_MS=600000\n';
+ assert.equal(verifyConnectionEnvironment(base+additions,digest),undefined);
+ assert.equal(verifyConnectionEnvironment(base+'HARBOR_RECORDING_CONTEXT_ENABLED=1\n'+additions,digest),'1');
+ for(const value of [base.replace('database.test','other.test')+additions,base.replace('MODE=report','MODE=local')+additions,base+'OTHER=1\n'+additions,base+'\n'+additions,base+additions+prefix+'=0\n',base+prefix+'=01\n',base+prefix+'_MAX_GROUPS=257\n',base+prefix+'_TTL_MS=0\n',base+prefix+'_MAX_REQUESTS=1\r\n'])assert.throws(()=>verifyConnectionEnvironment(value,digest),/local_assurance_connection_/);
+});
 test('关闭模式不加载安装工具/数据库或修改源',async()=>{assert.equal(validateProfile({enabled:false}),false);const value=await run('prepare',{enabled:false});assert.equal(value.state,'disabled');assert.equal(value.deploymentAllowed,false);});
 test('身份从root profile读取，单次release之外同作用域可用',()=>{assert.equal(validateProfile(profile()),true);});
 test('拒绝不可信模式/跨工程路径/非不可变镜像/重复材料',()=>{for(const change of [c=>c.mode='task-owned',c=>c.runDirectory='/tmp/other',c=>c.businessImage='registry.test/harbor-local-gateway:main',c=>c.source.dataDirectory='/etc',c=>c.source.containerId='other',c=>c.fileRoots[2].source='/root',c=>c.fileRoots[2].id='data']){const c=profile();change(c);assert.throws(()=>validateProfile(c),/local_assurance_/);}});

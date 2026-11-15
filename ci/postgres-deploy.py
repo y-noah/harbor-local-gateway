@@ -19,6 +19,10 @@ SHUTDOWN_CONTRACT='postgres-shutdown-v1'
 SHUTDOWN_ENV={'gateway_drain_ms':'HARBOR_GATEWAY_DRAIN_TIMEOUT_MS','cleanup_grace_ms':'HARBOR_SHUTDOWN_CLEANUP_GRACE_MS','worker_stop_ms':'HARBOR_WORKER_STOP_TIMEOUT_MS'}
 SHUTDOWN_DEFAULTS={'gateway_drain_ms':300000,'cleanup_grace_ms':30000,'worker_stop_ms':30000}
 SHUTDOWN_RANGES={'gateway_drain_ms':(100,3600000),'cleanup_grace_ms':(1000,300000),'worker_stop_ms':(1000,3600000)}
+INPUT_DIAGNOSTICS_FLAG='HARBOR_RECORDING_INPUT_DIAGNOSTICS'
+INPUT_DIAGNOSTICS_BUDGETS={'HARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_REQUESTS':(100,10000),'HARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_GROUPS':(64,256),'HARBOR_RECORDING_INPUT_DIAGNOSTICS_MAX_ITEMS_PER_REQUEST':(256,4096),'HARBOR_RECORDING_INPUT_DIAGNOSTICS_TTL_MS':(600000,3600000)}
+INPUT_DIAGNOSTICS_ENV={INPUT_DIAGNOSTICS_FLAG,*INPUT_DIAGNOSTICS_BUDGETS}
+
 
 class ShutdownUnconfirmed(RuntimeError):
     pass
@@ -178,6 +182,31 @@ def material_storage_guard(stack):
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     return module.guard(['application-data','application-runtime'],expected={'application-data':Path(stack)/'pg-data','application-runtime':Path(stack)/'runtime'},required=True)
 
+def input_diagnostics_configuration(values):
+    flag=values.get(INPUT_DIAGNOSTICS_FLAG,'0')
+    if flag not in ('0','1'):raise ValueError('Input shape diagnostics flag must be 0 or 1')
+    result={INPUT_DIAGNOSTICS_FLAG:flag}
+    for key,(default,maximum) in INPUT_DIAGNOSTICS_BUDGETS.items():
+        value=values.get(key,str(default))
+        if not isinstance(value,str) or not re.fullmatch('[0-9]+',value):raise ValueError('Input shape diagnostics budget is invalid')
+        normalized=value.lstrip('0') or '0'
+        if len(normalized)>len(str(maximum)) or not 1<=int(normalized)<=maximum:raise ValueError('Input shape diagnostics budget is invalid')
+        result[key]=int(normalized)
+    return result
+
+def input_diagnostics_environment(lines):
+    values={}
+    for line in lines:
+        key,separator,value=line.partition('=')
+        if key in INPUT_DIAGNOSTICS_ENV:
+            if not separator or key in values:raise ValueError('Input shape diagnostics environment is ambiguous')
+            values[key]=value
+    return input_diagnostics_configuration(values)
+
+def input_diagnostics_environment_matches(instance,stack):
+    try:return input_diagnostics_environment((Path(stack)/'secrets/postgres.env').read_text().splitlines())==input_diagnostics_environment((instance or {}).get('Config',{}).get('Env',[]))
+    except ValueError:return False
+
 def configuration(config,stack):
     material_storage_guard(stack)
     if config.get('postgres_legacy_source_engine') not in (None,'sqlite'):raise ValueError('Legacy source engine configuration is invalid')
@@ -186,12 +215,13 @@ def configuration(config,stack):
     env=Path(stack)/'secrets/postgres.env';secure(env,0,0o600)
     if env.stat().st_size>65536:raise ValueError('PostgreSQL environment exceeds budget')
     values={}
-    allowed={'HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE','HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES','HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO','HARBOR_RECORDING_CONTEXT_ENABLED'}
+    allowed={'HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE','HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES','HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO','HARBOR_RECORDING_CONTEXT_ENABLED'}|INPUT_DIAGNOSTICS_ENV
     for line in env.read_text().splitlines():
         if not line or line.startswith('#'):continue
         key,separator,value=line.partition('=')
         if not separator or key not in allowed or key in values or not value or '\x00' in value:raise ValueError('PostgreSQL environment is not a fixed configuration')
         values[key]=value
+    input_diagnostics_configuration(values)
     if values.get('HARBOR_RECORDING_CONTEXT_ENABLED') not in (None,'0','1'):raise ValueError('PostgreSQL context capture flag must be 0 or 1')
     if values.get('HARBOR_RECORDING_STORAGE_MODE')!='report':raise ValueError('PostgreSQL signed storage reports are required')
     address=urlsplit(values.get('HARBOR_DATABASE_URL',''));query=parse_qs(address.query)
@@ -314,7 +344,7 @@ def running_source_image_proof(api,instance,common):
         # A changed connection must use the original isolated check with the
         # requested environment; never send connection credentials as argv.
         return image_proof(api,instance['Config']['Image'],common)
-    overrides={key:expected.get(key) for key in ['HARBOR_RECORDING_STORAGE_MODE','HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES','HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO','HARBOR_RECORDING_CONTEXT_ENABLED']}
+    overrides={key:expected.get(key) for key in ['HARBOR_RECORDING_STORAGE_MODE','HARBOR_RECORDING_STORAGE_MIN_FREE_BYTES','HARBOR_RECORDING_STORAGE_MIN_FREE_RATIO','HARBOR_RECORDING_CONTEXT_ENABLED',*sorted(INPUT_DIAGNOSTICS_ENV)]}
     overrides.update({key:value for key,value in expected.items() if key!='HARBOR_DATABASE_URL'})
     timeout=preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30))
     program="import {postgresPreflight} from '/app/ci/postgres-preflight.mjs';const env={...process.env};for(const [key,value] of Object.entries(JSON.parse(process.argv[1]))){if(value===null)delete env[key];else env[key]=value;}const deadline=setTimeout(()=>{console.error('Source runtime preflight timed out');process.exit(1);},SOURCE_TIMEOUT_MS);try{console.log(JSON.stringify(await postgresPreflight({env})));}catch{console.error('Source runtime preflight failed');process.exitCode=1;}finally{clearTimeout(deadline);}".replace('SOURCE_TIMEOUT_MS',str(timeout*1000))
@@ -384,7 +414,7 @@ def context_environment_matches(instance,stack):
     # Docker environments are immutable. Missing is the supported disabled default,
     # while duplicate or malformed values must never count as an applied setting.
     same=len(expected)<=1 and len(actual)<=1 and all(value in ('0','1') for value in expected+actual) and (expected or ['0'])==(actual or ['0'])
-    return same and (expected!=['1'] or context_capture_guard(stack))
+    return same and input_diagnostics_environment_matches(instance,stack) and (expected!=['1'] or context_capture_guard(stack))
 
 def context_flag(values):
     found=[value.partition('=')[2] for value in values if value.startswith('HARBOR_RECORDING_CONTEXT_ENABLED=')]
@@ -411,7 +441,7 @@ def context_capture_guard(stack,enabled=None):
     finally:Path(name).unlink(missing_ok=True)
     return enabled
 
-def rollback_environment_matches(instance,stack,guard_supported=False):
+def rollback_environment_matches(instance,stack,guard_supported=False,*,restore_original_diagnostics=False):
     # Existing containers keep their original Env even after an env-file changes.
     # The image proof uses the new file, so it cannot authenticate those old Env values.
     expected={}
@@ -420,8 +450,12 @@ def rollback_environment_matches(instance,stack,guard_supported=False):
         if separator and key in ('HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE'):expected[key]=value
     values=(instance or {}).get('Config',{}).get('Env',[])
     same_database=set(expected)=={'HARBOR_DATABASE_URL','HARBOR_RECORDING_STORAGE_MODE'} and all([item for item in values if item.startswith(key+'=')]==[key+'='+value] for key,value in expected.items())
-    if not same_database:return False
+    if not same_database or type(restore_original_diagnostics) is not bool:return False
     try:
+        requested_diagnostics=input_diagnostics_environment((Path(stack)/'secrets/postgres.env').read_text().splitlines());previous_diagnostics=input_diagnostics_environment(values)
+        # Immediate pre-publication failure restores the original legal bounded
+        # diagnostic settings. Long-term backup qualification stays strict.
+        if not restore_original_diagnostics and previous_diagnostics[INPUT_DIAGNOSTICS_FLAG]=='1' and requested_diagnostics!=previous_diagnostics:return False
         requested=context_flag((Path(stack)/'secrets/postgres.env').read_text().splitlines());previous=context_flag(values)
         # Rolling back an attempted enable to disabled is safe. A formerly enabled
         # container may restart after disable only when it implements the durable veto.
@@ -539,6 +573,8 @@ def deploy(image,config,archive,api):
     verify_candidate_image(image_inspection(api,image,[]),approval,image)
     proof=activate('preflight').get('proof')
     if not isinstance(proof,dict) or proof.get('revision')!=approval['revision']:raise ValueError('Real candidate preflight is required')
+    diagnostics_requested=input_diagnostics_environment((Path(stack)/'secrets/postgres.env').read_text().splitlines())
+    if diagnostics_requested[INPUT_DIAGNOSTICS_FLAG]=='1' and proof.get('input_shape_diagnostics_contract')!='v1':raise ValueError('Candidate lacks input shape diagnostics contract')
     previous,previous_worker=inspect(name+'-previous'),inspect(worker+'-previous')
     if previous_worker:raise ShutdownUnconfirmed('Unexpected previous Worker requires inspection')
     if owned(current) or owned(old_worker) or previous:
@@ -576,6 +612,8 @@ def deploy(image,config,archive,api):
     for instance,values,sqlite in zip([current,old_worker],old_shutdown,sqlite_source):
         previous=None
         if instance and not sqlite:
+            try:input_diagnostics_environment(instance.get('Config',{}).get('Env',[]))
+            except ValueError as error:raise SourcePreflightRejected('Source input diagnostics environment is invalid; source retained') from error
             old_common=[next((label+'='+str(values[key]) for key,label in SHUTDOWN_ENV.items() if values is not None and item.startswith(label+'=')),item) for item in common]
             try:previous=api['source_image_preflight'](instance,old_common) if 'source_image_preflight' in api else image_proof(api,instance['Config']['Image'],old_common)
             except ShutdownContractUnsupported as error:
@@ -594,7 +632,7 @@ def deploy(image,config,archive,api):
         # Persist the restrictive policy before any old member is stopped. Both
         # candidate and rollback containers read the same startup file.
         if context_requested or old_context:context_capture_guard(stack,context_requested)
-        rollback=entry_deployment is None and bool(all(rollback_environment_matches(instance,stack,(old_proof or {}).get('context_capture_guard_contract')=='v1') for instance,old_proof in zip((current,old_worker),old_proofs)) and all(value is not None for value in old_shutdown) and current and old_worker and current.get('Config',{}).get('Image')==old_worker.get('Config',{}).get('Image') and all(value is not None and all(value[key]==proof[key] for key in ['contract','schema_digest','database_digest','device_ca_digest']) for value in old_proofs))
+        rollback=entry_deployment is None and bool(all(rollback_environment_matches(instance,stack,(old_proof or {}).get('context_capture_guard_contract')=='v1',restore_original_diagnostics=True) for instance,old_proof in zip((current,old_worker),old_proofs)) and all(value is not None for value in old_shutdown) and current and old_worker and current.get('Config',{}).get('Image')==old_worker.get('Config',{}).get('Image') and all(value is not None and all(value[key]==proof[key] for key in ['contract','schema_digest','database_digest','device_ca_digest']) for value in old_proofs))
         if activate('consume').get('state')!='active':raise ValueError('Database activation was not consumed')
         for index,(target,existing) in enumerate([(name,current),(worker,old_worker)]):
             if existing:
@@ -639,6 +677,10 @@ def deploy(image,config,archive,api):
                 docker('rename',target+'-previous',target);restored=inspect(target)
             if rollback and restored and restored.get('Config',{}).get('Image')==previous_image and restored.get('Config',{}).get('Labels',{}).get('com.aistrong.project')==name and not restored.get('State',{}).get('Running'):
                 docker('start',target)
+        if rollback and any(input_diagnostics_environment(row['Config'].get('Env',[]))!=diagnostics_requested for row in (current,old_worker)):
+            # The outer runtime-upgrade consumer promotes this receipt only after
+            # exact source identity, readiness/authentication and entry recovery.
+            api['input_diagnostics_restart']={'requestedConfigurationApplied':False,'originalSettingsRestored':True,'memoryCountersAndTtlRestarted':input_diagnostics_environment(current['Config'].get('Env',[]))[INPUT_DIAGNOSTICS_FLAG]=='1' and context_flag(current['Config'].get('Env',[])) and 'HARBOR_RECORDING_ENABLED=0' not in current['Config'].get('Env',[]) and context_requested and context_guard_before is not False}
         if not rollback:
             try:revoke_reclaimed(reclaimed)
             except Exception as cleanup_error:raise ShutdownUnconfirmed('Activation revocation unconfirmed; retain PG data and migration material') from cleanup_error

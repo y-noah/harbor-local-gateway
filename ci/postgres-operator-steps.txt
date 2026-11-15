@@ -11,7 +11,7 @@ wrapper/preflight 不创建数据库、不运行 migration、不生成或替换�
 迁移场景必须恢复原 key-encryption.key、recording-encryption.key、settings.json、spool 与 runtime，不能生成新钥替代原材料。
 若旧来源从未有正文密钥，须由管理员在确认无旧正文/导出/spool后单独初始化；此部署入口不代办。
 
-固定 STACK=/opt/product-development/harbor-local-gateway：
+普通PG部署的固定 STACK=/opt/product-development/harbor-local-gateway，目录布局如下。现用runtime-upgrade的实际材料目录由受保护发布记录的ticket.materialsDirectory确定，不能据工程根目录推断：
   secrets/                   root:root 0700
   secrets/postgres.env        root:root 0600，格式见 postgres-env.example，不得放任意环境变量
   secrets/postgres-report.key 1000:1000 0600，独立32字节，与DB主机发布器的专用材料相同
@@ -56,3 +56,59 @@ PG正常发布排空合同 postgres-shutdown-v1：root配置postgres_shutdown三
 
 错误分类只允许明确legacy与unknown两条结果：旧PG完整源码/数据预检成功后，明确缺少shutdown实现或声明不支持版本，才可在旧容器已停止时记录unclassified。daemon、超时、解析或证明字段缺失、材料/存储核验失败、诊断IO等均unknown，禁止降级并继续。
 首次SQLite迁移另须root显式postgres_legacy_source_engine=sqlite；核实际已停、固定server.mjs入口、实际Image ID、同项目SHA镜像及session-metadata-only-v1合约，不能通过PG预检失败猜它是SQLite。该分支无需旧SQLite具PG预检文件，永不自动回退旧SQLite；未知Cmd/合约/镜像身份仍拒绝。正常PG更新使用自身PG证明，不由此首切字段降低要求。正式operator source/activation fence接入时须保留该区分。
+
+输入结构诊断的受控启用（默认关闭，不是在线热改）：
+1. 先取得包含 recording-input-diagnostics.mjs、网关接线和新 postgres-preflight.mjs 的业务镜像及对应成功CI证据。
+   已实际启用正文/上下文且具有已核验结构23/24才会收集诊断；本功能不运行migration、不绕过持久上下文许可。
+2. 宿主 /usr/local/lib/harbor/postgres-deploy.py 也必须来自本次通过评审和资格验证的工具版本。
+   旧部署器只允许原五个环境键，会拒绝新增键；只更新业务镜像不能完成接线。
+   通过现有root批准的工具资格/安装流程，核原源版本、容器及材料，配套更新受控宿主工具字节、
+   /etc/harbor-postgres-runtime-tools.json 的revision/files，以及一次性升级票据的hostToolsRevision和完整绑定。
+   本次同时变更 /usr/local/lib/harbor/postgres-upgrade-deploy.py 的诊断备份兼容检查，必须与新postgres-deploy.py配套。
+   还须单独批准并安装本次 /usr/local/lib/harbor/local-assurance-migrate.mjs：它不在现有七文件runtime清单内，
+   不往该严格清单硬加第八项；从本次成功test_deployment_guard作业的固定artifact路径ci/local-assurance-migrate.mjs取得该独立helper，
+   在同次受控安装材料中另行绑定pipeline/job、revision、该固定目标路径及旧/新SHA256，核root属主、不可组写和安装后字节。
+   该helper按独立宿主脚本部署，无新增应用模块import依赖；缺此额外安装证明时不可声称启用链就绪。
+   运行中的Host代次、业务镜像代次和新工具代次分别核实；不得手工仅替换脚本、改摘要或继续使用旧批准票据冒充安装。
+   本功能没有另建安装器，也不会自动升级宿主工具；资格和受控安装未完成前禁止把新键加入实际env文件。
+3. 先核实际env入口，再改该文件；以下两个入口不能混用：
+   - 普通PG部署：由root受控部署配置确定普通STACK，使用STACK/secrets/postgres.env。
+   - 现用同库runtime-upgrade：从受信entry.active_record()取得当前active，再用受信upgrade.record_for(active['approval'])
+     校验durable发布记录、ticketDigest和approval绑定，取record['ticket']['materialsDirectory']，不能仅信任尚未消费的全局票据或工程根目录。
+     在改动前执行upgrade.check_storage(record['ticket'])；它会调用local.helper('check')，要求identityAndDataVerified、数据库身份、
+     materialsDirectory一致，且connectionEnvFile严格等于materialsDirectory+'/secrets/postgres.env'。
+     新票据的materialsDirectory还须与当前完成发布、Host迁移plan的材料目录一致，不另建env副本或切换路径。
+   将上述核实的connectionEnvFile记为本次实际env路径，root在该文件（root:root 0600，无链接）只加入/更新这五个获准键：
+     HARBOR_RECORDING_INPUT_DIAGNOSTICS=1
+   可选四预算（缺省/合法整数范围）：MAX_REQUESTS=100/1–10000，MAX_GROUPS=64/1–256，
+   MAX_ITEMS_PER_REQUEST=256/1–4096，TTL_MS=600000/1–3600000；均使用HARBOR_RECORDING_INPUT_DIAGNOSTICS_前缀。
+   开关仅0/1，重复键、未知键、非法或越界预算拒绝；即使关闭也不忽略非法预算。
+   不修改数据库URL、存储报告、设备TLS或其他环境键，不把凭据输出到命令或日志。
+   对runtime材料必须保留所有其他原始字节（含换行），不能从example重写整文件、插入说明/空行或改旧key值。
+   加密state.enc的connectionEnvDigest仍绑定原连接材料；新helper只剔除经过严格校验的这五键和既有上下文开关后核原摘要，
+   不重签或改写该见证，不修改postgres-storage.json、ACTIVE或Host迁移plan来迁就新env。
+   修改后再次执行上述check_storage/helper check，确认实际材料路径和连接身份仍受原见证认证。
+4. 完成实际env修改与helper复核后，再为当前源和目标业务镜像准备最终批准票据及工具清单，核from.activeIdentityDigest、
+   hostToolsRevision、目标image/configDigest/manifestDigest和相同materialsDirectory。保持既有Root/CI发布授权。
+   ACTIVE身份摘要和存储marker不包含诊断键；连接见证仅接受上述受限附加，源预检仍逐字节绑定实际env及其他材料。
+   因此不得在准备好的source preflight之后改env；有变动必须重新取得本次新鲜预检/来源材料绑定。
+   仍走既有GitLab受控部署/排空/预检，不传客户端env或任意Docker参数。
+   源预检清除新文件中已移除的五键；候选启用时必须声明input_shape_diagnostics_contract=v1。
+   源/候选仍执行原凭据、TLS、数据库与来源认证；诊断参数不提供任何额外授权。
+5. 部署成功后核实际镜像、容器健康、/app/data与/app/runtime来源均属于已核实materialsDirectory；
+   从实际GW和Worker的Config.Env只提取这五个非敏感键，核实际开关/预算（缺省按契约解释），不输出整个Env或数据库URL。
+   不把顶层STACK文件已修改、仅CI绿色或预检参数已覆盖视为实际容器已启用。
+   再由现有超管global Cookie读取GET /api/admin/recordings/status。
+   input_shape_diagnostics应出现，limits对应实际预算；仅观察后续自然请求，不为诊断新增模型请求。
+   TTL从网关构造开始，数量/TTL到限不自动续期；摘要仅在内存，不写DB、文件或日志。
+   部门视图/部门管理员/员工与健康接口不返回该字段，未知类型原值和正文不得回显。
+6. 关闭时移除五键（或开关设0并保留合法预算），重新走受控部署创建新容器；只改env文件不会改变旧容器。
+   缺省/关闭不新增状态字段，进程关闭会清空摘要；无需schema回滚或删除业务记录。
+   候选创建/续跑仍须与新env的五键有效配置一致，长期backup资格也保持独立严格比较。
+   仅在确认提交前失败、候选清理与其他回退安全门禁通过时，即时回退可重新启动原本合法、有界的诊断配置，
+   包括原on而本次请求off/移除键/变更预算；非法旧flag/预算不能取得此许可。正文采集的持久veto保持原规则，不由诊断回退撤销。
+   外层还须核原源ID/镜像/材料、check_storage、两服务就绪和鉴权、Worker进度与入口恢复，完成后才写rolled-back-pg失败回执。
+   若存在诊断差异，release.json的inputDiagnosticsRollback会明确requestedConfigurationApplied=false、originalSettingsRestored=true，
+   memoryCountersAndTtlRestarted描述原启用采集器的内存计数/TTL会从重启重新开始，不能声称恢复了旧统计或本次关闭成功。
+   本次待应用env文件可保留新请求值，实际恢复的是旧容器的合法Env；重试须按实际运行源重新绑定并重新预检，不以文件已改认定生效。
+   停源/清理/提交结果不明、来源/数据/权限不兼容等情形仍保留现场，不自动回退。
