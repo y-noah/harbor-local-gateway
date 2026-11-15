@@ -103,7 +103,7 @@ export async function recordQuotaSubjectDenial(store,request){
     if(binding)request={...request,quota_subject_ref:binding.subject_ref,quota_subject_scope:binding.scope};
   }
   if(request.quota_subject_scope!=='account_metered_bucket'||!request.quota_subject_ref)return;
-  const subject=await store.get('SELECT * FROM harbor.quota_subjects WHERE ref=$1 FOR UPDATE',request.quota_subject_ref);if(!subject||subject.scope!=='account_metered_bucket')fail();
+  const subject=await store.get('SELECT * FROM harbor.quota_subjects WHERE ref=$1 FOR NO KEY UPDATE',request.quota_subject_ref);if(!subject||subject.scope!=='account_metered_bucket')fail();
   await latchDenial(store,subject,request.ended);
 }
 async function latchDenial(store,subject,ended){
@@ -129,7 +129,7 @@ export function createPostgresQuotaSubjects(store,{identity,clock=Date.now}={}){
       account.quota_identity_epoch=changed.quota_identity_epoch;
     }
     await store.run('INSERT INTO harbor.quota_subjects(ref,scope,source,schema_version) VALUES($1,$2,$3,$4) ON CONFLICT(ref) DO NOTHING',facts.ref,facts.ordinary_scope,facts.source,facts.schema_version??null);
-    const subject=await store.get('SELECT * FROM harbor.quota_subjects WHERE ref=$1 FOR UPDATE',facts.ref);if(subject.scope!==facts.ordinary_scope)fail();
+    const subject=await store.get('SELECT * FROM harbor.quota_subjects WHERE ref=$1 FOR NO KEY UPDATE',facts.ref);if(subject.scope!==facts.ordinary_scope)fail();
     await store.run('INSERT INTO harbor.quota_subject_accounts(account_id,identity_epoch,subject_ref,updated) VALUES($1,$2,$3,$4) ON CONFLICT(account_id,identity_epoch) DO UPDATE SET subject_ref=EXCLUDED.subject_ref,updated=EXCLUDED.updated',account.id,account.quota_identity_epoch,facts.ref,clock());
     if(subject.scope==='account_metered_bucket'){
       const denial=await store.get('SELECT MAX(ended) ended FROM harbor.requests WHERE account_id=$1 AND quota_account_identity_epoch=$2 AND quota_ordinary=true AND quota_ordinary_denied IS TRUE',account.id,account.quota_identity_epoch);
@@ -163,7 +163,9 @@ export function createPostgresQuotaSubjects(store,{identity,clock=Date.now}={}){
         for(const peer of peers)await bind(peer.id===account.id?account:peer,facts);
       }
     }
-    return store.get('SELECT b.subject_ref,s.* FROM harbor.quota_subject_accounts b JOIN harbor.quota_subjects s ON s.ref=b.subject_ref WHERE b.account_id=$1 AND b.identity_epoch=$2 FOR UPDATE OF s',account.id,account.quota_identity_epoch);
+    // Only non-key subject state changes here. Keep admissions mutually exclusive
+    // without blocking the FK KEY SHARE retained by concurrent settlement.
+    return store.get('SELECT b.subject_ref,s.* FROM harbor.quota_subject_accounts b JOIN harbor.quota_subjects s ON s.ref=b.subject_ref WHERE b.account_id=$1 AND b.identity_epoch=$2 FOR NO KEY UPDATE OF s',account.id,account.quota_identity_epoch);
   }
   async function check(request,account,subject){
     if(!subject?.shared)return;

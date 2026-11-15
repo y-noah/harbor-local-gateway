@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {randomUUID} from 'node:crypto';
+import {randomUUID,createHash} from 'node:crypto';
+import {createUsageRollupRuntime} from './usage-rollup-fixture.mjs';
+import {migrateConsumptionPolicy} from '../postgres-consumption-policy.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
 import {migrateDepartmentIsolation} from '../postgres-departments.mjs';
 import {migrateQuotaSubjects,verifyQuotaSubjectAvailability,createPostgresQuotaSubjects} from '../postgres-quota-subjects.mjs';
@@ -229,4 +231,29 @@ test('普通拒绝结算和额度刷新统一先取路由边界，双连接交�
     assert.equal((await f.store.get("SELECT quota_ordinary_denied FROM harbor.requests WHERE id='denial-lock-order'")).quota_ordinary_denied,true);
     assert.equal((await f.store.get('SELECT snapshot FROM harbor.quota_subjects')).snapshot.ordinaryUsageAllowed,false);
   }finally{ready();release();await Promise.allSettled([refresh,finish]);await second.close();}
+});
+
+
+test('消耗尝试结算与同员工主体受理并发不死锁，保留部门鉴权与计量幂等',integration,async t=>{
+ for(const api of [false,true]){
+  const f=await fixture(t,{departments:true}),role=await createUsageRollupRuntime(f.store);
+  t.after(async()=>{const root=new PostgresStore(options());try{await root.query('DROP ROLE '+role);}finally{await root.close();}});
+  await migrateConsumptionPolicy(f.store,{apply:true});
+  const a=await f.account('lock-account',{...(api?{apiDigest:createHash('sha256').update('synthetic-api-digest').digest('hex')}:{})});if(!api)await f.bind(a);
+  const secret='synthetic-deadlock-key',digest=createHash('sha256').update(secret).digest('hex');
+  await f.store.run("INSERT INTO harbor.members(id,name,created,department_id) VALUES('lock-member','synthetic',0,'department-a')");
+  await f.store.run("INSERT INTO harbor.keys(id,member_id,digest,prefix,created,department_id) VALUES('lock-key','lock-member',$1,'synthetic',0,'department-a')",digest);
+  for(const id of ['settling','admitting']){await f.request(id,a);await f.store.run("UPDATE harbor.requests SET member_id='lock-member',key_id='lock-key' WHERE id=$1",id);}
+  await f.admit('settling',a);await f.store.run("UPDATE harbor.requests SET consumption_policy='inherit',consumption_policy_version=0,consumption_source=NULL,consumption_fallback=false,consumption_attempts='[]'::jsonb WHERE id='settling'");
+  const gate=()=>{let resolve;const promise=new Promise(done=>resolve=done);return {promise,resolve};},auth=gate(),memberUpdate=gate();
+  const wait=async promise=>{let timer;try{return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('synthetic lock interleave timeout')),5000);})]);}finally{clearTimeout(timer);}};
+  const original=f.store.query.bind(f.store);f.store.query=(sql,args)=>{if(sql.startsWith('UPDATE harbor.members SET used='))memberUpdate.resolve();return original(sql,args);};
+  const admission=f.store.transaction(async()=>{await f.store.authenticate(secret,{lock:true,at:f.now()});auth.resolve();await wait(memberUpdate.promise);return f.subjects.admit('admitting',a);});
+  await wait(auth.promise);
+  const result={status:'ok',input:2,output:1,consumptionAttempts:[{source:api?'api':'subscription',account_id:a.id,state:'completed',usage_known:true,started:f.now(),ended:f.now(),input:2,output:1,cached:0}]};
+  const outcomes=await Promise.allSettled([f.store.finish('settling',result,f.now()),admission]);assert.ok(outcomes.every(row=>row.status==='fulfilled'),JSON.stringify(outcomes.map(row=>({status:row.status,code:row.reason?.code}))));
+  assert.equal(outcomes[0].value.settled,true);assert.equal(outcomes[1].value.coordinated,true);
+  assert.equal((await f.store.finish('settling',result,f.now())).settled,false);
+  assert.deepEqual(await f.store.get("SELECT m.used member_used,k.used key_used,a.budget_used account_used FROM harbor.members m JOIN harbor.keys k ON k.member_id=m.id CROSS JOIN harbor.accounts a WHERE m.id='lock-member' AND a.id='lock-account'"),{member_used:3,key_used:3,account_used:3});
+ }
 });
