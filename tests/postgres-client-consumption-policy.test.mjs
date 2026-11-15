@@ -12,6 +12,7 @@ import {createPostgresQueryQueue} from '../postgres-query-queue.mjs';
 import {createPostgresRouter} from '../postgres-routing.mjs';
 import {createResponsesTransport} from '../responses.mjs';
 import {createUsageRollupRuntime} from './usage-rollup-fixture.mjs';
+import {migrateUsageRollups,backfillUsageRollups,reconcileUsageRollups} from '../postgres-usage-rollups.mjs';
 import {migrateConsumptionPolicy} from '../postgres-consumption-policy.mjs';
 
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需独立PG测试库':false,timeout:30000};
@@ -103,4 +104,14 @@ test('me/catalog full schema validation initializes once while ordinary reads re
  const original=f.store.query.bind(f.store),calls=[];f.store.query=(sql,args)=>{calls.push({sql,marker:sql==='SELECT value FROM harbor.gateway_settings WHERE name=$1'&&args[0]==='schema.key-consumption-policy',departmentProbe:sql.startsWith("SELECT to_regclass('harbor.gateway_settings')")});return original(sql,args);};
  assert.equal((await f.call('/api/me')).status,200);assert.equal((await f.call('/v1/codex/image-mcp.mjs')).status,200);assert.equal(calls.filter(row=>row.marker).length,2);
  calls.length=0;assert.equal((await f.call('/api/me')).status,200);assert.equal((await f.call('/v1/codex/image-mcp.mjs')).status,200);assert.equal(calls.some(row=>row.marker||/pg_proc|pg_constraint|pg_attribute/.test(row.sql)&&!row.departmentProbe),false);assert.ok(calls.some(row=>row.departmentProbe));console.log(JSON.stringify({diagnostic:'client-ordinary-read-sql',actualTotal:calls.length,departmentPresenceProbes:calls.filter(row=>row.departmentProbe).length,fullSchemaRescans:0}));
+}));
+
+
+test('legacy me保留member与Key交集，不以ready Key桶计入错配或无员工旧请求',integration,()=>fixture(async f=>{
+ const other=(await f.admin.handle('/api/admin/members','POST',{name:'合成旧归属员工',quota:null,expires:null})).value;
+ for(const [id,member] of [['own',f.member.memberId],['mismatch',other.memberId],['orphan',null]])await f.store.run("INSERT INTO harbor.requests(id,member_id,key_id,started,status,ip) VALUES($1,$2,$3,$4,'ok','synthetic')",id,member,f.member.keyId,f.at);
+ const before=await (await f.call('/api/me')).json();assert.equal(before.standard.requests,1);assert.equal(before.keyStandard.requests,1);
+ await migrateUsageRollups(f.store,{apply:true});await backfillUsageRollups(f.store);assert.equal((await reconcileUsageRollups(f.store,{publishReady:true})).ready,true);
+ const sqls=[],original=f.store.query.bind(f.store);f.store.query=(sql,args)=>{sqls.push(sql);return original(sql,args);};
+ const response=await f.call('/api/me');assert.equal(response.status,200);assert.deepEqual(await response.json(),before);assert.ok(!sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));
 }));

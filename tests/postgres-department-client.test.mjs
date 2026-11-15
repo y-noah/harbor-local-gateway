@@ -12,6 +12,8 @@ import {createPostgresDeviceAccess} from '../postgres-device-access.mjs';
 import {createPostgresQueryQueue} from '../postgres-query-queue.mjs';
 import {createPostgresRouter} from '../postgres-routing.mjs';
 import {migrateConsumptionPolicy,createPostgresConsumptionPolicy} from '../postgres-consumption-policy.mjs';
+import {migrateUsageRollups,backfillUsageRollups,reconcileUsageRollups,disableUsageRollups} from '../postgres-usage-rollups.mjs';
+import {usageWindow} from '../store.mjs';
 import {createUsageRollupRuntime} from './usage-rollup-fixture.mjs';
 const url=process.env.HARBOR_TEST_DATABASE_URL,socket=process.env.HARBOR_TEST_PG_SOCKET,integration={skip:!url&&!socket?'需独立PG18':false};
 function options(database){if(url){const target=new URL(url);if(database)target.pathname='/'+database;return {connectionString:target.href,allowPlaintextLocalNetwork:true};}return {connection:{host:socket,port:Number(process.env.HARBOR_TEST_PG_PORT),user:process.env.HARBOR_TEST_PG_USER,password:process.env.HARBOR_TEST_PG_PASSWORD,database:database??'postgres'}};}
@@ -54,4 +56,35 @@ test('api/me只汇总当前员工部门并核初始scope，停复旧scope与伪�
  let value=await (await f.call('/api/me')).json();assert.equal(value.department_id,f.a.id);assert.equal(value.standard.requests,1);assert.equal(value.keyStandard.requests,1);assert.equal(value.consumption_policy,'inherit');value=await (await f.call('/api/me',f.mb.secret)).json();assert.equal(value.department_id,f.b.id);assert.equal(value.standard.requests,2);
  const scopeA=f.store.departmentScope(memberA);await assert.rejects(f.self(f.ma.secret,{scope:f.store.departmentScope(memberB)}),{code:'department_forbidden'});await assert.rejects(f.self(f.ma.secret,{scope:JSON.parse(JSON.stringify(scopeA))}),{code:'department_scope_required'});
  await f.departments.updateDepartment(f.superAdmin,f.a.id,{enabled:false,expected_version:0});await f.departments.updateDepartment(f.superAdmin,f.a.id,{enabled:true,expected_version:1});await assert.rejects(f.self(f.ma.secret,{scope:scopeA}),{code:'department_forbidden'});const current=await f.store.authenticate(f.ma.secret,{at:f.at});assert.equal((await f.self(f.ma.secret,{scope:f.store.departmentScope(current)})).standard.requests,1);
+});
+
+
+test('api/me小时汇总与原始查询完整DTO一致，受限角色下隔离部门及多Key且保留精确计价',integration,async t=>{
+ const f=await fixture(t),window=usageWindow(f.at),extra=(await f.admin.handle('/api/admin/keys','POST',{memberId:f.ma.memberId,expires:null,consumption_policy:'subscription_only'},undefined,{scope:f.scopeA})).value;
+ await f.setPolicy('api_only');
+ const zero=(await f.admin.handle('/api/admin/members','POST',{name:'合成零请求',quota:null,expires:null},undefined,{scope:f.scopeA})).value;
+ await f.store.run("INSERT INTO harbor.pricing_versions(id,created,book) VALUES('synthetic-self-r1',0,'{}'),('synthetic-self-r2',0,'{}')");
+ const points=[window.start-1,window.start,window.start+1,window.start+3600000,window.start+3600001,window.end-1,window.end,window.start+7200000,window.start+10800000,window.start+14400000];
+ for(const [i,at] of points.entries()){
+  const key=i%2?extra:f.ma,id='self-synthetic-'+i;
+  await f.store.run("INSERT INTO harbor.requests(id,member_id,key_id,department_id,started,status,ip,price_version) VALUES($1,$2,$3,$4,$5,'ok','synthetic',$6)",id,f.ma.memberId,key.keyId,f.a.id,at,i%3?'synthetic-self-r1':'synthetic-self-r2');
+  if(i===1)continue;
+  const state=i===2?'unknown':i===3?'pending':i===4?'expired':'priced',amount=state==='priced'?String(900719925474099312345n+BigInt(i)):null;
+  await f.store.run('INSERT INTO harbor.request_prices(request_id,state,revision,input_atoms,total_atoms,measured_at) VALUES($1,$2,$3,$4,$4,0)',id,state,i===5?'synthetic-self-r2':i%3?'synthetic-self-r1':'synthetic-self-r2',amount);
+ }
+ await f.store.run("INSERT INTO harbor.requests(id,member_id,key_id,department_id,started,status,ip) VALUES('self-other-department',$1,$2,$3,$4,'ok','synthetic')",f.mb.memberId,f.mb.keyId,f.b.id,window.start+1);
+ await migrateUsageRollups(f.store,{apply:true});await backfillUsageRollups(f.store);
+ const {database}=await f.store.get('SELECT current_database() database'),role=database+'_runtime',restricted=new PostgresStore({...options(database),connection:{options:'-c role='+role},poolSize:1});
+ const queue=createPostgresQueryQueue();try{const self=createPostgresSelfQuery(restricted,{clock:()=>f.at,queryQueue:queue});
+ assert.equal((await restricted.get('SELECT current_user name')).name,role);
+ const secrets=[f.ma.secret,extra.secret,zero.secret,f.mb.secret],raw=[];for(const secret of secrets)raw.push(await f.self(secret));
+ assert.equal(raw[0].standard.requests,8);assert.equal(raw[0].keyStandard.requests,3);assert.equal(raw[1].keyStandard.requests,5);assert.deepEqual(raw[0].standard,raw[1].standard);assert.equal(raw[2].standard.requests,0);assert.equal(raw[3].standard.requests,1);
+ assert.equal(raw[0].consumption_policy,'api_only');assert.equal(raw[0].consumption_policy_version,1);assert.equal(raw[1].consumption_policy,'subscription_only');
+ assert.equal((await reconcileUsageRollups(f.store,{publishReady:true})).ready,true);
+ const sqls=[],original=restricted.query.bind(restricted);restricted.query=(sql,args)=>{sqls.push(sql);return original(sql,args);};
+ const ready=[await self(secrets[0])];assert.ok(sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));assert.ok(sqls.some(sql=>sql.includes('pg_constraint')),'cold client initializes its own schema attestation');sqls.length=0;
+ for(const secret of secrets.slice(1))ready.push(await self(secret));assert.deepEqual(ready,raw);assert.ok(sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));assert.ok(!sqls.some(sql=>/pg_proc|pg_constraint/.test(sql)),'warm client does not repeat full schema attestation');
+ const a=await restricted.authenticate(f.ma.secret,{at:f.at}),b=await restricted.authenticate(f.mb.secret,{at:f.at});await assert.rejects(self(f.ma.secret,{scope:restricted.departmentScope(b)}),{code:'department_forbidden'});assert.equal((await self(f.ma.secret,{scope:restricted.departmentScope(a)})).department_id,f.a.id);
+ await disableUsageRollups(f.store);sqls.length=0;assert.deepEqual(await self(f.ma.secret),raw[0]);assert.ok(!sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));
+ }finally{await queue.close();await restricted.close();}
 });
