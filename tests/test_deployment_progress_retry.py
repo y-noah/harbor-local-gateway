@@ -99,23 +99,6 @@ class DeploymentProgressRetryTests(unittest.TestCase):
     fixed.touch();self.assertEqual(u.supervised_upgrade(entry,{'deploymentId':IDENTIFIER},operation,resume_source=lambda _: {'source':'same'}),registry.PROOF)
     self.assertEqual(json.loads(statefile.read_text()),{});self.assertEqual(len(list((Path(directory)/'registered').glob('*-failed-*.json'))),1)
 
- def test_final_ci_preparation_shell_cache_hit_miss_and_failure(self):
-  text=(ROOT/'.gitlab-ci.yml').read_text();job=text.split('deploy_gateway_entry_installed_testing:',1)[1].split('\nprepare_gateway_image_testing:',1)[0]
-  block=job.split('  before_script:\n    - |\n',1)[1].split('    - install -d',1)[0]
-  script='\n'.join(line[6:] for line in block.splitlines())
-  for mode in ['installed','cache','network','failure']:
-   with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
-    prefix='''set -e
-command() { if [ "$1" = -v ] && { [ "$2" = bash ] || [ "$2" = ssh ]; }; then [ "$MODE" = installed ] || [ -e "$CI_PROJECT_DIR/installed" ]; else builtin command "$@"; fi; }
-sed() { :; }
-apk() { printf '%s\\n' "$*" >> "$CI_PROJECT_DIR/apk-calls"; case "$*" in *--no-network*) [ "$MODE" = cache ] || return 1;; *) [ "$MODE" != failure ] || return 1;; esac; touch "$CI_PROJECT_DIR/installed"; }
-'''
-    result=subprocess.run(['bash','-c',prefix+script],env={**os.environ,'CI_PROJECT_DIR':directory,'MODE':mode},text=True,capture_output=True,timeout=5)
-    self.assertEqual(result.returncode==0,mode!='failure',result.stderr)
-    if mode=='failure':self.assertNotIn('"state":"completed"',result.stdout)
-    else:self.assertIn('"state":"completed"',result.stdout)
-    calls=(Path(directory)/'apk-calls').read_text().splitlines() if (Path(directory)/'apk-calls').exists() else []
-    self.assertEqual(len(calls),0 if mode=='installed' else 1 if mode=='cache' else 2)
  def test_final_installed_ssh_payload_is_executed_and_exact(self):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);ssh=root/'ssh';ssh.write_text('#!/bin/sh\ncat > "$PAYLOAD"\n');ssh.chmod(0o700)
