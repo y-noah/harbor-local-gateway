@@ -287,7 +287,41 @@ def qualification_bytes_match(path, raw, row, side, directory):
     return body(json.loads(raw)) == body(json.loads(previous))
 
 
-def qualify(revision, *, runtime=False):
+def pending_binding(upgrade, entry, ticket, config, identifier, ticket_digest):
+    """Accept only an explicitly selected, unconsumed same-instance ticket."""
+    need(ticket.get('deploymentId') == identifier and upgrade.digest(ticket) == ticket_digest, 'qualification_pending_binding')
+    upgrade.verify_installed_tools(ticket)
+    upgrade.validate_ticket(ticket, ticket.get('to', {}).get('image'), config)
+    need(not os.path.lexists(upgrade.release_path(identifier)), 'qualification_pending_consumed')
+    for name in [identifier, identifier + '-preflights']:
+        need(not os.path.lexists(upgrade.RELEASES / 'runners' / name), 'qualification_pending_started')
+    control = entry.entry_state()
+    need(control.get('phase') == 'active' and control.get('slot') == 'candidate', 'qualification_pending_entry')
+    active = readonly_active_record(upgrade, entry)
+    record = upgrade.record_for(active.get('approval', {}))
+    need(record.get('phase') == 'complete' and record['ticket'].get('deploymentId') != identifier, 'qualification_pending_source')
+    previous = record['ticket']
+    for name in ['materialsDirectory', 'database', 'databaseDigest', 'deviceCaDigest', 'storageMarkerDigest']:
+        need(ticket.get(name) == previous.get(name), 'qualification_pending_materials')
+    gateway = entry.inspect_container(active['candidate']['containerId'])
+    worker = entry.inspect_container(record['workerId'])
+    upgrade.verify_source(ticket, active, gateway, worker)
+    for row in [gateway, worker]:
+        state = row.get('State', {})
+        need(state.get('Health', {}).get('Status') == 'healthy' and not any(state.get(name) for name in ['Paused', 'Restarting', 'Dead', 'OOMKilled']), 'qualification_pending_source_health')
+    upgrade.check_storage(ticket)
+    upgrade.network_snapshot(ticket, entry, gateway, worker)
+    status = entry.read_active_authorization(active['image'])
+    need(status.get('state') == 'active' and upgrade.approval_binding(status) == active['approval'], 'qualification_pending_authorization')
+    # The caller holds the deployment/controller locks. Still reject any
+    # unexpected publication evidence appearing during slow observations.
+    need(not os.path.lexists(upgrade.release_path(identifier)), 'qualification_pending_consumed')
+    for name in [identifier, identifier + '-preflights']:
+        need(not os.path.lexists(upgrade.RELEASES / 'runners' / name), 'qualification_pending_started')
+    return upgrade.active_identity(active)
+
+
+def qualify(revision, *, runtime=False, pending_deployment_id=None, pending_ticket_digest=None):
     """Read-only Host qualification after an explicit supervisor refresh.
 
     The refresh helper needs these same locks during its controlled stop/start,
@@ -296,6 +330,9 @@ def qualify(revision, *, runtime=False):
     """
     need(os.geteuid() == 0 and re.fullmatch('[a-f0-9]{40}', revision) is not None, 'root_required')
     need(type(runtime) is bool, 'mode')
+    pending = pending_deployment_id is not None or pending_ticket_digest is not None
+    if pending:
+        need(runtime and isinstance(pending_deployment_id, str) and re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', pending_deployment_id) is not None and isinstance(pending_ticket_digest, str) and re.fullmatch('[a-f0-9]{64}', pending_ticket_digest) is not None, 'qualification_pending_parameters')
     fds = []
     try:
         for name in LOCKS:
@@ -310,7 +347,10 @@ def qualify(revision, *, runtime=False):
         observed, observed_modes = {}, {}
         for name, row in journal['files'].items():
             actual = optional(Path(name))
-            need(qualification_bytes_match(Path(name), actual, row, side, directory), 'qualification_bytes')
+            # Only the exact explicit pending is allowed to replace the source
+            # ticket. Code bytes and the manifest binding stay install-bound.
+            if not (pending and Path(name) == TICKET):
+                need(qualification_bytes_match(Path(name), actual, row, side, directory), 'qualification_bytes')
             observed[name] = actual
             mode = None if actual is None else stat.S_IMODE(Path(name).lstat().st_mode)
             expected_mode = row['modeAfter' if side == 'after' else 'modeBefore']
@@ -320,23 +360,29 @@ def qualify(revision, *, runtime=False):
         upgrade, entry = module(UPGRADE, 'host_qualification_upgrade'), module(ENTRY, 'host_qualification_entry')
         entry.runtime_upgrade_module = lambda: upgrade
         ticket = json.loads(read(TICKET, 0o600))
-        active, _ = current_binding(upgrade, entry, ticket, readonly=True)
-        need(active == journal['active'], 'qualification_active_changed')
         config_raw = read(CONFIG, 0o600)
         config = json.loads(config_raw)
+        if pending:
+            active = pending_binding(upgrade, entry, ticket, config, pending_deployment_id, pending_ticket_digest)
+        else:
+            active, _ = current_binding(upgrade, entry, ticket, readonly=True)
+        need(active == journal['active'], 'qualification_active_changed')
         compose = module(COMPOSE, 'host_qualification_composition')
         policy = compose.storage_restart_policy(config)
         need(policy in ['no', 'unless-stopped'], 'qualification_restart_policy')
         # A guard check may perform slow Docker/systemd reads. Neither source
         # approval nor installed files may change while it is being observed.
-        final_active, _ = current_binding(upgrade, entry, ticket, readonly=True)
+        if pending:
+            final_active = pending_binding(upgrade, entry, ticket, config, pending_deployment_id, pending_ticket_digest)
+        else:
+            final_active, _ = current_binding(upgrade, entry, ticket, readonly=True)
         need(final_active == active and read(CONFIG, 0o600) == config_raw, 'qualification_changed')
         for name, row in journal['files'].items():
             actual = optional(Path(name))
             need(actual == observed[name], 'qualification_bytes_changed')
             mode = None if actual is None else stat.S_IMODE(Path(name).lstat().st_mode)
             need(mode == observed_modes[name], 'qualification_mode_changed')
-        return {'hostToolsReady': True, 'qualificationRequired': False, 'revision': ticket['hostToolsRevision'], 'installationRevision': revision, 'storageStartupGuardEnabled': config.get('postgres_storage_startup_guard', False), 'businessContainersTouched': False, 'publicationTriggered': False}
+        return {'hostToolsReady': True, 'qualificationRequired': False, 'revision': ticket['hostToolsRevision'], 'installationRevision': revision, 'storageStartupGuardEnabled': config.get('postgres_storage_startup_guard', False), 'businessContainersTouched': False, 'publicationTriggered': False, **({'pendingDeploymentId': pending_deployment_id, 'pendingTicketDigest': pending_ticket_digest} if pending else {})}
     finally:
         for fd in reversed(fds):
             os.close(fd)
@@ -408,15 +454,19 @@ if __name__ == '__main__':
     parser.add_argument('action', choices=['install', 'rollback', 'install-runtime', 'rollback-runtime', 'qualify', 'qualify-runtime'])
     parser.add_argument('--revision', required=True)
     parser.add_argument('--source', type=Path)
+    parser.add_argument('--pending-deployment-id')
+    parser.add_argument('--pending-ticket-digest')
     for name in ['manifest', 'ticket', 'wrapper', 'helper', 'compose', 'upgrade']:
         parser.add_argument('--expected-' + name + '-sha256')
     arguments = parser.parse_args()
     try:
         if arguments.action in ['qualify', 'qualify-runtime']:
-            result = qualify(arguments.revision, runtime=arguments.action == 'qualify-runtime')
+            result = qualify(arguments.revision, runtime=arguments.action == 'qualify-runtime', pending_deployment_id=arguments.pending_deployment_id, pending_ticket_digest=arguments.pending_ticket_digest)
         elif arguments.action in ['rollback', 'rollback-runtime']:
+            need(arguments.pending_deployment_id is None and arguments.pending_ticket_digest is None, 'qualification_pending_action')
             result = rollback(arguments.revision, runtime=arguments.action == 'rollback-runtime')
         else:
+            need(arguments.pending_deployment_id is None and arguments.pending_ticket_digest is None, 'qualification_pending_action')
             need(arguments.source is not None, 'source')
             result = install(arguments.source, arguments.revision, arguments.expected_manifest_sha256, arguments.expected_ticket_sha256, arguments.expected_wrapper_sha256, arguments.expected_helper_sha256, runtime=arguments.action == 'install-runtime', expected_compose=arguments.expected_compose_sha256, expected_upgrade=arguments.expected_upgrade_sha256)
         print(json.dumps(result))

@@ -10,7 +10,7 @@ from contextlib import ExitStack
 from unittest.mock import patch
 from unittest.mock import Mock
 from types import SimpleNamespace
-from test_postgres_runtime_upgrade import ticket, active, CONFIG, MATERIALS, IMAGE, upgrade, controller, pg
+from test_postgres_runtime_upgrade import ticket, active, target, CONFIG, MATERIALS, IMAGE, upgrade, controller, pg
 
 spec = importlib.util.spec_from_file_location('image_stage_install', Path(__file__).parents[1] / 'ci/install-image-stage.py')
 i = importlib.util.module_from_spec(spec);spec.loader.exec_module(i)
@@ -236,6 +236,133 @@ class ImageStageInstallTests(unittest.TestCase):
             def lose_execute(config):paths['wrapper.py'].chmod(0o644);return 'no'
             guard.side_effect=lose_execute
             with self.assertRaisesRegex(ValueError,'qualification_mode_changed'):i.qualify('8' * 40)
+
+    def pending_fixture(self, directory, stack, guard=None):
+        configuration={**CONFIG,'storage_engine':'postgres','local_assurance_release':True,'entry_installed_release':True,'image_prefix':IMAGE.rsplit(':',1)[0],'postgres_network':'owned-pg-net','postgres_storage_startup_guard':True}
+        guard=guard or Mock(return_value='no')
+        values, config_path=self.qualification_fixture(directory,stack,configuration,guard)
+        paths, old_ticket, _, history, _, arguments=values;root=Path(directory)
+        compose, next_upgrade=root/'composition.py',root/'upgrade.py'
+        for path in [compose,next_upgrade,root/'host-3.py']:
+            path.write_bytes(b'SYNTHETIC_TOOL = True\n');path.chmod(0o600)
+        stack.enter_context(patch.object(i,'COMPOSE',compose));stack.enter_context(patch.object(i,'UPGRADE',next_upgrade))
+        tools=(*upgrade.HOST_FILES,str(compose),str(next_upgrade),str(root/'host-3.py'))
+        stack.enter_context(patch.object(upgrade,'HOST_FILES',tools))
+        manifest=json.loads(paths['manifest.json'].read_bytes());manifest['files']={name:i.sha(Path(name).read_bytes()) for name in tools};paths['manifest.json'].write_bytes(i.body(manifest))
+        paths['helper.py'].write_bytes(b'APPROVED_HELPER = True\n');paths['helper.py'].chmod(0o644)
+        source=arguments[0]
+        (source/'postgres-deploy.py').write_bytes(b'APPROVED_COMPOSE = True\n');(source/'postgres-upgrade-deploy.py').write_bytes(b'APPROVED_UPGRADE = True\n')
+        arguments=(*arguments[:2],i.sha(paths['manifest.json'].read_bytes()),*arguments[3:5],i.sha(paths['helper.py'].read_bytes()))
+        historical=json.loads(history.read_bytes());historical['workerId']='d'*64;historical['candidate']['imageId']=old_ticket['to']['configDigest'];history.write_bytes(i.body(historical))
+        i.install(*arguments,runtime=True,expected_compose=i.sha((source/'postgres-deploy.py').read_bytes()),expected_upgrade=i.sha((source/'postgres-upgrade-deploy.py').read_bytes()))
+        current=json.loads(paths['active.json'].read_bytes());source_ticket=json.loads(paths['ticket.json'].read_bytes());pending=copy.deepcopy(source_ticket)
+        pending['deploymentId']='00000000-0000-0000-0000-000000000003'
+        pending['to']={'image':configuration['image_prefix']+':'+'e'*40,'revision':'e'*40,'configDigest':'sha256:'+'e'*64,'manifestDigest':'sha256:'+'f'*64}
+        pending['from']={'containerId':current['candidate']['containerId'],'workerId':'d'*64,'imageId':current['candidate']['imageId'],'image':current['image'],'activeIdentityDigest':upgrade.digest(upgrade.active_identity(current))}
+        paths['ticket.json'].write_bytes(i.body(pending))
+        rows={}
+        for role in ['gateway','worker']:
+            row=target(source_ticket,role);row['Config']['Labels'].update({'com.harbor.activation-deployment-id':current['approval']['deploymentId'],'com.harbor.activation-receipt':current['approval']['receiptDigest']});rows[row['Id']]=row
+        stack.enter_context(patch.object(controller,'inspect_container',side_effect=lambda identifier:rows[identifier]))
+        controller.entry_state.return_value={'phase':'active','slot':'candidate'}
+        network={'Id':pending['network']['id'],'Driver':'bridge','Internal':False,'Containers':{identifier:{} for identifier in [*pending['network']['infrastructureContainerIds'],*rows]}}
+        def execute(args):
+            if args[:3]==['/usr/bin/docker','network','inspect']:return json.dumps([network])
+            if args[:6]==['/usr/sbin/ip','-j','link','show','dev',pending['network']['bridge']]:return json.dumps([{'ifindex':pending['network']['bridgeIfindex'],'address':pending['network']['bridgeMac']}])
+            if args[:6]==['/usr/sbin/ip','-j','link','show','master',pending['network']['bridge']]:return '[]'
+            raise AssertionError('qualification attempted non-readonly command')
+        stack.enter_context(patch.object(controller,'execute',side_effect=execute))
+        return paths,pending,rows,network,guard,source_ticket,history,config_path
+
+    def test_explicit_fresh_pending_is_readonly_and_bound_to_original_source(self):
+        with tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
+            paths,pending,rows,network,guard,_,_,_=self.pending_fixture(directory,stack)
+            snapshot={p:(p.read_bytes(),p.stat().st_mtime_ns,p.stat().st_ctime_ns) for p in Path(directory).rglob('*') if p.is_file()}
+            controller.entry_state.reset_mock()
+            with patch.object(controller,'save_json',side_effect=AssertionError('pending qualification wrote state')) as save:
+                ready=i.qualify('8'*40,runtime=True,pending_deployment_id=pending['deploymentId'],pending_ticket_digest=upgrade.digest(pending))
+            self.assertTrue(ready['hostToolsReady']);self.assertFalse(ready['publicationTriggered']);self.assertEqual(ready['pendingTicketDigest'],upgrade.digest(pending));save.assert_not_called()
+            self.assertTrue(all(not call.args and not call.kwargs for call in controller.entry_state.call_args_list));self.assertEqual(snapshot,{p:(p.read_bytes(),p.stat().st_mtime_ns,p.stat().st_ctime_ns) for p in snapshot})
+            with self.assertRaises((ValueError,RuntimeError)):i.qualify('8'*40,runtime=True)  # No implicit broadening of the completed-source path.
+
+    def test_pending_parameters_must_be_paired_and_exact(self):
+        for change in ['missing-id','missing-digest','wrong-id','wrong-digest','non-runtime']:
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
+                paths,pending,_,_,guard,_,_,_=self.pending_fixture(directory,stack)
+                options={'runtime':True,'pending_deployment_id':pending['deploymentId'],'pending_ticket_digest':upgrade.digest(pending)}
+                if change=='missing-id':options['pending_deployment_id']=None
+                elif change=='missing-digest':options['pending_ticket_digest']=None
+                elif change=='wrong-id':options['pending_deployment_id']='00000000-0000-0000-0000-000000000004'
+                elif change=='wrong-digest':options['pending_ticket_digest']='0'*64
+                else:options['runtime']=False
+                with self.assertRaises((ValueError,RuntimeError)):i.qualify('8'*40,**options)
+                guard.assert_not_called()
+
+    def test_pending_rejects_started_or_consumed_release_including_failed_old_ticket(self):
+        for kind in ['rolled-back-durable','runner','preflights','dangling-preflight']:
+            with self.subTest(kind=kind),tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
+                _,pending,_,_,guard,_,_,_=self.pending_fixture(directory,stack);identifier=pending['deploymentId']
+                if kind=='rolled-back-durable':
+                    path=upgrade.release_path(identifier);path.mkdir();(path/'release.json').write_bytes(i.body({'phase':'rolled-back-pg','ticket':pending}))
+                else:
+                    path=upgrade.RELEASES/'runners'/(identifier if kind=='runner' else identifier+'-preflights');path.parent.mkdir(exist_ok=True)
+                    if kind=='dangling-preflight':path.symlink_to(Path(directory)/'missing')
+                    else:path.mkdir()
+                with self.assertRaisesRegex(ValueError,'pending_(consumed|started)'):i.qualify('8'*40,runtime=True,pending_deployment_id=identifier,pending_ticket_digest=upgrade.digest(pending))
+                guard.assert_not_called()
+
+    def test_pending_requires_actual_source_materials_database_network_and_health(self):
+        for change in ['database','materials','source','network','health']:
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
+                paths,pending,rows,network,guard,_,_,_=self.pending_fixture(directory,stack)
+                if change=='database':pending['database']['name']='other_owned_database'
+                elif change=='materials':pending['materialsDirectory']=MATERIALS.rsplit('/',1)[0]+'/00000000-0000-0000-0000-000000000004'
+                elif change=='source':rows[pending['from']['containerId']]['Id']='7'*64
+                elif change=='network':network['Id']='7'*64
+                else:rows[pending['from']['workerId']]['State']['Health']['Status']='unhealthy'
+                paths['ticket.json'].write_bytes(i.body(pending))
+                with self.assertRaises((ValueError,RuntimeError)):i.qualify('8'*40,runtime=True,pending_deployment_id=pending['deploymentId'],pending_ticket_digest=upgrade.digest(pending))
+                guard.assert_not_called()
+
+    def test_pending_rechecks_consumption_and_raw_ticket_after_guard(self):
+        for change in ['durable','runner','ticket']:
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
+                paths,pending,_,_,guard,_,_,_=self.pending_fixture(directory,stack)
+                def consume(config):
+                    if change=='durable':upgrade.release_path(pending['deploymentId']).mkdir()
+                    elif change=='runner':(upgrade.RELEASES/'runners'/pending['deploymentId']).mkdir(parents=True)
+                    else:paths['ticket.json'].write_text(json.dumps(pending,indent=2)+'\n')
+                    return 'no'
+                guard.side_effect=consume
+                with self.assertRaises((ValueError,RuntimeError)):i.qualify('8'*40,runtime=True,pending_deployment_id=pending['deploymentId'],pending_ticket_digest=upgrade.digest(pending))
+
+    def test_existing_host_contract_accepts_pending_without_rebinding_history(self):
+        with tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
+            guard=Mock();paths,pending,rows,_,_,source_ticket,history,_=self.pending_fixture(directory,stack,guard)
+            spec=importlib.util.spec_from_file_location('unchanged_storage_host_contract',Path(__file__).parents[1]/'ci/harbor-pg-storage-host.py')
+            host=importlib.util.module_from_spec(spec);spec.loader.exec_module(host)
+            manifest=json.loads(paths['manifest.json'].read_bytes());material=Path(directory)/'host-0.py'
+            mutable=frozenset([str(paths['wrapper.py']),str(i.COMPOSE),str(i.UPGRADE),str(Path(directory)/'host-3.py')])
+            plan={'scope':'harbor-pg-storage-move-v1','runId':'a'*32,'systemId':pending['database']['cluster'],'materialsDirectory':MATERIALS,'toolSha256':{str(material):manifest['files'][str(material)]}}
+            journal={'scope':plan['scope'],'runId':plan['runId'],'phase':'complete','oldDataRollbackForbidden':True}
+            current=json.loads(paths['active.json'].read_bytes())
+            mapping={str(paths['manifest.json']):paths['manifest.json'],str(paths['ticket.json']):paths['ticket.json'],'/var/lib/harbor-entry/active.json':paths['active.json'],'/var/lib/harbor-postgres-upgrades/'+current['approval']['deploymentId']+'/release.json':history}
+            def docker(args):
+                self.assertEqual(args[:3],['/usr/bin/docker','container','inspect'])
+                identifier=pending['from']['containerId'] if args[-1]==host.GW else pending['from']['workerId']
+                return json.dumps([rows[identifier]])
+            for name,value in [('RUNTIME_MANIFEST',paths['manifest.json']),('RUNTIME_TICKET',paths['ticket.json']),('MATERIAL',material),('MUTABLE_TOOLS',mutable),('RUNTIME_TOOLS',frozenset(manifest['files']))]:stack.enter_context(patch.object(host,name,value))
+            stack.enter_context(patch.object(host,'private',side_effect=lambda path,*args:mapping[str(path)].read_bytes()))
+            stack.enter_context(patch.object(host,'code_bytes',side_effect=lambda path:Path(path).read_bytes()))
+            stack.enter_context(patch.object(host,'run',side_effect=docker))
+            original_history=history.read_bytes();paths['ticket.json'].write_bytes(i.body(source_ticket))
+            with self.assertRaisesRegex(RuntimeError,'host_runtime_ticket_not_current'):host.verified_runtime_tools(plan,journal)
+            paths['ticket.json'].write_bytes(i.body(pending))
+            def real_guard(config):
+                self.assertEqual(host.verified_runtime_tools(plan,journal),{name:manifest['files'][name] for name in mutable});return 'no'
+            guard.side_effect=real_guard
+            ready=i.qualify('8'*40,runtime=True,pending_deployment_id=pending['deploymentId'],pending_ticket_digest=upgrade.digest(pending))
+            self.assertTrue(ready['hostToolsReady']);self.assertEqual(history.read_bytes(),original_history)
 
     def test_qualification_rejects_configuration_or_tool_changes_during_guard(self):
         for change in ['config', 'wrapper']:
