@@ -282,3 +282,10 @@ test('stdout JSON shape never upgrades ordinary business data into protocol cont
     const {events,collector}=capture(),filter=new JsonRecordRedactor(),expected=filter.push(raw)+filter.finish();collector.input({input:[{type:'custom_tool_call_output',call_id:'call',output:raw}]});const result=collector.finish();assert.equal(events[0].content.output,expected);assert.equal(result.incomplete,false);assert.equal(result.coverage.unsupported.contentParts,0);assert.ok(!JSON.stringify(events).includes('opaque-fixture-secret'));
   }
 });
+
+test('agent typed input remains a turn boundary and is never relabeled user or assistant',()=>{
+ const agent={type:'agent_message',author:'synthetic',recipient:'synthetic',content:[{type:'input_text',text:'PRIVATE_AGENT_HISTORY'}]};
+ assert.deepEqual(currentInput({input:[{role:'user',content:'PRIVATE_PREVIOUS_USER'},agent]}).events,[]);
+ const current=currentInput({input:[{role:'user',content:'PRIVATE_PREVIOUS_USER'},agent,{type:'message',role:'user',content:[{type:'input_text',text:'current visible user'}]}]});
+ assert.equal(current.events.length,1);assert.equal(current.events[0].content.text,'current visible user');assert.ok(!JSON.stringify(current).includes('PRIVATE_'));
+});

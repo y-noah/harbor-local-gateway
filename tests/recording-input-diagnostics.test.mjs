@@ -33,19 +33,15 @@ test('同步异常及异步拒绝不改变unsupported_input、可采前缀或异
  }
  await new Promise(resolve=>setImmediate(resolve));
 });
-test('agent_message仅识别诊断枚举，不放行正文、身份或通用auxiliary字段且不读取加密子项',async()=>{
- const item={type:'agent_message',author:'synthetic author',recipient:'synthetic recipient',content:[{type:'input_text',text:'synthetic visible content'},{type:'encrypted_content',encrypted_content:'synthetic opaque content'}],auxiliary:'synthetic auxiliary value'};
- const payload={input:[item]},baseline=captureRequestContext(payload);
- assert.equal(baseline.state,'incomplete');assert.deepEqual(baseline.reasons,['unsupported_input']);assert.deepEqual(baseline.components,[]);
+test('agent_message已知明文上下文不再误报未知input，诊断DTO仍不读取内容',async()=>{
+ const item={type:'agent_message',author:'synthetic author',recipient:'synthetic recipient',content:[{type:'input_text',text:'synthetic visible content'},{type:'encrypted_content',get encrypted_content(){throw Error('must not read opaque child');}}]};
  for(const capture of [captureRequestContext,captureRequestContextAsync]){
-  const diagnostics=createRecordingInputDiagnostics({enabled:true}),view=await capture(payload,{onUnsupportedInputShape:diagnostics.beginRequest()});
-  assert.deepEqual(view,baseline);
-  const status=diagnostics.status();assert.equal(status.groups.length,1);
-  assert.deepEqual(status.groups[0],{source:'input',location:'array_item',shape:'object',type:'agent_message',role:'missing',has_type:true,has_role:false,has_content:true,has_input:false,has_output:false,has_call_id:false,has_tools:false,has_encrypted_content:false,has_summary:false,count:1});
-  for(const value of ['synthetic author','synthetic recipient','synthetic visible content','synthetic opaque content','auxiliary','synthetic auxiliary value'])assert.ok(!JSON.stringify({view,status}).includes(value));
-  const guarded={type:'agent_message',get content(){throw Error('must not read content');},get author(){throw Error('must not read identity');},get recipient(){throw Error('must not read identity');}};
-  assert.deepEqual(await capture({input:[guarded]},{onUnsupportedInputShape:diagnostics.beginRequest()}),baseline);
+  const diagnostics=createRecordingInputDiagnostics({enabled:true}),view=await capture({input:[item]},{onUnsupportedInputShape:diagnostics.beginRequest()});
+  assert.equal(view.state,'complete');assert.equal(view.opaqueReasoningExcluded,1);assert.match(JSON.stringify(view),/synthetic visible content/);assert.deepEqual(diagnostics.status().groups,[]);
  }
+ const guarded={type:'agent_message',get content(){throw Error('must not read content');},get author(){throw Error('must not read identity');}};
+ assert.equal(recordingInputShape(guarded,'input','array_item').type,'agent_message');
+ assert.equal(recordingInputShape(guarded,'input','array_item').has_content,true);
 });
 test('请求数、每请求shape数、组合数分别封顶，组合只保留枚举计数',()=>{
  const d=createRecordingInputDiagnostics({enabled:true,maxRequests:2,maxGroups:1,maxItemsPerRequest:2,ttlMs:50,clock:()=>0});

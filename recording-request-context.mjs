@@ -8,12 +8,12 @@ import {recordingTextMetadata,finalizeRecordingTokens} from './recording-text-me
 const media=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
 // Parser support is independent of diagnostic recognition: observing a new
 // protocol must not admit it through the generic field walker below.
-const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output','item_reference','compaction']);
+const itemTypes=new Set(['message','agent_message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output','item_reference','compaction']);
 const textTypes=new Set(['text','input_text','output_text','summary_text','refusal']);
-const scalarFields=new Set(['role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments','code','container_id','server_label','approval_request_id','reason']);
+const scalarFields=new Set(['author','recipient','role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments','code','container_id','server_label','approval_request_id','reason']);
 const toolItems=new Set(['function_call','custom_tool_call','function_call_output','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output']);
 const toolFacts=['status','error','duration_ms','elapsed_ms'];
-const itemFields={additional_tools:['type','id','role','tools'],function_call:['type','id','call_id','name','namespace','arguments',...toolFacts],custom_tool_call:['type','id','call_id','name','namespace','input',...toolFacts],function_call_output:['type','id','call_id','name','namespace','output',...toolFacts],custom_tool_call_output:['type','id','call_id','name','namespace','output',...toolFacts],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
+const itemFields={agent_message:['type','id','author','recipient','content'],additional_tools:['type','id','role','tools'],function_call:['type','id','call_id','name','namespace','arguments',...toolFacts],custom_tool_call:['type','id','call_id','name','namespace','input',...toolFacts],function_call_output:['type','id','call_id','name','namespace','output',...toolFacts],custom_tool_call_output:['type','id','call_id','name','namespace','output',...toolFacts],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
 Object.assign(itemFields,{shell_call:['type','id','call_id','action',...toolFacts],shell_call_output:['type','id','call_id','output','max_output_length',...toolFacts],apply_patch_call:['type','id','call_id','operation',...toolFacts],apply_patch_call_output:['type','id','call_id','output',...toolFacts]});
 Object.assign(itemFields,{code_interpreter_call:['type','id','code','container_id','outputs',...toolFacts],mcp_call:['type','id','name','server_label','arguments','approval_request_id','output',...toolFacts]});
 Object.assign(itemFields,{mcp_list_tools:['type','id','server_label','tools','error'],mcp_approval_request:['type','id','arguments','name','server_label'],mcp_approval_response:['type','approval_request_id','approve','id','reason']});
@@ -24,7 +24,7 @@ for(const type of ['function_call','custom_tool_call'])itemFields[type].push('as
 itemFields.shell_call.push('environment');
 const callerFields={direct:['type'],program:['type','caller_id']};
 const shellEnvironmentFields={local:['type','skills'],container_reference:['type','container_id']};
-const nullableItemIds=new Set(['function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
+const nullableItemIds=new Set(['agent_message','function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
 const computerActionFields={click:['type','button','x','y','keys'],double_click:['type','x','y','keys'],drag:['type','path','keys'],keypress:['type','keys'],move:['type','x','y','keys'],screenshot:['type'],scroll:['type','x','y','scroll_x','scroll_y','keys'],type:['type','text'],wait:['type']};
 const webActionFields={search:['type','query','queries','sources'],open_page:['type','url'],find_in_page:['type','pattern','url']};
 const factFields={web_source:['type','url'],file_result:['attributes','file_id','filename','score','text'],safety_check:['id','code','message'],coordinate:['x','y'],local_skill:['name','description','path']};
@@ -69,6 +69,20 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     if(protocol&&factSlots.has(slot)&&(!value||typeof value!=='object'||Array.isArray(value))){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(!value||typeof value!=='object')return value;
     if(protocol&&(slot==='web_action'&&!Object.hasOwn(webActionFields,value.type)||slot==='computer_action'&&!Object.hasOwn(computerActionFields,value.type)||slot==='web_source'&&value.type!=='url'||slot==='tool_caller'&&!Object.hasOwn(callerFields,value.type)||slot==='shell_environment'&&!Object.hasOwn(shellEnvironmentFields,value.type))){reasons.add('unsupported_content');return {content:'[未支持的工具动作已省略]'};}
+    // Codex rust-v0.167.2 AgentMessageInputContent is a separate wire union;
+    // never infer a role or inspect the opaque encrypted child's value.
+    if(protocol&&slot==='agent_content'){
+      if(value.type==='encrypted_content'){
+        opaqueReasoningExcluded++;
+        for(const key in value){if(--nodes<0){cut();break;}if(Object.hasOwn(value,key)&&!['type','encrypted_content'].includes(key))reasons.add('unsupported_field');}
+        if(!Object.hasOwn(value,'encrypted_content'))reasons.add('unsupported_content');
+        return {type:'encrypted_content'};
+      }
+      if(value.type!=='input_text'||typeof value.text!=='string'){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
+    }
+    if(protocol&&value.type==='agent_message'&&!slot){
+      if(typeof value.author!=='string'||typeof value.recipient!=='string'||!Array.isArray(value.content))reasons.add('unsupported_content');
+    }
     if(protocol&&slot==='code_output'&&(!['logs','image'].includes(value.type)||value.type==='logs'&&typeof value.logs!=='string')){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(protocol&&slot!=='mcp_tool'&&!factSlots.has(slot)&&media.has(value.type)){
       return attachment(value);
@@ -83,7 +97,7 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     }
     if(protocol&&['content','summary'].includes(slot)&&!textTypes.has(value.type)){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(protocol&&textTypes.has(value.type)&&typeof value[value.type==='refusal'?'refusal':'text']==='string'&&value[value.type==='refusal'?'refusal':'text'].length&&(value.type!=='output_text'||!Array.isArray(value.logprobs)||!value.logprobs.length))tokenSequence.incomplete=true;
-    const slotFields=slot==='function'?['name','namespace','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','namespace','function','mode','tools']:slot==='code_output'?['type','logs']:slot==='mcp_tool'?['name','input_schema','annotations','description']:slot==='web_action'?webActionFields[value.type]:slot==='computer_action'?computerActionFields[value.type]:slot==='tool_caller'?callerFields[value.type]:slot==='shell_environment'?shellEnvironmentFields[value.type]:factFields[slot]||null;
+    const slotFields=slot==='agent_content'?['type','text']:slot==='function'?['name','namespace','arguments']:slot==='tool_call'?['id','type','function']:slot==='conversation'?['id']:slot==='tool_choice'?['type','name','namespace','function','mode','tools']:slot==='code_output'?['type','logs']:slot==='mcp_tool'?['name','input_schema','annotations','description']:slot==='web_action'?webActionFields[value.type]:slot==='computer_action'?computerActionFields[value.type]:slot==='tool_caller'?callerFields[value.type]:slot==='shell_environment'?shellEnvironmentFields[value.type]:factFields[slot]||null;
     const fields=slotFields||itemFields[value.type]||(value.role!==undefined||value.type==='message'?['type','role','id','content','name','status','channel','phase',...(value.role==='assistant'?['tool_calls','refusal']:[]),...(value.role==='tool'?['tool_call_id']:[])]:null);
     if(protocol&&!slotFields&&value.type!==undefined&&!itemTypes.has(value.type)&&!textTypes.has(value.type)&&value.type!=='function'){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     const result=Object.create(null);
@@ -103,6 +117,9 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     for(const key in value){
       if(--nodes<0){cut();break;}
       if(!Object.hasOwn(value,key))continue;
+      // Agent fields must match their own union before generic opaque exclusions;
+      // misplaced reasoning fields remain unsupported, without reading values.
+      if(protocol&&(value.type==='agent_message'||slot==='agent_content')&&fields&&!fields.includes(key)){reasons.add('unsupported_field');continue;}
       // Never retain opaque compaction/reasoning blobs, even as redacted data.
       if(protocol&&['encrypted_content','reasoning_content','thinking'].includes(key)){opaqueReasoningExcluded++;continue;}
       if(protocol&&fields&&!fields.includes(key)){reasons.add('unsupported_field');continue;}
@@ -175,6 +192,10 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       }
       if(protocol&&value.type==='code_interpreter_call'&&key==='outputs'){
         result.outputs=value.outputs===null?null:visible(value.outputs,depth+1,true,'code_output');continue;
+      }
+      if(protocol&&value.type==='agent_message'&&key==='content'){
+        if(!Array.isArray(value.content)){reasons.add('unsupported_content');continue;}
+        result.content=visible(value.content,depth+1,true,'agent_content');continue;
       }
       if(protocol&&textTypes.has(value.type)&&['text','refusal'].includes(key)&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
       if(protocol&&value.role!==undefined&&key==='refusal'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}

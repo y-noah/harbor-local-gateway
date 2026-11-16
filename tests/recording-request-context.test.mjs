@@ -320,3 +320,29 @@ test('shell环境保留local技能可见配置或container引用，凭据附件�
  const split={input:[{type:'shell_call',environment:{type:'local',skills:[{name:'one',description:'Authorization: Bearer ',path:'one'},{name:'two',description:'private-skill-secret',path:'two'}]}}]};const safe=captureRequestContext(split);assert.equal(safe.state,'complete');assert.ok(!JSON.stringify(safe).includes('private-skill-secret'));
  const large={input:[{type:'shell_call',environment:{type:'local',skills:Array.from({length:100},()=>({name:'visible',description:'visible',path:'visible'}))}}]};for(const options of [{maxNodes:60},{maxBytes:512}]){const result=captureRequestContext(large,options);assert.equal(result.state,'incomplete');assert.ok(result.reasons.includes('size_limit'));assert.deepEqual(await captureRequestContextAsync(large,options),result);}
 });
+
+// Protocol fixture follows openai/codex rust-v0.167.2 models.rs AgentMessage /
+// AgentMessageInputContent, not CLI item.completed.agent_message{text} events.
+test('agent_message retains only its explicit wire fields without inventing a message role',()=>{
+ const item={type:'agent_message',id:null,author:'synthetic-agent-a',recipient:'synthetic-agent-b',content:[{type:'input_text',text:'synthetic visible text'},{type:'encrypted_content',get encrypted_content(){throw Error('opaque must not be accessed');}}]};
+ const view=captureRequestContext({input:[item]});assert.equal(view.state,'complete');assert.equal(view.opaqueReasoningExcluded,1);
+ const saved=view.components[0].content.value;assert.deepEqual(saved,{type:'agent_message',id:null,author:item.author,recipient:item.recipient,content:[{type:'input_text',text:'synthetic visible text'},{type:'encrypted_content'}]});assert.equal(Object.hasOwn(saved,'role'),false);
+});
+test('agent typed unknown fields, malformed children and identity never become silently complete',()=>{
+ for(const change of [{auxiliary:'PRIVATE_UNKNOWN'},{author:{text:'PRIVATE_IDENTITY'}},{content:'PRIVATE_CONTENT'},{content:[{type:'future_part',text:'PRIVATE_UNKNOWN'}]},{content:[{type:'input_text'}]},{content:[{type:'input_text',text:'safe',extra:'PRIVATE_EXTRA'}]}]){
+  const view=captureRequestContext({input:[{type:'agent_message',author:'a',recipient:'b',content:[],...change}]});assert.equal(view.state,'incomplete');assert.ok(!JSON.stringify(view).includes('PRIVATE_'));
+ }
+ const missing=captureRequestContext({input:[{type:'agent_message',content:[]}]});assert.equal(missing.state,'incomplete');
+});
+test('agent message text shares redaction and budgets while arbitrary typed input stays unsupported',()=>{
+ const view=captureRequestContext({input:[{type:'agent_message',author:'Bearer synthetic-credential',recipient:'b',content:[{type:'input_text',text:'Bearer '},{type:'input_text',text:'synthetic-secret'}]}]});assert.ok(!JSON.stringify(view).includes('synthetic-secret'));assert.ok(!JSON.stringify(view).includes('synthetic-credential'));
+ const unknown=captureRequestContext({input:[{type:'synthetic_unknown',content:[{type:'input_text',text:'PRIVATE_UNKNOWN'}]}]});assert.equal(unknown.state,'incomplete');assert.deepEqual(unknown.reasons,['unsupported_input']);assert.deepEqual(unknown.components,[]);
+ const limited=captureRequestContext({input:[{type:'agent_message',author:'a',recipient:'b',content:Array.from({length:100},()=>({type:'input_text',text:'synthetic'}))}]},{maxNodes:32});assert.equal(limited.state,'incomplete');assert.ok(limited.reasons.includes('size_limit'));
+});
+
+test('agent保留字段位于错误层级必须incomplete且不读取未知字段值',()=>{
+ for(const key of ['thinking','reasoning_content','encrypted_content'])for(const where of ['item','text']){
+  const item={type:'agent_message',author:'a',recipient:'b',content:[{type:'input_text',text:'safe'}]};Object.defineProperty(where==='item'?item:item.content[0],key,{enumerable:true,get(){throw Error('must not read misplaced opaque field');}});
+  const view=captureRequestContext({input:[item]});assert.equal(view.state,'incomplete');assert.deepEqual(view.reasons,['unsupported_field']);assert.equal(view.opaqueReasoningExcluded,0);assert.equal(view.components[0].content.value.content[0].text,'safe');
+ }
+});
