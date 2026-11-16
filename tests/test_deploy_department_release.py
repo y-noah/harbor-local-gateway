@@ -73,6 +73,43 @@ class DepartmentReleaseTests(unittest.TestCase):
    with self.assertRaises(release.subprocess.TimeoutExpired):value.command('install',{})
    with self.assertRaisesRegex(RuntimeError,'maintenance_process_unconfirmed'):value.confirmed_status()
   self.assertEqual(operations,['create','start','kill','wait']);self.assertTrue(value.maintenance_unconfirmed);self.assertFalse(value.record['departmentIsolation']['maintenance']['processExitConfirmed'])
+ def unstarted(self):
+  image='sha256:'+'b'*64
+  return {'Id':'a'*64,'Name':'/harbor-department-release-synthetic','Image':image,'Config':{'Image':image,'Labels':{'com.harbor.maintenance':'harbor-department-release-synthetic'},'User':'node','Entrypoint':['node'],'Cmd':['/app/postgres-department-release.mjs','plan']},'HostConfig':{'ReadonlyRootfs':True,'NetworkMode':'host','CapDrop':['ALL'],'SecurityOpt':['no-new-privileges'],'PidsLimit':64,'Memory':536870912,'NanoCpus':500000000,'Tmpfs':{'/tmp':'rw,noexec,nosuid,size=16m'}},'Mounts':[],'State':{'Running':False,'Pid':0,'Status':'created','StartedAt':'0001-01-01T00:00:00Z'}}
+ def test_create_ack_timeout_resumes_exact_unstarted_task_or_cleans_before_start_failure(self):
+  for before_start_failure in [False,True]:
+   with self.subTest(before_start_failure=before_start_failure):
+    row=self.unstarted();cid=row['Id'];value=object.__new__(release.DepartmentRelease);value.image='synthetic';value.image_id=row['Image'];value.connection={'oversized':'x'*131072} if before_start_failure else {};value.record={};value.save=Mock();operations=[];removed=[]
+    value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:None if removed else row}
+    def command(args,**kwargs):
+     operations.append(args[1])
+     if args[1]=='create':raise release.subprocess.TimeoutExpired('synthetic create',30)
+     if args[1]=='start':
+      self.assertEqual(args[-1],cid);self.assertEqual(kwargs['timeout'],75);row['State']={'Running':False,'Pid':0,'Status':'exited'};return types.SimpleNamespace(returncode=0,stdout=b'{"action":"plan"}',stderr=b'')
+     self.assertEqual(args[1:],['rm',cid]);removed.append(cid);return types.SimpleNamespace(returncode=0)
+    with patch.object(release.uuid,'uuid4',return_value=types.SimpleNamespace(hex='synthetic')),patch.object(release.subprocess,'run',side_effect=command):
+     if before_start_failure:
+      with self.assertRaisesRegex(RuntimeError,'maintenance_input_budget'):value.command('plan',{})
+     else:self.assertEqual(value.command('plan',{}),{'action':'plan'})
+    self.assertEqual(operations,['create','rm'] if before_start_failure else ['create','start','rm']);self.assertFalse(value.maintenance_unconfirmed);self.assertTrue(value.record['departmentIsolation']['maintenance']['processExitConfirmed'])
+ def test_create_ack_timeout_preserves_absent_changed_or_started_task(self):
+  import copy
+  baseline=self.unstarted()
+  cases=[None]
+  for path,replacement in [(('Id',),'invalid'),(('Name',),'/other'),(('Image',),'sha256:'+'c'*64),(('Config','Image'),'other'),(('Config','Labels','com.harbor.maintenance'),'other'),(('Config','Cmd'),['/app/postgres-department-release.mjs','install']),(('Config','Entrypoint'),['other']),(('Config','User'),'root'),(('HostConfig','ReadonlyRootfs'),False),(('HostConfig','NetworkMode'),'other'),(('HostConfig','CapDrop'),[]),(('HostConfig','SecurityOpt'),[]),(('HostConfig','PidsLimit'),0),(('HostConfig','Memory'),0),(('HostConfig','NanoCpus'),0),(('HostConfig','Tmpfs'),{}),(('Mounts',),[{'Type':'bind','Destination':'/tmp'}]),(('State','StartedAt'),'2026-11-17T00:00:00Z'),(('State','OOMKilled'),True),(('State',),{'Running':True,'Pid':123,'Status':'running'}),(('State',),{'Running':False,'Pid':0,'Status':'exited'})]:
+   row=copy.deepcopy(baseline);target=row
+   for key in path[:-1]:target=target[key]
+   target[path[-1]]=replacement;cases.append(row)
+  for row in cases:
+   with self.subTest(row=row):
+    value=object.__new__(release.DepartmentRelease);value.image='synthetic';value.image_id=baseline['Image'];value.record={};value.save=Mock();operations=[]
+    value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:row}
+    def command(args,**kwargs):
+     operations.append(args[1]);self.assertEqual(args[1],'create');raise release.subprocess.TimeoutExpired('synthetic create',30)
+    with patch.object(release.uuid,'uuid4',return_value=types.SimpleNamespace(hex='synthetic')),patch.object(release.subprocess,'run',side_effect=command):
+     with self.assertRaises((RuntimeError,release.subprocess.TimeoutExpired)):value.command('plan',{})
+     with self.assertRaisesRegex(RuntimeError,'maintenance_process_unconfirmed'):value.confirmed_status()
+    self.assertEqual(operations,['create']);self.assertTrue(value.maintenance_unconfirmed)
  def test_unconfirmed_process_never_starts_outcome_query(self):
   value=self.prepared(activate=True);value.maintenance_unconfirmed=True
   with self.assertRaisesRegex(RuntimeError,'maintenance_process_unconfirmed'):value.confirmed_status()

@@ -60,6 +60,14 @@ class DeploymentProgressRetryTests(unittest.TestCase):
    with patch.object(w,'storage_operation_helper',return_value=helper),patch.object(w,'deploy_entry_postgres',side_effect=RuntimeError('PRIVATE')),contextlib.redirect_stderr(io.StringIO()):
     with self.assertRaises(RuntimeError) as failure:w.storage_deployment({},'image',None,'deploy-entry-postgres',12)
    self.assertEqual(str(failure.exception),'PRIVATE');self.assertEqual(w.deployment_error(failure.exception)['hostOperation'],'released' if released else 'protected');self.assertNotIn('_PLANNED_OPERATION_ACTIVE',vars(w))
+ def test_post_backup_phases_survive_real_runner_and_safe_wrapper_diagnostic(self):
+  for phase in ['network_validation','runtime_guard','usage_plan','department_plan']:
+   with self.subTest(phase=phase),tempfile.TemporaryDirectory() as directory,patch.object(u,'RELEASES',Path(directory)),contextlib.redirect_stderr(io.StringIO()):
+    def operation():
+     u.deployment_progress(phase);raise subprocess.TimeoutExpired('PRIVATE-COMMAND',30)
+    with self.assertRaises(RuntimeError) as failure:u.supervised_upgrade(self.entry(),{'deploymentId':IDENTIFIER},operation)
+    diagnostic=w.deployment_error(failure.exception)
+    self.assertEqual(diagnostic['phase'],phase);self.assertEqual(diagnostic['exceptionType'],'TimeoutExpired');self.assertNotIn('PRIVATE',json.dumps(diagnostic))
  def test_progress_atomic_replace_retries_but_static_trust_error_is_not_hidden(self):
   with tempfile.TemporaryDirectory() as directory:
    path=Path(directory)/'progress.json';path.write_text('{"phase":"prepare"}');path.chmod(0o600);calls=[];original=Path.lstat

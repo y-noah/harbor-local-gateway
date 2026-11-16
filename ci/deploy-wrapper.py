@@ -436,7 +436,7 @@ def deployment_progress(phase,state):
 def deployment_error(error):
     value=getattr(error,'deployment_diagnostic',None)
     diagnostic={'phase':_DEPLOYMENT_PHASE,'code':'deployment_failed','exceptionType':type(error).__name__ if type(error).__name__ in ['ValueError','RuntimeError','TimeoutExpired','CalledProcessError','OSError','FileNotFoundError','PermissionError','BlockingIOError'] else 'OtherError'}
-    if isinstance(value,dict) and value.get('phase') in ['prepare','source_validation','preflight_target','preflight_sources','preflight_create','preflight_execute','preflight_cleanup','preflight_backup','switch_drain','switch_apply','switch_verify','cleanup','finished'] and re.fullmatch('(?:deployment_failed|preflight_[a-z_]{1,64})',str(value.get('code',''))):
+    if isinstance(value,dict) and value.get('phase') in ['prepare','source_validation','preflight_target','preflight_sources','preflight_create','preflight_execute','preflight_cleanup','preflight_backup','network_validation','runtime_guard','usage_plan','department_plan','switch_drain','switch_apply','switch_verify','cleanup','finished'] and re.fullmatch('(?:deployment_failed|preflight_[a-z_]{1,64})',str(value.get('code',''))):
         diagnostic.update(phase=value['phase'],code=value['code'])
         if value.get('exceptionType') in ['ShutdownUnconfirmed','TimeoutExpired','RuntimeError','ValueError','OSError','FileNotFoundError','PermissionError','CalledProcessError','JSONDecodeError','OtherError']:diagnostic['exceptionType']=value['exceptionType']
         observed=value.get('preflight')

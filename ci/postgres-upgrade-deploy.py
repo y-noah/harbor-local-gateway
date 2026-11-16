@@ -186,7 +186,7 @@ def controller_lock(entry):
   info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'controller lock identity');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);yield
  finally:os.close(fd)
 
-PROGRESS_PHASES={'prepare','source_validation','preflight_target','preflight_sources','preflight_create','preflight_execute','preflight_cleanup','preflight_backup','switch_drain','switch_apply','switch_verify','cleanup','finished'}
+PROGRESS_PHASES={'prepare','source_validation','preflight_target','preflight_sources','preflight_create','preflight_execute','preflight_cleanup','preflight_backup','network_validation','runtime_guard','usage_plan','department_plan','switch_drain','switch_apply','switch_verify','cleanup','finished'}
 _progress_sink=None
 _current_phase='prepare'
 _phase_started=time.monotonic()
@@ -682,19 +682,22 @@ def run_upgrade(image,config,api,ticket,entry):
  consumption_upgrade_guard(pg,pg_api,ticket,entry,gateway,common,proof)
  department_sources=department_upgrade_guard(pg,pg_api,ticket,gateway,worker,common,proof)
  deployment_progress('preflight_backup');backup=qualify_backup(pg,pg_api,config,ticket,active,gateway,worker,common,proof)
+ deployment_progress('network_validation')
  network_snapshot(ticket,entry,gateway,worker)
  # Image and backup probes can take minutes. Recheck the live guard before
  # creating release state, changing the probe bridge, or holding admission.
- pg.storage_restart_policy(config)
+ deployment_progress('runtime_guard');pg.storage_restart_policy(config)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
  if backup is not None:
   entry.save_json(path/'backup.json',backup);record['backupDigest']=digest(backup);entry.save_json(path/'release.json',record)
  context=SimpleNamespace(config=original,state=entry.private_json(entry.STATE));entry.EntryDeployment.enter_probe_worker(context);entry.EntryDeployment.allow_probe_worker(context)
  active=entry.private_json(entry.ACTIVE);record['fromActive']=active;entry.save_json(path/'release.json',record);gate=None;gate_attempted=False;commit_started=False
  if proof.get('usage_rollup_cascade_contract') is not None:
+  deployment_progress('usage_plan')
   cascade=load(Path(__file__).with_name('postgres-usage-cascade.py'),'runtime_upgrade_usage_cascade')
   pg_api['usage_cascade_release']=cascade.UsageCascadeRelease(api=api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path)
  if department_contract(proof)==DEPARTMENT_CONTRACT:
+  deployment_progress('department_plan')
   department=load(Path(__file__).with_name('postgres-department-release.py'),'runtime_upgrade_department')
   pg_api['department_release']=department.DepartmentRelease(api=api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path,source_proofs=department_sources)
  target=approval(ticket);activation_state='pending'
