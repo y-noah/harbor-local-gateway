@@ -289,3 +289,53 @@ test('agent typed input remains a turn boundary and is never relabeled user or a
  const current=currentInput({input:[{role:'user',content:'PRIVATE_PREVIOUS_USER'},agent,{type:'message',role:'user',content:[{type:'input_text',text:'current visible user'}]}]});
  assert.equal(current.events.length,1);assert.equal(current.events[0].content.text,'current visible user');assert.ok(!JSON.stringify(current).includes('PRIVATE_'));
 });
+
+// Shapes verified against codex-cli 0.169.0 app-server generated
+// v2/RawResponseItemCompletedNotification.json; no opaque bodies are fixtures.
+test('官方可见local shell、tool search及image快照保留事实而不伪造nullable关联',async()=>{
+ const {assembleRecording}=await import('../recording-search-index.mjs'),{events,collector}=capture();
+ const items=[{type:'local_shell_call',id:null,call_id:null,status:'completed',action:{type:'exec',command:['printf','visible'],timeout_ms:1000,working_directory:'/synthetic/work',user:'synthetic'}},{type:'tool_search_call',id:null,call_id:null,execution:'server',status:null,arguments:{query:'visible tool query',api_key:'synthetic-private-query'}},{type:'tool_search_output',id:null,call_id:null,execution:'server',status:'completed',tools:[{type:'function',name:'lookup',description:'visible tool description',parameters:{type:'object',properties:{query:{type:'string'},api_key:{type:'string',default:'synthetic-private-default'}}}}]},{type:'image_generation_call',id:null,status:'completed',revised_prompt:'visible revised prompt',result:'PRIVATE_IMAGE_BASE64'}];
+ const summary=collector.finish({output:items});assert.equal(summary.incomplete,false);assert.deepEqual(summary.coverage.seen,{toolCalls:3,toolResults:2,reasoningSummaries:0});
+ const assembled=assembleRecording(events.map((event,index)=>({...event,sequence:index+1}))),all=JSON.stringify(assembled);
+ for(const text of ['visible','visible tool description','visible revised prompt','/synthetic/work','[附件数据已省略]'])assert.ok(all.includes(text),text);
+ for(const text of ['PRIVATE_IMAGE_BASE64','synthetic-private-query','synthetic-private-default'])assert.ok(!all.includes(text),text);
+ for(const item of assembled){assert.equal(item.metadata.item,null);assert.equal(item.metadata.callId,null);}
+ assert.equal(assembled.find(item=>item.metadata.toolType==='local_shell_call').metadata.association_state,'unavailable');
+ const catalog=JSON.parse(assembled.find(item=>item.metadata.toolType==='tool_search_output').text);assert.deepEqual(catalog.tools[0].parameters.properties,{query:{type:'string'},api_key:{type:'string',default:'[已脱敏]'}});
+});
+
+test('新公开工具的opaque、环境变量和图片原始结果在读取值前排除',()=>{
+ const {events,collector}=capture();let accessed=0;
+ const hidden=()=>{accessed++;throw Error('excluded value read');};
+ const item={type:'local_shell_call',status:'completed',action:{type:'exec',command:['echo','visible']}};
+ for(const field of ['encrypted_content','internal_chat_message_metadata_passthrough'])Object.defineProperty(item,field,{enumerable:true,get:hidden});
+ Object.defineProperty(item.action,'env',{enumerable:true,get:hidden});
+ const image={type:'image_generation_call',status:'completed',revised_prompt:null};Object.defineProperty(image,'result',{enumerable:true,get:hidden});
+ const result=collector.finish({output:[item,image]});assert.equal(accessed,0);assert.equal(result.incomplete,false);assert.equal(result.coverage.opaqueReasoningExcluded,1);assert.ok(JSON.stringify(events).includes('[环境变量已省略]'));assert.ok(JSON.stringify(events).includes('[附件数据已省略]'));
+});
+
+test('公开工具added/done与最终响应不重复正文，客户端search结果仍保留来源',async()=>{
+ const {assembleRecording}=await import('../recording-search-index.mjs'),{events,collector}=capture();
+ collector.input({input:[{type:'tool_search_output',call_id:'search-call',execution:'client',status:'completed',tools:[{type:'function',name:'lookup',description:'visible client tool'}]}]});
+ const initial={type:'image_generation_call',id:'image',status:'in_progress'},terminal={...initial,status:'completed',revised_prompt:'visible final prompt',result:'PRIVATE_IMAGE'};
+ collector.event({type:'response.output_item.added',output_index:0,item:initial});collector.event({type:'response.output_item.done',output_index:0,item:terminal});const result=collector.finish({output:[terminal]});
+ assert.equal(result.incomplete,false);const rows=assembleRecording(events.map((event,index)=>({...event,sequence:index+1})));assert.equal(rows.filter(row=>row.metadata.toolType==='image_generation_call').length,2);assert.equal(rows.find(row=>row.metadata.toolType==='tool_search_output').provenance,'client');assert.equal(rows.find(row=>row.metadata.toolType==='tool_search_output').metadata.item,null);assert.equal(rows.find(row=>row.kind==='tool_call').metadata.status,'completed');assert.ok(!JSON.stringify(rows).includes('PRIVATE_IMAGE'));
+});
+
+test('新公开工具malformed、未知动作及未知stream仍明确不完整',()=>{
+ for(const item of [{type:'local_shell_call',status:'completed',action:{type:'future',command:['PRIVATE_UNKNOWN']}},{type:'local_shell_call',status:'completed',action:{type:'exec'}},{type:'tool_search_call',execution:'server'},{type:'tool_search_output',execution:'server',status:'completed',tools:'PRIVATE_MALFORMED'},{type:'image_generation_call',status:'completed'},{type:'tool_search_call',call_id:5,execution:'server',arguments:{query:'visible'}}]){
+  const {events,collector}=capture(),result=collector.finish({output:[item]});assert.equal(result.incomplete,true,JSON.stringify(item));assert.equal(result.coverage.complete,false);assert.ok(!JSON.stringify(events).includes('PRIVATE_'));
+ }
+ const {collector}=capture();collector.event({type:'response.image_generation_call.future_event',item_id:'image'});assert.equal(collector.finish().coverage.complete,false);
+});
+
+test('新公开工具沿用整体节点预算并在截断时不声称完整',()=>{
+ const {collector}=capture({maxNodes:64});const result=collector.finish({output:[{type:'tool_search_output',execution:'server',status:'completed',tools:Array.from({length:100},(_,index)=>({type:'function',name:'synthetic_'+index,description:'visible'}))}]});assert.equal(result.incomplete,true);assert.ok(result.coverage.reasons.includes('size_limit'));
+});
+
+test('tool search公开结果允许anyJSON元素并保留工具对象的schema脱敏',async()=>{
+ const {captureRequestContext}=await import('../recording-request-context.mjs'),{assembleRecording}=await import('../recording-search-index.mjs');
+ const tools=['public tool description',null,3,true,['nested visible',{password:'PRIVATE_NESTED'}],{type:'function',name:'lookup',description:'visible description',parameters:{properties:{query:{type:'string'},api_key:{type:'string',default:'PRIVATE_DEFAULT'}}}}],item={type:'tool_search_output',execution:'server',status:'completed',tools};
+ const context=captureRequestContext({input:[item]});assert.equal(context.state,'complete');assert.deepEqual(context.components[0].content.value.tools.slice(0,5),['public tool description',null,3,true,['nested visible',{password:'[已脱敏]'}]]);
+ const {events,collector}=capture(),result=collector.finish({output:[item]});assert.equal(result.incomplete,false);const [row]=assembleRecording(events.map((event,index)=>({...event,sequence:index+1}))),value=JSON.parse(row.text);assert.deepEqual(value.tools,context.components[0].content.value.tools);assert.deepEqual(value.tools[5].parameters.properties,{query:{type:'string'},api_key:{type:'string',default:'[已脱敏]'}});assert.ok(!JSON.stringify({context,events}).includes('PRIVATE_'));
+});

@@ -9,32 +9,37 @@ const media=new Set(['image','image_url','input_image','output_image','input_fil
 // Parser support is independent of diagnostic recognition: observing a new
 // protocol must not admit it through the generic field walker below.
 const itemTypes=new Set(['message','agent_message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output','item_reference','compaction']);
+const publicToolRequired={local_shell_call:['action','status'],tool_search_call:['arguments','execution'],tool_search_output:['execution','status','tools'],image_generation_call:['result','status']};
+const publicToolItems=new Set(['local_shell_call','tool_search_call','tool_search_output','image_generation_call']);
 const textTypes=new Set(['text','input_text','output_text','summary_text','refusal']);
 const scalarFields=new Set(['author','recipient','role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments','code','container_id','server_label','approval_request_id','reason']);
 const toolItems=new Set(['function_call','custom_tool_call','function_call_output','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output']);
+for(const type of publicToolItems){itemTypes.add(type);toolItems.add(type);}
 const toolFacts=['status','error','duration_ms','elapsed_ms'];
 const itemFields={agent_message:['type','id','author','recipient','content'],additional_tools:['type','id','role','tools'],function_call:['type','id','call_id','name','namespace','arguments',...toolFacts],custom_tool_call:['type','id','call_id','name','namespace','input',...toolFacts],function_call_output:['type','id','call_id','name','namespace','output',...toolFacts],custom_tool_call_output:['type','id','call_id','name','namespace','output',...toolFacts],item_reference:['type','id'],compaction:['type','id','encrypted_content']};
 Object.assign(itemFields,{shell_call:['type','id','call_id','action',...toolFacts],shell_call_output:['type','id','call_id','output','max_output_length',...toolFacts],apply_patch_call:['type','id','call_id','operation',...toolFacts],apply_patch_call_output:['type','id','call_id','output',...toolFacts]});
 Object.assign(itemFields,{code_interpreter_call:['type','id','code','container_id','outputs',...toolFacts],mcp_call:['type','id','name','server_label','arguments','approval_request_id','output',...toolFacts]});
 Object.assign(itemFields,{mcp_list_tools:['type','id','server_label','tools','error'],mcp_approval_request:['type','id','arguments','name','server_label'],mcp_approval_response:['type','approval_request_id','approve','id','reason']});
 Object.assign(itemFields,{web_search_call:['type','id','status','action'],file_search_call:['type','id','status','queries','results'],computer_call:['type','id','call_id','status','pending_safety_checks','action','actions'],computer_call_output:['type','call_id','id','status','output','acknowledged_safety_checks']});
+// Official codex-cli 0.169.0 generated RawResponseItemCompletedNotification schema.
+Object.assign(itemFields,{local_shell_call:['type','id','call_id','status','action'],tool_search_call:['type','id','call_id','status','execution','arguments'],tool_search_output:['type','id','call_id','status','execution','tools'],image_generation_call:['type','id','status','revised_prompt','result']});
 const callerItems=new Set(['function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
 for(const type of callerItems)itemFields[type].push('caller');
 for(const type of ['function_call','custom_tool_call'])itemFields[type].push('async');
 itemFields.shell_call.push('environment');
 const callerFields={direct:['type'],program:['type','caller_id']};
 const shellEnvironmentFields={local:['type','skills'],container_reference:['type','container_id']};
-const nullableItemIds=new Set(['agent_message','function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
+const nullableItemIds=new Set(['local_shell_call','tool_search_call','tool_search_output','image_generation_call','agent_message','function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output']);
 const computerActionFields={click:['type','button','x','y','keys'],double_click:['type','x','y','keys'],drag:['type','path','keys'],keypress:['type','keys'],move:['type','x','y','keys'],screenshot:['type'],scroll:['type','x','y','scroll_x','scroll_y','keys'],type:['type','text'],wait:['type']};
 const webActionFields={search:['type','query','queries','sources'],open_page:['type','url'],find_in_page:['type','pattern','url']};
-const factFields={web_source:['type','url'],file_result:['attributes','file_id','filename','score','text'],safety_check:['id','code','message'],coordinate:['x','y'],local_skill:['name','description','path']};
+const factFields={local_shell_action:['type','command','timeout_ms','working_directory','user','env'],web_source:['type','url'],file_result:['attributes','file_id','filename','score','text'],safety_check:['id','code','message'],coordinate:['x','y'],local_skill:['name','description','path']};
 const factSlots=new Set([...Object.keys(factFields),'web_action','computer_action','tool_caller','shell_environment']);
 const schemaBranches=new Set(['allOf','anyOf','oneOf','not','items','prefixItems','contains','additionalProperties','unevaluatedProperties','unevaluatedItems','propertyNames','if','then','else','additionalItems','contentSchema']);
 export const requestContextReasons=Object.freeze(['invalid_payload','unsupported_tools','unsupported_input','unsupported_instructions','ambiguous_input','unsupported_content','unsupported_field','schema_name_collision','size_limit']);
 
 // This view describes the received context, not a claim about the current turn
 // or local execution. Authentication and scope come from the recording store.
-function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=65536,attachmentFingerprint,onUnsupportedInputShape}={}){
+function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNodes=65536,attachmentFingerprint,onUnsupportedInputShape,partialToolItems=false}={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<256||!Number.isSafeInteger(maxComponents)||maxComponents<1||!Number.isSafeInteger(maxNodes)||maxNodes<1)throw TypeError('Invalid request context budget');
   const redactions=new Set(),onRedact=category=>redactions.add(category);
   const components=[],reasons=new Set();let bytes=2,nodes=maxNodes,opaqueReasoningExcluded=0;
@@ -61,14 +66,14 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
         codeLogs=redactRecordParts(parts,{maxBytes:maxBytes-bytes,maxParts:maxNodes,onTruncate:cut,onRedact}).parts;
       }
       if(protocol&&factTextKey){const parts=[];for(const child of value){if(parts.length>=nodes){cut();break;}parts.push(typeof child?.[factTextKey]==='string'?child[factTextKey]:'');}resultTexts=redactRecordParts(parts,{maxBytes:maxBytes-bytes,maxParts:maxNodes,onTruncate:cut,onRedact}).parts;}
-      const result=[];let inputIndex=0;for(const child of value){const index=inputIndex++;if(nodes<=0){result.push(cut());break;}if((protocol&&slot||schema==='tools')&&(!child||typeof child!=='object'||Array.isArray(child))){nodes--;reasons.add(schema==='tools'?'unsupported_tools':'unsupported_content');result.push({content:'[未支持的上下文结构已省略]'});continue;}const item=visible(child,depth+1,protocol,slot,sensitiveDefinition,schema==='tools'?'envelope':schema);result.push(codeLogs&&item?.type==='logs'&&typeof child.logs==='string'?{...item,logs:codeLogs[index]??''}:resultTexts&&typeof child?.[factTextKey]==='string'&&typeof item?.[factTextKey]==='string'?{...item,[factTextKey]:resultTexts[index]??''}:item);}
+      const result=[];let inputIndex=0;for(const child of value){const index=inputIndex++;if(nodes<=0){result.push(cut());break;}if((protocol&&slot||schema==='tools')&&(!child||typeof child!=='object'||Array.isArray(child))){nodes--;reasons.add(schema==='tools'?'unsupported_tools':'unsupported_content');result.push({content:'[未支持的上下文结构已省略]'});continue;}const item=visible(child,depth+1,protocol,slot,sensitiveDefinition,schema==='tools'?'envelope':schema==='tool_search_results'?Array.isArray(child)?'tool_search_results':child&&typeof child==='object'?'envelope':false:schema);result.push(codeLogs&&item?.type==='logs'&&typeof child.logs==='string'?{...item,logs:codeLogs[index]??''}:resultTexts&&typeof child?.[factTextKey]==='string'&&typeof item?.[factTextKey]==='string'?{...item,[factTextKey]:resultTexts[index]??''}:item);}
       const positions=[],texts=[];for(let i=0;i<result.length;i++){const field=result[i]?.type==='refusal'?'refusal':'text';if(textTypes.has(result[i]?.type)&&typeof result[i][field]==='string'){positions.push([i,field]);texts.push(result[i][field]);}}
       const filtered=redactRecordParts(texts,{maxBytes,maxParts:maxNodes,onTruncate:cut,onRedact}).parts;
       for(let i=0;i<positions.length;i++){const [position,field]=positions[i];result[position]={...result[position],[field]:filtered[i]??''};}return result;
     }
     if(protocol&&factSlots.has(slot)&&(!value||typeof value!=='object'||Array.isArray(value))){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     if(!value||typeof value!=='object')return value;
-    if(protocol&&(slot==='web_action'&&!Object.hasOwn(webActionFields,value.type)||slot==='computer_action'&&!Object.hasOwn(computerActionFields,value.type)||slot==='web_source'&&value.type!=='url'||slot==='tool_caller'&&!Object.hasOwn(callerFields,value.type)||slot==='shell_environment'&&!Object.hasOwn(shellEnvironmentFields,value.type))){reasons.add('unsupported_content');return {content:'[未支持的工具动作已省略]'};}
+    if(protocol&&(slot==='web_action'&&!Object.hasOwn(webActionFields,value.type)||slot==='computer_action'&&!Object.hasOwn(computerActionFields,value.type)||slot==='web_source'&&value.type!=='url'||slot==='tool_caller'&&!Object.hasOwn(callerFields,value.type)||slot==='shell_environment'&&!Object.hasOwn(shellEnvironmentFields,value.type)||slot==='local_shell_action'&&value.type!=='exec')){reasons.add('unsupported_content');return {content:'[未支持的工具动作已省略]'};}
     // Codex rust-v0.167.2 AgentMessageInputContent is a separate wire union;
     // never infer a role or inspect the opaque encrypted child's value.
     if(protocol&&slot==='agent_content'){
@@ -80,6 +85,8 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
       }
       if(value.type!=='input_text'||typeof value.text!=='string'){reasons.add('unsupported_content');return {content:'[未支持的上下文结构已省略]'};}
     }
+    if(protocol&&publicToolItems.has(value.type)&&!slot&&!partialToolItems)for(const name of publicToolRequired[value.type])if(!Object.hasOwn(value,name))reasons.add('unsupported_content');
+    if(protocol&&slot==='local_shell_action'&&!partialToolItems&&!Object.hasOwn(value,'command'))reasons.add('unsupported_content');
     if(protocol&&value.type==='agent_message'&&!slot){
       if(typeof value.author!=='string'||typeof value.recipient!=='string'||!Array.isArray(value.content))reasons.add('unsupported_content');
     }
@@ -117,15 +124,20 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
     for(const key in value){
       if(--nodes<0){cut();break;}
       if(!Object.hasOwn(value,key))continue;
+      // Known private fields and image bytes are excluded before reading their
+      // value, including getter-backed fixtures. No local files are inspected.
+      if(protocol&&publicToolItems.has(value.type)&&['encrypted_content','internal_chat_message_metadata_passthrough'].includes(key)){if(key==='encrypted_content')opaqueReasoningExcluded++;continue;}
+      if(protocol&&value.type==='image_generation_call'&&key==='result'){const descriptor=Object.getOwnPropertyDescriptor(value,key);if(Object.hasOwn(descriptor,'value')&&typeof descriptor.value!=='string')reasons.add('unsupported_content');onRedact('attachment_data');result.result={type:'image',content:'[附件数据已省略]'};continue;}
+      if(protocol&&slot==='local_shell_action'&&key==='env'){const descriptor=Object.getOwnPropertyDescriptor(value,key);if(Object.hasOwn(descriptor,'value')&&descriptor.value!==null&&(!descriptor.value||typeof descriptor.value!=='object'||Array.isArray(descriptor.value)))reasons.add('unsupported_content');onRedact('sensitive_field');result.env='[环境变量已省略]';continue;}
       // Agent fields must match their own union before generic opaque exclusions;
       // misplaced reasoning fields remain unsupported, without reading values.
       if(protocol&&(value.type==='agent_message'||slot==='agent_content')&&fields&&!fields.includes(key)){reasons.add('unsupported_field');continue;}
       // Never retain opaque compaction/reasoning blobs, even as redacted data.
       if(protocol&&['encrypted_content','reasoning_content','thinking'].includes(key)){opaqueReasoningExcluded++;continue;}
       if(protocol&&fields&&!fields.includes(key)){reasons.add('unsupported_field');continue;}
-      const nullableMetadata=(['phase','namespace'].includes(key)||toolItems.has(value.type)&&key==='status'||value.type==='code_interpreter_call'&&key==='code'||value.type==='mcp_call'&&key==='approval_request_id'||value.type==='mcp_approval_response'&&['id','reason'].includes(key)||slot==='mcp_tool'&&key==='description'||value.type==='computer_call_output'&&key==='id'||slot==='safety_check'&&['code','message'].includes(key)||!slotFields&&(key==='id'&&nullableItemIds.has(value.type)||value.type==='function_call_output'&&['call_id','name'].includes(key)))&&value[key]===null;
+      const nullableMetadata=(publicToolItems.has(value.type)&&['call_id','revised_prompt'].includes(key)||slot==='local_shell_action'&&['timeout_ms','working_directory','user'].includes(key)||['phase','namespace'].includes(key)||toolItems.has(value.type)&&key==='status'||value.type==='code_interpreter_call'&&key==='code'||value.type==='mcp_call'&&key==='approval_request_id'||value.type==='mcp_approval_response'&&['id','reason'].includes(key)||slot==='mcp_tool'&&key==='description'||value.type==='computer_call_output'&&key==='id'||slot==='safety_check'&&['code','message'].includes(key)||!slotFields&&(key==='id'&&nullableItemIds.has(value.type)||value.type==='function_call_output'&&['call_id','name'].includes(key)))&&value[key]===null;
       if(protocol&&slotFields&&['id','type','name','namespace','arguments','mode'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
-      if(protocol&&(value.role!==undefined||itemTypes.has(value.type))&&scalarFields.has(key)&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
+      if(protocol&&(value.role!==undefined||itemTypes.has(value.type))&&scalarFields.has(key)&&!(value.type==='tool_search_call'&&key==='arguments')&&typeof value[key]!=='string'&&!nullableMetadata){reasons.add('unsupported_content');continue;}
       if(protocol&&slot==='mcp_tool'&&(['name','description'].includes(key)&&typeof value[key]!=='string'&&!nullableMetadata)){reasons.add('unsupported_content');continue;}
       if(protocol&&factSlots.has(slot)){
         const stringField=(slot==='web_action'&&['query','pattern','url'].includes(key)||slot==='web_source'&&key==='url'||slot==='file_result'&&['file_id','filename','text'].includes(key)||slot==='safety_check'&&['id','code','message'].includes(key)||slot==='computer_action'&&['button','text'].includes(key)||slot==='tool_caller'&&key==='caller_id'||slot==='shell_environment'&&key==='container_id'||slot==='local_skill'&&['name','description','path'].includes(key));
@@ -140,6 +152,23 @@ function* requestContext(payload,{maxBytes=2*1024*1024,maxComponents=4096,maxNod
         if(['queries','keys'].includes(key)){const list=key==='keys'&&value[key]===null&&value.type!=='keypress'?null:strings(value[key]);result[key]=searchTexts&&key==='queries'&&Array.isArray(list)?list.map((part,index)=>typeof value[key][index]==='string'?searchTexts[index+(searchQuery?1:0)]??'':part):list;continue;}
         if(searchTexts&&key==='query'){result.query=searchTexts[0]??'';continue;}
         if(slot==='web_action'&&key==='sources'||slot==='computer_action'&&key==='path'){if(!Array.isArray(value[key])){reasons.add('unsupported_content');continue;}result[key]=visible(value[key],depth+1,true,key==='sources'?'web_source':'coordinate');continue;}
+      }
+      if(protocol&&value.type==='local_shell_call'&&key==='status'&&!['in_progress','completed','incomplete'].includes(value.status)){reasons.add('unsupported_content');continue;}
+      if(protocol&&['tool_search_output','image_generation_call'].includes(value.type)&&key==='status'&&typeof value.status!=='string'){reasons.add('unsupported_content');continue;}
+      if(protocol&&publicToolItems.has(value.type)&&key==='execution'&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
+      if(protocol&&value.type==='image_generation_call'&&key==='revised_prompt'&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
+      if(protocol&&value.type==='local_shell_call'&&key==='action'){
+        if(!value.action||typeof value.action!=='object'||Array.isArray(value.action)){reasons.add('unsupported_content');continue;}result.action=visible(value.action,depth+1,true,'local_shell_action');continue;
+      }
+      if(protocol&&slot==='local_shell_action'){
+        if(key==='command'){result.command=strings(value.command);continue;}
+        if(key==='timeout_ms'&&value[key]!==null&&(!Number.isSafeInteger(value[key])||value[key]<0)||['working_directory','user'].includes(key)&&value[key]!==null&&typeof value[key]!=='string'){reasons.add('unsupported_content');continue;}
+      }
+      if(protocol&&value.type==='tool_search_call'&&key==='arguments'){
+        result.arguments=safeToolOutput(value.arguments,{maxBytes:maxBytes-bytes,maxNodes:Math.max(1,nodes),protocolContent:false,onTruncate:cut,onRedact,onUnsupported:()=>reasons.add('unsupported_content'),onNodes:count=>{nodes-=count;return nodes>=0;},attachmentMetadata:attachment});continue;
+      }
+      if(protocol&&value.type==='tool_search_output'&&key==='tools'){
+        if(!Array.isArray(value.tools)){reasons.add('unsupported_content');continue;}result.tools=visible(value.tools,depth+1,false,null,false,'tool_search_results');continue;
       }
       if(protocol&&key==='caller'&&callerItems.has(value.type)){
         if(value.caller!==null&&(!value.caller||typeof value.caller!=='object'||Array.isArray(value.caller))){reasons.add('unsupported_content');continue;}result.caller=value.caller===null?null:visible(value.caller,depth+1,true,'tool_caller');continue;

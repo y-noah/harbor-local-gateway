@@ -346,3 +346,18 @@ test('agent保留字段位于错误层级必须incomplete且不读取未知字�
   const view=captureRequestContext({input:[item]});assert.equal(view.state,'incomplete');assert.deepEqual(view.reasons,['unsupported_field']);assert.equal(view.opaqueReasoningExcluded,0);assert.equal(view.components[0].content.value.content[0].text,'safe');
  }
 });
+
+test('官方新公开工具上下文保留参数说明并在读取前排除opaque、env和图片数据',()=>{
+ let reads=0;const excluded=()=>{reads++;throw Error('excluded source read');};
+ const local={type:'local_shell_call',id:null,call_id:null,status:'completed',action:{type:'exec',command:['echo','visible'],timeout_ms:null,working_directory:null,user:null}};
+ Object.defineProperty(local,'encrypted_content',{enumerable:true,get:excluded});Object.defineProperty(local,'internal_chat_message_metadata_passthrough',{enumerable:true,get:excluded});Object.defineProperty(local.action,'env',{enumerable:true,get:excluded});
+ const image={type:'image_generation_call',id:null,status:'completed',revised_prompt:'visible image prompt'};Object.defineProperty(image,'result',{enumerable:true,get:excluded});
+ const result=captureRequestContext({input:[local,{type:'tool_search_call',id:null,call_id:null,execution:'client',status:null,arguments:{query:'visible search'}},{type:'tool_search_output',id:null,call_id:null,execution:'client',status:'completed',tools:[{type:'function',name:'lookup',description:'visible description',parameters:{type:'object',properties:{query:{type:'string'}}}}]},image]});
+ assert.equal(reads,0);assert.equal(result.state,'complete');assert.equal(result.components.length,4);const values=result.components.map(row=>row.content.value);assert.equal(values[0].action.env,'[环境变量已省略]');assert.equal(values[1].call_id,null);assert.equal(values[2].tools[0].description,'visible description');assert.deepEqual(values[3].result,{type:'image',content:'[附件数据已省略]'});assert.ok(result.redaction.categories.includes('attachment_data'));
+});
+
+test('新公开工具缺少必填字段及非法状态不能标记完整上下文',()=>{
+ for(const item of [{type:'local_shell_call',status:'completed',action:{type:'exec'}},{type:'local_shell_call',status:'future',action:{type:'exec',command:[]}},{type:'tool_search_call',arguments:{}},{type:'tool_search_output',execution:'client',tools:[]},{type:'image_generation_call',status:'completed'},{type:'image_generation_call',result:'PRIVATE_IMAGE',status:null},{type:'image_generation_call',result:null,status:'completed'},{type:'local_shell_call',status:'completed',action:{type:'exec',command:[],env:'PRIVATE_ENV'}}]){
+  const view=captureRequestContext({input:[item]});assert.equal(view.state,'incomplete',JSON.stringify(item));assert.ok(view.reasons.includes('unsupported_content'));assert.ok(!JSON.stringify(view).includes('PRIVATE_IMAGE'));
+ }
+});

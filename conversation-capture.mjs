@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {RecordRedactor,recordRedactionSummary,sanitizeRecord,sanitizeToolRecord,boundedRecordText,redactRecordParts,filteredRecordField,restoreAuthenticatedRecord,isFilteredRecord} from './record-redaction.mjs';
+import {RecordRedactor,recordRedactionSummary,sanitizeRecord,sanitizeToolRecord,boundedRecordText,redactRecordParts,filteredRecordField,restoreAuthenticatedRecord,isFilteredRecord,sensitiveRecordField} from './record-redaction.mjs';
 import {JsonRecordRedactor} from './record-json.mjs';
 import {hostedToolProtocols,captureHostedItem,captureHostedEvent} from './recording-hosted-tools.mjs';
 import {visibleToolProtocols,captureVisibleItem,captureVisibleEvent,captureToolAssociations} from './recording-visible-tools.mjs';
@@ -10,7 +10,7 @@ const textOf=content=>typeof content==='string'?[{type:'text',text:content}]:Arr
 const structuredCalls={shell_call:{name:'shell',field:'action'},apply_patch_call:{name:'apply_patch',field:'operation'}};
 const resultCalls={function_call_output:'function_call',custom_tool_call_output:'custom_tool_call',shell_call_output:'shell_call',apply_patch_call_output:'apply_patch_call'};
 const resultTypes=new Set(Object.keys(resultCalls));
-const nullableToolIds=new Set(['function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','mcp_approval_response','computer_call_output']);
+const nullableToolIds=new Set(['local_shell_call','tool_search_call','tool_search_output','image_generation_call','function_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','mcp_approval_response','computer_call_output']);
 const mediaTypes=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
 const unknownToolResult=item=>item?.role==='tool'||typeof item?.type==='string'&&/_call_output$/.test(item.type.slice(0,256));
 const visibleClientItem=item=>Object.hasOwn(visibleToolProtocols,item?.type)&&visibleToolProtocols[item.type].client;
@@ -127,7 +127,7 @@ export function safeToolOutput(value,{maxBytes,maxNodes=1024,contentParts=false,
         ...(Number.isSafeInteger(item.size??item.bytes)&&(item.size??item.bytes)>=0?{bytes:item.size??item.bytes}:{}),
         ...(Number.isSafeInteger(item.position)&&item.position>=0?{position:item.position}:{}),...(['low','high','auto'].includes(item.detail)?{detail:item.detail}:{}),content:'[附件数据已省略]'};}
       const result=Object.create(null);for(const key in item){if(!Object.hasOwn(item,key))continue;if(onNodes?.(1)===false||nodes<=0||remaining<=0){result.recording_truncated=cut();break;}
-        const name=boundedRecordText(key,Math.min(remaining,256));remaining-=Buffer.byteLength(name);if(name.length!==key.length){onTruncate();result[name]='[已脱敏]';}else result[name]=visit(item[key],depth+1,protocolContent&&key==='content'&&Array.isArray(item[key]));
+        const name=boundedRecordText(key,Math.min(remaining,256));remaining-=Buffer.byteLength(name);if(name.length!==key.length){onTruncate();result[name]='[已脱敏]';}else if(sensitiveRecordField(key)){onRedact?.('sensitive_field');result[name]='[已脱敏]';}else result[name]=visit(item[key],depth+1,protocolContent&&key==='content'&&Array.isArray(item[key]));
       }return result;
     }return item;
   };
@@ -257,7 +257,7 @@ export class ConversationCapture{
   toolMetadata(item,id,type){
     if(Object.hasOwn(item,'id')&&typeof item.id!=='string'&&!(item.id===null&&nullableToolIds.has(item.type)))this.incompleteReasons.add('malformed_tool_item');
     if(Object.hasOwn(item,'name')&&typeof item.name!=='string'&&!(item.type==='function_call_output'&&item.name===null))this.incompleteReasons.add('malformed_tool_item');
-    if(Object.hasOwn(item,'call_id')&&typeof item.call_id!=='string'&&!(item.type==='function_call_output'&&item.call_id===null))this.incompleteReasons.add('malformed_tool_item');
+    if(Object.hasOwn(item,'call_id')&&typeof item.call_id!=='string'&&!(['function_call_output','local_shell_call','tool_search_call','tool_search_output'].includes(item.type)&&item.call_id===null))this.incompleteReasons.add('malformed_tool_item');
     return {item:Object.hasOwn(item,'id')&&item.id===null?null:id,toolType:type,callId:typeof item.call_id==='string'?item.call_id:null,...this.toolFacts(item),...(item.type==='function_call_output'&&Object.hasOwn(item,'call_id')&&(item.call_id===null||typeof item.call_id==='string'&&item.call_id.length)?{association_state:item.call_id===null?'unavailable':'provided'}:{}),...(typeof item.name==='string'||item.type==='function_call_output'&&item.name===null?{name:item.name}:Object.hasOwn(structuredCalls,type)?{name:structuredCalls[type].name}:{}),...(typeof item.namespace==='string'?{namespace:item.namespace}:{})};
   }
   structuredTool(item,index,partial=false){
