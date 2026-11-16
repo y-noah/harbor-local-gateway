@@ -1,3 +1,4 @@
+import {syntheticCodexProfile} from './codex-model-profile-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn,execFile} from 'node:child_process';
@@ -44,7 +45,7 @@ for(const device of [false,true])test('official Codex runs multiple image tools 
    return new Response([{type:'response.created',response:{id:response.id}},{type:'response.output_item.done',output_index:0,item},{type:'response.completed',response}].map(event=>'data: '+JSON.stringify(event)+'\n\n').join(''),{headers:{'content-type':'text/event-stream'}});
   }});
   if(device)ca=await certificateFixture(root);
-  app=await createPostgresGateway({database:connection(name),env:{},dataDir:data,runtimeDir:join(root,'runtime'),recording:{enabled:false},config:{port:43127,codexBinary:binary,adminPasswordHash:passwordHash('synthetic-native-password')},responsesTransport:{...transport,models:async()=>[{slug:'gpt-6.1-sol',display_name:'Synthetic Sol'}]},rateReader:async()=>null,...(device?{devices:{issuer:ca.issuer,tls:{key:ca.key,cert:ca.cert,ca:ca.ca,port:0}}}:{})});
+  app=await createPostgresGateway({database:connection(name),env:{},dataDir:data,runtimeDir:join(root,'runtime'),recording:{enabled:false},config:{port:43127,codexBinary:binary,adminPasswordHash:passwordHash('synthetic-native-password')},responsesTransport:{...transport,models:async()=>[syntheticCodexProfile({slug:'gpt-6.1-sol',display_name:'Synthetic Sol'})]},rateReader:async()=>null,...(device?{devices:{issuer:ca.issuer,tls:{key:ca.key,cert:ca.cert,ca:ca.ca,port:0}}}:{})});
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));let origin='http://127.0.0.1:'+app.server.address().port,localToken,deviceId;
   if(device){
    helper=join(root,'HarborDevice.exe');await execute(compiler,['/nologo','/target:exe','/out:'+await windowsPath(helper),'/r:System.Net.Http.dll','/r:System.Management.dll','/r:System.Web.Extensions.dll',await windowsPath(fileURLToPath(new URL('../clients/harbor-device/HarborDevice.cs',import.meta.url)))],{timeout:30000,maxBuffer:65536});await chmod(helper,0o700);

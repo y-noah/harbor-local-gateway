@@ -1,3 +1,4 @@
+import {syntheticCodexProfile} from './codex-model-profile-fixture.mjs';
 import {once as eventOnce} from 'node:events';
 import {createPostgresChatState} from '../postgres-chat-state.mjs';
 import {chatSettlementFacts,digestChatMessages} from '../chat-facts.mjs';
@@ -866,7 +867,7 @@ test('PostgreSQL employee and Key management uses authenticated HTTP, atomic cre
 
 const gatewayWait=async(predicate,timeout=5000)=>{const end=Date.now()+timeout;while(!await predicate()){assert.ok(Date.now()<end,'gateway condition timeout');await new Promise(resolve=>setTimeout(resolve,10));}};
 const controlledResponses=(before=async()=>{})=>createResponsesTransport({version:async()=>'0.160.1',credentials:async()=>({token:'synthetic-runtime-upstream',accountId:'synthetic-runtime-account'}),fetchImpl:async(_url,{signal})=>{
-  if(new URL(_url).pathname.endsWith('/models'))return new Response(JSON.stringify({models:[{slug:'gpt-6.1-sol'},{slug:'gpt-6-astra'}]}),{headers:{'content-type':'application/json'}});
+  if(new URL(_url).pathname.endsWith('/models'))return new Response(JSON.stringify({models:[{slug:'gpt-6.1-sol'},{slug:'gpt-6-astra'}].map(syntheticCodexProfile)}),{headers:{'content-type':'application/json'}});
   await before(signal);return new Response([
     {type:'response.output_text.delta',item_id:'synthetic-message',content_index:0,delta:'服务入口合成回复'},
     {type:'response.completed',response:{id:'synthetic-runtime-response',model:'gpt-6.1-sol',output:[{id:'synthetic-message',type:'message',content:[{type:'output_text',text:'服务入口合成回复'}]}],usage:{input_tokens:100,output_tokens:20,input_tokens_details:{cached_tokens:10}}}}
