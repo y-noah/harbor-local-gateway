@@ -669,6 +669,9 @@ def run_upgrade(image,config,api,ticket,entry):
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
  preflight_timeout=pg.preflight_timeout_seconds(config.get('postgres_preflight_timeout_seconds',30))
  active,original,gateway=entry.active_record();worker=api['inspect_container'](api['NAME']+'-worker');verify_source(ticket,active,gateway,worker);check_storage(ticket)
+ # The migrated instance supervisor must already recognize this Host tool
+ # generation. Discover a missing refresh while the public entry is active.
+ pg.storage_restart_policy(config)
  if RELEASES.exists():need(retired_cleanup(config,api,entry,protect_retained=True)['state']=='complete','retired_service_cleanup_pending: retry before starting another upgrade')
  pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout,'deployment_progress':deployment_progress}
  if isinstance(getattr(entry,'_harbor_preflight_directory',None),Path):pg_api.update(preflight_directory=str(entry._harbor_preflight_directory),preflight_read=entry.private_json,preflight_save=entry.save_json,preflight_retry_allowed=getattr(entry,'_harbor_preflight_retry_allowed',False) is True)
@@ -680,6 +683,9 @@ def run_upgrade(image,config,api,ticket,entry):
  department_sources=department_upgrade_guard(pg,pg_api,ticket,gateway,worker,common,proof)
  deployment_progress('preflight_backup');backup=qualify_backup(pg,pg_api,config,ticket,active,gateway,worker,common,proof)
  network_snapshot(ticket,entry,gateway,worker)
+ # Image and backup probes can take minutes. Recheck the live guard before
+ # creating release state, changing the probe bridge, or holding admission.
+ pg.storage_restart_policy(config)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
  if backup is not None:
   entry.save_json(path/'backup.json',backup);record['backupDigest']=digest(backup);entry.save_json(path/'release.json',record)

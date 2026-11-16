@@ -21,6 +21,7 @@ MANIFEST = Path('/etc/harbor-postgres-runtime-tools.json')
 TICKET = Path('/etc/harbor-postgres-runtime-upgrade.json')
 UPGRADE = Path('/usr/local/lib/harbor/postgres-upgrade-deploy.py')
 ENTRY = Path('/usr/local/lib/harbor/gateway-entry-controller.py')
+CONFIG = Path('/etc/harbor-gateway-deploy.json')
 HISTORY = Path('/var/lib/harbor-host-tool-installs')
 LOCKS = ['/run/harbor-gateway-deploy.lock', '/run/harbor-entry/controller-state.lock']
 LIMIT = 1024**2
@@ -115,10 +116,36 @@ def transition(old_manifest, old_ticket, files, wrapper_bytes, revision, replace
     return manifest, ticket
 
 
-def current_binding(upgrade, entry, ticket):
+def readonly_active_record(upgrade, entry):
+    """Validate the existing PG binding without active_record's write refresh.
+
+    Keep compatibility with already-installed controllers: runtime installation
+    replaces only WRAPPER/COMPOSE/UPGRADE, not the entry controller API.
+    Runtime PID/IP observations are never published by this read-only path.
+    """
+    active = entry.private_json(entry.ACTIVE)
+    config = entry.validate(entry.private_json(entry.PROFILE))
+    entry.verify_candidate_bridge(active.get('networkSnapshot', {}))
+    need(active.get('version') == 1 and active.get('configDigest') == entry.fingerprint(config), 'qualification_active_configuration')
+    need(active.get('approval', {}).get('contract') == upgrade.CONTRACT, 'qualification_active_contract')
+    marker = upgrade.verified_marker_path(active['image'], active)
+    need(active.get('storageMarkerDigest') == entry.fingerprint(entry.private_json(marker)), 'qualification_active_marker')
+    temporary = object.__new__(entry.EntryDeployment)
+    temporary.image, temporary.approval = active['image'], active['approval']
+    row = entry.inspect_container(active['candidate']['containerId'])
+    temporary.verify_candidate_row(row)
+    need(row['Image'] == active['candidate']['imageId'] and entry.candidate_mounts(row, active['approval']) == active['mounts'], 'qualification_active_materials')
+    address = temporary.endpoint(row)
+    profile = entry.private_json(entry.CANDIDATE_PROFILE)
+    need(profile.get('socketPath') == '/run/harbor-entry/candidate.sock', 'qualification_active_slot')
+    need(active['candidate'].get('address') == address and profile.get('sourceAddress') == address and profile.get('sourcePort') == active['candidate']['port'], 'qualification_active_address_changed')
+    return active
+
+
+def current_binding(upgrade, entry, ticket, *, readonly=False):
     upgrade.verify_installed_tools(ticket)
     need(entry.entry_state().get('phase') == 'active', 'entry_not_active')
-    active, _, _ = entry.active_record()
+    active = readonly_active_record(upgrade, entry) if readonly else entry.active_record()[0]
     record = upgrade.record_for(active.get('approval', {}))
     need(record.get('phase') == 'complete' and active.get('image') == ticket.get('to', {}).get('image') and active.get('approval', {}).get('deploymentId') == ticket.get('deploymentId'), 'current_release')
     same_release = lambda value: {key: item for key, item in value.items() if key != 'hostToolsRevision'}
@@ -172,7 +199,7 @@ def install(source, revision, expected_manifest, expected_ticket, expected_wrapp
                 current = json.loads(read(TICKET, 0o600))
                 actual, _ = current_binding(upgrade, entry, current)
                 need(actual == prior['active'], 'completed_active')
-                return {'installed': True, 'reused': True, 'revision': revision, 'activeApprovalPreserved': True, 'businessContainersTouched': False, 'rootStagingSwitchChanged': False, 'backupDirectory': str(destination)}
+                return {'installed': True, 'reused': True, 'revision': revision, 'activeApprovalPreserved': True, 'businessContainersTouched': False, 'rootStagingSwitchChanged': False, 'hostToolsReady': False, 'qualificationRequired': True, 'backupDirectory': str(destination)}
             need(prior.get('state') in ['prepared', 'rolled-back'], 'existing_state')
         before_manifest, before_ticket = read(MANIFEST, 0o600), read(TICKET, 0o600)
         need(sha(before_manifest) == expected_manifest and sha(before_ticket) == expected_ticket, 'expected_current')
@@ -238,7 +265,78 @@ def install(source, revision, expected_manifest, expected_ticket, expected_wrapp
             journal['state'] = 'rolled-back'
             write(destination / 'journal.json', body(journal), 0o600)
             raise
-        return {'installed': True, 'revision': revision, 'activeApprovalPreserved': True, 'businessContainersTouched': False, 'rootStagingSwitchChanged': False, 'backupDirectory': str(destination)}
+        return {'installed': True, 'revision': revision, 'activeApprovalPreserved': True, 'businessContainersTouched': False, 'rootStagingSwitchChanged': False, 'hostToolsReady': False, 'qualificationRequired': True, 'backupDirectory': str(destination)}
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def qualification_bytes_match(path, raw, row, side, directory):
+    expected = row[side]
+    if (None if raw is None else sha(raw)) == expected:
+        return True
+    if path not in [TICKET, MANIFEST] or raw is None or expected is None:
+        return False
+    # The fixed recovery writer may re-encode the same authenticated source
+    # ticket. Accept its value, never altered approvals or executable bytes.
+    if side == 'after':
+        return sha(body(json.loads(raw))) == expected
+    need(re.fullmatch('[0-9]+\.before', row.get('backup', '')) is not None, 'qualification_backup_path')
+    previous = read(directory / row['backup'], 0o600)
+    need(sha(previous) == expected, 'qualification_backup')
+    return body(json.loads(raw)) == body(json.loads(previous))
+
+
+def qualify(revision, *, runtime=False):
+    """Read-only Host qualification after an explicit supervisor refresh.
+
+    The refresh helper needs these same locks during its controlled stop/start,
+    so it is never invoked from inside the file installation transaction.
+    A successful result is not an image approval or a deployment action.
+    """
+    need(os.geteuid() == 0 and re.fullmatch('[a-f0-9]{40}', revision) is not None, 'root_required')
+    need(type(runtime) is bool, 'mode')
+    fds = []
+    try:
+        for name in LOCKS:
+            read(Path(name))
+            fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW);fds.append(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        directory = HISTORY / (('runtime-tools-' if runtime else 'image-stage-') + revision)
+        journal = json.loads(read(directory / 'journal.json', 0o600))
+        scope = {str(WRAPPER), str(HELPER), str(MANIFEST), str(TICKET)} | ({str(COMPOSE), str(UPGRADE)} if runtime else set())
+        need(journal.get('version') == 1 and journal.get('revision') == revision and journal.get('state') in ['complete', 'rolled-back'] and set(journal.get('files', {})) == scope, 'qualification_record')
+        side = 'after' if journal['state'] == 'complete' else 'before'
+        observed, observed_modes = {}, {}
+        for name, row in journal['files'].items():
+            actual = optional(Path(name))
+            need(qualification_bytes_match(Path(name), actual, row, side, directory), 'qualification_bytes')
+            observed[name] = actual
+            mode = None if actual is None else stat.S_IMODE(Path(name).lstat().st_mode)
+            expected_mode = row['modeAfter' if side == 'after' else 'modeBefore']
+            need(mode == expected_mode and (mode is None or type(expected_mode) is int), 'qualification_mode')
+            if Path(name) == WRAPPER:need(mode is not None and mode & 0o111, 'qualification_wrapper_not_executable')
+            observed_modes[name] = mode
+        upgrade, entry = module(UPGRADE, 'host_qualification_upgrade'), module(ENTRY, 'host_qualification_entry')
+        entry.runtime_upgrade_module = lambda: upgrade
+        ticket = json.loads(read(TICKET, 0o600))
+        active, _ = current_binding(upgrade, entry, ticket, readonly=True)
+        need(active == journal['active'], 'qualification_active_changed')
+        config_raw = read(CONFIG, 0o600)
+        config = json.loads(config_raw)
+        compose = module(COMPOSE, 'host_qualification_composition')
+        policy = compose.storage_restart_policy(config)
+        need(policy in ['no', 'unless-stopped'], 'qualification_restart_policy')
+        # A guard check may perform slow Docker/systemd reads. Neither source
+        # approval nor installed files may change while it is being observed.
+        final_active, _ = current_binding(upgrade, entry, ticket, readonly=True)
+        need(final_active == active and read(CONFIG, 0o600) == config_raw, 'qualification_changed')
+        for name, row in journal['files'].items():
+            actual = optional(Path(name))
+            need(actual == observed[name], 'qualification_bytes_changed')
+            mode = None if actual is None else stat.S_IMODE(Path(name).lstat().st_mode)
+            need(mode == observed_modes[name], 'qualification_mode_changed')
+        return {'hostToolsReady': True, 'qualificationRequired': False, 'revision': ticket['hostToolsRevision'], 'installationRevision': revision, 'storageStartupGuardEnabled': config.get('postgres_storage_startup_guard', False), 'businessContainersTouched': False, 'publicationTriggered': False}
     finally:
         for fd in reversed(fds):
             os.close(fd)
@@ -264,7 +362,10 @@ def rollback(revision, *, runtime=False):
         for name, row in journal['files'].items():
             path = Path(name)
             present = optional(path)
-            need((None if present is None else sha(present)) in [row['before'], row['after']], 'rollback_changed')
+            known = (None if present is None else sha(present)) in [row['before'], row['after']]
+            if not known:
+                known = any(qualification_bytes_match(path, present, row, side, directory) for side in ['before', 'after'])
+            need(known, 'rollback_changed')
             allowed_after = row.get('modeAfter') == row.get('modeBefore') if runtime and path == HELPER else row.get('modeAfter') in [0o600, 0o644, 0o755]
             need(type(row.get('modeAfter')) is int and allowed_after and (row['modeBefore'] is None if row['before'] is None else type(row['modeBefore']) is int and 0 <= row['modeBefore'] <= 0o777 and not row['modeBefore'] & 0o022), 'rollback_modes')
             need(re.fullmatch('[0-9]+\.before', row.get('backup', '')) is not None, 'rollback_backup_path')
@@ -296,7 +397,7 @@ def rollback(revision, *, runtime=False):
         old_ticket = json.loads(originals[TICKET]);upgrade.verify_installed_tools(old_ticket)
         current_binding(upgrade, entry, old_ticket)
         journal['state'] = 'rolled-back';write(directory / 'journal.json', body(journal), 0o600)
-        return {'rolledBack': True, 'revision': revision, 'activeApprovalPreserved': True, 'businessContainersTouched': False}
+        return {'rolledBack': True, 'revision': revision, 'activeApprovalPreserved': True, 'businessContainersTouched': False, 'hostToolsReady': False, 'qualificationRequired': True}
     finally:
         for fd in reversed(fds):
             os.close(fd)
@@ -304,14 +405,16 @@ def rollback(revision, *, runtime=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['install', 'rollback', 'install-runtime', 'rollback-runtime'])
+    parser.add_argument('action', choices=['install', 'rollback', 'install-runtime', 'rollback-runtime', 'qualify', 'qualify-runtime'])
     parser.add_argument('--revision', required=True)
     parser.add_argument('--source', type=Path)
     for name in ['manifest', 'ticket', 'wrapper', 'helper', 'compose', 'upgrade']:
         parser.add_argument('--expected-' + name + '-sha256')
     arguments = parser.parse_args()
     try:
-        if arguments.action in ['rollback', 'rollback-runtime']:
+        if arguments.action in ['qualify', 'qualify-runtime']:
+            result = qualify(arguments.revision, runtime=arguments.action == 'qualify-runtime')
+        elif arguments.action in ['rollback', 'rollback-runtime']:
             result = rollback(arguments.revision, runtime=arguments.action == 'rollback-runtime')
         else:
             need(arguments.source is not None, 'source')
