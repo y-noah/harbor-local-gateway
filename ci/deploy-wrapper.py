@@ -17,6 +17,9 @@ import importlib.util
 import stat
 import urllib.request
 import urllib.error
+import http.client
+import socket
+import threading
 
 CONFIG='/etc/harbor-gateway-deploy.json'
 NAME='harbor-local-gateway'
@@ -65,16 +68,86 @@ def inspect(name):
     result=docker('inspect',name,check=False,timeout=10)
     return json.loads(result.stdout)[0] if result.returncode==0 else None
 
+DOCKER_INSPECT_SOCKET = Path('/run/docker.sock')
+DOCKER_INSPECT_TIMEOUT = 10
+DOCKER_INSPECT_MAX_BYTES = 4 * 1024 * 1024
+
+
+def docker_inspect_socket_identity():
+    for parent in DOCKER_INSPECT_SOCKET.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError('Docker inspection socket parent is untrusted')
+    info = DOCKER_INSPECT_SOCKET.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o002 or info.st_nlink != 1:
+        raise RuntimeError('Docker inspection socket is untrusted')
+    return info.st_dev, info.st_ino, info.st_ctime_ns
+
+
+def docker_container_read(name):
+    """One bounded, local read; never fall back to CLI or retry a mutation."""
+    if not isinstance(name, str) or re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]{0,255}', name) is None:
+        raise ValueError('Container inspection identity is invalid')
+    identity = docker_inspect_socket_identity()
+    deadline = time.monotonic() + DOCKER_INSPECT_TIMEOUT
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection = http.client.HTTPConnection('localhost', timeout=DOCKER_INSPECT_TIMEOUT)
+    expired = threading.Event()
+    guard = None
+    response = None
+    def expire():
+        expired.set()
+        try:
+            (guard if guard is not None else peer).shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    timer = threading.Timer(DOCKER_INSPECT_TIMEOUT, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        peer.settimeout(DOCKER_INSPECT_TIMEOUT)
+        peer.connect(str(DOCKER_INSPECT_SOCKET))
+        # getresponse() may close its socket on Connection: close while its
+        # file reader stays open. A duplicate lets the deadline interrupt it.
+        guard = peer.dup()
+        if expired.is_set():
+            raise TimeoutError('Container inspection deadline exceeded')
+        connection.sock = peer
+        connection.request('GET', '/containers/' + name + '/json', headers={'Accept': 'application/json'})
+        response = connection.getresponse()
+        raw = response.read(DOCKER_INSPECT_MAX_BYTES + 1)
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError('Container inspection deadline exceeded')
+        if len(raw) > DOCKER_INSPECT_MAX_BYTES:
+            raise RuntimeError('Container inspection response exceeds limit')
+        if docker_inspect_socket_identity() != identity:
+            raise RuntimeError('Docker inspection socket changed')
+        return response.status, json.loads(raw)
+    except (OSError, http.client.HTTPException, UnicodeError, json.JSONDecodeError) as error:
+        # Do not expose daemon response bodies, credentials or container Env.
+        raise RuntimeError('Container inspection is not verified') from None
+    finally:
+        timer.cancel()
+        timer.join()
+        if response is not None:
+            response.close()
+        connection.close()
+        peer.close()
+        if guard is not None:
+            guard.close()
+
+
 def inspect_container(name):
-    """PG-only lookup: a failed inspection is not evidence of absence."""
-    result=docker('container','inspect',name,check=False,timeout=10)
-    if result.returncode==0:
-        value=json.loads(result.stdout)
-        if not isinstance(value,list) or len(value)!=1 or not isinstance(value[0],dict) or not isinstance(value[0].get('Id'),str) or not value[0]['Id'] or not isinstance(value[0].get('Config'),dict) or type(value[0].get('State',{}).get('Running'))!=bool:raise RuntimeError('Container inspection response is invalid')
-        return value[0]
-    inventory=docker('container','ls','--all','--filter','name=^/'+re.escape(name)+'$','--format','{{json .Names}}',check=False,timeout=10)
-    if inventory.returncode==0 and not inventory.stdout.strip():return None
-    raise RuntimeError('Container existence is not verified')
+    """PG-only lookup: only a daemon-confirmed missing container is absence."""
+    status, value = docker_container_read(name)
+    if status == 404 and isinstance(value, dict) and value.get('message') == 'No such container: ' + name:
+        return None
+    if status != 200:
+        raise RuntimeError('Container existence is not verified')
+    if not isinstance(value, dict) or not isinstance(value.get('Id'), str) or not value['Id'] or not isinstance(value.get('Config'), dict) or type(value.get('State', {}).get('Running')) != bool:
+        raise RuntimeError('Container inspection response is invalid')
+    return value
+
 
 def inspect_image(name):
     """PG-only image proof: neither absence nor daemon failure is a capability."""

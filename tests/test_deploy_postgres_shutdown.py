@@ -162,8 +162,8 @@ class PostgreSQLShutdownTests(unittest.TestCase):
  def test_real_wrapper_lookup_distinguishes_absence_and_failed_daemon(self):
   from unittest.mock import Mock
   wrapper=base.wrapper
-  for responses,missing in [([Mock(returncode=1,stdout=''),Mock(returncode=0,stdout='')],True),([Mock(returncode=1,stdout=''),Mock(returncode=1,stdout='')],False),([Mock(returncode=1,stdout=''),Mock(returncode=0,stdout='"harbor-local-gateway"')],False)]:
-   with patch.object(wrapper,'docker',side_effect=responses):
+  for response,missing in [((404,{'message':'No such container: '+base.NAME}),True),((500,{'message':'synthetic failure'}),False),((404,{'message':'page not found'}),False)]:
+   with patch.object(wrapper,'docker_container_read',return_value=response):
     if missing:self.assertIsNone(wrapper.inspect_container(base.NAME))
     else:
      with self.assertRaises(RuntimeError):wrapper.inspect_container(base.NAME)
@@ -216,9 +216,8 @@ class PostgreSQLShutdownTests(unittest.TestCase):
    with self.assertRaises(subprocess.TimeoutExpired):base.wrapper.inspect_image(base.IMAGE)
    self.assertEqual(docker.call_count,1)
  def test_zero_exit_inspect_with_incomplete_json_is_not_absence(self):
-  from unittest.mock import Mock
-  for value in [[],[{}],[{'Id':'synthetic','Config':{},'State':{}}]]:
-   with patch.object(base.wrapper,'docker',return_value=Mock(returncode=0,stdout=json.dumps(value))),self.assertRaises(RuntimeError):base.wrapper.inspect_container(base.NAME)
+  for value in [[],{}, {'Id':'synthetic','Config':{},'State':{}}]:
+   with patch.object(base.wrapper,'docker_container_read',return_value=(200,value)),self.assertRaises(RuntimeError):base.wrapper.inspect_container(base.NAME)
 
  def test_stopped_candidate_missing_its_expected_contract_is_unknown(self):
   with tempfile.TemporaryDirectory() as directory,patch.object(pg,'secure'):
