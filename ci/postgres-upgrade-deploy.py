@@ -674,6 +674,10 @@ def run_upgrade(image,config,api,ticket,entry):
  pg.storage_restart_policy(config)
  if RELEASES.exists():need(retired_cleanup(config,api,entry,protect_retained=True)['state']=='complete','retired_service_cleanup_pending: retry before starting another upgrade')
  pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout,'deployment_progress':deployment_progress}
+ # Only maintenance-object reads retry transient daemon observation failures.
+ # Each read remains bounded by the existing validated preflight budget;
+ # the underlying global/source inspector and all mutations stay unchanged.
+ pg_api['maintenance_container_inspection']=lambda target:pg.container_inspection(pg_api,target,[],retry_deadline=time.monotonic()+preflight_timeout)
  if isinstance(getattr(entry,'_harbor_preflight_directory',None),Path):pg_api.update(preflight_directory=str(entry._harbor_preflight_directory),preflight_read=entry.private_json,preflight_save=entry.save_json,preflight_retry_allowed=getattr(entry,'_harbor_preflight_retry_allowed',False) is True)
  common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);deployment_progress('preflight_target');proof=pg.image_proof(pg_api,image,common)
  need(all(proof[k]==ticket[v] for k,v in [('database_digest','databaseDigest'),('schema_digest','schemaDigest'),('device_ca_digest','deviceCaDigest')]),'new image changed database/schema/device identity')

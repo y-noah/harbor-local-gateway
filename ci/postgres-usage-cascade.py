@@ -12,6 +12,22 @@ try{c=await s.pool.connect();const {rows:[r]}=await c.query('SELECT (SELECT oid:
 def need(ok,code):
     if not ok:raise RuntimeError('usage_cascade_'+code)
 
+def inspect_maintenance(api,target):
+    observer=api.get('maintenance_container_inspection')
+    if observer is None:return api['inspect_container'](target)
+    need(callable(observer),'maintenance_inspector_invalid');return observer(target)
+
+def maintenance_cleanup_failure(primary_error,primary_result,cleanup_error,family):
+    if primary_error is not None:
+        primary_error.maintenance_cleanup_error=cleanup_error
+        raise primary_error from cleanup_error
+    if primary_result is not None:
+        failure=RuntimeError(family+'_maintenance_cleanup_unconfirmed_after_result')
+        failure.deployment_code='preflight_maintenance_cleanup_unconfirmed_after_result'
+        failure.maintenance_primary_result=primary_result
+        raise failure from cleanup_error
+    raise cleanup_error
+
 def unstarted_maintenance_task(row,name,image_id,program,action,require=need):
     require(row is not None,'maintenance_creation_pending')
     config=(row or {}).get('Config',{});host=(row or {}).get('HostConfig',{});state=(row or {}).get('State',{})
@@ -29,7 +45,7 @@ def create_maintenance_task(api,args,name,image_id,program,action,require=need):
     except subprocess.TimeoutExpired:
         # The client lost only the acknowledgement. Reconcile this same task;
         # never send another create or adopt a process that already started.
-        return unstarted_maintenance_task(api['inspect_container'](name),name,image_id,program,action,require),True
+        return unstarted_maintenance_task(inspect_maintenance(api,name),name,image_id,program,action,require),True
     require(created.returncode==0,'maintenance_create_failed');cid=created.stdout.decode().strip();require(re.fullmatch('[a-f0-9]{64}',cid),'maintenance_container_id')
     return cid,False
 
@@ -153,13 +169,13 @@ class UsageCascadeRelease:
 
     def command(self,action,cascade):
         need(not getattr(self,'maintenance_unconfirmed',False),'maintenance_process_unconfirmed')
-        name='harbor-usage-cascade-'+uuid.uuid4().hex;cid=None;payload=b'';start_attempted=False
+        name='harbor-usage-cascade-'+uuid.uuid4().hex;cid=None;payload=b'';start_attempted=False;primary_result=None;primary_error=None
         try:
             need(self.api['inspect_image'](self.image).get('Id')==self.image_id,'candidate_image_changed')
             args=['/usr/bin/docker','create','--name',name,'--label','com.harbor.maintenance='+name,'--network','host','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--pids-limit','64','--memory','512m','--cpus','0.5','--no-healthcheck','--tmpfs','/tmp:rw,noexec,nosuid,size=16m','--interactive','--entrypoint','node',self.image_id,'/app/postgres-usage-rollups-cli.mjs',action]
             self.maintenance_unconfirmed=True
             cid,reconciled=create_maintenance_task(self.api,args,name,self.image_id,'/app/postgres-usage-rollups-cli.mjs',action)
-            row=self.api['inspect_container'](cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
+            row=inspect_maintenance(self.api,cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
             if reconciled:need(unstarted_maintenance_task(row,name,self.image_id,'/app/postgres-usage-rollups-cli.mjs',action)==cid,'maintenance_container_changed')
             if callable(cascade):cascade=cascade()
             payload=json.dumps({'connection':self.connection,'cascade':cascade}).encode();need(len(payload)<=131072,'maintenance_input_budget')
@@ -167,17 +183,22 @@ class UsageCascadeRelease:
             result=subprocess.run(['/usr/bin/docker','start','--attach','--interactive',cid],input=payload,capture_output=True,timeout=75)
             need(len(result.stdout)<=131072 and len(result.stderr)<=16384,'maintenance_output_budget')
             if result.returncode!=0:raise RuntimeError('usage_cascade_maintenance_'+action.replace('-','_')+'_failed')
-            value=json.loads(result.stdout);need(isinstance(value,dict) and value.get('action')==action,'maintenance_result');return value
+            value=json.loads(result.stdout);need(isinstance(value,dict) and value.get('action')==action,'maintenance_result');primary_result=value;return value
+        except BaseException as error:
+            primary_error=error;raise
         finally:
             payload=b''
-            row=self.api['inspect_container'](name)
-            if row is not None or cid is not None:
-                if not start_attempted:
-                    found=unstarted_maintenance_task(row,name,self.image_id,'/app/postgres-usage-rollups-cli.mjs',action)
-                    need(cid is None or cid==found,'maintenance_cleanup_identity');cid=found
-                need(row is not None and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name,'maintenance_cleanup_identity')
-                done=subprocess.run(['/usr/bin/docker','rm',*(['--force'] if start_attempted else []),cid],capture_output=True,timeout=30);need(done.returncode==0 and self.api['inspect_container'](name) is None,'maintenance_cleanup_failed')
-                self.maintenance_unconfirmed=False
+            try:
+                row=inspect_maintenance(self.api,name)
+                if row is not None or cid is not None:
+                    if not start_attempted:
+                        found=unstarted_maintenance_task(row,name,self.image_id,'/app/postgres-usage-rollups-cli.mjs',action)
+                        need(cid is None or cid==found,'maintenance_cleanup_identity');cid=found
+                    need(row is not None and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name,'maintenance_cleanup_identity')
+                    done=subprocess.run(['/usr/bin/docker','rm',*(['--force'] if start_attempted else []),cid],capture_output=True,timeout=30);need(done.returncode==0 and inspect_maintenance(self.api,name) is None,'maintenance_cleanup_failed')
+                    self.maintenance_unconfirmed=False
+            except BaseException as cleanup_error:
+                maintenance_cleanup_failure(primary_error,primary_result,cleanup_error,'usage_cascade')
 
     def repair(self):
         self.check_active();self.check_sources(stopped=True)

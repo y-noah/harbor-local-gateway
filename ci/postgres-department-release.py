@@ -74,13 +74,13 @@ class DepartmentRelease(transport.UsageCascadeRelease):
 
     def command(self,action,cascade):
         need(not getattr(self,'maintenance_unconfirmed',False),'maintenance_process_unconfirmed')
-        name='harbor-department-release-'+uuid.uuid4().hex;cid=None;payload=b'';start_attempted=False
+        name='harbor-department-release-'+uuid.uuid4().hex;cid=None;payload=b'';start_attempted=False;primary_result=None;primary_error=None
         try:
             need(self.api['inspect_image'](self.image).get('Id')==self.image_id,'candidate_image_changed')
             args=['/usr/bin/docker','create','--name',name,'--label','com.harbor.maintenance='+name,'--network','host','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--pids-limit','64','--memory','512m','--cpus','0.5','--no-healthcheck','--tmpfs','/tmp:rw,noexec,nosuid,size=16m','--interactive','--entrypoint','node',self.image_id,'/app/postgres-department-release.mjs',action]
             self.maintenance_unconfirmed=True
             cid,reconciled=transport.create_maintenance_task(self.api,args,name,self.image_id,'/app/postgres-department-release.mjs',action,need)
-            row=self.api['inspect_container'](cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
+            row=transport.inspect_maintenance(self.api,cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
             if reconciled:need(unstarted_task(row,name,self.image_id,action)==cid,'maintenance_container_changed')
             self.maintenance_unconfirmed=True
             if callable(cascade):cascade=cascade()
@@ -96,35 +96,40 @@ class DepartmentRelease(transport.UsageCascadeRelease):
                     if isinstance(error,dict) and set(error)=={'ok','code'} and error['ok'] is False and isinstance(error['code'],str) and re.fullmatch('[A-Za-z0-9_]{1,80}',error['code']):code=error['code']
                 except (ValueError,UnicodeError):pass
                 error=RuntimeError('department_release_maintenance_'+action.replace('-','_')+'_failed'+('_'+code if code else ''));error.maintenance_code=code;raise error
-            value=json.loads(result.stdout);need(isinstance(value,dict) and value.get('action')==action,'maintenance_result');return value
+            value=json.loads(result.stdout);need(isinstance(value,dict) and value.get('action')==action,'maintenance_result');primary_result=value;return value
+        except BaseException as error:
+            primary_error=error;raise
         finally:
             payload=b''
-            row=self.api['inspect_container'](name)
-            if row is not None or cid is not None:
-                self.maintenance_unconfirmed=True
-                if cid is None:
-                    # A create timeout loses the acknowledgement, not necessarily
-                    # the container. Discover only this exact unstarted task;
-                    # never start it or infer that the maintenance plan ran.
-                    cid=unstarted_task(row,name,self.image_id,action)
-                diagnostic={'action':action,'containerId':cid,'processExitConfirmed':False}
-                self.record.setdefault('departmentIsolation',{})['maintenance']=diagnostic;self.save()
-                def owned(value):
-                    need(value is not None and value['Id']==cid and value['Image']==self.image_id and value.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name,'maintenance_cleanup_identity')
-                    return value['State']
-                state=owned(row)
-                if not start_attempted:
-                    need(state.get('Running') is False and state.get('Pid')==0 and state.get('Status')=='created' and not any(state.get(k) for k in ['Paused','Restarting','Dead']),'maintenance_creation_unconfirmed')
-                if state.get('Running') is True:
-                    # Cancel only this authenticated task. Docker CLI loss does
-                    # not prove that the container or its PG transaction exited.
-                    subprocess.run(['/usr/bin/docker','kill','--signal=SIGTERM',cid],capture_output=True,timeout=30)
-                    waited=subprocess.run(['/usr/bin/docker','wait',cid],capture_output=True,timeout=30)
-                    need(waited.returncode==0,'maintenance_exit_unconfirmed');state=owned(self.api['inspect_container'](cid))
-                need(state.get('Running') is False and state.get('Pid')==0 and state.get('Status')==('exited' if start_attempted else 'created') and not any(state.get(k) for k in ['Paused','Restarting','Dead']),'maintenance_exit_unconfirmed')
-                diagnostic['processExitConfirmed']=True;self.save()
-                done=subprocess.run(['/usr/bin/docker','rm',cid],capture_output=True,timeout=30);need(done.returncode==0 and self.api['inspect_container'](name) is None,'maintenance_cleanup_failed')
-                self.maintenance_unconfirmed=False
+            try:
+                row=transport.inspect_maintenance(self.api,name)
+                if row is not None or cid is not None:
+                    self.maintenance_unconfirmed=True
+                    if cid is None:
+                        # A create timeout loses the acknowledgement, not necessarily
+                        # the container. Discover only this exact unstarted task;
+                        # never start it or infer that the maintenance plan ran.
+                        cid=unstarted_task(row,name,self.image_id,action)
+                    diagnostic={'action':action,'containerId':cid,'processExitConfirmed':False}
+                    self.record.setdefault('departmentIsolation',{})['maintenance']=diagnostic;self.save()
+                    def owned(value):
+                        need(value is not None and value['Id']==cid and value['Image']==self.image_id and value.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name,'maintenance_cleanup_identity')
+                        return value['State']
+                    state=owned(row)
+                    if not start_attempted:
+                        need(state.get('Running') is False and state.get('Pid')==0 and state.get('Status')=='created' and not any(state.get(k) for k in ['Paused','Restarting','Dead']),'maintenance_creation_unconfirmed')
+                    if state.get('Running') is True:
+                        # Cancel only this authenticated task. Docker CLI loss does
+                        # not prove that the container or its PG transaction exited.
+                        subprocess.run(['/usr/bin/docker','kill','--signal=SIGTERM',cid],capture_output=True,timeout=30)
+                        waited=subprocess.run(['/usr/bin/docker','wait',cid],capture_output=True,timeout=30)
+                        need(waited.returncode==0,'maintenance_exit_unconfirmed');state=owned(transport.inspect_maintenance(self.api,cid))
+                    need(state.get('Running') is False and state.get('Pid')==0 and state.get('Status')==('exited' if start_attempted else 'created') and not any(state.get(k) for k in ['Paused','Restarting','Dead']),'maintenance_exit_unconfirmed')
+                    diagnostic['processExitConfirmed']=True;self.save()
+                    done=subprocess.run(['/usr/bin/docker','rm',cid],capture_output=True,timeout=30);need(done.returncode==0 and transport.inspect_maintenance(self.api,name) is None,'maintenance_cleanup_failed')
+                    self.maintenance_unconfirmed=False
+            except BaseException as cleanup_error:
+                transport.maintenance_cleanup_failure(primary_error,primary_result,cleanup_error,'department_release')
 
     def confirmed_status(self):
         # status holds the same transaction advisory lock as install. A success

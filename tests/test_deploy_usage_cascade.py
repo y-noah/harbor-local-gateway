@@ -140,6 +140,46 @@ class UsageCascadeDeploymentTests(unittest.TestCase):
   with self.assertRaises(RuntimeError):release.check_sources(stopped=True)
 
 class SharedMaintenanceCreationTests(unittest.TestCase):
+ def test_retryable_maintenance_reads_preserve_primary_outcome_without_replaying_mutations(self):
+  import copy
+  from types import SimpleNamespace
+  import test_postgres_runtime_upgrade as boundary
+  for cls,original,action in self.cases():
+   for outcome in ['cleanup_recovers','removed_confirmation_recovers','permanent_timeout','primary_error','nonretryable']:
+    with self.subTest(cls=cls.__name__,outcome=outcome):
+     row=copy.deepcopy(original);value=object.__new__(cls);value.image='synthetic';value.image_id=row['Image'];value.connection={};value.record={};value.save=Mock();ops=[];started=[];removed=[];clock=[0];missed=[];sleeps=[]
+     expected={'action':action,'installed':False,'safe':True}
+     def raw_inspect(target):
+      key='after_remove' if removed else 'cleanup' if started else 'before_start'
+      inject=(outcome=='removed_confirmation_recovers' and key=='after_remove' and not missed) or (outcome=='cleanup_recovers' and key=='cleanup' and not missed) or (outcome in ['permanent_timeout','primary_error','nonretryable'] and key=='cleanup')
+      if inject:
+       missed.append(key)
+       if outcome=='nonretryable':raise RuntimeError('synthetic_nonretryable_read')
+       clock[0]+=10;raise boundary.wrapper.ContainerInspectionUnavailable('synthetic timeout')
+      return None if removed else row
+     value.api={'STACK':'synthetic-stack','inspect_image':lambda _: {'Id':value.image_id},'inspect_container':raw_inspect}
+     value.api['maintenance_container_inspection']=lambda target:pg.container_inspection(value.api,target,[],retry_deadline=clock[0]+pg.preflight_timeout_seconds(30))
+     def run(args,**options):
+      ops.append(args[1])
+      if args[1]=='create':return SimpleNamespace(returncode=0,stdout=row['Id'].encode(),stderr=b'')
+      if args[1]=='start':started.append(True);row['State']={'Running':False,'Pid':0,'Status':'exited'};return SimpleNamespace(returncode=1 if outcome=='primary_error' else 0,stdout=json.dumps(expected).encode(),stderr=b'{}')
+      self.assertEqual(args[1],'rm');removed.append(True);return SimpleNamespace(returncode=0)
+     def sleep(seconds):sleeps.append(seconds);clock[0]+=seconds
+     with patch.object(cascade.uuid,'uuid4',return_value=SimpleNamespace(hex='synthetic')),patch.object(subprocess,'run',side_effect=run),patch.object(pg.time,'monotonic',side_effect=lambda:clock[0]),patch.object(pg.time,'sleep',side_effect=sleep),patch.object(pg,'record_shutdown_diagnostic'):
+      if outcome in ['cleanup_recovers','removed_confirmation_recovers']:
+       self.assertEqual(value.command(action,{}),expected);self.assertFalse(value.maintenance_unconfirmed);self.assertEqual(len(missed),1);self.assertEqual(len(sleeps),1)
+      elif outcome=='primary_error':
+       with self.assertRaisesRegex(RuntimeError,'maintenance_'+action.replace('-','_')+'_failed') as failure:value.command(action,{})
+       self.assertIsInstance(failure.exception.maintenance_cleanup_error,pg.ShutdownUnconfirmed);self.assertIs(failure.exception.__cause__,failure.exception.maintenance_cleanup_error);self.assertTrue(value.maintenance_unconfirmed)
+      else:
+       with self.assertRaisesRegex(RuntimeError,'cleanup_unconfirmed_after_result') as failure:value.command(action,{})
+       self.assertEqual(failure.exception.maintenance_primary_result,expected);self.assertEqual(failure.exception.deployment_code,'preflight_maintenance_cleanup_unconfirmed_after_result');self.assertTrue(value.maintenance_unconfirmed)
+       failure.exception.deployment_diagnostic=boundary.upgrade.deployment_failure(failure.exception)
+       self.assertEqual(boundary.wrapper.deployment_error(failure.exception)['code'],'preflight_maintenance_cleanup_unconfirmed_after_result')
+       self.assertNotIn('maintenance_primary_result',json.dumps(boundary.wrapper.deployment_error(failure.exception)))
+       if outcome=='nonretryable':self.assertEqual(len(missed),1);self.assertEqual(sleeps,[])
+       else:self.assertGreaterEqual(clock[0],30)
+     self.assertEqual(ops.count('create'),1);self.assertEqual(ops.count('start'),1);self.assertEqual(ops.count('rm'),1 if outcome in ['cleanup_recovers','removed_confirmation_recovers'] else 0)
  def test_real_constructors_open_witness_after_slow_create_and_close_on_factory_failures(self):
   import copy,io
   from contextlib import nullcontext

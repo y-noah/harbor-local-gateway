@@ -44,6 +44,9 @@ class RuntimeUpgradeTests(unittest.TestCase):
     upgrade.run_upgrade(IMAGE,{**CONFIG,'postgres_preflight_timeout_seconds':180},api,t,entry)
    context=cascade.UsageCascadeRelease.call_args.kwargs['api'];self.assertIs(context,department.DepartmentRelease.call_args.kwargs['api']);self.assertIsNot(context,api)
    self.assertEqual(context['postgres_preflight_timeout_seconds'],180);self.assertEqual(context['STACK'],t['materialsDirectory']);self.assertEqual(api['postgres_preflight_timeout_seconds'],999)
+   self.assertIs(context['inspect_container'],api['inspect_container']);self.assertNotIn('maintenance_container_inspection',api)
+   with patch.object(upgrade.time,'monotonic',return_value=100):context['maintenance_container_inspection']('owned-maintenance')
+   composition.container_inspection.assert_called_once_with(context,'owned-maintenance',[],retry_deadline=280)
    entry.entry_state.assert_not_called();composition.deploy.assert_not_called()
  def test_source_preflight_failure_happens_before_entry_hold_or_composition(self):
   t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest'],'consumption_policy_contract':'v1'};composition.prepare_source_image_preflights.side_effect=pg.ShutdownUnconfirmed('source proof failed')
