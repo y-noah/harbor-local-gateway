@@ -28,10 +28,7 @@ def install_timeout_seconds(config):
     return value
 
 def unstarted_task(row,name,image_id,action):
-    config=(row or {}).get('Config',{});host=(row or {}).get('HostConfig',{});state=(row or {}).get('State',{})
-    need(row is not None and re.fullmatch('[a-f0-9]{64}',row.get('Id','')) and row.get('Name')=='/'+name and row.get('Image')==image_id and config.get('Image')==image_id and config.get('Labels',{}).get('com.harbor.maintenance')==name and config.get('Entrypoint')==['node'] and config.get('Cmd')==['/app/postgres-department-release.mjs',action] and config.get('User')=='node' and host.get('ReadonlyRootfs') is True and host.get('NetworkMode')=='host' and host.get('CapDrop')==['ALL'] and host.get('SecurityOpt')==['no-new-privileges'] and host.get('PidsLimit')==64 and host.get('Memory')==512*1024*1024 and host.get('NanoCpus')==500000000 and host.get('Tmpfs')=={'/tmp':'rw,noexec,nosuid,size=16m'} and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_creation_identity')
-    need(state.get('Running') is False and state.get('Pid')==0 and state.get('Status')=='created' and state.get('StartedAt')=='0001-01-01T00:00:00Z' and not any(state.get(k) for k in ['Paused','Restarting','Dead','OOMKilled']),'maintenance_creation_unconfirmed')
-    return row['Id']
+    return transport.unstarted_maintenance_task(row,name,image_id,'/app/postgres-department-release.mjs',action,need)
 
 class DepartmentRelease(transport.UsageCascadeRelease):
     def __init__(self,*,api,entry,ticket,active,gateway,worker,image,proof,record,path,source_proofs):
@@ -78,15 +75,9 @@ class DepartmentRelease(transport.UsageCascadeRelease):
             need(self.api['inspect_image'](self.image).get('Id')==self.image_id,'candidate_image_changed')
             args=['/usr/bin/docker','create','--name',name,'--label','com.harbor.maintenance='+name,'--network','host','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--pids-limit','64','--memory','512m','--cpus','0.5','--no-healthcheck','--tmpfs','/tmp:rw,noexec,nosuid,size=16m','--interactive','--entrypoint','node',self.image_id,'/app/postgres-department-release.mjs',action]
             self.maintenance_unconfirmed=True
-            try:
-                created=subprocess.run(args,capture_output=True,timeout=30)
-            except subprocess.TimeoutExpired:
-                # Recover only the lost create acknowledgement. The exact task
-                # must never have started; a running task is not safe to replay.
-                cid=unstarted_task(self.api['inspect_container'](name),name,self.image_id,action)
-            else:
-                need(created.returncode==0,'maintenance_create_failed');cid=created.stdout.decode().strip();need(re.fullmatch('[a-f0-9]{64}',cid),'maintenance_container_id')
+            cid,reconciled=transport.create_maintenance_task(self.api,args,name,self.image_id,'/app/postgres-department-release.mjs',action,need)
             row=self.api['inspect_container'](cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
+            if reconciled:need(unstarted_task(row,name,self.image_id,action)==cid,'maintenance_container_changed')
             self.maintenance_unconfirmed=True
             payload=json.dumps({'connection':self.connection,'cascade':cascade}).encode();need(len(payload)<=131072,'maintenance_input_budget')
             budget=getattr(self,'install_timeout_seconds',75) if action=='install' else 75

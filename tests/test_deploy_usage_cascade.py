@@ -139,4 +139,62 @@ class UsageCascadeDeploymentTests(unittest.TestCase):
   row['Config']['Env'].append('CHANGED=1')
   with self.assertRaises(RuntimeError):release.check_sources(stopped=True)
 
+class SharedMaintenanceCreationTests(unittest.TestCase):
+ def cases(self):
+  import test_deploy_department_release as department
+  for cls,prefix,program,action in [(cascade.UsageCascadeRelease,'harbor-usage-cascade-','/app/postgres-usage-rollups-cli.mjs','cascade-plan'),(department.release.DepartmentRelease,'harbor-department-release-','/app/postgres-department-release.mjs','plan')]:
+   row=department.DepartmentReleaseTests.unstarted(None);name=prefix+'synthetic';row['Name']='/'+name;row['Config']['Labels']={'com.harbor.maintenance':name};row['Config']['Cmd']=[program,action]
+   yield cls,row,action
+ def test_both_transports_reconcile_one_create_ack_and_preserve_pre_start_cleanup(self):
+  from types import SimpleNamespace
+  for cls,original,action in self.cases():
+   for before_start_failure in [False,True]:
+    with self.subTest(cls=cls.__name__,before_start_failure=before_start_failure):
+     import copy
+     row=copy.deepcopy(original);value=object.__new__(cls);value.image='synthetic';value.image_id=row['Image'];value.connection={'oversized':'x'*131072} if before_start_failure else {};value.record={};value.save=Mock();ops=[];removed=[]
+     value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:None if removed else row}
+     def run(args,**options):
+      ops.append(args[1]);self.assertNotIn('kill',ops)
+      if args[1]=='create':self.assertEqual(options['timeout'],30);raise subprocess.TimeoutExpired('synthetic create',30)
+      if args[1]=='start':row['State']={'Running':False,'Pid':0,'Status':'exited'};return SimpleNamespace(returncode=0,stdout=json.dumps({'action':action}).encode(),stderr=b'')
+      self.assertEqual(args[1],'rm');self.assertEqual(args[-1],row['Id'])
+      if before_start_failure:self.assertNotIn('--force',args)
+      removed.append(row['Id']);return SimpleNamespace(returncode=0)
+     with patch.object(cascade.uuid,'uuid4',return_value=SimpleNamespace(hex='synthetic')),patch.object(subprocess,'run',side_effect=run):
+      if before_start_failure:
+       with self.assertRaisesRegex(RuntimeError,'maintenance_input_budget'):value.command(action,{})
+      else:self.assertEqual(value.command(action,{}),{'action':action})
+     self.assertEqual(ops,['create','rm'] if before_start_failure else ['create','start','rm']);self.assertFalse(value.maintenance_unconfirmed)
+ def test_both_transports_reject_missing_changed_started_or_running_create_results(self):
+  import copy
+  from types import SimpleNamespace
+  changes=[(('Image',),'sha256:'+'c'*64),(('Config','Cmd'),['unexpected']),(('HostConfig','ReadonlyRootfs'),False),(('HostConfig','SecurityOpt'),[]),(('HostConfig','CapDrop'),[]),(('HostConfig','NetworkMode'),'bridge'),(('HostConfig','PidsLimit'),0),(('HostConfig','Memory'),0),(('HostConfig','NanoCpus'),0),(('HostConfig','Tmpfs'),{}),(('State','StartedAt'),'2026-11-17T00:00:00Z'),(('State',),{'Status':'running','Running':True,'Pid':123}),(('State',),{'Status':'exited','Running':False,'Pid':0})]
+  for cls,baseline,action in self.cases():
+   rows=[None]
+   for path,replacement in changes:
+    row=copy.deepcopy(baseline);target=row
+    for key in path[:-1]:target=target[key]
+    target[path[-1]]=replacement;rows.append(row)
+   for row in rows:
+    with self.subTest(cls=cls.__name__,row=row):
+     value=object.__new__(cls);value.image='synthetic';value.image_id=baseline['Image'];value.connection={};value.record={};value.save=Mock();ops=[]
+     value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:row}
+     def run(args,**options):ops.append(args[1]);self.assertEqual(args[1],'create');raise subprocess.TimeoutExpired('synthetic create',30)
+     with patch.object(cascade.uuid,'uuid4',return_value=SimpleNamespace(hex='synthetic')),patch.object(subprocess,'run',side_effect=run):
+      with self.assertRaises(RuntimeError):value.command(action,{})
+      with self.assertRaisesRegex(RuntimeError,'maintenance_process_unconfirmed'):value.command(action,{})
+     self.assertEqual(ops,['create']);self.assertTrue(value.maintenance_unconfirmed)
+ def test_both_transports_recheck_reconciled_task_before_start(self):
+  import copy
+  from types import SimpleNamespace
+  for cls,row,action in self.cases():
+   with self.subTest(cls=cls.__name__):
+    changed=copy.deepcopy(row);changed['State']={'Status':'running','Running':True,'Pid':123};seen=[];value=object.__new__(cls);value.image='synthetic';value.image_id=row['Image'];value.record={};value.save=Mock();ops=[]
+    def inspect(_):seen.append(True);return row if len(seen)==1 else changed
+    value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':inspect}
+    def run(args,**options):ops.append(args[1]);self.assertEqual(args[1],'create');raise subprocess.TimeoutExpired('synthetic create',30)
+    with patch.object(cascade.uuid,'uuid4',return_value=SimpleNamespace(hex='synthetic')),patch.object(subprocess,'run',side_effect=run):
+     with self.assertRaisesRegex(RuntimeError,'maintenance_creation_unconfirmed'):value.command(action,{})
+    self.assertEqual(ops,['create']);self.assertTrue(value.maintenance_unconfirmed)
+
 if __name__=='__main__':unittest.main()
