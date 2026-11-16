@@ -50,7 +50,9 @@ test('真实HTTP部门管理只由超管执行，选择头不能提升部门权�
   assert.equal((await call('/scope',{cookie:departmentCookie,department:'global'})).status,403);
   assert.equal((await call('/api/admin/departments',{cookie:departmentCookie})).status,403);
   assert.equal((await call('/api/admin/departments/'+b.value.id+'/management-keys',{cookie:departmentCookie,method:'POST',body:{label:'forbidden'}})).status,403);
-  const selected=await call('/scope',{cookie,department:a.value.id});assert.equal(selected.value.department_id,a.value.id);assert.equal(selected.value.role,'super_admin');
+  const selected=await call('/scope',{cookie});assert.equal(selected.value.department_id,'department-default');assert.equal(selected.value.role,'super_admin');
+  assert.equal((await call('/scope',{cookie,department:a.value.id})).status,403);
+  assert.equal((await call('/scope',{cookie,department:'global'})).status,403);
   assert.equal((await call('/api/admin/departments',{cookie,department:a.value.id,method:'POST',body:{name:'forbidden-global-write'}})).status,403);
   const revoked=await call('/api/admin/departments/'+a.value.id+'/management-keys/'+issued.value.key.id+'/revoke',{cookie,method:'POST',body:{expected_version:issued.value.key.version}});assert.equal(revoked.status,200);
   assert.equal((await call('/scope',{cookie:departmentCookie})).status,401);
@@ -88,8 +90,8 @@ test('真实网关隔离部门首屏、员工及模型调用归属，拒跨部�
   assert.equal((await call('/api/admin/members',{cookie:loginA.cookie,department:b.id})).status,403);
   assert.equal((await call('/api/admin/status',{cookie:loginA.cookie})).status,401);
   const superLogin=await call('/api/auth/login',{method:'POST',body:{password:'synthetic-super',includeOverview:true}});assert.equal(superLogin.status,200);assert.ok(superLogin.value.initialState);
-  const global=await call('/api/admin/members',{cookie:superLogin.cookie});assert.equal(global.status,200);assert.ok(JSON.stringify(global.value).includes('A的员工')&&JSON.stringify(global.value).includes('B的员工'));
-  assert.equal((await call('/api/admin/members',{cookie:superLogin.cookie,method:'POST',body:{name:'缺部门',quota:null,expires:null}})).status,403);
+  const ownDefault=await call('/api/admin/members',{cookie:superLogin.cookie});assert.equal(ownDefault.status,200);assert.equal(JSON.stringify(ownDefault.value).includes('A的员工'),false);assert.equal(JSON.stringify(ownDefault.value).includes('B的员工'),false);
+  const defaultMember=await call('/api/admin/members',{cookie:superLogin.cookie,method:'POST',body:{name:'默认团队员工',quota:null,expires:null}});assert.equal(defaultMember.status,201);assert.equal((await store.get('SELECT department_id FROM harbor.members WHERE id=$1',defaultMember.value.memberId)).department_id,'department-default');
   assert.equal((await call('/api/admin/pricing',{cookie:loginA.cookie})).status,403);
   assert.equal((await call('/api/admin/pricing',{cookie:superLogin.cookie,department:a.id})).status,403);
   const devices=await call('/api/admin/devices',{cookie:loginA.cookie});assert.equal(devices.status,200,JSON.stringify(devices.value));

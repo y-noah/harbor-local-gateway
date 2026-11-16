@@ -1,5 +1,5 @@
 import {AppError} from './store.mjs';
-import {requireDepartmentScope} from './department-access.mjs';
+import {requireDepartmentScope,defaultDepartmentId} from './department-access.mjs';
 
 const denied=()=>{throw new AppError(403,'当前身份无权访问此部门','department_forbidden');};
 const invalid=()=>{throw new AppError(400,'部门管理参数无效','department_query_invalid');};
@@ -26,12 +26,18 @@ function pagination(params){
 // or changes a department administrator's ownership.
 export function createPostgresDepartmentHttp({auth,departments,issuer,installed,readBody}={}){
  if(typeof installed!=='boolean'||!auth||typeof auth.context!=='function'||typeof auth.revalidateScope!=='function'||!departments||typeof departments.getDepartment!=='function'||typeof issuer?.forDepartment!=='function'||typeof readBody!=='function')throw new AppError(503,'部门HTTP入口未配置完整','department_http_configuration');
- const contexts=new WeakMap();
- async function resolveContext(req){
+ const contexts=new WeakMap(),managementContexts=new WeakMap();
+ async function businessIdentity(base,{allowDisabled=false}={}){
+  const trusted=requireDepartmentScope(base,{allowGlobal:true}),departmentId=trusted.role==='super_admin'?defaultDepartmentId:trusted.department_id;
+  const scope=trusted.role==='super_admin'?issuer.forDepartment(trusted,departmentId):trusted;
+  const department=await departments.getDepartment(scope,departmentId);if(!department.enabled&&!allowDisabled)denied();return scope;
+ }
+ async function resolveContext(req,{management=false}={}){
   const selected=selection(req),base=await auth.context(req);
   if(!base)throw new AppError(401,'请先输入管理密钥登录','admin_required');
   const scope=requireDepartmentScope(base,{allowGlobal:true});
   if(!installed){if(selected!==null||scope.role!=='super_admin')throw new AppError(503,'部门隔离尚未启用','department_unavailable');return undefined;}
+  if(!management){const identity=await businessIdentity(scope);if(selected!==null&&selected!==identity.department_id)denied();return identity;}
   if(scope.role==='department_admin'){
    if(selected!==null&&selected!==scope.department_id)denied();
    return scope;
@@ -43,15 +49,22 @@ export function createPostgresDepartmentHttp({auth,departments,issuer,installed,
  function context(req){
   let pending=contexts.get(req);if(!pending){pending=resolveContext(req);contexts.set(req,pending);}return pending;
  }
+ async function sessionIdentity(req){
+  const base=await auth.context(req);if(!base)return null;
+  const identity=await businessIdentity(base,{allowDisabled:base.role==='super_admin'}),selected=selection(req);
+  if(selected!==null&&selected!==identity.department_id)denied();return identity;
+ }
+ function managementContext(req){let pending=managementContexts.get(req);if(!pending){pending=resolveContext(req,{management:true});managementContexts.set(req,pending);}return pending;}
  async function revalidate(req,scope){
+  const expected=await context(req);if(!expected||scope.view!=='department'||scope.department_id!==expected.department_id)denied();
   const current=await auth.revalidateScope(req,scope);if(!current)throw new AppError(401,'管理会话已失效，请重新登录','admin_required');
-  if(current.view==='department')await departments.getDepartment(current,current.department_id);
+  if(current.view==='department'&&!(await departments.getDepartment(current,current.department_id)).enabled)denied();
   return current;
  }
  async function handle(req,res,{signal}={}){
   const url=new URL(req.url,'http://localhost'),path=url.pathname;
   if(!/^\/api\/admin\/departments(?:\/|$)/.test(path))return false;
-  const scope=await context(req);
+  const scope=await managementContext(req);
   if(!installed)throw new AppError(503,'部门隔离尚未启用','department_unavailable');
   requireDepartmentScope(scope,{allowGlobal:true,roles:['super_admin']});
   const match=path.match(/^\/api\/admin\/departments(?:\/([a-zA-Z0-9][a-zA-Z0-9-]{0,99})(?:\/management-keys(?:\/([a-zA-Z0-9][a-zA-Z0-9-]{0,99})\/(revoke|reveal))?)?)?$/);
@@ -65,7 +78,7 @@ export function createPostgresDepartmentHttp({auth,departments,issuer,installed,
   }else if(['POST','PATCH'].includes(req.method)){
    if([...url.searchParams].length)invalid();
    const payload=await readBody(req,{owner:'admin',maxBytes:65536,signal});
-   const current=await revalidate(req,scope);
+   const current=await auth.revalidateScope(req,scope);if(!current)throw new AppError(401,'管理会话已失效，请重新登录','admin_required');
    if(req.method==='POST'&&!departmentId){value=await departments.createDepartment(current,payload);status=201;}
    else if(req.method==='PATCH'&&departmentId&&!keys)value=await departments.updateDepartment(current,departmentId,payload);
    else if(req.method==='POST'&&keys&&!keyId){value=await departments.issueManagementKey(current,departmentId,payload);status=201;}
@@ -75,5 +88,5 @@ export function createPostgresDepartmentHttp({auth,departments,issuer,installed,
   if(signal?.aborted)throw signal.reason;
   res.setHeader('Cache-Control','no-store');res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(value));return true;
  }
- return {context,revalidate,handle,installed};
+ return {context,revalidate,handle,installed,businessIdentity,sessionIdentity};
 }

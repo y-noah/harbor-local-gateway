@@ -231,8 +231,7 @@ export function createPostgresDepartments(store,{issuer,clock=Date.now,authorize
  async function listDepartments(scope,{limit=20,after}={}){
   const trusted=superScope(scope);if(trusted.view!=='global')denied();if(![20,50,100].includes(limit))bad();await ready();
   const args=[];let seek='';if(after!==undefined){object(after,['created','id']);version(after.created);identifier(after.id);args.push(after.created,after.id);seek=' WHERE (d.created,d.id)<($1,$2)';}
-  args.push(limit+1);const rows=await store.all(`SELECT d.*,(SELECT COUNT(*) FROM harbor.members m WHERE m.department_id=d.id AND m.removed_at IS NULL) members,
-   (SELECT COUNT(*) FROM harbor.accounts a WHERE a.department_id=d.id AND a.removed_at IS NULL) accounts,
+  args.push(limit+1);const rows=await store.all(`SELECT d.*,
    (SELECT COUNT(*) FROM harbor.department_admin_keys k WHERE k.department_id=d.id AND k.enabled AND k.revoked_at IS NULL) management_keys
    FROM harbor.departments d${seek} ORDER BY d.created DESC,d.id DESC LIMIT $${args.length}`,...args);
   const selected=rows.slice(0,limit),last=selected.at(-1);return {rows:selected,next:rows.length>limit?{created:last.created,id:last.id}:null};
@@ -334,6 +333,9 @@ export function createPostgresDepartments(store,{issuer,clock=Date.now,authorize
    return issuer.system({purpose:kind,departmentId});
   }
   if(role!=='super_admin'&&role!=='department_admin'||global&&(role!=='super_admin'||kind!=='recording.export')||systemGlobalKinds.has(kind))denied();
+  // Persisted actors retain their original scope. Old global or cross-team
+  // super-admin work cannot acquire the administrator's new business scope.
+  if(role==='super_admin'&&(global||departmentId!==defaultDepartmentId))denied();
   if(!global&&!await store.get('SELECT id FROM harbor.departments WHERE id=$1 AND enabled'+(lock?' FOR SHARE':''),departmentId))denied();
   if(role==='department_admin'){
    const key=await store.get('SELECT id FROM harbor.department_admin_keys WHERE id=$1 AND department_id=$2 AND version=$3 AND enabled AND revoked_at IS NULL'+(lock?' FOR SHARE':''),credentialId,departmentId,credentialVersion);if(!key)denied();

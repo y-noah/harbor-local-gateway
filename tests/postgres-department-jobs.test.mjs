@@ -35,13 +35,33 @@ test('恢复按DB lease和原owner重核，不从传入JSON造权限，撤销与
  await f.jobs.enqueue('recording.export',{id:'export-b',scope:f.scopeB});const other=await f.jobs.claim(['recording.export']);await f.departments.updateDepartment(f.superAdmin,f.b.id,{enabled:false,expected_version:0});await f.departments.updateDepartment(f.superAdmin,f.b.id,{enabled:true,expected_version:1});await assert.rejects(f.jobs.authorizePersistedActor(other),{code:'department_forbidden'});await f.jobs.fail(other,{retry:false,errorCode:'department_forbidden'});assert.equal((await f.store.get("SELECT status FROM harbor.background_jobs WHERE id='export-b'")).status,'failed');
 });
 
-test('全局导出仅当前超管，密码配置变化撤销旧job；系统scope只固定handler且不能导出',integration,async t=>{
- const f=await fixture(t);await f.jobs.enqueue('recording.export',{id:'global-export',scope:f.superAdmin});const global=await f.jobs.claim(['recording.export']);assert.equal(global.department_id,null);assert.equal((await f.jobs.authorizePersistedActor(global)).view,'global');
+test('旧超管全局及其他团队任务拒绝恢复，默认团队保留；系统scope不受业务收紧影响',integration,async t=>{
+ const f=await fixture(t);
+ for(const [id,department] of [['old-global-export',null],['old-foreign-export',f.a.id]]){
+  await f.store.run("INSERT INTO harbor.background_jobs(id,kind,status,available_at,created,updated,department_id,scope_kind,scope_identity,actor_kind,actor_id,actor_version) VALUES($1,'recording.export','pending',1000,1000,1000,$2,$3,$4,'super_admin',$5,$6)",id,department,department?'department':'global',department?'department:'+department:'global',f.superAdmin.credential_id,f.superAdmin.credential_version);
+  await assert.rejects(f.jobs.authorizePersistedActor({id},{requireLease:false}),{code:'department_forbidden'});
+ }
+ await assert.rejects(f.jobs.enqueue('recording.export',{scope:f.superAdmin}),{code:'department_forbidden'});
+ await assert.rejects(f.jobs.enqueue('recording.export',{scope:f.issuer.forDepartment(f.superAdmin,f.a.id)}),{code:'department_forbidden'});
  const system=f.issuer.system({purpose:'worker.startup'});await f.jobs.enqueue('worker.startup',{scope:system});const probe=await f.jobs.claim(['worker.startup']);assert.equal((await f.jobs.authorizePersistedActor(probe)).role,'system');
  await assert.rejects(f.jobs.enqueue('recording.export',{scope:f.issuer.system({purpose:'recording.export'})}),{code:'department_forbidden'});await assert.rejects(f.jobs.enqueue('worker.startup',{scope:f.superAdmin}),{code:'department_forbidden'});await assert.rejects(f.jobs.enqueue('worker.startup',{scope:f.issuer.system({purpose:'different-purpose'})}),{code:'department_forbidden'});
- const departmentRoot=f.issuer.forDepartment(f.superAdmin,f.a.id);await f.jobs.enqueue('recording.export',{id:'department-root-export',scope:departmentRoot});assert.equal((await f.jobs.authorizePersistedActor({id:'department-root-export'},{requireLease:false})).department_id,f.a.id);
- f.config.adminPasswordHash=passwordHash('synthetic-rotated');await assert.rejects(f.jobs.authorizePersistedActor(global),{code:'department_forbidden'});await assert.rejects(f.jobs.authorizePersistedActor({id:'department-root-export'},{requireLease:false}),{code:'department_forbidden'});
+ const departmentRoot=f.issuer.forDepartment(f.superAdmin,'department-default');await f.jobs.enqueue('recording.export',{id:'department-root-export',scope:departmentRoot});assert.equal((await f.jobs.authorizePersistedActor({id:'department-root-export'},{requireLease:false})).department_id,'department-default');
+ f.config.adminPasswordHash=passwordHash('synthetic-rotated');await assert.rejects(f.jobs.authorizePersistedActor({id:'department-root-export'},{requireLease:false}),{code:'department_forbidden'});
  f.advance(1001);await assert.rejects(f.jobs.authorizePersistedActor(probe),{code:'job_lease_lost'});
+});
+
+test('持久人工换绑恢复拒绝旧超管其他团队身份，不改变任务归属；默认团队及部门负责人保留',integration,async t=>{
+ const f=await fixture(t);
+ for(const [suffix,department,actor] of [['foreign',f.a.id,f.superAdmin],['own','department-default',f.superAdmin],['department',f.a.id,f.scopeA]]){
+  await f.store.run('INSERT INTO harbor.members(id,department_id,name,created) VALUES($1,$2,$1,1000)','member-'+suffix,department);
+  for(const side of ['source','target'])await f.store.run('INSERT INTO harbor.accounts(id,department_id,name,home) VALUES($1,$2,$1,$1)',side+'-'+suffix,department);
+  await f.store.run('INSERT INTO harbor.sessions(id,department_id,member_id,account_id,created,updated) VALUES($1,$2,$3,$4,1000,1000)','session-'+suffix,department,'member-'+suffix,'source-'+suffix);
+  await f.store.run("INSERT INTO harbor.session_handoffs(id,department_id,session_id,member_id,source_account_id,target_account_id,expected_route_version,source_epoch,target_epoch,source_nightly_enabled,origin,status,requested,expires,actor_kind,actor_id,actor_version) VALUES($1,$2,$3,$4,$5,$6,0,0,0,1,'manual','waiting',1000,2000,$7,$8,$9)",'handoff-'+suffix,department,'session-'+suffix,'member-'+suffix,'source-'+suffix,'target-'+suffix,actor.role,actor.credential_id,actor.credential_version);
+ }
+ await assert.rejects(f.departments.authorizeHandoffActor('handoff-foreign'),{code:'department_forbidden'});
+ assert.equal((await f.store.get("SELECT department_id FROM harbor.session_handoffs WHERE id='handoff-foreign'")).department_id,f.a.id);
+ assert.equal((await f.departments.authorizeHandoffActor('handoff-own')).department_id,'department-default');
+ assert.equal((await f.departments.authorizeHandoffActor('handoff-department')).credential_id,f.scopeA.credential_id);
 });
 
 test('legacy入队不变，热安装旧工厂拒绝；迁移来源不伪造当前管理凭据',integration,async t=>{
