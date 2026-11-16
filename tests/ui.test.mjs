@@ -111,7 +111,7 @@ test('会话筛选提交后从第一页读取，分页和返回页面保留条�
 test('会话筛选失败恢复已展示范围，离开后迟到结果不能改写条件和数据',async()=>{
  let fail=false,release;const base={...handoffSnapshot(),capabilities:{sessionFilters:true},sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};
  const page=await ui(()=>fail?response({error:{message:'合成筛选失败'}},503):new Promise(resolve=>release=()=>resolve(response(base))));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsFilters={q:"old",type:"",account:"",status:""};sessionsConfirmedFilters={...sessionsFilters};render();globalThis.FormData=class{get(key){return key==="q"?"new":"";}};');
- fail=true;await page.node('#session-filter-form').onsubmit({preventDefault(){},target:{}});assert.equal(page.run('sessionsFilters.q'),'old');assert.equal(page.run('sessionsLoading'),false);assert.match(page.node('#toast').textContent,/合成筛选失败/);
+ fail=true;await page.node('#session-filter-form').onsubmit({preventDefault(){},target:{}});assert.equal(page.run('sessionsFilters.q'),'old');assert.equal(page.run('sessionsLoading'),false);assert.match(page.node('#page-read-feedback').innerHTML,/合成筛选失败/);assert.equal(page.node('#toast').textContent,'');
  fail=false;const pending=page.node('#session-filter-form').onsubmit({preventDefault(){},target:{}});page.run('setTab("overview")');release();await pending;assert.equal(page.run('sessionsConfirmedFilters.q'),'old');assert.equal(page.run('state.sessions[0].id'),'session');
 });
 test('会话筛选成功后账号页刷新，再返回失败仍恢复会话原条件页码和行集合',async()=>{
@@ -351,7 +351,7 @@ test('手动刷新只显示侧栏反馈，切页和失败会解除，后台刷�
  let release;const page=await ui(()=>new Promise(resolve=>release=()=>resolve(response({...snapshot(),busy:9}))));page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";render();');
  const pending=page.run('refresh()');assert.equal(page.run('pageRefreshing()'),true);assert.equal(page.node('#refresh').disabled,true);assert.equal(page.node('#page-refresh-note').hidden,true);
  page.run('setTab("members")');assert.equal(page.run('pageRefreshing()'),false);assert.equal(page.node('#refresh').disabled,false);release();await pending;assert.equal(page.run('state.busy'),0);assert.equal(page.run('foregroundRefreshVersion'),0);
- const failed=await ui(()=>response({error:{message:'合成刷新失败'}},503));failed.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";render();');await failed.run('refresh()');assert.equal(failed.run('pageRefreshing()'),false);assert.equal(failed.node('#refresh').disabled,false);assert.match(failed.node('#toast').textContent,/合成刷新失败/);
+ const failed=await ui(()=>response({error:{message:'合成刷新失败'}},503));failed.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";render();');await failed.run('refresh()');assert.equal(failed.run('pageRefreshing()'),false);assert.equal(failed.node('#refresh').disabled,false);assert.match(failed.node('#page-read-feedback').innerHTML,/合成刷新失败/);assert.equal(failed.node('#toast').textContent,'');
  let finish;const background=await ui(()=>new Promise(resolve=>finish=()=>resolve(response(snapshot()))));background.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";render();');const updating=background.run('automaticRefresh()');assert.equal(background.run('pageRefreshing()'),false);assert.equal(background.node('#refresh').disabled,false);finish();await updating;
 });
 
@@ -580,7 +580,7 @@ test('session pagination preserves pages on refresh and rejects late results fro
 test('failed page changes retain the last confirmed page and unlock pagination',async()=>{
  const page=await ui(()=>response({error:{message:'synthetic network failure'}},503));
  page.run(`admin=true;state={...${JSON.stringify(snapshot())},sessions:[],sessionsPagination:{page:2,pageSize:25,total:130,totalPages:6}};sessionsPage=2;tab='sessions';render();`);
- await page.click('sessions-page','3');assert.equal(page.run('sessionsPage'),2);assert.equal(page.run('state.sessionsPagination.page'),2);assert.equal(page.run('sessionsLoading'),false);assert.match(page.node('#toast').textContent,/synthetic network failure/);
+ await page.click('sessions-page','3');assert.equal(page.run('sessionsPage'),2);assert.equal(page.run('state.sessionsPagination.page'),2);assert.equal(page.run('sessionsLoading'),false);assert.match(page.node('#page-read-feedback').innerHTML,/synthetic network failure/);assert.equal(page.node('#toast').textContent,'');
 });
 
 test('pending pagination disables old row management and in-flight refresh preserves an open session dialog',async()=>{
@@ -677,7 +677,7 @@ test('manual request refresh recovers after an outage without accepting late res
  let failing=true,release;
  const page=await ui(()=>release===null?new Promise(r=>release=()=>r(response(data))):failing?response({error:{message:'synthetic outage'}},502):response(data));
  page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';requestsData="+JSON.stringify(data));
- await page.run('loadRequests()');assert.equal(page.run('requestsData.rows.length'),0);assert.match(page.node('#toast').textContent,/synthetic outage/);assert.match(page.node('#connection').textContent,/可刷新重试/);
+ await page.run('loadRequests()');assert.equal(page.run('requestsData.rows.length'),0);assert.match(page.node('#page-read-feedback').innerHTML,/synthetic outage/);assert.equal(page.node('#toast').textContent,'');assert.match(page.node('#connection').textContent,/可刷新重试/);
  failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'服务在线');
  failing=true;await page.run('loadRequests()');failing=false;await page.run('loadRequests()');assert.equal(page.node('#connection').textContent,'服务在线');
  release=null;const pending=page.run('loadRequests()');page.run("tab='members';render()");page.node('#connection').textContent='new-page-status';release();await pending;
@@ -1306,7 +1306,7 @@ test('账号视图迟到响应不能覆盖切回后的总览，刷新失败保�
  const accountView={view:'accounts',accounts:[{id:'synthetic-account',name:'合成保留账号',kind:'codex',auth_mode:'subscription',enabled:1,state:'ready',standard:{total:12.34}}],capabilities:capability,balancing:{weights:{accounts:[]}}};
  let release,fail=false;const paths=[];const page=await ui(path=>{paths.push(path);if(!path.startsWith('/api/admin/state'))return response({});if(fail)return response({error:{message:'合成暂时不可用'}},503);return new Promise(resolve=>{const finish=()=>resolve(response(path.includes('view=accounts')?accountView:base));if(path.includes('view=accounts'))release=finish;else finish();});});
  page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";render();globalThis.previousContent=document.querySelector("#content").innerHTML;setTab("accounts")');page.run('setTab("overview")');release();await new Promise(setImmediate);assert.equal(page.run('state.view'),'overview');assert.doesNotMatch(page.node('#content').innerHTML,/合成保留账号/);
- page.run('state='+JSON.stringify(accountView)+';tab="accounts";render()');fail=true;await page.run('refresh()');assert.equal(page.run('state.accounts[0].standard.total'),12.34);assert.match(page.node('#content').innerHTML,/\$12\.34/);assert.match(page.node('#toast').textContent,/合成暂时不可用/);
+ page.run('state='+JSON.stringify(accountView)+';tab="accounts";render()');fail=true;await page.run('refresh()');assert.equal(page.run('state.accounts[0].standard.total'),12.34);assert.match(page.node('#content').innerHTML,/\$12\.34/);assert.match(page.node('#page-read-feedback').innerHTML,/合成暂时不可用/);assert.equal(page.node('#toast').textContent,'');
 });
 
 test('旧后端无账号视图能力时仍请求原完整状态',async()=>{
@@ -2023,4 +2023,20 @@ test('平台离线指南分两部分覆盖按角色上手与模型demo，不带�
  for(const link of html.matchAll(/href="([^"]+)"/g))assert.ok(link[1].startsWith('#')||link[1].startsWith('https://developers.openai.com/')||link[1]==='https://nodejs.org/en/download'||link[1]==='https://openai.com/codex/',link[1]);
  await page.click('download-platform-guide');assert.equal(page.downloads.at(-1),'Harbor-平台说明.html');assert.equal(page.node('#modal').open,false);
  assert.throws(()=>page.run('platformGuideDocument("https://user:private@gateway.example.test/v1")'));assert.throws(()=>page.run('platformGuideDocument("https://gateway.example.test/v1?key=private")'));
+});
+
+test('已有页面错误banner的查询不再重复全局toast，操作通知仍保留',async()=>{
+ const cases=[['state','tab="accounts";','refresh()'],['members','tab="members";','loadMembers()'],['key-usage','tab="requests";recordView="usage";','loadKeyUsage()'],['requests','tab="requests";recordView="requests";','loadRequests()'],['history','tab="history";','loadHistory()'],['type-statistics','tab="requests";recordView="types";','loadTypeStatistics()'],['recording-status','tab="requests";recordView="recordings";','loadRecordingAdminStatus()']];
+ for(const [source,setup,read] of cases){
+  const page=await ui(()=>response({error:{message:'page-read-'+source}},504)),base={...pagedSnapshot(),endpoint:'http://synthetic.invalid',capabilities:{...pagedSnapshot().capabilities,typeStatistics:true,recordingHistory:true}};
+  page.run('admin=true;state='+JSON.stringify(base)+';'+setup);assert.equal(await page.run(read),false,source);assert.match(page.node('#page-read-feedback').innerHTML,new RegExp('page-read-'+source));assert.match(page.node('#page-read-feedback').innerHTML,/data-action="retry-workspace"/);assert.equal(page.node('#toast').textContent,'',source);
+  page.run('toast("操作已保存")');assert.equal(page.node('#toast').textContent,'操作已保存');page.run('setTab("overview")');assert.equal(page.node('#toast').textContent,'操作已保存',source);
+ }
+});
+
+test('离页后的迟到查询失败不会弹全局toast或覆盖当前页错误反馈',async()=>{
+ for(const [source,setup,read] of [['state','tab="accounts";','refresh()'],['members','tab="members";','loadMembers()'],['key-usage','tab="requests";recordView="usage";','loadKeyUsage()'],['requests','tab="requests";recordView="requests";','loadRequests()'],['history','tab="history";','loadHistory()'],['type-statistics','tab="requests";recordView="types";','loadTypeStatistics()'],['recording-status','tab="requests";recordView="recordings";','loadRecordingAdminStatus()']]){
+  let release,first=true;const base={...pagedSnapshot(),endpoint:'http://synthetic.invalid',capabilities:{...pagedSnapshot().capabilities,typeStatistics:true,recordingHistory:true}},page=await ui(()=>{if(first){first=false;return new Promise(resolve=>release=()=>resolve(response({error:{message:'late-page-read-'+source}},504)));}return response(base);});
+  page.run('admin=true;state='+JSON.stringify(base)+';'+setup+';toast("操作已保存")');const pending=page.run(read);assert.ok(release,source);page.run('setTab("overview")');release();await pending;await new Promise(setImmediate);assert.equal(page.run('tab'),'overview');assert.equal(page.run('pageReadError'),'',source);assert.doesNotMatch(page.node('#page-read-feedback').innerHTML,/late-page-read/);assert.equal(page.node('#toast').textContent,'操作已保存',source);
+ }
 });
