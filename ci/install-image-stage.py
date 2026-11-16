@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Root-only host update; keeps the existing release/activation history intact."""
+import sys
+sys.dont_write_bytecode = True
 import argparse
 import copy
 import fcntl
 import hashlib
-import importlib.util
+from types import ModuleType
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import stat
 import tempfile
 
 WRAPPER = Path('/usr/local/bin/harbor-gateway-deploy')
+COMPOSE = Path('/usr/local/lib/harbor/postgres-deploy.py')
 HELPER = Path('/usr/local/lib/harbor/release-image.py')
 MANIFEST = Path('/etc/harbor-postgres-runtime-tools.json')
 TICKET = Path('/etc/harbor-postgres-runtime-upgrade.json')
@@ -76,24 +79,38 @@ def write(path, raw, mode):
         Path(name).unlink(missing_ok=True)
 
 
-def module(path, name):
-    read(path)
-    spec = importlib.util.spec_from_file_location(name, path)
-    value = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(value)
+def module_bytes(raw, path, name):
+    value = ModuleType(name)
+    value.__file__ = str(path)
+    exec(compile(raw, str(path), 'exec'), value.__dict__)
     return value
 
 
-def transition(old_manifest, old_ticket, files, wrapper_bytes, revision):
+def module(path, name):
+    # dont_write_bytecode does not prevent consuming stale timestamp .pyc files.
+    return module_bytes(read(path), path, name)
+
+
+def runtime_modules(prefix):
+    module(WRAPPER, prefix + '_wrapper')
+    module(COMPOSE, prefix + '_compose')
+    return module(UPGRADE, prefix + '_upgrade')
+
+
+def transition(old_manifest, old_ticket, files, wrapper_bytes, revision, replacements=None):
     """Keep both historical approval contents and the current deployment target."""
     need(re.fullmatch('[a-f0-9]{40}', revision) is not None, 'revision')
     need(old_manifest.get('contract') == 'harbor-postgres-runtime-tools-v1' and old_manifest.get('revision') == old_ticket.get('hostToolsRevision'), 'old_binding')
     need(set(old_manifest.get('files', {})) == set(files) and all(sha(raw) == old_manifest['files'][path] for path, raw in files.items()), 'old_bytes')
     need(str(WRAPPER) in files, 'wrapper_binding')
-    compile(wrapper_bytes, str(WRAPPER), 'exec')
+    replacements = {str(WRAPPER): wrapper_bytes} if replacements is None else replacements
+    need(set(replacements) <= set(files), 'replacement_scope')
+    for path, raw in replacements.items():
+        compile(raw, path, 'exec')
     manifest, ticket = copy.deepcopy(old_manifest), copy.deepcopy(old_ticket)
     manifest['revision'] = revision
-    manifest['files'][str(WRAPPER)] = sha(wrapper_bytes)
+    for path, raw in replacements.items():
+        manifest['files'][path] = sha(raw)
     ticket['hostToolsRevision'] = revision
     return manifest, ticket
 
@@ -113,25 +130,42 @@ def current_binding(upgrade, entry, ticket):
     return upgrade.active_identity(active), before
 
 
-def install(source, revision, expected_manifest, expected_ticket, expected_wrapper, expected_helper):
+def install(source, revision, expected_manifest, expected_ticket, expected_wrapper, expected_helper, *, runtime=False, expected_compose=None, expected_upgrade=None):
     need(os.geteuid() == 0, 'root_required')
-    for digest in [expected_manifest, expected_ticket, expected_wrapper, expected_helper]:
+    need(type(runtime) is bool, 'mode')
+    need(isinstance(revision, str) and re.fullmatch('[a-f0-9]{40}', revision) is not None, 'revision')
+    for digest in [expected_manifest, expected_ticket, expected_wrapper, expected_helper] + ([expected_compose, expected_upgrade] if runtime else []):
         need(re.fullmatch('[a-f0-9]{64}', digest) is not None, 'expected_digest')
-    wrapper, helper = read(source / 'deploy-wrapper.py'), read(source / 'release-image.py')
+    wrapper = read(source / 'deploy-wrapper.py')
+    helper = read(HELPER) if runtime else read(source / 'release-image.py')
+    replacements = {str(WRAPPER): wrapper}
+    if runtime:
+        compose, next_upgrade = read(source / 'postgres-deploy.py'), read(source / 'postgres-upgrade-deploy.py')
+        need(sha(compose) == expected_compose and sha(next_upgrade) == expected_upgrade, 'runtime_source_digest')
+        replacements.update({str(COMPOSE): compose, str(UPGRADE): next_upgrade})
     need(sha(wrapper) == expected_wrapper and sha(helper) == expected_helper, 'source_digest')
     compile(helper, str(HELPER), 'exec')
     upgrade, entry = module(UPGRADE, 'image_stage_install_upgrade'), module(ENTRY, 'image_stage_install_entry')
+    if runtime:
+        # Bind indirect ACTIVE/authorization checks to the same verified source
+        # module; ENTRY's ordinary importer may still find an old timestamp pyc.
+        entry.runtime_upgrade_module = lambda: upgrade
     fds = []
     try:
         for path in LOCKS:
+            if runtime:
+                read(Path(path))
             fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
             fds.append(fd)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        destination = HISTORY / ('image-stage-' + revision)
+        destination = HISTORY / (('runtime-tools-' if runtime else 'image-stage-') + revision)
+        scope = {str(WRAPPER), str(HELPER), str(MANIFEST), str(TICKET)} | ({str(COMPOSE), str(UPGRADE)} if runtime else set())
         prior = json.loads(read(destination / 'journal.json', 0o600)) if (destination / 'journal.json').exists() else None
         if prior is not None:
-            need(prior.get('version') == 1 and prior.get('revision') == revision and set(prior.get('files', {})) == {str(WRAPPER), str(HELPER), str(MANIFEST), str(TICKET)}, 'existing_record')
+            need(prior.get('version') == 1 and prior.get('revision') == revision and set(prior.get('files', {})) == scope, 'existing_record')
             need(prior['files'][str(MANIFEST)]['before'] == expected_manifest and prior['files'][str(TICKET)]['before'] == expected_ticket and prior['files'][str(WRAPPER)]['after'] == expected_wrapper and prior['files'][str(HELPER)]['after'] == expected_helper, 'existing_source')
+            if runtime:
+                need(prior['files'][str(COMPOSE)]['after'] == expected_compose and prior['files'][str(UPGRADE)]['after'] == expected_upgrade and prior['files'][str(HELPER)]['before'] == expected_helper, 'existing_runtime_source')
             if prior.get('state') == 'complete':
                 for name, row in prior['files'].items():
                     need(sha(read(Path(name))) == row['after'], 'completed_bytes')
@@ -145,17 +179,23 @@ def install(source, revision, expected_manifest, expected_ticket, expected_wrapp
         old_manifest, old_ticket = json.loads(before_manifest), json.loads(before_ticket)
         active, authorization = current_binding(upgrade, entry, old_ticket)
         files = {path: read(Path(path)) for path in upgrade.HOST_FILES}
-        next_manifest, next_ticket = transition(old_manifest, old_ticket, files, wrapper, revision)
+        if runtime:
+            need(len(files) == 7 and set(replacements) == {str(WRAPPER), str(COMPOSE), str(UPGRADE)} and set(replacements) <= set(files), 'runtime_fixed_tools')
+        next_manifest, next_ticket = transition(old_manifest, old_ticket, files, wrapper, revision, replacements)
         need(str(WRAPPER) in files and set(next_manifest['files']) == set(upgrade.HOST_FILES), 'fixed_tools')
         parents(HISTORY)
         HISTORY.mkdir(mode=0o700, exist_ok=True)
         parents(destination)
         destination.mkdir(mode=0o700, exist_ok=True)
+        parents(destination / 'journal.json')
         info = destination.lstat();need(stat.S_ISDIR(info.st_mode) and not info.st_mode & 0o077, 'history_directory')
         before = {WRAPPER: files[str(WRAPPER)], MANIFEST: before_manifest, TICKET: before_ticket, HELPER: optional(HELPER)}
         after = {HELPER: helper, WRAPPER: wrapper, MANIFEST: body(next_manifest), TICKET: body(next_ticket)}
+        if runtime:
+            before.update({COMPOSE: files[str(COMPOSE)], UPGRADE: files[str(UPGRADE)]})
+            after = {COMPOSE: compose, UPGRADE: next_upgrade, **after}
         modes_before = {path: stat.S_IMODE(path.lstat().st_mode) if raw is not None else None for path, raw in before.items()}
-        modes_after = {path: 0o755 if path == WRAPPER else 0o644 if path == HELPER else 0o600 for path in after}
+        modes_after = {path: 0o755 if path == WRAPPER else modes_before[path] if runtime and path == HELPER else 0o644 if path in [HELPER, COMPOSE, UPGRADE] else 0o600 for path in after}
         journal = {'version': 1, 'revision': revision, 'state': 'prepared', 'active': active, 'attempts': (prior.get('attempts', 1) + 1) if prior else 1, 'files': {str(path): {'before': None if raw is None else sha(raw), 'after': sha(after[path]), 'modeBefore': modes_before[path], 'modeAfter': modes_after[path]} for path, raw in before.items()}}
         allowed = {'journal.json', *(str(index) + '.before' for index, raw in enumerate(before.values()) if raw is not None)}
         need(set(p.name for p in destination.iterdir()) <= allowed, 'history_contents')
@@ -173,7 +213,10 @@ def install(source, revision, expected_manifest, expected_ticket, expected_wrapp
         try:
             for path, raw in after.items():
                 need(optional(path) == before[path], 'changed_before_install')
-                write(path, raw, modes_after[path])
+                if raw != before[path]:
+                    write(path, raw, modes_after[path])
+            if runtime:
+                upgrade = runtime_modules('runtime_tools_install_verified')
             upgrade.verify_installed_tools(next_ticket)
             now, status = current_binding(upgrade, entry, next_ticket)
             need(now == active and status == authorization, 'active_changed')
@@ -189,6 +232,8 @@ def install(source, revision, expected_manifest, expected_ticket, expected_wrapp
                     path.unlink()
                 else:
                     write(path, before[path], modes_before[path])
+            if runtime:
+                upgrade = runtime_modules('runtime_tools_install_restored')
             upgrade.verify_installed_tools(old_ticket)
             journal['state'] = 'rolled-back'
             write(destination / 'journal.json', body(journal), 0o600)
@@ -199,34 +244,55 @@ def install(source, revision, expected_manifest, expected_ticket, expected_wrapp
             os.close(fd)
 
 
-def rollback(revision):
+def rollback(revision, *, runtime=False):
     need(os.geteuid() == 0 and re.fullmatch('[a-f0-9]{40}', revision) is not None, 'root_required')
-    directory = HISTORY / ('image-stage-' + revision)
+    need(type(runtime) is bool, 'mode')
+    directory = HISTORY / (('runtime-tools-' if runtime else 'image-stage-') + revision)
     journal = json.loads(read(directory / 'journal.json', 0o600))
     need(journal.get('version') == 1 and journal.get('revision') == revision and journal.get('state') in ['prepared', 'complete', 'rolled-back'], 'rollback_record')
-    need(set(journal.get('files', {})) == {str(WRAPPER), str(HELPER), str(MANIFEST), str(TICKET)}, 'rollback_files')
-    upgrade, entry = module(UPGRADE, 'image_stage_rollback_upgrade'), module(ENTRY, 'image_stage_rollback_entry')
+    need(set(journal.get('files', {})) == ({str(WRAPPER), str(HELPER), str(MANIFEST), str(TICKET)} | ({str(COMPOSE), str(UPGRADE)} if runtime else set())), 'rollback_files')
+    # Runtime recovery must not execute the possibly broken new UPGRADE.
+    entry = module(ENTRY, 'image_stage_rollback_entry')
+    upgrade = None if runtime else module(UPGRADE, 'image_stage_rollback_upgrade')
     fds = []
     try:
         for name in LOCKS:
+            if runtime:
+                read(Path(name))
             fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW);fds.append(fd);fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        need(entry.entry_state().get('phase') == 'active', 'entry_not_active')
-        active, _, _ = entry.active_record()
-        need(upgrade.active_identity(active) == journal['active'], 'rollback_active_changed')
         originals = {}
         for name, row in journal['files'].items():
             path = Path(name)
             present = optional(path)
             need((None if present is None else sha(present)) in [row['before'], row['after']], 'rollback_changed')
-            need(type(row.get('modeAfter')) is int and row['modeAfter'] in [0o600, 0o644, 0o755] and (row['modeBefore'] is None if row['before'] is None else type(row['modeBefore']) is int and 0 <= row['modeBefore'] <= 0o777 and not row['modeBefore'] & 0o022), 'rollback_modes')
+            allowed_after = row.get('modeAfter') == row.get('modeBefore') if runtime and path == HELPER else row.get('modeAfter') in [0o600, 0o644, 0o755]
+            need(type(row.get('modeAfter')) is int and allowed_after and (row['modeBefore'] is None if row['before'] is None else type(row['modeBefore']) is int and 0 <= row['modeBefore'] <= 0o777 and not row['modeBefore'] & 0o022), 'rollback_modes')
+            need(re.fullmatch('[0-9]+\.before', row.get('backup', '')) is not None, 'rollback_backup_path')
             backup = None if row['before'] is None else read(directory / row['backup'], 0o600)
             need(backup is None or sha(backup) == row['before'], 'rollback_backup')
             originals[path] = backup
+        if runtime:
+            upgrade = module_bytes(originals[UPGRADE], UPGRADE, 'runtime_tools_rollback_previous_upgrade')
+            original_manifest, original_ticket = json.loads(originals[MANIFEST]), json.loads(originals[TICKET])
+            need(set(original_manifest.get('files', {})) == set(upgrade.HOST_FILES) and original_manifest.get('revision') == original_ticket.get('hostToolsRevision'), 'rollback_original_binding')
+            for name, expected in original_manifest['files'].items():
+                raw = originals[Path(name)] if Path(name) in originals else read(Path(name))
+                need(sha(raw) == expected, 'rollback_original_tools')
+            # Only this in-memory controller uses the already authenticated backup;
+            # no installed helper or active history is patched.
+            entry.runtime_upgrade_module = lambda: upgrade
+        need(entry.entry_state().get('phase') == 'active', 'entry_not_active')
+        active, _, _ = entry.active_record()
+        need(upgrade.active_identity(active) == journal['active'], 'rollback_active_changed')
         for path, raw in originals.items():
+            if optional(path) == raw:
+                continue
             if raw is None:
                 path.unlink(missing_ok=True)
             else:
                 write(path, raw, journal['files'][str(path)]['modeBefore'])
+        if runtime:
+            upgrade = runtime_modules('runtime_tools_rollback_restored')
         old_ticket = json.loads(originals[TICKET]);upgrade.verify_installed_tools(old_ticket)
         current_binding(upgrade, entry, old_ticket)
         journal['state'] = 'rolled-back';write(directory / 'journal.json', body(journal), 0o600)
@@ -238,18 +304,18 @@ def rollback(revision):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['install', 'rollback'])
+    parser.add_argument('action', choices=['install', 'rollback', 'install-runtime', 'rollback-runtime'])
     parser.add_argument('--revision', required=True)
     parser.add_argument('--source', type=Path)
-    for name in ['manifest', 'ticket', 'wrapper', 'helper']:
+    for name in ['manifest', 'ticket', 'wrapper', 'helper', 'compose', 'upgrade']:
         parser.add_argument('--expected-' + name + '-sha256')
     arguments = parser.parse_args()
     try:
-        if arguments.action == 'rollback':
-            result = rollback(arguments.revision)
+        if arguments.action in ['rollback', 'rollback-runtime']:
+            result = rollback(arguments.revision, runtime=arguments.action == 'rollback-runtime')
         else:
             need(arguments.source is not None, 'source')
-            result = install(arguments.source, arguments.revision, arguments.expected_manifest_sha256, arguments.expected_ticket_sha256, arguments.expected_wrapper_sha256, arguments.expected_helper_sha256)
+            result = install(arguments.source, arguments.revision, arguments.expected_manifest_sha256, arguments.expected_ticket_sha256, arguments.expected_wrapper_sha256, arguments.expected_helper_sha256, runtime=arguments.action == 'install-runtime', expected_compose=arguments.expected_compose_sha256, expected_upgrade=arguments.expected_upgrade_sha256)
         print(json.dumps(result))
     except BaseException:
         raise SystemExit('image_stage_install_failed_retained')
