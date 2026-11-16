@@ -54,7 +54,7 @@ export function createPostgresDepartmentHttp({auth,departments,issuer,installed,
   const scope=await context(req);
   if(!installed)throw new AppError(503,'部门隔离尚未启用','department_unavailable');
   requireDepartmentScope(scope,{allowGlobal:true,roles:['super_admin']});
-  const match=path.match(/^\/api\/admin\/departments(?:\/([a-zA-Z0-9][a-zA-Z0-9-]{0,99})(?:\/management-keys(?:\/([a-zA-Z0-9][a-zA-Z0-9-]{0,99})\/revoke)?)?)?$/);
+  const match=path.match(/^\/api\/admin\/departments(?:\/([a-zA-Z0-9][a-zA-Z0-9-]{0,99})(?:\/management-keys(?:\/([a-zA-Z0-9][a-zA-Z0-9-]{0,99})\/(revoke|reveal))?)?)?$/);
   if(!match)throw new AppError(404,'部门管理入口不存在','not_found');
   const departmentId=match[1],keyId=match[2],keys=path.includes('/management-keys');
   let value,status=200;
@@ -69,7 +69,7 @@ export function createPostgresDepartmentHttp({auth,departments,issuer,installed,
    if(req.method==='POST'&&!departmentId){value=await departments.createDepartment(current,payload);status=201;}
    else if(req.method==='PATCH'&&departmentId&&!keys)value=await departments.updateDepartment(current,departmentId,payload);
    else if(req.method==='POST'&&keys&&!keyId){value=await departments.issueManagementKey(current,departmentId,payload);status=201;}
-   else if(req.method==='POST'&&keyId)value=await departments.revokeManagementKey(current,departmentId,keyId,payload);
+   else if(req.method==='POST'&&keyId)value=match[3]==='reveal'?await departments.revealManagementKey(current,departmentId,keyId,payload):await departments.revokeManagementKey(current,departmentId,keyId,payload);
    else throw new AppError(405,'此入口不支持该操作','method_not_allowed');
   }else throw new AppError(405,'此入口不支持该操作','method_not_allowed');
   if(signal?.aborted)throw signal.reason;

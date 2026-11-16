@@ -1,4 +1,5 @@
 import {createPostgresAudit} from './postgres-audit.mjs';
+import {createDepartmentKeySecrets} from './postgres-department-key-secrets.mjs';
 import {migrateRecordingRetention} from './recording-retention.mjs';
 import {migrateQuotaSubjects,verifyQuotaSubjectAvailability} from './postgres-quota-subjects.mjs';
 import {createHash} from 'node:crypto';
@@ -204,7 +205,8 @@ function identifier(value){if(typeof value!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9-
 function version(value){if(!Number.isSafeInteger(value)||value<0)bad();return value;}
 const publicKeyColumns='id,department_id,prefix,label,enabled,version,created,revoked_at';
 
-export function createPostgresDepartments(store,{issuer,clock=Date.now,authorizeSuperAdmin}={}){
+export function createPostgresDepartments(store,{issuer,clock=Date.now,authorizeSuperAdmin,encryptionKey,keySecretsInstalled}={}){
+ const keySecrets=createDepartmentKeySecrets(store,{encryptionKey,installed:keySecretsInstalled});
  if(!issuer||typeof issuer.departmentAdmin!=='function'||typeof issuer.system!=='function'||typeof clock!=='function'||authorizeSuperAdmin!==undefined&&typeof authorizeSuperAdmin!=='function')throw new AppError(503,'部门身份签发器未配置','department_identity_configuration');
  let initialized;
  async function ready({legacy=false}={}){
@@ -274,6 +276,7 @@ export function createPostgresDepartments(store,{issuer,clock=Date.now,authorize
   return store.transaction(async()=>{
    if(!await store.get('SELECT id FROM harbor.departments WHERE id=$1 FOR SHARE',departmentId))throw new AppError(404,'部门不可用','department_not_found');
    const material=issueDepartmentManagementKey(),key=await store.get(`INSERT INTO harbor.department_admin_keys(id,department_id,digest,prefix,label,created) VALUES($1,$2,$3,$4,$5,$6) RETURNING ${publicKeyColumns}`,id(),departmentId,material.digest,material.prefix,label,clock());
+   await keySecrets.save(departmentId,key.id,material.secret);
    await audit(trusted,'department.management_key.issue',departmentId,{key_id:key.id});return {key,secret:material.secret};
   });
  }
@@ -283,14 +286,24 @@ export function createPostgresDepartments(store,{issuer,clock=Date.now,authorize
   args.push(limit+1);const rows=await store.all(`SELECT ${publicKeyColumns} FROM harbor.department_admin_keys WHERE department_id=$1${seek} ORDER BY created DESC,id DESC LIMIT $${args.length}`,...args),selected=rows.slice(0,limit),last=selected.at(-1);
   return {rows:selected,next:rows.length>limit?{created:last.created,id:last.id}:null};
  }
+ async function revealManagementKey(scope,departmentId,keyId,payload={}){
+  const trusted=target(scope,departmentId,{superOnly:true});identifier(keyId);object(payload,[]);await ready();
+  return store.transaction(async()=>{
+   if(!await store.get('SELECT id FROM harbor.departments WHERE id=$1 FOR SHARE',departmentId))throw new AppError(404,'部门不可用','department_not_found');
+   const key=await store.get('SELECT id,digest FROM harbor.department_admin_keys WHERE department_id=$1 AND id=$2 AND enabled AND revoked_at IS NULL FOR SHARE',departmentId,keyId);
+   if(!key)throw new AppError(404,'管理密钥不可用','department_management_key_not_found');
+   const result=await keySecrets.reveal(departmentId,key);
+   if(result.available)await audit(trusted,'department.management_key.reveal',departmentId,{key_id:keyId});return result;
+  });
+ }
  async function revokeManagementKey(scope,departmentId,keyId,payload){
   const trusted=target(scope,departmentId,{superOnly:true});identifier(keyId);object(payload,['expected_version']);version(payload.expected_version);await ready();
   return store.transaction(async()=>{
    if(!await store.get('SELECT id FROM harbor.departments WHERE id=$1 FOR SHARE',departmentId))throw new AppError(404,'部门不可用','department_not_found');
    const row=await store.get(`SELECT ${publicKeyColumns} FROM harbor.department_admin_keys WHERE department_id=$1 AND id=$2 FOR UPDATE`,departmentId,keyId);if(!row)throw new AppError(404,'管理密钥不可用','department_management_key_not_found');
-   if(row.version!==payload.expected_version)throw new AppError(409,'管理密钥已变化，请刷新后重试','department_key_version_conflict');if(!row.enabled)return row;
+   if(row.version!==payload.expected_version)throw new AppError(409,'管理密钥已变化，请刷新后重试','department_key_version_conflict');if(!row.enabled){await keySecrets.remove(departmentId,keyId);return row;}
    const next=await store.get(`UPDATE harbor.department_admin_keys SET enabled=FALSE,revoked_at=$1,version=version+1 WHERE department_id=$2 AND id=$3 RETURNING ${publicKeyColumns}`,clock(),departmentId,keyId);
-   await audit(trusted,'department.management_key.revoke',departmentId,{key_id:keyId});return next;
+   await keySecrets.remove(departmentId,keyId);await audit(trusted,'department.management_key.revoke',departmentId,{key_id:keyId});return next;
   });
  }
  async function authenticateManagementKey(secret){
@@ -379,5 +392,5 @@ export function createPostgresDepartments(store,{issuer,clock=Date.now,authorize
   // Group identity is immutable; decision rows are locked later, after members.
   return actor;
  }
- const service={listDepartments,getDepartment,createDepartment,updateDepartment,issueManagementKey,listManagementKeys,revokeManagementKey,authenticateManagementKey,validateManagementSession,readSetting,authorizeJobEnqueue,authorizePersistedActor,authorizeHandoffActor,authorizeNightlyPlanActor,authorizeAutomaticGroupActor};actorServices.set(service,store);return service;
+ const service={listDepartments,getDepartment,createDepartment,updateDepartment,issueManagementKey,listManagementKeys,revealManagementKey,revokeManagementKey,authenticateManagementKey,validateManagementSession,readSetting,authorizeJobEnqueue,authorizePersistedActor,authorizeHandoffActor,authorizeNightlyPlanActor,authorizeAutomaticGroupActor};actorServices.set(service,store);return service;
 }

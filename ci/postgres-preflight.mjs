@@ -1,3 +1,5 @@
+import {verifyDepartmentKeySecretsAvailability} from '../postgres-department-key-secrets.mjs';
+import {departmentManagementKeyDigest} from '../department-access.mjs';
 import {recordingInputDiagnosticsConfiguration} from '../recording-input-diagnostics.mjs';
 import {verifyDepartmentIsolationAvailability,departmentIsolationContract} from '../postgres-departments.mjs';
 import {hasWorkerProgress} from '../postgres-worker-startup.mjs';
@@ -17,7 +19,18 @@ export async function verifyStoredCredentials(store,encryptionKey){
  if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32)throw Error('Stored credential material mismatch');
  // A 1MiB upstream login response expands below 2MiB after authenticated
  // encryption/base64. Bound each read and keep plaintext out of all results.
- await store.transaction(async()=>{for(const [table,cipher,hash,prefix] of [['keys','secret_cipher','digest',''],['accounts','api_secret_cipher','api_secret_digest','upstream:']]){let after='';for(;;){const rows=await store.all(`SELECT id row_id,$3||id id,${hash} digest,CASE WHEN octet_length(${cipher})<=$2 THEN ${cipher} END secret_cipher FROM harbor.${table} WHERE ${cipher} IS NOT NULL AND id>$1 ORDER BY id LIMIT 16`,after,2*1024*1024,prefix);for(const row of rows)if(!revealStoredKey(encryptionKey,row))throw Error('Stored credential material mismatch');if(rows.length<16)break;after=rows.at(-1).row_id;}}},{level:'REPEATABLE READ',readOnly:true});
+ await store.transaction(async()=>{for(const [table,cipher,hash,prefix] of [['keys','secret_cipher','digest',''],['accounts','api_secret_cipher','api_secret_digest','upstream:']]){let after='';for(;;){const rows=await store.all(`SELECT id row_id,$3||id id,${hash} digest,CASE WHEN octet_length(${cipher})<=$2 THEN ${cipher} END secret_cipher FROM harbor.${table} WHERE ${cipher} IS NOT NULL AND id>$1 ORDER BY id LIMIT 16`,after,2*1024*1024,prefix);for(const row of rows)if(!revealStoredKey(encryptionKey,row))throw Error('Stored credential material mismatch');if(rows.length<16)break;after=rows.at(-1).row_id;}}
+  if(await verifyDepartmentKeySecretsAvailability(store)){
+   let after='';for(;;){
+    const rows=await store.all(`SELECT s.key_id row_id,'harbor-department-management:'||s.department_id||':'||s.key_id id,
+      s.secret_cipher,s.secret_digest digest,k.digest management_digest
+      FROM harbor.department_admin_key_secrets s JOIN harbor.department_admin_keys k
+      ON k.department_id=s.department_id AND k.id=s.key_id WHERE s.key_id>$1 ORDER BY s.key_id LIMIT 16`,after);
+    for(const row of rows){const secret=revealStoredKey(encryptionKey,row);if(!secret||departmentManagementKeyDigest(secret)!==row.management_digest)throw Error('Stored credential material mismatch');}
+    if(rows.length<16)break;after=rows.at(-1).row_id;
+   }
+  }
+ },{level:'REPEATABLE READ',readOnly:true});
 }
 async function privateFile(path,size){const file=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);try{const info=await file.stat();if(!info.isFile()||info.uid!==process.getuid()||(info.mode&0o077)!==0||info.size>65536||size!==undefined&&info.size!==size)throw Error('Private material not prepared');return await file.readFile();}finally{await file.close();}}
 export async function postgresMaterialsPreflight({env=process.env,database,workerHealth=false,progressSince}={}){let store,monitor;try{recordingInputDiagnosticsConfiguration({env});const device=await deviceMaterials(env),data=env.HARBOR_DATA_DIR;if(!data||!database&&!env.HARBOR_DATABASE_URL||env.HARBOR_RECORDING_ENABLED==='0'||env.HARBOR_RECORDING_WORKER_ENABLED==='0')throw Error('PG runtime configuration not prepared');const info=await lstat(data);if(!info.isDirectory()||info.isSymbolicLink()||info.uid!==process.getuid()||(info.mode&0o077)!==0)throw Error('PG data directory not prepared');try{await lstat(join(data,'gateway.sqlite'));throw Error('SQLite source is not a PG runtime');}catch(error){if(error.code!=='ENOENT')throw error;}

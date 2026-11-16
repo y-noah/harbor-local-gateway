@@ -2,6 +2,7 @@ import {createPostgresJobs} from './postgres-jobs.mjs';
 import {recordingContextConfiguration} from './recording-context-configuration.mjs';
 import {createDepartmentScopeIssuer,requireDepartmentScope} from './department-access.mjs';
 import {createPostgresDepartments,verifyDepartmentIsolationAvailability} from './postgres-departments.mjs';
+import {verifyDepartmentKeySecretsAvailability} from './postgres-department-key-secrets.mjs';
 import {createPostgresDepartmentHttp} from './postgres-department-http.mjs';
 import {beginAdminRequestTiming,finishAdminRequestTiming} from './admin-request-timing.mjs';
 import {postgresShutdownConfiguration,installPostgresGatewayShutdown} from './postgres-shutdown.mjs';
@@ -154,6 +155,7 @@ export async function createPostgresGateway(options={}){
     const consumptionSchemaAvailable=await verifyConsumptionPolicyAvailability(store),consumptionReadSchemaAvailable=await verifyConsumptionPolicyAvailability(queryStore);
     if(consumptionSchemaAvailable!==consumptionReadSchemaAvailable)throw new AppError(503,'读写连接的消耗来源结构不一致','database_migration_conflict');
     const departmentInstalled=await verifyDepartmentIsolationAvailability(store);
+    const departmentKeySecretsInstalled=await verifyDepartmentKeySecretsAvailability(store);
     if(departmentInstalled!==await verifyDepartmentIsolationAvailability(queryStore))throw new AppError(503,'读写连接的部门结构不一致','database_migration_conflict');
     const contextSchemaVersion=(await store.get('SELECT MAX(version) version FROM harbor.schema_migrations')).version,{available:contextAvailable}=recordingContextConfiguration({env,enabled:options.recording?.contextEnabled,schemaVersion:contextSchemaVersion});
     await store.initializePricing();
@@ -169,7 +171,7 @@ export async function createPostgresGateway(options={}){
     // startup policy must still veto capture after an operator has closed it.
     const {enabled:contextEnabled}=recordingContextConfiguration({env,enabled:options.recording?.contextEnabled,allowed:config.recordingContextAllowed,schemaVersion:contextSchemaVersion});
     deviceSettings=options.devices??await deviceConfiguration(env);if(options.devices===undefined)ownedDeviceIssuer=deviceSettings?.issuer;
-    const encrypted=(await store.get("SELECT EXISTS(SELECT 1 FROM harbor.keys WHERE secret_cipher IS NOT NULL) OR EXISTS(SELECT 1 FROM harbor.accounts WHERE api_secret_cipher IS NOT NULL) required")).required;
+    const encrypted=(await store.get("SELECT EXISTS(SELECT 1 FROM harbor.keys WHERE secret_cipher IS NOT NULL) OR EXISTS(SELECT 1 FROM harbor.accounts WHERE api_secret_cipher IS NOT NULL)"+(departmentKeySecretsInstalled?' OR EXISTS(SELECT 1 FROM harbor.department_admin_key_secrets)':'')+" required")).required;
     const key=await material(join(data,'key-encryption.key'),encrypted||!await missing(join(data,'metering-spool')));
     const recordKey=await loadPostgresRecordingKey(store,{dataDir:data,createIfEmpty:true,spoolLimits:options.recordingBuffer});
     // Even with new capture disabled, a schema-23 bridge must replay existing
@@ -200,7 +202,7 @@ export async function createPostgresGateway(options={}){
     if(lostOwnership)throw new AppError(503,'数据库单实例锁已丢失','gateway_ownership_lost');
     const extraUsage=createPostgresAccountExtraUsage(store,{...options.extraUsage,clock}),extraRuntime=createPostgresExtraRuntime(store,{clock,service:extraUsage});await extraUsage.recover({limit:100});requireOwnership();
     const scopeIssuer=createDepartmentScopeIssuer();let auth;
-    const departments=createPostgresDepartments(store,{issuer:scopeIssuer,clock,authorizeSuperAdmin:credential=>auth.authorizeSuperAdmin(credential)});
+    const departments=createPostgresDepartments(store,{issuer:scopeIssuer,clock,encryptionKey:key,keySecretsInstalled:departmentKeySecretsInstalled,authorizeSuperAdmin:credential=>auth.authorizeSuperAdmin(credential)});
     auth=createAdminAuth(config,{clock,scopeIssuer,...(departmentInstalled?{departmentKeys:{authenticate:departments.authenticateManagementKey,validate:departments.validateManagementSession}}:{})});
     const departmentHttp=createPostgresDepartmentHttp({auth,departments,issuer:scopeIssuer,installed:departmentInstalled,readBody:requestBodies.read});
     const publicIdentity=async identity=>({role:identity.role,view:identity.view,department_id:identity.department_id,department_name:identity.view==='department'?(await departments.getDepartment(identity,identity.department_id)).name:null});
