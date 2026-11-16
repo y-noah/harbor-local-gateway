@@ -88,9 +88,9 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
       FROM harbor.keys WHERE member_id=ANY($1::text[]) AND removed_at IS NULL GROUP BY member_id`,ids,at);
     return new Map(rows.map(({member_id,...value})=>[member_id,value]));
   }
-  async function member(row,data,at,deviceCounts,{metadata=false,usageProfile='full'}={}){
+  async function member(row,data,at,deviceCounts,{metadata=false,usageProfile='full',limitStatuses}={}){
     const {default_models,usage_limits,usage_limits_version,...view}=row,configuration=postgresMemberLimitConfiguration({usage_limits,usage_limits_version});
-    return {...view,default_models:storedModelAllowlist(default_models),usage_limits:configuration,...(metadata?{}:{limit_usage:configuration.enabled?(await limits.status(row.id,at)).usage:[],...used(data,row.id,{profile:usageProfile})}),registered_devices:(deviceCounts??await registered('member',[row.id])).get(row.id)??0};
+    return {...view,default_models:storedModelAllowlist(default_models),usage_limits:configuration,...(metadata?{}:{limit_usage:configuration.enabled?(limitStatuses?.get(row.id)??await limits.status(row.id,at)).usage:[],...used(data,row.id,{profile:usageProfile})}),registered_devices:(deviceCounts??await registered('member',[row.id])).get(row.id)??0};
   }
   const budget=value=>{if(Buffer.byteLength(JSON.stringify(value))>pageBytes)fail(503,'完整员工页超过字节预算，请减小页大小','member_query_capacity');return value;};
   async function list(query,{signal,scope}={}){return read(async()=>{
@@ -102,7 +102,7 @@ export function createPostgresMemberQueries(store,{clock=Date.now,encryptionKey,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL) key_count,
       (SELECT COUNT(*) FROM harbor.keys k WHERE k.member_id=m.id AND k.removed_at IS NULL AND k.model_source->>'kind'='custom') key_exceptions
       FROM harbor.members m LEFT JOIN harbor.member_types t ON t.id=m.usage_type_id WHERE ${condition.where} ORDER BY m.created DESC,m.id DESC LIMIT $${n+1} OFFSET $${n+2}`,...condition.values,query.pageSize,(page-1)*query.pageSize);
-    const metadata=query.view==='list',ids=rows.map(row=>row.id),data=metadata?null:await usage('member',ids,at,{profile:query.usageProfile??'full'}),deviceCounts=await registered('member',ids),expirations=await keyExpirations(ids,at),items=[];for(const row of rows)items.push(await member({...row,key_expiration:expirations.get(row.id)??{permanent:0,expired:0,next:null,last_expired:null}},data,at,deviceCounts,{metadata,usageProfile:query.usageProfile??'full'}));
+    const metadata=query.view==='list',ids=rows.map(row=>row.id),data=metadata?null:await usage('member',ids,at,{profile:query.usageProfile??'full'}),deviceCounts=await registered('member',ids),expirations=await keyExpirations(ids,at),limitStatuses=metadata?null:await limits.statusForRows(rows.filter(row=>postgresMemberLimitConfiguration(row).enabled),at),items=[];for(const row of rows)items.push(await member({...row,key_expiration:expirations.get(row.id)??{permanent:0,expired:0,next:null,last_expired:null}},data,at,deviceCounts,{metadata,usageProfile:query.usageProfile??'full',limitStatuses}));
     return budget({rows:items,types,pagination:{page,pageSize:query.pageSize,total,totalPages},filters:query,observedAt:at,...(metadata?{usagePending:items.length>0}:{})});
   },{signal});}
   async function detail(memberId,{signal,scope}={}){return read(async()=>{

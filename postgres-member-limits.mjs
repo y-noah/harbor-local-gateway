@@ -105,6 +105,17 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
     });
     return {...config,currency:'USD',observed_at:at,usage};
   }
+  // Internal list reader: rows must come from the caller's already-authorized
+  // page in its current read snapshot. Nothing survives this operation.
+  async function statusForRows(rows,at=clock()){
+    if(!store.context?.getStore())fail(503,'批量限额读取须在员工查询事务内执行','member_limits_transaction_required');
+    if(!Array.isArray(rows)||rows.length>100||new Set(rows.map(row=>row.id)).size!==rows.length)fail(400,'批量限额员工范围无效');
+    const configurations=rows.map(row=>({id:row.id,config:postgresMemberLimitConfiguration(row)})),result=new Map();
+    if(!configurations.length)return result;
+    const book=await currentBook();
+    for(const {id,config} of configurations)result.set(id,await calculate(id,at,config,book));
+    return result;
+  }
   async function status(memberId,at=clock()){
     return store.transaction(async()=>calculate(memberId,at,await configuration(memberId),await currentBook()),{level:'REPEATABLE READ',readOnly:true});
   }
@@ -133,5 +144,5 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
       }
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {configuration,validate,save,status,check};
+  return {configuration,validate,save,status,statusForRows,check};
 }
