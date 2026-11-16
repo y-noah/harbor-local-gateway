@@ -630,16 +630,41 @@ def verify_candidate_image(inspection,approval,image):
 
 def verify_started_composition(api,image,config,started,approval):
     stack=api['STACK'];name=api['NAME'];worker=name+'-worker';port=config['port']
-    end=time.monotonic()+90
-    while time.monotonic()<end:
-        candidate,background=container_inspection(api,name,[]),container_inspection(api,worker,[])
-        good=all(value and signed_candidate_image_id(value.get('Image'),approval) and value.get('Config',{}).get('Image')==image and value.get('State',{}).get('Running') and value['State'].get('Health',{}).get('Status')=='healthy' for value in [candidate,background])
-        if good and api['http_code'](port,'/health')==200 and api['http_code'](port,'/ready')==200 and device_http_code(stack,config,'/ready')==200:
-            progress=api['docker']('exec',worker,'node','/app/ci/postgres-preflight.mjs','--progress-since',str(started),check=False,timeout=10)
-            if progress.returncode==0:break
-        time.sleep(2)
-    else:raise RuntimeError('PostgreSQL gateway/Worker readiness or progress failed')
-    if api['http_code'](port,'/api/admin/state')!=401 or api['http_code'](port,'/health',{'Host':'untrusted.invalid'})!=403 or device_http_code(stack,config,'/api/admin/state')!=401 or device_http_code(stack,config,'/health',{'Host':'untrusted.invalid'})!=403:raise RuntimeError('PostgreSQL authentication checks failed')
+    begin=time.monotonic();end=begin+90
+    observation={'contract':'harbor-startup-check-v1','attempts':0,'elapsedMs':0,'stage':'initial','checks':{}}
+    def timed(key,operation):
+        observation['stage']=key;at=time.monotonic();row={'attempted':True,'elapsedMs':0};observation['checks'][key]=row
+        if key=='progress':row['returncode']=None
+        elif key.endswith('_http'):row['status']=None
+        try:
+            value=operation()
+            if key=='progress':row['returncode']=value.returncode if type(value.returncode) is int else None
+            elif key.endswith('_http'):row['status']=value if type(value) is int and 100<=value<=599 else None
+            return value
+        finally:row['elapsedMs']=max(0,int((time.monotonic()-at)*1000))
+    def composition(value):
+        state=value.get('State',{}) if isinstance(value,dict) else {}
+        health=state.get('Health',{}).get('Status')
+        return {'present':bool(value),'imageMatches':bool(value and signed_candidate_image_id(value.get('Image'),approval) and value.get('Config',{}).get('Image')==image),
+                'running':bool(state.get('Running')),'health':health if health in ['starting','healthy','unhealthy'] else 'unknown'}
+    try:
+        while time.monotonic()<end:
+            observation['attempts']+=1;observation['containers']={};observation['checks']={'progress':{'attempted':False,'elapsedMs':0,'returncode':None}}
+            candidate=timed('gateway_inspection',lambda:container_inspection(api,name,[]))
+            observation['containers']['gateway']=composition(candidate)
+            background=timed('worker_inspection',lambda:container_inspection(api,worker,[]))
+            observation['containers']['worker']=composition(background)
+            good=all(value and signed_candidate_image_id(value.get('Image'),approval) and value.get('Config',{}).get('Image')==image and value.get('State',{}).get('Running') and value['State'].get('Health',{}).get('Status')=='healthy' for value in [candidate,background])
+            if good and timed('gateway_health_http',lambda:api['http_code'](port,'/health'))==200 and timed('gateway_ready_http',lambda:api['http_code'](port,'/ready'))==200 and timed('device_ready_http',lambda:device_http_code(stack,config,'/ready'))==200:
+                progress=timed('progress',lambda:api['docker']('exec',worker,'node','/app/ci/postgres-preflight.mjs','--progress-since',str(started),check=False,timeout=10))
+                if progress.returncode==0:break
+            time.sleep(2)
+        else:raise RuntimeError('PostgreSQL gateway/Worker readiness or progress failed')
+        if timed('gateway_auth_http',lambda:api['http_code'](port,'/api/admin/state'))!=401 or timed('gateway_host_http',lambda:api['http_code'](port,'/health',{'Host':'untrusted.invalid'}))!=403 or timed('device_auth_http',lambda:device_http_code(stack,config,'/api/admin/state'))!=401 or timed('device_host_http',lambda:device_http_code(stack,config,'/health',{'Host':'untrusted.invalid'}))!=403:raise RuntimeError('PostgreSQL authentication checks failed')
+    except Exception as error:
+        observation['elapsedMs']=max(0,int((time.monotonic()-begin)*1000))
+        error.startup_observation=observation
+        raise
 
 STORAGE_STARTUP_CONTRACT='harbor-pg-storage-boot-v1'
 

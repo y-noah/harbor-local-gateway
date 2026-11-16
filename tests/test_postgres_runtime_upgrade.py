@@ -580,7 +580,9 @@ class DiagnosticImmediateOuterRecoveryTests(unittest.TestCase):
       if args[1]==base.IMAGE:
        # Exercise the actual readiness timeout branch, then use real checks for
        # the restored source. This controls only the timeout being tested.
-       with patch.object(pg.time,'monotonic',side_effect=[0,0,91]),patch.object(pg.time,'sleep'):return real_verify(*args)
+       clock=[0]
+       def expire(_seconds):clock[0]=91
+       with patch.object(pg.time,'monotonic',side_effect=lambda:clock[0]),patch.object(pg.time,'sleep',side_effect=expire):return real_verify(*args)
       return real_verify(*args)
      def refresh():
       self.assertEqual(control['phase'],'drained');upgrade.verify_source(t,data[str(entry.ACTIVE)],rows[NAME],rows[NAME+'-worker']);upgrade.check_storage(t)

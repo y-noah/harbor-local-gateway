@@ -199,6 +199,24 @@ def deployment_progress(phase,state='started'):
  if _progress_sink:_progress_sink(event)
  else:print(json.dumps(event,sort_keys=True),file=sys.stderr,flush=True)
 
+def startup_failure_observation(value):
+ # Accept only fixed scalar diagnostics, never arbitrary exception attributes.
+ stages={'initial','gateway_inspection','worker_inspection','progress','gateway_health_http','gateway_ready_http','device_ready_http','gateway_auth_http','gateway_host_http','device_auth_http','device_host_http'}
+ number=lambda item:type(item) is int and 0<=item<=2**40
+ if not isinstance(value,dict) or not {'contract','attempts','elapsedMs','stage','checks'}<=value.keys() or value.keys()-{'contract','attempts','elapsedMs','stage','checks','containers'}:return None
+ if value['contract']!='harbor-startup-check-v1' or not number(value['attempts']) or not number(value['elapsedMs']) or not isinstance(value['stage'],str) or value['stage'] not in stages:return None
+ checks=value['checks']
+ if not isinstance(checks,dict) or checks.keys()-(stages-{'initial'}):return None
+ for key,row in checks.items():
+  extra='returncode' if key=='progress' else 'status' if key.endswith('_http') else None
+  if not isinstance(row,dict) or set(row)!={'attempted','elapsedMs'}|({extra} if extra else set()) or type(row['attempted']) is not bool or not number(row['elapsedMs']):return None
+  if extra and row[extra] is not None and not (type(row[extra]) is int and (-2**31<=row[extra]<=2**31-1 if extra=='returncode' else 100<=row[extra]<=599)):return None
+ containers=value.get('containers',{})
+ if not isinstance(containers,dict) or containers.keys()-{'gateway','worker'}:return None
+ for row in containers.values():
+  if not isinstance(row,dict) or set(row)!={'present','imageMatches','running','health'} or any(type(row[key]) is not bool for key in ['present','imageMatches','running']) or row['health'] not in ['starting','healthy','unhealthy','unknown']:return None
+ return json.loads(json.dumps(value))
+
 def deployment_failure(error):
  code=getattr(error,'deployment_code','deployment_failed')
  if not isinstance(code,str) or re.fullmatch('preflight_[a-z_]{1,64}',code) is None:code='deployment_failed'
@@ -207,6 +225,8 @@ def deployment_failure(error):
  result={'phase':_current_phase,'code':code,'exceptionType':kind}
  observed=getattr(error,'preflight_observation',None)
  if isinstance(observed,dict) and observed.get('containerState') in ['unknown','created','running','exited'] and all(type(observed.get(key)) is int and 0<=observed[key]<=2**40 for key in ['stdoutBytes','stderrBytes']):result['preflight']=observed
+ startup=startup_failure_observation(getattr(error,'startup_observation',None))
+ if startup is not None:result['startup']=startup
  return result
 
 def progress_snapshot(entry,path):
