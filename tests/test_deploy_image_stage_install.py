@@ -17,6 +17,149 @@ i = importlib.util.module_from_spec(spec);spec.loader.exec_module(i)
 
 
 class ImageStageInstallTests(unittest.TestCase):
+    def bundle_fixture(self, directory, stack, guard=None):
+        values, config_path = self.qualification_fixture(directory, stack, guard=guard or Mock(return_value='no'))
+        paths, old_ticket, _, history, history_before, arguments = values
+        root = Path(directory)
+        for field in ['COMPOSE', 'UPGRADE', 'ENTRY', 'MATERIAL', 'USAGE', 'DEPARTMENT']:
+            path = root / (field.lower() + '.py');path.write_bytes(('OLD_' + field + ' = True\n').encode());path.chmod(0o644)
+            stack.enter_context(patch.object(i, field, path))
+        stack.enter_context(patch.object(upgrade, 'ENTRY', i.ENTRY))
+        tools = tuple(i.host_sources())
+        stack.enter_context(patch.object(upgrade, 'HOST_FILES', tools))
+        manifest = json.loads(paths['manifest.json'].read_bytes());manifest['files'] = {name: i.sha(Path(name).read_bytes()) for name in tools};paths['manifest.json'].write_bytes(i.body(manifest))
+        paths['helper.py'].write_bytes(b'APPROVED_HELPER = True\n');paths['helper.py'].chmod(0o644)
+        source = arguments[0]
+        for path, name in i.host_sources().items():
+            (source / name).write_bytes(('NEW_' + Path(name).stem.replace('-', '_').upper() + ' = True\n').encode())
+        replacements = {path: (source / name).read_bytes() for path, name in i.host_sources().items()}
+        arguments = (source, arguments[1], i.sha(paths['manifest.json'].read_bytes()), arguments[3], i.sha(replacements[str(i.WRAPPER)]), i.sha(paths['helper.py'].read_bytes()))
+        options = {'runtime': True, 'expected_compose': i.sha(replacements[str(i.COMPOSE)]), 'expected_upgrade': i.sha(replacements[str(i.UPGRADE)]), 'expected_host_bundle': i.sha(i.body(i.host_bundle(arguments[1], replacements)))}
+        original_module_bytes = i.module_bytes
+        stack.enter_context(patch.object(i, 'module_bytes', side_effect=lambda raw, path, name: upgrade if path == i.UPGRADE else controller if path == i.ENTRY else original_module_bytes(raw, path, name)))
+        return paths, old_ticket, history, history_before, arguments, options, replacements, config_path
+
+    def test_bundle_replaces_all_seven_modules_and_qualification_requires_same_ci_source_pin(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            paths, old_ticket, history, old_history, args, options, replacements, _ = self.bundle_fixture(directory, stack)
+            before = {name: Path(name).read_bytes() for name in replacements}
+            installed = i.install(*args, **options)
+            self.assertTrue(installed['installed']);self.assertEqual(installed['installationScope'], 'fixed-seven-host-modules');self.assertEqual(installed['verifiedHostBundleSha256'], options['expected_host_bundle'])
+            for name, raw in replacements.items():self.assertEqual(Path(name).read_bytes(), raw)
+            self.assertNotEqual(before[str(i.USAGE)], Path(i.USAGE).read_bytes());self.assertNotEqual(before[str(i.DEPARTMENT)], Path(i.DEPARTMENT).read_bytes())
+            journal = json.loads((i.HISTORY / ('runtime-tools-' + args[1]) / 'journal.json').read_bytes())
+            self.assertEqual(journal['version'], 2);self.assertEqual(set(journal['files']), set(i.host_sources()) | {str(i.HELPER), str(i.MANIFEST), str(i.TICKET)})
+            self.assertEqual(journal['hostBundleSha256'], options['expected_host_bundle'])
+            with self.assertRaisesRegex(ValueError, 'bundle_pin_required'):i.qualify(args[1], runtime=True)
+            with self.assertRaisesRegex(ValueError, 'bundle_source'):i.qualify(args[1], runtime=True, expected_host_bundle='0' * 64)
+            ready = i.qualify(args[1], runtime=True, expected_host_bundle=options['expected_host_bundle'])
+            self.assertTrue(ready['hostToolsReady']);self.assertFalse(ready['publicationTriggered']);self.assertEqual(ready['installationScope'], 'fixed-seven-host-modules')
+            self.assertEqual(ready['verifiedHostBundleSha256'], options['expected_host_bundle']);self.assertEqual(history.read_bytes(), old_history)
+            self.assertTrue(i.install(*args, **options)['reused'])
+            original_module = i.module
+            def restored_entry_only(path, name):
+                if path == i.ENTRY:self.assertEqual(Path(path).read_bytes(), before[str(i.ENTRY)])
+                return original_module(path, name)
+            with patch.object(i, 'module', side_effect=restored_entry_only):restored = i.rollback(args[1], runtime=True)
+            for name, raw in before.items():self.assertEqual(Path(name).read_bytes(), raw)
+            self.assertEqual(json.loads(paths['ticket.json'].read_bytes()), old_ticket);self.assertEqual(history.read_bytes(), old_history)
+            restored_pin = i.sha(i.body(i.host_bundle(old_ticket['hostToolsRevision'], before)))
+            self.assertEqual(restored['restoredHostBundleSha256'], restored_pin)
+            self.assertTrue(i.qualify(args[1], runtime=True, expected_host_bundle=restored_pin)['hostToolsReady'])
+            self.assertTrue(i.install(*args, **options)['installed'])
+
+    def test_bundle_normalizes_unchanged_code_mode_and_restores_its_original_mode(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            _, _, _, _, args, options, replacements, _ = self.bundle_fixture(directory, stack)
+            Path(i.USAGE).write_bytes(replacements[str(i.USAGE)]);Path(i.USAGE).chmod(0o600)
+            manifest = json.loads(i.MANIFEST.read_bytes());manifest['files'][str(i.USAGE)] = i.sha(Path(i.USAGE).read_bytes());i.MANIFEST.write_bytes(i.body(manifest))
+            args = (*args[:2], i.sha(i.MANIFEST.read_bytes()), *args[3:])
+            i.install(*args, **options);self.assertEqual(Path(i.USAGE).stat().st_mode & 0o777, 0o644)
+            i.rollback(args[1], runtime=True);self.assertEqual(Path(i.USAGE).stat().st_mode & 0o777, 0o600)
+
+    def test_bundle_rollback_authorization_never_indirectly_imports_broken_new_entry(self):
+        real_module_bytes = i.module_bytes
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            _, old_ticket, history, history_before, args, options, replacements, _ = self.bundle_fixture(directory, stack)
+            before = {name: (Path(name).read_bytes(), Path(name).stat().st_mode & 0o777) for name in replacements}
+            replacements[str(i.ENTRY)] = b'raise RuntimeError("new_entry_must_not_execute_during_recovery")\n'
+            (args[0] / 'gateway-entry-controller.py').write_bytes(replacements[str(i.ENTRY)])
+            options['expected_host_bundle'] = i.sha(i.body(i.host_bundle(args[1], replacements)))
+            i.install(*args, **options)
+            journal_path = i.HISTORY / ('runtime-tools-' + args[1]) / 'journal.json'
+            journal = json.loads(journal_path.read_bytes());journal['state'] = 'prepared';journal_path.write_bytes(i.body(journal))
+            def real_entry_loader(path, name):
+                self.assertEqual(Path(path), i.ENTRY)
+                return real_module_bytes(i.read(Path(path)), Path(path), name)
+            # Keep the real active_record -> read_active_authorization ->
+            # upgrade.active_authorization chain. If any indirect loader reads
+            # the installed new ENTRY, its actual module body raises above.
+            with patch.object(upgrade, 'load', side_effect=real_entry_loader), patch.object(controller, 'read_active_authorization', wraps=controller.read_active_authorization) as authorization, patch.object(upgrade, 'active_authorization', wraps=upgrade.active_authorization) as upgrade_authorization:
+                result = i.rollback(args[1], runtime=True)
+                self.assertTrue(result['rolledBack']);self.assertGreater(authorization.call_count, 0);self.assertGreater(upgrade_authorization.call_count, 0)
+            self.assertEqual(before, {name: (Path(name).read_bytes(), Path(name).stat().st_mode & 0o777) for name in before})
+            self.assertEqual(history.read_bytes(), history_before);upgrade.verify_installed_tools(old_ticket)
+
+    def test_bundle_source_pin_rejects_changed_missing_and_wrong_mode_before_writing(self):
+        for change in ['usage', 'department', 'entry', 'material', 'missing', 'wrong-pin', 'non-runtime']:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                paths, _, _, _, args, options, replacements, _ = self.bundle_fixture(directory, stack)
+                before = {name: Path(name).read_bytes() for name in replacements}
+                target = {'usage': i.USAGE, 'department': i.DEPARTMENT, 'entry': i.ENTRY, 'material': i.MATERIAL}.get(change)
+                if target:(args[0] / i.host_sources()[str(target)]).write_bytes(b'FOREIGN = True\n')
+                elif change == 'missing':(args[0] / 'postgres-usage-cascade.py').unlink()
+                elif change == 'wrong-pin':options['expected_host_bundle'] = '0' * 64
+                else:options['runtime'] = False
+                with self.assertRaises((ValueError, FileNotFoundError)):i.install(*args, **options)
+                self.assertEqual(before, {name: Path(name).read_bytes() for name in before});self.assertFalse(i.HISTORY.exists())
+
+    def test_bundle_requires_new_revision_and_preserves_complete_or_rolled_back_v1_history(self):
+        for rollback_first in [False, True]:
+            with self.subTest(rollback_first=rollback_first), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                _, _, _, _, args, options, _, _ = self.bundle_fixture(directory, stack)
+                legacy_options = {key: value for key, value in options.items() if key != 'expected_host_bundle'}
+                i.install(*args, **legacy_options)
+                if rollback_first:i.rollback(args[1], runtime=True)
+                before = {path: path.read_bytes() for path in Path(directory).rglob('*') if path.is_file()}
+                current_args = (*args[:2], i.sha(i.MANIFEST.read_bytes()), i.sha(i.TICKET.read_bytes()), *args[4:])
+                with self.assertRaisesRegex(ValueError, 'existing_record'):i.install(*current_args, **options)
+                self.assertEqual(before, {path: path.read_bytes() for path in before})
+                journal = json.loads((i.HISTORY / ('runtime-tools-' + args[1]) / 'journal.json').read_bytes())
+                self.assertEqual(journal['version'], 1);self.assertEqual(journal['state'], 'rolled-back' if rollback_first else 'complete')
+                self.assertEqual(i.qualify(args[1], runtime=True)['installationScope'], 'legacy-three-runtime-files')
+
+    def test_bundle_postcheck_failure_and_explicit_rollback_restore_each_module_byte_and_mode(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            paths, old_ticket, history, old_history, args, options, replacements, _ = self.bundle_fixture(directory, stack)
+            before = {name: (Path(name).read_bytes(), Path(name).stat().st_mode & 0o777) for name in replacements}
+            original = i.current_binding;count = 0
+            def postcheck(*arguments, **kwargs):
+                nonlocal count
+                count += 1
+                if count == 2:raise RuntimeError('synthetic bundle postcheck')
+                return original(*arguments, **kwargs)
+            with patch.object(i, 'current_binding', side_effect=postcheck), self.assertRaisesRegex(RuntimeError, 'bundle postcheck'):i.install(*args, **options)
+            self.assertEqual(before, {name: (Path(name).read_bytes(), Path(name).stat().st_mode & 0o777) for name in before})
+            self.assertEqual(history.read_bytes(), old_history);upgrade.verify_installed_tools(old_ticket)
+            i.install(*args, **options)
+            Path(i.ENTRY).write_bytes(b'BROKEN =\n');Path(i.UPGRADE).write_bytes(b'BROKEN =\n')
+            with self.assertRaisesRegex(ValueError, 'rollback_changed'):i.rollback(args[1], runtime=True)
+            Path(i.ENTRY).write_bytes(replacements[str(i.ENTRY)]);Path(i.UPGRADE).write_bytes(replacements[str(i.UPGRADE)])
+            i.rollback(args[1], runtime=True)
+            self.assertEqual(before, {name: (Path(name).read_bytes(), Path(name).stat().st_mode & 0o777) for name in before})
+
+    def test_bundle_qualification_rejects_revision_only_relabel_and_changes_during_guard(self):
+        for target in ['USAGE', 'DEPARTMENT', 'ENTRY', 'MATERIAL']:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                guard = Mock(return_value='no')
+                _, _, _, _, args, options, _, _ = self.bundle_fixture(directory, stack, guard)
+                i.install(*args, **options)
+                path = getattr(i, target);original = path.read_bytes();path.write_bytes(b'OLD_MAINTENANCE = True\n')
+                with self.assertRaisesRegex(ValueError, 'qualification_bytes'):i.qualify(args[1], runtime=True, expected_host_bundle=options['expected_host_bundle'])
+                path.write_bytes(original)
+                guard.side_effect = lambda config: (path.write_bytes(b'CHANGED_DURING_GUARD = True\n'), 'no')[1]
+                with self.assertRaisesRegex((ValueError, RuntimeError), 'qualification_bytes_changed|installed host tool bytes differ'):i.qualify(args[1], runtime=True, expected_host_bundle=options['expected_host_bundle'])
+
     def fixture(self, directory, stack):
         root = Path(directory)
         paths = {name: root / name for name in ['wrapper.py', 'helper.py', 'manifest.json', 'ticket.json', 'active.json', 'candidate.json']}
@@ -40,7 +183,9 @@ class ImageStageInstallTests(unittest.TestCase):
         # Actual source verification and startup authorization read real JSON and
         # code files; only platform ownership and unrelated Docker/DB I/O are substituted.
         def read_file(path, mode=None):
-            path = Path(path);self.assertTrue(path.is_file() and not path.is_symlink())
+            path = Path(path)
+            if not path.exists():raise FileNotFoundError(path)
+            self.assertTrue(path.is_file() and not path.is_symlink())
             if mode is not None:
                 self.assertEqual(path.stat().st_mode & 0o777, mode)
             return path.read_bytes()
@@ -237,7 +382,7 @@ class ImageStageInstallTests(unittest.TestCase):
             guard.side_effect=lose_execute
             with self.assertRaisesRegex(ValueError,'qualification_mode_changed'):i.qualify('8' * 40)
 
-    def pending_fixture(self, directory, stack, guard=None):
+    def pending_fixture(self, directory, stack, guard=None, bundled=False):
         configuration={**CONFIG,'storage_engine':'postgres','local_assurance_release':True,'entry_installed_release':True,'image_prefix':IMAGE.rsplit(':',1)[0],'postgres_network':'owned-pg-net','postgres_storage_startup_guard':True}
         guard=guard or Mock(return_value='no')
         values, config_path=self.qualification_fixture(directory,stack,configuration,guard)
@@ -254,7 +399,12 @@ class ImageStageInstallTests(unittest.TestCase):
         (source/'postgres-deploy.py').write_bytes(b'APPROVED_COMPOSE = True\n');(source/'postgres-upgrade-deploy.py').write_bytes(b'APPROVED_UPGRADE = True\n')
         arguments=(*arguments[:2],i.sha(paths['manifest.json'].read_bytes()),*arguments[3:5],i.sha(paths['helper.py'].read_bytes()))
         historical=json.loads(history.read_bytes());historical['workerId']='d'*64;historical['candidate']['imageId']=old_ticket['to']['configDigest'];history.write_bytes(i.body(historical))
-        i.install(*arguments,runtime=True,expected_compose=i.sha((source/'postgres-deploy.py').read_bytes()),expected_upgrade=i.sha((source/'postgres-upgrade-deploy.py').read_bytes()))
+        bundle_pin = None
+        if bundled:
+            for field, suffix in [('ENTRY', 0), ('MATERIAL', 1), ('USAGE', 2), ('DEPARTMENT', 3)]:stack.enter_context(patch.object(i, field, root / ('host-' + str(suffix) + '.py')))
+            for name in ['gateway-entry-controller.py', 'harbor-material-storage.py', 'postgres-usage-cascade.py', 'postgres-department-release.py']:(source / name).write_bytes(b'APPROVED_BUNDLE_MODULE = True\n')
+            bundle_pin = i.sha(i.body(i.host_bundle(arguments[1], {path: (source / name).read_bytes() for path, name in i.host_sources().items()})))
+        i.install(*arguments,runtime=True,expected_compose=i.sha((source/'postgres-deploy.py').read_bytes()),expected_upgrade=i.sha((source/'postgres-upgrade-deploy.py').read_bytes()),expected_host_bundle=bundle_pin)
         current=json.loads(paths['active.json'].read_bytes());source_ticket=json.loads(paths['ticket.json'].read_bytes());pending=copy.deepcopy(source_ticket)
         pending['deploymentId']='00000000-0000-0000-0000-000000000003'
         pending['to']={'image':configuration['image_prefix']+':'+'e'*40,'revision':'e'*40,'configDigest':'sha256:'+'e'*64,'manifestDigest':'sha256:'+'f'*64}
@@ -273,6 +423,22 @@ class ImageStageInstallTests(unittest.TestCase):
             raise AssertionError('qualification attempted non-readonly command')
         stack.enter_context(patch.object(controller,'execute',side_effect=execute))
         return paths,pending,rows,network,guard,source_ticket,history,config_path
+
+    def test_full_bundle_fresh_pending_qualification_pins_ci_modules_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            paths, pending, _, _, _, _, _, _ = self.pending_fixture(directory, stack, bundled=True)
+            journal = json.loads((i.HISTORY / ('runtime-tools-' + '8' * 40) / 'journal.json').read_bytes())
+            before = {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ctime_ns, p.stat().st_ino) for p in Path(directory).rglob('*') if p.is_file()}
+            with patch.object(controller, 'save_json', side_effect=AssertionError('read-only bundle qualification wrote state')):
+                ready = i.qualify('8' * 40, runtime=True, expected_host_bundle=journal['hostBundleSha256'], pending_deployment_id=pending['deploymentId'], pending_ticket_digest=upgrade.digest(pending))
+            self.assertTrue(ready['hostToolsReady']);self.assertFalse(ready['publicationTriggered']);self.assertEqual(ready['verifiedHostBundleSha256'], journal['hostBundleSha256'])
+            self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ctime_ns, p.stat().st_ino) for p in before})
+
+    def test_legacy_runtime_qualification_cannot_claim_a_full_ci_bundle(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            _, pending, _, _, _, _, _, _ = self.pending_fixture(directory, stack)
+            with self.assertRaisesRegex(ValueError, 'bundle_pin_required'):
+                i.qualify('8' * 40, runtime=True, expected_host_bundle='0' * 64, pending_deployment_id=pending['deploymentId'], pending_ticket_digest=upgrade.digest(pending))
 
     def test_explicit_fresh_pending_is_readonly_and_bound_to_original_source(self):
         with tempfile.TemporaryDirectory() as directory,ExitStack() as stack:
