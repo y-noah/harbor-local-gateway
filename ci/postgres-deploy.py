@@ -261,11 +261,154 @@ def configuration(config,stack):
     common=[*network_args,'--user','1000:1000','--cap-drop','ALL','--security-opt','no-new-privileges','--env-file',str(env),'--env','TZ=Asia/Shanghai','--env','HARBOR_DATA_DIR=/app/data','--env','HARBOR_RUNTIME_DIR=/app/runtime','--env','HARBOR_RECORDING_ENABLED=1','--env','HARBOR_RECORDING_WORKER_ENABLED=1','--env','HARBOR_RECORDING_STORAGE_REPORT_KEY_FILE=/run/secrets/postgres-report.key',*mounts,*device_environment,*shutdown_environment]
     return common,budgets
 
+def preflight_failure(code,cause=None):
+    error=ShutdownUnconfirmed('PostgreSQL preflight did not complete; retain the registered attempt')
+    error.deployment_code=code
+    if cause is not None:error.__cause__=cause
+    return error
+
+def preflight_progress(api,phase,state):
+    callback=api.get('deployment_progress')
+    if callback:callback(phase,state)
+
+def preflight_spec(common,candidate,stack):
+    environment=dict(item.split('=',1) for item in candidate['Config'].get('Env',[]));mounts={};options={}
+    for index in range(0,len(common),2):
+        flag,value=common[index:index+2]
+        if flag=='--env-file':environment.update(line.split('=',1) for line in Path(value).read_text().splitlines() if line and not line.startswith('#'))
+        elif flag=='--env':environment.update([value.split('=',1)])
+        elif flag=='--mount':
+            fields=value.split(',');attributes=dict(item.split('=',1) for item in fields if '=' in item)
+            if set(attributes)!={'type','src','dst'} or attributes['type']!='bind' or 'readonly' not in fields:raise preflight_failure('preflight_mount_contract_invalid')
+            mounts[attributes['dst']]=(attributes['src'],False)
+        elif flag in ['--network','--user','--cap-drop','--security-opt']:options[flag]=value
+        else:raise preflight_failure('preflight_common_contract_invalid')
+    mounts.update({'/app/data':(stack+'/pg-data',False),'/app/runtime':(stack+'/runtime',False)})
+    return environment,mounts,options
+
+def preflight_shape_matches(row,candidate,spec):
+    environment,mounts,options=spec;config=row.get('Config',{});host=row.get('HostConfig',{})
+    actual_env=config.get('Env',[])
+    if len(actual_env)!=len(environment) or dict(item.split('=',1) for item in actual_env)!=environment:return False
+    if config.get('User')!=options.get('--user') or config.get('Entrypoint')!=candidate['Config'].get('Entrypoint'):return False
+    if host.get('ReadonlyRootfs') is not True or host.get('NetworkMode')!=options.get('--network','default') or host.get('Tmpfs')!={'/tmp':'rw,noexec,nosuid,size=64m'} or host.get('CapDrop')!=['ALL'] or host.get('SecurityOpt')!=[options.get('--security-opt')]:return False
+    if any(host.get(field) for field in ['Privileged','PortBindings','PublishAllPorts','Binds','Devices','DeviceRequests','CapAdd','PidMode','AutoRemove','Ulimits','CpusetCpus','CpusetMems','BlkioWeightDevice','BlkioDeviceReadBps','BlkioDeviceWriteBps','BlkioDeviceReadIOps','BlkioDeviceWriteIOps','OomKillDisable']):return False
+    if any(host.get(field,0)!=0 for field in ['Memory','NanoCpus','CpuQuota','CpuPeriod','CpuShares','CpuRealtimePeriod','CpuRealtimeRuntime','MemoryReservation','MemorySwap','BlkioWeight']):return False
+    if host.get('PidsLimit') not in (None,0) or host.get('MemorySwappiness') not in (None,0) or host.get('IpcMode') not in ('','private') or host.get('RestartPolicy',{}).get('Name') not in ('','no'):return False
+    actual_mounts={}
+    for mount in row.get('Mounts',[]):
+        if mount.get('Type')=='tmpfs':
+            if mount.get('Destination')!='/tmp':return False
+            continue
+        destination=mount.get('Destination')
+        if mount.get('Type')!='bind' or destination in actual_mounts:return False
+        actual_mounts[destination]=(mount.get('Source'),mount.get('RW'))
+    return actual_mounts==mounts
+
+def registered_image_proof(api,image,common,candidate):
+    # Only the supervised installed publisher supplies this private directory
+    # and its root-owned atomic reader/writer. No CI request selects a path.
+    root=Path(api['preflight_directory']);root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    materials=source_preflight_material_identity(api['STACK'])
+    signature=hashlib.sha256(repr((image,candidate['Id'],common,materials)).encode()).hexdigest()
+    spec=preflight_spec(common,candidate,api['STACK'])
+    path=root/(signature+'.json');read=api['preflight_read'];save=api['preflight_save']
+    value=read(path) if path.exists() else None
+    def owned(row):
+        return bool(row and row.get('Name')=='/'+value['name'] and row.get('Image')==candidate['Id'] and row.get('Config',{}).get('Image')==image and row['Config'].get('Cmd')==['node','/app/ci/postgres-preflight.mjs'] and row['Config'].get('Labels',{}).get('com.aistrong.project')==api['NAME'] and row['Config']['Labels'].get('com.harbor.preflight')=='true' and row['Config']['Labels'].get('com.harbor.preflight-nonce')==value['nonce'] and (not value.get('containerId') or row.get('Id')==value['containerId']) and preflight_shape_matches(row,candidate,spec))
+    def inspect():return container_inspection(api,value['name'],[])
+    def checkpoint(phase,**fields):
+        value.update(phase=phase,**fields);save(path,value)
+    if value is not None:
+        if not isinstance(value,dict) or value.get('version')!=1 or value.get('signature')!=signature or value.get('image')!=image or value.get('imageId')!=candidate['Id'] or not re.fullmatch('[a-f0-9]{32}',str(value.get('nonce',''))) or value.get('name')!=api['NAME']+'-postgres-check-'+value['nonce']:
+            raise preflight_failure('preflight_attempt_binding_invalid')
+        row=inspect()
+        if row is not None and not owned(row):raise preflight_failure('preflight_attempt_identity_changed')
+        # Successful prior proof is never reused. Remove its exact exited
+        # object first, then execute a fresh proof with a new registered nonce.
+        failed_retry=value.get('phase') in ['execution_failed','proof_invalid'] and api.get('preflight_retry_allowed') is True
+        if value.get('phase') in ['completed','removed','failed_removed'] or failed_retry:
+            if failed_retry:save(path.with_name(signature+'-failed-'+value['nonce']+'.json'),dict(value))
+            if row is not None:
+                state=row.get('State',{})
+                if state.get('Running') is not False or state.get('Status')!='exited' or state.get('Pid',0)!=0 or type(state.get('ExitCode')) is not int or (not failed_retry and state['ExitCode']!=0):raise preflight_failure('preflight_cleanup_unknown')
+                api['docker']('rm',value['name'],timeout=10)
+                if inspect() is not None:raise preflight_failure('preflight_cleanup_unknown')
+            value=None
+        elif row is None:
+            # A client timeout is not evidence that the daemon has finished
+            # creation. Keep this nonce; a later observer can find the late row.
+            raise preflight_failure('preflight_creation_pending')
+        elif row.get('State',{}).get('Status') not in ['created','running','exited']:
+            raise preflight_failure('preflight_execution_pending')
+    if value is None:
+        nonce=secrets.token_hex(16);value={'version':1,'signature':signature,'image':image,'imageId':candidate['Id'],'nonce':nonce,'name':api['NAME']+'-postgres-check-'+nonce,'phase':'intent'};save(path,value)
+        if inspect() is not None:raise preflight_failure('preflight_name_in_use')
+        args=['create','--pull=never','--name',value['name'],'--label','com.aistrong.project='+api['NAME'],'--label','com.harbor.preflight=true','--label','com.harbor.preflight-nonce='+nonce,'--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=64m',*common,'--mount','type=bind,src='+api['STACK']+'/pg-data,dst=/app/data,readonly','--mount','type=bind,src='+api['STACK']+'/runtime,dst=/app/runtime,readonly',image,'node','/app/ci/postgres-preflight.mjs']
+        checkpoint('create_requested');preflight_progress(api,'preflight_create','started')
+        result=None;create_error=None
+        try:result=api['docker'](*args,timeout=preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30)))
+        except (subprocess.TimeoutExpired,subprocess.CalledProcessError) as error:
+            checkpoint('create_unknown');create_error=error
+        row=inspect()
+        if create_error is not None and row is None:raise preflight_failure('preflight_create_unknown',create_error)
+        if not owned(row) or (result is not None and result.stdout.strip()!=row.get('Id')):raise preflight_failure('preflight_create_identity_unknown')
+        checkpoint('created',containerId=row['Id']);preflight_progress(api,'preflight_create','completed')
+    timeout=preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30))
+    deadline=time.monotonic()+timeout
+    row=inspect()
+    if not owned(row):raise preflight_failure('preflight_start_identity_unknown')
+    state=row.get('State',{})
+    if state.get('Status')=='created':
+        if state.get('Running') is not False or state.get('Pid',0)!=0:raise preflight_failure('preflight_start_identity_unknown')
+        checkpoint('start_requested',containerId=row['Id']);preflight_progress(api,'preflight_execute','started')
+        # A Docker CLI ACK is not the Node process result. In particular attach
+        # can hang after a successful exit. Start without attach and reconcile
+        # the same registered object, even if the start ACK is lost.
+        try:api['docker']('start',value['name'],timeout=min(10,timeout))
+        except (subprocess.TimeoutExpired,subprocess.CalledProcessError):pass
+    elif value.get('phase') not in ['start_requested','execution_unknown']:
+        raise preflight_failure('preflight_unexpected_execution')
+    while True:
+        row=inspect()
+        if not owned(row):raise preflight_failure('preflight_execution_identity_changed')
+        state=row.get('State',{});observed=state.get('Status','unknown')
+        if any(state.get(key) for key in ['Paused','Restarting','Dead','OOMKilled']):
+            checkpoint('execution_unknown',observedState=observed);raise preflight_failure('preflight_exit_unknown')
+        if observed=='exited':
+            if state.get('Running') is not False or state.get('Pid',0)!=0 or state.get('ExitCode')!=0:
+                checkpoint('execution_failed');raise preflight_failure('preflight_exit_failed')
+            break
+        if observed not in ['created','running'] or time.monotonic()>=deadline:
+            checkpoint('execution_unknown',observedState=observed)
+            failure=preflight_failure('preflight_execute_unknown');failure.preflight_observation={'containerState':observed if observed in ['created','running','exited'] else 'unknown','stdoutBytes':0,'stderrBytes':0};raise failure
+        time.sleep(min(.25,max(0,deadline-time.monotonic())))
+    try:
+        result=api['docker']('logs',value['name'],timeout=max(1,min(10,deadline-time.monotonic())))
+        proof=validate_image_proof(json.loads(result.stdout),image,common)
+    except (subprocess.TimeoutExpired,subprocess.CalledProcessError) as error:
+        checkpoint('execution_unknown',observedState='exited');raise preflight_failure('preflight_logs_unknown',error)
+    except Exception as error:
+        checkpoint('proof_invalid');raise preflight_failure('preflight_proof_invalid',error)
+    checkpoint('completed');preflight_progress(api,'preflight_execute','completed')
+    preflight_progress(api,'preflight_cleanup','started')
+    try:
+        api['docker']('rm',value['name'],timeout=10)
+        if inspect() is not None:raise preflight_failure('preflight_cleanup_unknown')
+        checkpoint('removed');preflight_progress(api,'preflight_cleanup','completed')
+    except subprocess.TimeoutExpired:
+        # A valid, confirmed exited proof can be retained. The registered name
+        # prevents any later job from mistaking it for an unrelated object.
+        preflight_progress(api,'preflight_cleanup','retained')
+    return proof
+
 def image_proof_content(api,image,common):
     timeout=preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30))
     candidate=image_inspection(api,image,[])
     labels=(candidate or {}).get('Config',{}).get('Labels',{})
     if labels.get('com.harbor.ci-validation-only')=='true' or labels.get('com.harbor.storage.postgres')!=CONTRACT or labels.get('com.harbor.postgres-preflight')!='v1' or labels.get('com.harbor.extra-usage-dispatch')!=EXTRA_USAGE_DISPATCH_CONTRACT or labels.get('org.opencontainers.image.revision')!=image.rsplit(':',1)[-1]:raise ValueError('Candidate does not provide the PostgreSQL image capability')
+    if api.get('preflight_directory'):
+        return registered_image_proof(api,image,common,candidate)
     stack=api['STACK']
     nonce=secrets.token_hex(16)
     check_name=api['NAME']+'-postgres-check-'+nonce

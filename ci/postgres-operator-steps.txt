@@ -112,3 +112,14 @@ PG正常发布排空合同 postgres-shutdown-v1：root配置postgres_shutdown三
    memoryCountersAndTtlRestarted描述原启用采集器的内存计数/TTL会从重启重新开始，不能声称恢复了旧统计或本次关闭成功。
    本次待应用env文件可保留新请求值，实际恢复的是旧容器的合法Env；重试须按实际运行源重新绑定并重新预检，不以文件已改认定生效。
    停源/清理/提交结果不明、来源/数据/权限不兼容等情形仍保留现场，不自动回退。
+
+installed 同库发布进度与失败续接：
+CI 实时输出准备、创建预检、执行预检、切换及收尾阶段和耗时；失败输出固定类别，不向 CI 发送私有异常原文或凭据。
+预检采用 create --pull=never、start（不 attach）、精确 inspect exited/ExitCode0 与 logs 原 proof 校验。
+Docker ACK 超时先核同一登记对象；未知创建保留 nonce，不新建第二轮、不按前缀清理。运行未知时保留原业务转发。
+登记在 RELEASES/runners/<deploymentId>-preflights 的私有目录；成功输出不作为后续发布的缓存证明，每轮正式检查仍 fresh。
+本版生成 request.json 后，失败且执行者确死、无 durable、同票/同源/同材料、Host 已完成旧计划协调时，可归档原证据并安全续接。
+旧版无绑定 request、活动执行者、未知终态、已产生 durable 或来源变化仍拒绝自动续接，由原受控恢复入口处理。
+有效且已确认退出的预检对象如清理超时会保留精确登记；下一轮确认清理后才新建 fresh 预检，禁止 force remove。
+Runner 仅缓存 Alpine 3.20 APK 包；工具已存在时跳过安装，离线缓存未命中才联网，不降低镜像或发布门禁。
+回退须同时恢复 wrapper、postgres-deploy.py 与 postgres-upgrade-deploy.py；已有失败和预检证据保留，不删除数据库或材料。

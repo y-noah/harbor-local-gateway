@@ -322,15 +322,45 @@ def storage_operation_helper(config):
 
 
 def storage_deployment(config,image,archive,action,lock_fd):
+    deployment_progress('host_prepare','started')
     helper=storage_operation_helper(config);nonce=helper.deployment_begin(config,image,lock_fd) if helper else None
+    globals()['_PLANNED_OPERATION_ACTIVE']=helper is not None and nonce is not None
+    deployment_progress('host_prepare','completed')
     try:result=(deploy_entry_postgres if action=='deploy-entry-postgres' else deploy)(image,config,archive)
-    except BaseException:
+    except BaseException as error:
         if helper:
-            try:helper.deployment_finish(config,nonce,False,lock_fd)
-            except Exception:syslog.syslog(syslog.LOG_ERR,'Harbor planned operation remains protected; inspect storage helper status')
+            deployment_progress('host_finish','started')
+            try:released=helper.deployment_finish(config,nonce,False,lock_fd).get('released') is True
+            except Exception:released=False
+            error.host_operation='released' if released else 'protected'
+            deployment_progress('host_finish','completed' if released else 'retained')
+            if not released:syslog.syslog(syslog.LOG_ERR,'Harbor planned operation remains protected; inspect storage helper status')
         raise
+    finally:globals().pop('_PLANNED_OPERATION_ACTIVE',None)
+    deployment_progress('host_finish','started')
     if helper and helper.deployment_finish(config,nonce,True,lock_fd).get('released') is not True:raise RuntimeError('Harbor planned operation result remains protected')
+    deployment_progress('host_finish','completed')
     return result
+
+_DEPLOYMENT_PHASE='request'
+_DEPLOYMENT_PHASE_STARTED=time.monotonic()
+def deployment_progress(phase,state):
+    global _DEPLOYMENT_PHASE,_DEPLOYMENT_PHASE_STARTED
+    if phase not in ['host_prepare','host_finish','receive_image'] or state not in ['started','completed','retained']:raise ValueError('Deployment progress is invalid')
+    if state=='started':_DEPLOYMENT_PHASE_STARTED=time.monotonic()
+    _DEPLOYMENT_PHASE=phase
+    print(json.dumps({'event':'harbor_deployment_phase','phase':phase,'state':state,'elapsedMs':max(0,int((time.monotonic()-_DEPLOYMENT_PHASE_STARTED)*1000))}),file=sys.stderr,flush=True)
+
+def deployment_error(error):
+    value=getattr(error,'deployment_diagnostic',None)
+    diagnostic={'phase':_DEPLOYMENT_PHASE,'code':'deployment_failed','exceptionType':type(error).__name__ if type(error).__name__ in ['ValueError','RuntimeError','TimeoutExpired','CalledProcessError','OSError','FileNotFoundError','PermissionError','BlockingIOError'] else 'OtherError'}
+    if isinstance(value,dict) and value.get('phase') in ['prepare','source_validation','preflight_target','preflight_sources','preflight_create','preflight_execute','preflight_cleanup','preflight_backup','switch_drain','switch_apply','switch_verify','cleanup','finished'] and re.fullmatch('(?:deployment_failed|preflight_[a-z_]{1,64})',str(value.get('code',''))):
+        diagnostic.update(phase=value['phase'],code=value['code'])
+        if value.get('exceptionType') in ['ShutdownUnconfirmed','TimeoutExpired','RuntimeError','ValueError','OSError','FileNotFoundError','PermissionError','CalledProcessError','JSONDecodeError','OtherError']:diagnostic['exceptionType']=value['exceptionType']
+        observed=value.get('preflight')
+        if isinstance(observed,dict) and set(observed)=={'containerState','stdoutBytes','stderrBytes'} and observed.get('containerState') in ['unknown','created','running','exited'] and all(type(observed.get(key)) is int and 0<=observed[key]<=2**40 for key in ['stdoutBytes','stderrBytes']):diagnostic['preflight']=observed
+    if getattr(error,'host_operation',None) in ['released','protected']:diagnostic['hostOperation']=error.host_operation
+    return {'event':'harbor_deployment_failure',**diagnostic}
 
 def main():
     os.umask(0o077)
@@ -384,7 +414,9 @@ def main():
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         archive=None
         try:
+            deployment_progress('receive_image','started')
             archive,transport=receive_deployment_image(sys.stdin.buffer,payload,config,action)
+            deployment_progress('receive_image','completed')
             result=storage_deployment(config,image,archive,action,lock.fileno())
             if action=='deploy-entry-postgres':result={**result,'wireAction':payload['action'],'effectiveAction':action,'imageTransport':transport}
             if config.get('storage_engine')=='postgres':print(json.dumps({'postgres_deployment':result},sort_keys=True))
@@ -395,6 +427,6 @@ def main():
 if __name__=='__main__':
     try:
         main()
-    except (ValueError,RuntimeError,subprocess.CalledProcessError,subprocess.TimeoutExpired,OSError,tarfile.TarError,EOFError) as error:
-        print('Harbor deployment failed: '+type(error).__name__,file=sys.stderr)
+    except Exception as error:
+        print(json.dumps(deployment_error(error),sort_keys=True),file=sys.stderr)
         sys.exit(1)

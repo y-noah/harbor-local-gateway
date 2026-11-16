@@ -1,7 +1,7 @@
 """Root-approved same-database PostgreSQL code upgrade; never migrates SQLite."""
 from pathlib import Path
 from types import SimpleNamespace
-import copy,fcntl,hashlib,http.client,importlib.util,json,os,re,stat,time,traceback
+import copy,fcntl,hashlib,http.client,importlib.util,json,os,re,stat,time,traceback,uuid,sys
 from contextlib import contextmanager
 CONTRACT='harbor-postgres-runtime-upgrade-v1'
 TICKET=Path('/etc/harbor-postgres-runtime-upgrade.json')
@@ -186,30 +186,94 @@ def controller_lock(entry):
   info=os.fstat(fd);need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1,'controller lock identity');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);yield
  finally:os.close(fd)
 
-def supervised_upgrade(entry,ticket,operation):
+PROGRESS_PHASES={'prepare','source_validation','preflight_target','preflight_sources','preflight_create','preflight_execute','preflight_cleanup','preflight_backup','switch_drain','switch_apply','switch_verify','cleanup','finished'}
+_progress_sink=None
+_current_phase='prepare'
+_phase_started=time.monotonic()
+def deployment_progress(phase,state='started'):
+ global _current_phase,_phase_started
+ need(phase in PROGRESS_PHASES and state in ['started','completed','failed','retained'],'invalid progress')
+ if phase!=_current_phase or state=='started':_phase_started=time.monotonic()
+ _current_phase=phase
+ event={'event':'harbor_deployment_phase','phase':phase,'state':state,'startedMonotonic':_phase_started,'elapsedMs':max(0,int((time.monotonic()-_phase_started)*1000))}
+ if _progress_sink:_progress_sink(event)
+ else:print(json.dumps(event,sort_keys=True),file=sys.stderr,flush=True)
+
+def deployment_failure(error):
+ code=getattr(error,'deployment_code','deployment_failed')
+ if not isinstance(code,str) or re.fullmatch('preflight_[a-z_]{1,64}',code) is None:code='deployment_failed'
+ kind=type(error).__name__
+ if kind not in ['ShutdownUnconfirmed','TimeoutExpired','RuntimeError','ValueError','OSError','FileNotFoundError','PermissionError','CalledProcessError','JSONDecodeError']:kind='OtherError'
+ result={'phase':_current_phase,'code':code,'exceptionType':kind}
+ observed=getattr(error,'preflight_observation',None)
+ if isinstance(observed,dict) and observed.get('containerState') in ['unknown','created','running','exited'] and all(type(observed.get(key)) is int and 0<=observed[key]<=2**40 for key in ['stdoutBytes','stderrBytes']):result['preflight']=observed
+ return result
+
+def progress_snapshot(entry,path):
+ # private_json rejects unlinked files. A legitimate atomic replacement can
+ # unlink the inode between open and fstat; retry only a verified replacement.
+ for _ in range(3):
+  before=path.lstat()
+  try:return entry.private_json(path)
+  except (OSError,ValueError,RuntimeError):
+   after=path.lstat()
+   trusted=lambda row:stat.S_ISREG(row.st_mode) and row.st_uid==0 and stat.S_IMODE(row.st_mode)==0o600 and row.st_nlink==1
+   if (before.st_dev,before.st_ino)==(after.st_dev,after.st_ino) or not trusted(before) or not trusted(after):raise
+ return None
+
+def supervised_upgrade(entry,ticket,operation,resume_source=None):
  # The child keeps both inherited deployment locks and its own session. An SSH
  # disconnect may stop the CI observer, but cannot abandon a held public entry.
  root=RELEASES/'runners';root.mkdir(mode=0o700,parents=True,exist_ok=True)
- run=root/ticket['deploymentId'];run.mkdir(mode=0o700)
+ run=root/ticket['deploymentId'];binding=resume_source(False) if resume_source else None
+ preflights=root/(ticket['deploymentId']+'-preflights');retry_allowed=False
+ if run.exists():
+  # Old installations without a bound request remain manual recovery only.
+  if resume_source is None:raise FileExistsError('upgrade runner already exists; inspect retained release')
+  previous=entry.private_json(run/'request.json');result=entry.private_json(run/'result.json');process=entry.private_json(run/'process.json')
+  need(previous=={'version':1,'ticketDigest':digest(ticket),'source':binding} and result.get('ok') is False,'upgrade retry is not a bound terminal failure')
+  need(not release_path(ticket['deploymentId']).exists(),'durable release cannot be retried')
+  pid=process.get('pid');ticks=process.get('startTicks');need(type(pid) is int and pid>1 and isinstance(ticks,str) and re.fullmatch('[0-9]{1,20}',ticks),'upgrade process identity is unknown')
+  try:alive=entry.process_ticks(pid)==ticks
+  except (FileNotFoundError,ProcessLookupError):alive=False
+  need(not alive,'upgrade runner is still active')
+  need(resume_source(True)==binding,'upgrade source changed before retry')
+  archived=root/(ticket['deploymentId']+'-failed-'+uuid.uuid4().hex);os.rename(run,archived);retry_allowed=True
+ run.mkdir(mode=0o700)
+ if binding is not None:entry.save_json(run/'request.json',{'version':1,'ticketDigest':digest(ticket),'source':binding})
+ entry._harbor_preflight_directory=preflights;entry._harbor_preflight_retry_allowed=retry_allowed
  out=os.open(run/'runner.log',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
  pid=os.fork()
  if pid==0:
   try:
+   global _progress_sink
+   _progress_sink=lambda event:entry.save_json(run/'progress.json',event)
    os.setsid();null=os.open('/dev/null',os.O_RDONLY)
    os.dup2(null,0);os.close(null);os.dup2(out,1);os.dup2(out,2);os.close(out)
    entry.save_json(run/'process.json',{'pid':os.getpid(),'startTicks':entry.process_ticks(os.getpid()),'deploymentId':ticket['deploymentId']})
    try:
-    result=operation();entry.save_json(run/'result.json',{'ok':True,'result':result});os._exit(0)
+    result=operation();deployment_progress('finished','completed');entry.save_json(run/'result.json',{'ok':True,'result':result});os._exit(0)
    except BaseException as error:
-    traceback.print_exc();entry.save_json(run/'result.json',{'ok':False,'errorCategory':type(error).__name__});os._exit(1)
+    traceback.print_exc();entry.save_json(run/'result.json',{'ok':False,'errorCategory':type(error).__name__,'diagnostic':deployment_failure(error)});os._exit(1)
   except BaseException:traceback.print_exc();os._exit(2)
  os.close(out)
+ last=None;last_emit=0
  while True:
-  try:_,status=os.waitpid(pid,0);break
+  try:
+   child,status=os.waitpid(pid,os.WNOHANG)
+   progress=run/'progress.json'
+   if progress.exists():
+    event=progress_snapshot(entry,progress)
+    if event is not None and event.get('phase') in PROGRESS_PHASES and event.get('state') in ['started','completed','failed','retained'] and (event!=last or time.monotonic()-last_emit>=15):
+     elapsed=max(0,int((time.monotonic()-event.get('startedMonotonic',time.monotonic()))*1000))
+     print(json.dumps({'event':'harbor_deployment_phase','phase':event['phase'],'state':event['state'],'elapsedMs':elapsed},sort_keys=True),file=sys.stderr,flush=True);last=event;last_emit=time.monotonic()
+   if child:break
+   time.sleep(.25)
   except InterruptedError:continue
  need(os.WIFEXITED(status),'upgrade runner exited without a confirmed result; inspect retained release')
  result=entry.private_json(run/'result.json')
- need(os.WEXITSTATUS(status)==0 and result.get('ok') is True,'upgrade failed; inspect private runner log and retained release')
+ if os.WEXITSTATUS(status)!=0 or result.get('ok') is not True:
+  failure=RuntimeError('upgrade failed; inspect private runner log and retained release');failure.deployment_diagnostic=result.get('diagnostic');raise failure
  return result['result']
 
 METADATA_FILES=(Path('/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db'),Path('/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/metadata.db'))
@@ -250,12 +314,24 @@ def metadata_residency(config):
   if changed:resource.setrlimit(resource.RLIMIT_MEMLOCK,previous)
 
 def run_with_metadata_residency(image,config,api,ticket,entry):
- with metadata_residency(config):return run_upgrade(image,config,api,ticket,entry)
+ deployment_progress('prepare')
+ with metadata_residency(config):
+  deployment_progress('prepare','completed');return run_upgrade(image,config,api,ticket,entry)
 
 def deploy(image,config,archive,api):
  verify_retention_qualification(config)
  need(archive is None,'installed CI image required');ticket=validate_ticket(private_json(TICKET),image,config);verify_installed_tools(ticket);entry=load(api['ENTRY_HELPER'],'runtime_upgrade_entry')
- with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry))
+ def retry_source(retry):
+  if retry:need(config.get('postgres_storage_startup_guard') is True and api.get('_PLANNED_OPERATION_ACTIVE') is True,'retry requires completed Host operation reconciliation')
+  active=entry.private_json(entry.ACTIVE);gw=api['inspect_container'](api['NAME']);worker=api['inspect_container'](api['NAME']+'-worker');verify_source(ticket,active,gw,worker)
+  control=entry.entry_state();need(control.get('slot')=='candidate' and control.get('phase')=='active','retry requires active original entry');check_storage(ticket)
+  pg=load(Path(__file__).with_name('postgres-deploy.py'),'retry_materials')
+  materials=pg.source_preflight_material_identity(ticket['materialsDirectory'])
+  return {'activeDigest':digest(active_identity(active)),'gateway':generation_identity(gw),'worker':generation_identity(worker),'materialsDigest':hashlib.sha256(repr(materials).encode()).hexdigest()}
+ with controller_lock(entry):return supervised_upgrade(entry,ticket,lambda:run_with_metadata_residency(image,config,api,ticket,entry),resume_source=retry_source)
+
+def generation_identity(row):
+ return {key:row.get(key) for key in ['Id','Image']}|{'started':row.get('State',{}).get('StartedAt')}
 
 def interrupt_entry_clients(entry,ticket,api,active,deadline,held_epoch):
  # Root ticket approval authorizes dropping only this entry's TCP clients.
@@ -588,18 +664,21 @@ def finish_retired_cleanup(config,api,entry,record,path):
  return record['cleanup']
 
 def run_upgrade(image,config,api,ticket,entry):
+ deployment_progress('source_validation')
  verify_retention_qualification(config,ticket)
  pg=load(Path(__file__).with_name('postgres-deploy.py'),'runtime_upgrade_composition')
  preflight_timeout=pg.preflight_timeout_seconds(config.get('postgres_preflight_timeout_seconds',30))
  active,original,gateway=entry.active_record();worker=api['inspect_container'](api['NAME']+'-worker');verify_source(ticket,active,gateway,worker);check_storage(ticket)
  if RELEASES.exists():need(retired_cleanup(config,api,entry,protect_retained=True)['state']=='complete','retired_service_cleanup_pending: retry before starting another upgrade')
- pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout};common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);proof=pg.image_proof(pg_api,image,common)
+ pg_api={**api,'STACK':ticket['materialsDirectory'],'postgres_preflight_timeout_seconds':preflight_timeout,'deployment_progress':deployment_progress}
+ if isinstance(getattr(entry,'_harbor_preflight_directory',None),Path):pg_api.update(preflight_directory=str(entry._harbor_preflight_directory),preflight_read=entry.private_json,preflight_save=entry.save_json,preflight_retry_allowed=getattr(entry,'_harbor_preflight_retry_allowed',False) is True)
+ common,_=pg.configuration(config,pg_api['STACK']);pg.verify_candidate_image(api['inspect_image'](image),approval(ticket),image);deployment_progress('preflight_target');proof=pg.image_proof(pg_api,image,common)
  need(all(proof[k]==ticket[v] for k,v in [('database_digest','databaseDigest'),('schema_digest','schemaDigest'),('device_ca_digest','deviceCaDigest')]),'new image changed database/schema/device identity')
- pg.container_shutdown(pg_api,gateway,'gateway');pg.container_shutdown(pg_api,worker,'worker')
+ deployment_progress('preflight_sources');pg.container_shutdown(pg_api,gateway,'gateway');pg.container_shutdown(pg_api,worker,'worker')
  pg_api['source_image_preflight']=pg.prepare_source_image_preflights(pg_api,[(gateway,'gateway'),(worker,'worker')],common)
  consumption_upgrade_guard(pg,pg_api,ticket,entry,gateway,common,proof)
  department_sources=department_upgrade_guard(pg,pg_api,ticket,gateway,worker,common,proof)
- backup=qualify_backup(pg,pg_api,config,ticket,active,gateway,worker,common,proof)
+ deployment_progress('preflight_backup');backup=qualify_backup(pg,pg_api,config,ticket,active,gateway,worker,common,proof)
  network_snapshot(ticket,entry,gateway,worker)
  RELEASES.mkdir(mode=0o700,exist_ok=True);path=release_path(ticket['deploymentId']);path.mkdir(mode=0o700);record={'contract':CONTRACT,'ticket':ticket,'ticketDigest':digest(ticket),'phase':'prepared','offhostVerified':False};entry.save_json(path/'release.json',record);entry.save_json(path/'active.before.json',active)
  if backup is not None:
@@ -625,13 +704,14 @@ def run_upgrade(image,config,api,ticket,entry):
   return probe(entry,ticket,row,port,path,headers)
  verify_installed_tools(ticket)
  try:
+  deployment_progress('switch_drain')
   record['phase']='draining-entry';entry.save_json(path/'release.json',record)
   control=drain_active_entry(entry,ticket,api,active)
   gate_attempted=True;gate=gate_install(entry,ticket,config);record.update(phase='holding',gate=gate);entry.save_json(path/'release.json',record);record['retiredSqlite']=retire_sqlite(api,ticket);entry.save_json(path/'release.json',record)
   pg_api.update(runtime_upgrade=True,retain_previous=True,activation=activation,http_code=http_code)
-  result=pg.deploy(image,config,None,pg_api);new_gateway=api['inspect_container'](api['NAME']);new_worker=api['inspect_container'](api['NAME']+'-worker')
-  commit_started=True;publish(entry,ticket,record,new_gateway,new_worker,active);gate_remove(entry,gate);gate=None
-  cleanup=finish_retired_cleanup(config,api,entry,record,path)
+  deployment_progress('switch_apply');result=pg.deploy(image,config,None,pg_api);new_gateway=api['inspect_container'](api['NAME']);new_worker=api['inspect_container'](api['NAME']+'-worker')
+  deployment_progress('switch_verify');commit_started=True;publish(entry,ticket,record,new_gateway,new_worker,active);gate_remove(entry,gate);gate=None
+  deployment_progress('cleanup');cleanup=finish_retired_cleanup(config,api,entry,record,path);deployment_progress('cleanup','completed')
   return {'contract':CONTRACT,'state':'active','sameDatabase':True,'offhostVerified':False,'composition':result,'cleanup':cleanup}
  except Exception as error:
   if isinstance(error,pg.ShutdownUnconfirmed):
