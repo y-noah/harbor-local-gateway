@@ -213,6 +213,7 @@ class StorageToolsTests(unittest.TestCase):
             target = app / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text('{}' if name.endswith('.json') else ('export {};' if name.endswith('.mjs') else 'synthetic'))
+        shutil.copytree(ROOT / 'third-party/codex-models', app / 'third-party/codex-models')
         shutil.copyfile(ROOT / 'ci/postgres-image-manifest.mjs', app / 'ci/postgres-image-manifest.mjs')
         result = subprocess.run([str(NODE), str(app / 'ci/postgres-image-manifest.mjs'), '--create'], env={**b.ENV, 'HARBOR_IMAGE_REVISION': config()['revision']}, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
@@ -265,7 +266,7 @@ class StorageToolsTests(unittest.TestCase):
         stage = self.path / 'stage'
         app = stage / 'app'
         app.mkdir(parents=True)
-        for name in ['public', 'clients', 'migrations', 'node_modules']:
+        for name in ['public', 'clients', 'migrations', 'node_modules', 'third-party/codex-models']:
             shutil.copytree(ROOT / name, app / name, symlinks=False)
         for path in ROOT.glob('*.mjs'):
             shutil.copyfile(path, app / path.name)
@@ -288,6 +289,22 @@ class StorageToolsTests(unittest.TestCase):
             b.project_operator_tools(app)
             proof = b.verify_copy(stage, config())
         self.assertEqual(proof['revision'], config()['revision'])
+        # 真实业务依赖和许可材料必须随 app 保留，且继续受镜像清单校验。
+        for name in ['models.json', 'source.json', 'LICENSE.txt']:
+            asset = app / 'third-party/codex-models' / name
+            original = (ROOT / 'third-party/codex-models' / name).read_bytes()
+            self.assertEqual(asset.read_bytes(), original)
+            for mutation in ['tampered', 'missing']:
+                with self.subTest(asset=name, mutation=mutation):
+                    if mutation == 'tampered':
+                        asset.write_bytes(original + b'\nchanged')
+                    else:
+                        asset.unlink()
+                    try:
+                        with self.root_metadata(), self.assertRaises(subprocess.CalledProcessError):
+                            b.verify_copy(stage, config())
+                    finally:
+                        asset.write_bytes(original)
         # 同时验证投影被篡改后入口会拒绝，不能只检查原镜像包。
         (app / 'tools/capacity/owned-runtime.mjs').write_text('export {};')
         with self.root_metadata(), self.assertRaises(subprocess.CalledProcessError):
