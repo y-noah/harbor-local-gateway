@@ -156,59 +156,93 @@ let managementIdentity=null,departmentView='global',departmentViewName='',scopeT
 const adminReads=new Set();
 function departmentHeaders(){if(scopeTransitioning)throw Error('正在切换部门，请稍候');return managementIdentity?{'X-Harbor-Department':departmentView}:{};}
 function applyManagementIdentity(identity){
- managementIdentity=identity||null;departmentView='global';departmentViewName='';scopeTransitioning=false;
- if(!identity)return;
- if(identity.role==='department_admin'){departmentView=identity.department_id;departmentViewName=identity.department_name||identity.department_id;return;}
- try{const saved=JSON.parse(sessionStorage.getItem('harbor.department-view')||'null');if(saved&&typeof saved.id==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9-]{0,99}$/.test(saved.id)){departmentView=saved.id;}}catch{}
+ managementIdentity=identity||null;departmentView=identity?.department_id||'global';departmentViewName=identity?.department_name||identity?.department_id||'';scopeTransitioning=false;
+ try{sessionStorage.removeItem('harbor.department-view');}catch{}
 }
-async function verifyManagementView(){if(managementIdentity?.role!=='super_admin'||departmentView==='global')return;const epoch=authEpoch,id=departmentView;try{const row=await api('/api/admin/departments/'+encodeURIComponent(id));if(epoch===authEpoch&&id===departmentView)departmentViewName=row.name;}catch(error){if(epoch===authEpoch)toast(error.message);}}
+async function verifyManagementView(){}
 function departmentSidebar(){
  if(!managementIdentity)return '';
- const global=departmentView==='global';
- return `<div class="department-context"><small>${managementIdentity.role==='super_admin'?'超级管理员':'部门管理员'}</small><strong>${esc(global?'全局视图':departmentViewName||departmentView)}</strong>${global?'<p class="hint">业务操作请先选择部门</p>':''}${managementIdentity.role==='super_admin'?button('department-picker',global?'选择与管理部门':'切换部门','text-button'):''}</div>`;
+ const name=departmentView==='global'?'全局视图':departmentViewName||departmentView;
+ return `<span class="department-scope" title="${esc('当前管理范围：'+name)}">范围：${esc(name)}</span>`;
 }
-function switchDepartment(id,name=''){
- if(!managementIdentity||managementIdentity.role!=='super_admin'||scopeTransitioning)return;
- if(sending||managementSecretPending)return toast('请等待当前请求完成后再切换部门');
- if(id===departmentView)return close();
- // Store only a view selector; the server authenticates and authorizes it again.
- try{sessionStorage.setItem('harbor.department-view',JSON.stringify({id}));}catch{return toast('无法保存部门视图，请允许此页面使用会话存储');}
- scopeTransitioning=true;authEpoch++;for(const controller of adminReads)controller.abort();adminReads.clear();state=null;showLogin();$('#login').classList.add('hidden');connectionState('正在切换部门');location.reload();
+function globalDepartmentView(){return admin&&managementIdentity?.role==='super_admin'&&departmentView==='global';}
+function departmentManagementContext(){if(managementIdentity?.role!=='super_admin')return '';return `<div class="department-context"><strong>${esc(departmentViewName||departmentView)}</strong>${button('department-picker','团队管理','primary')}</div>`;}
+// Enter a real department before opening business editors. UI scope never
+// substitutes for the server's authentication and object ownership checks.
+const departmentBusinessActions=new Set(('account-pool-settings api-account-settings api-weights apply-member-type archive-member-type balancing-preview balancing-settings cancel-login change-member-type check-account confirm-disable-account confirm-remove-account confirm-remove-key confirm-remove-member confirm-upstream create-account create-fixed-session create-member create-member-type device-approve device-cancel-renewal device-key-policy device-policy device-rename device-renew device-replace device-scope-remove device-scope-save device-toggle disable-session edit-member edit-member-type edit-member-type-metadata enable-session extra-global extra-account extra-refresh extra-policy-preview extra-batch-execute extra-batch-retry handoff-cancel handoff-edit key-models keys-renew-selected login-account manage-member-type member-batch-cancel member-batch-execute member-batch-retry member-batch-settings member-batch-undo member-limits member-types members-access-disable members-access-enable members-configure-selected members-configure-type new-key nightly-session package-account package-account-advanced package-catalog package-policy package-preview-apply package-template-edit package-template-new planning-new platform-cancel-login platform-check platform-credential platform-login refresh-quotas remove-account remove-key remove-member renew-key route-session routing-auto routing-weights settle toggle-account toggle-key toggle-member toggle-session transfer-schedule type-history-restore').split(' '));
+const accountDepartmentActions=new Set(('api-account-settings check-account confirm-disable-account confirm-remove-account create-fixed-session extra-account login-account package-account package-account-advanced platform-cancel-login platform-check platform-credential platform-login remove-account toggle-account cancel-login').split(' '));
+for(const action of ['execute','retry','undo','cancel'])departmentBusinessActions.add('access-batch-'+action);
+const memberDepartmentActions=new Set(('edit-member new-key toggle-member remove-member confirm-remove-member member-limits member-batch-settings change-member-type member-devices').split(' '));
+async function chooseBusinessDepartment(action='',id=''){
+ if(!globalDepartmentView())return;
+ const entity=accountDepartmentActions.has(action)?'accounts':memberDepartmentActions.has(action)?'members':null;
+ if(!id||!entity)return openDepartments(null,false,{selectOnly:true});
+ modal('<h2>进入所属团队</h2><p>正在核对归属…</p>');
+ const view={epoch:authEpoch,version:dialogVersion,rows:[],kind:'departments',selectOnly:true};departmentDialog=view;
+ try{
+  const account=await api('/api/admin/'+entity+'/'+encodeURIComponent(id));if(!departmentDialogCurrent(view))return;
+  if(account.id!==id||typeof account.department_id!=='string'||!account.department_id)throw Error('归属信息不完整，请刷新后选择所属团队');
+  const department=await api('/api/admin/departments/'+encodeURIComponent(account.department_id));if(!departmentDialogCurrent(view))return;
+  if(department.id!==account.department_id)throw Error('团队归属信息不一致，请刷新后重试');
+  view.rows=[department];renderDepartments(view);
+ }catch(error){if(departmentDialogCurrent(view))$('#modal-content').innerHTML=`<h2>选择业务所属部门</h2><p class="inline-error">${esc(error.message)}</p>${button('department-business-picker','选择部门','primary')}`;}
 }
+function switchDepartment(){return toast('业务数据仅限当前团队');}
 function departmentPageQuery(after){return '?limit=20'+(after?'&after_created='+encodeURIComponent(after.created)+'&after_id='+encodeURIComponent(after.id):'');}
 function departmentDialogCurrent(view){return departmentDialog===view&&admin&&view.epoch===authEpoch&&view.version===dialogVersion&&dialogOpen();}
-async function openDepartments(after=null,append=false){
+async function openDepartments(after=null,append=false,{selectOnly=false}={}){
  if(managementIdentity?.role!=='super_admin')return;
- if(departmentView!=='global')return modal(`<h2>切换部门</h2><p class="hint">返回全局视图后可选择或管理部门。</p><div class="dialog-actions">${button('department-global','返回全局视图','primary')}</div>`);
  const previous=append?departmentDialog?.rows||[]:[];
  modal('<h2>部门管理</h2><p class="hint">正在读取部门…</p>',true);
- const view={epoch:authEpoch,version:dialogVersion,rows:previous,kind:'departments'};departmentDialog=view;
+ const view={epoch:authEpoch,version:dialogVersion,rows:previous,kind:'departments',selectOnly};departmentDialog=view;
  try{const data=await api('/api/admin/departments'+departmentPageQuery(after));if(!departmentDialogCurrent(view))return;view.rows=[...previous,...data.rows];view.next=data.next;renderDepartments(view);}catch(error){if(departmentDialogCurrent(view))$('#modal-content').innerHTML='<h2>部门管理</h2><p class="inline-error">'+esc(error.message)+'</p>'+button('department-picker','重新读取');}
 }
 function renderDepartments(view){
- $('#modal-content').innerHTML=`<h2>部门管理</h2><p class="hint">每个部门独立管理员工、密钥和账号。停用部门会使其已有管理会话失效，恢复后需重新登录。</p><div class="actions">${button('department-create','新建部门','primary')}</div><div class="department-list">${view.rows.map(row=>`<article class="department-row"><div><strong>${esc(row.name)}</strong><small>${row.enabled?'已启用':'已停用'} · 员工 ${fmt(row.members)} · 账号 ${fmt(row.accounts)} · 有效管理 Key ${fmt(row.management_keys)}</small></div><div class="actions">${button('department-select','进入部门','secondary',row.id)}${button('department-edit','编辑','secondary',row.id)}${button('department-keys','管理 Key','secondary',row.id)}</div></article>`).join('')||empty('尚无部门')}</div>${view.next?button('department-more','加载更多部门'):''}`;
+ const selectOnly=view.selectOnly;
+ $('#modal-content').innerHTML=`<h2>${selectOnly?'选择业务所属部门':'部门管理'}</h2><p class="hint">${selectOnly?'进入所属部门后再配置员工、账号或会话。全局视图不会提交部门业务变更。':'每个部门独立管理员工、密钥和账号。停用部门会使其已有管理会话失效，恢复后需重新登录。'}</p>${selectOnly?'':`<div class="actions">${button('department-create','新建部门','primary')}</div>`}<div class="department-list">${view.rows.map(row=>`<article class="department-row"><div><strong>${esc(row.name)}</strong><small>${row.enabled?'已启用':'已停用'}${selectOnly?'':' · 有效管理 Key '+fmt(row.management_keys)}</small></div><div class="actions">${selectOnly?'':button('department-edit','编辑','secondary',row.id)+button('department-keys','管理 Key','secondary',row.id)}</div></article>`).join('')||empty('尚无部门')}</div>${view.next?button('department-more','加载更多部门'):''}`;
 }
 async function openDepartmentKeys(id,after=null,append=false){
  const previous=append?departmentDialog?.rows||[]:[];
  modal('<h2>部门管理 Key</h2><p class="hint">正在读取…</p>',true);
  const view={epoch:authEpoch,version:dialogVersion,kind:'keys',id,rows:previous};departmentDialog=view;
  try{const data=await api('/api/admin/departments/'+encodeURIComponent(id)+'/management-keys'+departmentPageQuery(after));if(!departmentDialogCurrent(view))return;view.rows=[...previous,...data.rows];view.next=data.next;
- $('#modal-content').innerHTML=`<h2>部门管理 Key</h2><p class="hint">仅显示标识和状态。新 Key 只在生成时展示一次；撤销后相关管理会话立即失效。</p><div class="actions">${button('department-key-create','生成管理 Key','primary',id)}${button('department-picker','返回部门列表')}</div><div class="department-list">${view.rows.map(row=>`<article class="department-row"><div><strong>${esc(row.label)}</strong><small>${esc(row.prefix)} · ${row.enabled?'有效':'已撤销'} · ${date(row.created)}</small></div>${row.enabled?button('department-key-revoke','撤销','secondary',row.id):''}</article>`).join('')||empty('尚无管理 Key')}</div>${view.next?button('department-keys-more','加载更多 Key'):''}`;
+ $('#modal-content').innerHTML=`<h2>部门管理 Key</h2><p class="hint">可回读安全保存的有效 Key；历史未保存原文的 Key 无法恢复。撤销后相关管理会话立即失效。</p><div class="actions">${button('department-key-create','生成管理 Key','primary',id)}${button('department-picker','返回部门列表')}</div><div class="department-list">${view.rows.map(row=>`<article class="department-row"><div><strong>${esc(row.label)}</strong><small>${esc(row.prefix)} · ${row.enabled?'有效':'已撤销'} · ${date(row.created)}</small></div>${row.enabled?'<div class="actions">'+button('department-key-reveal','查看／复制','secondary',row.id)+button('department-key-revoke','撤销','secondary',row.id)+'</div>':''}</article>`).join('')||empty('尚无管理 Key')}</div>${view.next?button('department-keys-more','加载更多 Key'):''}`;
  }catch(error){if(departmentDialogCurrent(view))$('#modal-content').innerHTML='<h2>部门管理 Key</h2><p class="inline-error">'+esc(error.message)+'</p>'+button('department-keys','重新读取','secondary',id);}
 }
 async function departmentAction(action,id){
+ if(action==='department-business-picker')return globalDepartmentView()?openDepartments(null,false,{selectOnly:true}):undefined;
  if(action==='department-picker')return openDepartments();
  if(managementIdentity?.role!=='super_admin')return;
  if(action==='department-global')return switchDepartment('global');
- if(departmentView!=='global')return;
  const view=departmentDialog;
- if(action==='department-more'&&departmentDialogCurrent(view)&&view.next)return openDepartments(view.next,true);
+ if(action==='department-more'&&departmentDialogCurrent(view)&&view.next)return openDepartments(view.next,true,{selectOnly:view.selectOnly});
  if(action==='department-keys')return openDepartmentKeys(id);
  if(action==='department-keys-more'&&departmentDialogCurrent(view)&&view.next)return openDepartmentKeys(view.id,view.next,true);
  if(action==='department-select'){const row=view?.rows.find(row=>row.id===id);if(row)return switchDepartment(row.id,row.name);return;}
  if(action==='department-create')return formModal('新建部门','新部门从平台默认配置开始，独立管理员工和账号。','<label>部门名称<input name="name" maxlength="60" required></label>',async(f,current)=>{await api('/api/admin/departments','POST',{name:f.get('name')});if(current())await openDepartments();});
- if(action==='department-edit'){const row=view?.rows.find(row=>row.id===id);if(!row)return;return formModal('编辑部门','停用会撤销该部门已有管理会话的资格。',`<label>部门名称<input name="name" maxlength="60" required value="${esc(row.name)}"></label><label>状态<select name="enabled"><option value="true" ${row.enabled?'selected':''}>启用</option><option value="false" ${row.enabled?'':'selected'}>停用</option></select></label>`,async(f,current)=>{await api('/api/admin/departments/'+encodeURIComponent(id),'PATCH',{name:f.get('name'),enabled:f.get('enabled')==='true',expected_version:row.version});if(current())await openDepartments();});}
- if(action==='department-key-create')return formModal('生成部门管理 Key','管理 Key 只在生成成功时展示一次，请及时保存。','<label>用途名称<input name="label" maxlength="60" required></label>',async(f,current)=>{managementSecretPending=true;try{const result=await api('/api/admin/departments/'+encodeURIComponent(id)+'/management-keys','POST',{label:f.get('label')});if(!current())return;modal(`<h2>管理 Key 已生成</h2><p class="hint">此 Key 仅展示一次。请保存在可信位置，不要放入截图、日志或聊天。</p><div class="secret" id="department-secret"></div><div class="dialog-actions">${button('department-key-copy','复制管理 Key','primary')}${button('department-keys','已保存，返回列表','secondary',id)}</div>`);$('#department-secret').textContent=result.secret;}finally{managementSecretPending=false;}});
+ if(action==='department-edit'){
+  const row=view?.rows.find(row=>row.id===id);if(!row)return;const editEpoch=authEpoch;
+  return formModal('编辑部门','停用会撤销该部门已有管理会话的资格。',`<label>部门名称<input name="name" maxlength="60" required value="${esc(row.name)}"></label><label>状态<select name="enabled"><option value="true" ${row.enabled?'selected':''}>启用</option><option value="false" ${row.enabled?'':'selected'}>停用</option></select></label>`,async(f,current)=>{
+   await api('/api/admin/departments/'+encodeURIComponent(id),'PATCH',{name:f.get('name'),enabled:f.get('enabled')==='true',expected_version:row.version});
+   if(!admin||editEpoch!==authEpoch)return;
+   if(id===managementIdentity?.department_id){
+    const session=await api('/api/auth/session');if(!admin||editEpoch!==authEpoch)return;
+    if(!session.authenticated||!session.identity)throw Error('管理身份已变化，请重新登录');
+    applyManagementIdentity(session.identity);pageStateCache.clear();state=null;
+    if(managementIdentity.business_available!==false)await refresh(true,'',{initialize:true});else render();
+   }
+   if(current())await openDepartments();
+  });
+ }
+ if(action==='department-key-create')return formModal('生成部门管理 Key','新 Key 可在管理列表中查看和复制。','<label>用途名称<input name="label" maxlength="60" required></label>',async(f,current)=>{managementSecretPending=true;try{const result=await api('/api/admin/departments/'+encodeURIComponent(id)+'/management-keys','POST',{label:f.get('label')});if(!current())return;modal(`<h2>管理 Key 已生成</h2><p class="hint">请保存在可信位置；之后可在管理列表中查看和复制。</p><div class="secret" id="department-secret"></div><div class="dialog-actions">${button('department-key-copy','复制管理 Key','primary')}${button('department-keys','已保存，返回列表','secondary',id)}</div>`);$('#department-secret').textContent=result.secret;}finally{managementSecretPending=false;}});
+ if(action==='department-key-reveal'){
+  const row=view?.rows.find(row=>row.id===id);if(!departmentDialogCurrent(view)||view.kind!=='keys'||!row?.enabled)return;
+  const result=await api('/api/admin/departments/'+encodeURIComponent(view.id)+'/management-keys/'+encodeURIComponent(id)+'/reveal','POST',{});
+  if(!departmentDialogCurrent(view))return;
+  if(result.available===true&&typeof result.secret==='string'&&result.secret){modal(`<h2>部门管理 Key</h2><p class="hint">仅在当前窗口显示，请勿放入截图、日志或聊天。</p><div class="secret" id="department-secret"></div><div class="dialog-actions">${button('department-key-copy','复制管理 Key','primary')}${button('department-keys','返回列表','secondary',view.id)}</div>`);$('#department-secret').textContent=result.secret;}
+  else modal(`<h2>此 Key 无法回读</h2><p class="hint">${result.reason==='not_stored'?'此历史 Key 未保存可恢复的原文，请使用已有副本，或按需生成并替换。':result.reason==='storage_not_enabled'?'当前环境尚未启用安全回读存储，请联系管理员配置。':'未取得可回读的 Key，请重新读取。'}</p>${button('department-keys','返回列表','secondary',view.id)}`);
+  return;
+ }
  if(action==='department-key-copy'){const secret=$('#department-secret')?.textContent;if(secret)await navigator.clipboard.writeText(secret);return toast('已复制管理 Key');}
  if(action==='department-key-revoke'){const row=view?.rows.find(row=>row.id===id),departmentId=view?.id;if(!row||view.kind!=='keys')return;return formModal('撤销管理 Key',`确认撤销「${esc(row.label)}」？相关管理会话将失效。`,'',async(_f,current)=>{await api('/api/admin/departments/'+encodeURIComponent(departmentId)+'/management-keys/'+encodeURIComponent(id)+'/revoke','POST',{expected_version:row.version});if(current())await openDepartmentKeys(departmentId);});}
 }
@@ -220,7 +254,9 @@ async function verifyUnauthorizedSession(epoch){
  await sessionVerification.promise;
 }
 async function api(path,method='GET',data,credential='',signal){
-  const epoch=authEpoch,requestNavigation=navigationVersion,requestDialog=dialogVersion,isAdmin=path.startsWith('/api/admin/'),scopeHeaders=isAdmin?departmentHeaders():{};
+ if(managementIdentity?.business_available===false&&path.startsWith('/api/admin/')&&!/^\/api\/admin\/departments(?:\/|\?|$)/.test(path))throw Error('当前团队已停用，请先在团队管理中恢复');
+ if(globalDepartmentView()&&path.startsWith('/api/admin/')&&method!=='GET'&&!/^\/api\/admin\/(?:departments(?:\/|$)|pricing(?:\/|$)|recordings(?:\/|$)|backup$)/.test(path))throw Error('请先选择业务所属部门，再进行此操作');
+  const epoch=authEpoch,requestNavigation=navigationVersion,requestDialog=dialogVersion,isAdmin=path.startsWith('/api/admin/'),scopeHeaders=isAdmin?(/^\/api\/admin\/departments(?:\/|\?|$)/.test(path)&&managementIdentity?.role==='super_admin'?{'X-Harbor-Department':'global'}:departmentHeaders()):{};
   let controller,forwardAbort,timeout,timedOut=false;
   if((isAdmin||path==='/api/auth/session')&&method==='GET'){controller=new AbortController();forwardAbort=()=>controller.abort();if(signal?.aborted)controller.abort();else signal?.addEventListener?.('abort',forwardAbort,{once:true});adminReads.add(controller);timeout=setTimeout(()=>{timedOut=true;controller.abort();},30000);}
   try{const r=await fetch(path,{method,signal:controller?.signal||signal,headers:{...scopeHeaders,...(credential?{Authorization:'Bearer '+credential}:{}),...(data!==undefined?{'Content-Type':'application/json'}:{})},...(data!==undefined?{body:JSON.stringify(data)}:{})});
@@ -331,15 +367,15 @@ async function automaticRefresh(){
   const scope=automaticRefreshScope();if(!scope||autoRefreshPending||sessionsLoading||requestsLoading)return;
   autoRefreshPending=true;try{await refresh(true,scope);}finally{autoRefreshPending=false;}
 }
-async function refresh(renderPage=true,automaticScope='',{preserveRequestsPage=false,initialState=null}={}){
-  if(!admin)return;const priorSessionError=tab==='sessions'?sessionsLoadError:'';const epoch=authEpoch,version=++refreshVersion,foreground=renderPage&&!automaticScope&&!!state,scope=pageScope();if(foreground){foregroundRefreshVersion=version;foregroundRefreshScope=scope;}syncLoadingRegions();
-  const params=new URLSearchParams();if(tab==='sessions'){params.set('session_page',sessionsPage);params.set('session_page_size',sessionsPageSize);}if(!state||pagedPeople())params.set('people','none');if(tab==='sessions'&&state?.capabilities?.sessionStateView)params.set('view','sessions');else if(tab==='accounts'&&state?.capabilities?.accountStateView)params.set('view','accounts');else if(tab==='overview'&&(!state||pagedPeople())||state?.capabilities?.sessionStateView&&!['accounts','sessions'].includes(tab)||state?.view==='accounts'&&!needsFullState())params.set('view','overview');const sessionSelection=tab==='sessions'&&state?.capabilities?.sessionFilters?{...sessionsFilters}:emptySessionFilters();for(const [key,value] of Object.entries(sessionSelection))if(value)params.set('session_'+key,value);const query=params.size?'?'+params:'';
+async function refresh(renderPage=true,automaticScope='',{preserveRequestsPage=false,initialState=null,initialize=false}={}){
+  if(!admin)return;if(managementIdentity?.business_available===false){if(renderPage)render();return;}const priorSessionError=tab==='sessions'?sessionsLoadError:'';const epoch=authEpoch,version=++refreshVersion,foreground=renderPage&&!automaticScope&&!!state,scope=pageScope();if(foreground){foregroundRefreshVersion=version;foregroundRefreshScope=scope;}syncLoadingRegions();
+  const params=new URLSearchParams();if(tab==='sessions'){params.set('session_page',sessionsPage);params.set('session_page_size',sessionsPageSize);}if(!state||pagedPeople())params.set('people','none');if(tab==='sessions'&&(state?.capabilities?.sessionStateView||initialize&&managementIdentity))params.set('view','sessions');else if(tab==='accounts'&&state?.capabilities?.accountStateView)params.set('view','accounts');else if(tab==='overview'&&(!state||pagedPeople())||state?.capabilities?.sessionStateView&&!['accounts','sessions'].includes(tab)||state?.view==='accounts'&&!needsFullState())params.set('view','overview');const sessionSelection=tab==='sessions'&&(state?.capabilities?.sessionFilters||initialize&&managementIdentity)?{...sessionsFilters}:emptySessionFilters();for(const [key,value] of Object.entries(sessionSelection))if(value)params.set('session_'+key,value);const query=params.size?'?'+params:'';
   // Independent page queries must not wait for the more expensive global
   // snapshot. Each region owns its loading state and stale-response guard.
   const pageLoads={},pageLoadOwners={};
   const readVersion=source=>({'members':membersVersion,'key-usage':keyUsageVersion,'requests':requestsVersion,'type-statistics':typeStatisticsVersion,'history':historyVersion,'recording-status':recordingAdminStatusController})[source];
   const loadRequiredPages=()=>{
-    if(dialogOpen())return;
+    if(dialogOpen()&&!initialize)return;
     const start=(source,needed,read)=>{if(needed&&!pageLoads[source]){pageLoads[source]=read();pageLoadOwners[source]={epoch:authEpoch,navigation:navigationVersion,scope:pageScope(),version:readVersion(source)};}};
     start('members',pagedPeople()&&tab==='members',()=>loadMembers());
     start('key-usage',pagedPeople()&&tab==='requests'&&recordView==='usage',()=>loadKeyUsage(!!automaticScope));
@@ -354,7 +390,7 @@ async function refresh(renderPage=true,automaticScope='',{preserveRequestsPage=f
   try{
     stateReadController?.abort();const stateController=new AbortController();stateReadController=stateController;const next=initialState??await api('/api/admin/state'+query,'GET',undefined,'',stateController.signal);
     if(!admin||epoch!==authEpoch||version!==refreshVersion||automaticScope&&automaticRefreshScope()!==automaticScope||foreground&&pageScope()!==scope)return;
-    if(tab==='sessions'&&dialogOpen())return;
+    if(tab==='sessions'&&dialogOpen()&&!initialize)return;
     const changed=stateSnapshot(next)!==stateSnapshot(state)||!!priorSessionError;state=next;reconcilePageReadDependencies();pageReadSucceeded('state',scope);cachePageState(next);if(overviewCostData&&JSON.stringify(overviewCostData.usageWindow)!==JSON.stringify(next.usageWindow))overviewCostData=null;if(tab==='overview')overviewCostRevision++;if(tab==='sessions'&&next.view!=='overview'){sessionsConfirmedFilters={...sessionSelection};sessionsConfirmedSnapshot={sessions:(next.sessions||[]).map(row=>({...row})),pagination:next.sessionsPagination?{...next.sessionsPagination}:null,usageWindow:next.usageWindow?{start:next.usageWindow.start,end:next.usageWindow.end}:null};sessionsLoadError='';}if(state.capabilities?.accountPackages&&tab==='accounts'&&!packageCatalog&&!packageCatalogController)void loadPackageCatalog();if(state.capabilities?.typeStatistics&&!(tab==='requests'&&recordView==='recordings')&&!typeCatalog.length&&!typeCatalogController)void loadTypeCatalog();sessionsPage=next.sessionsPagination?.page??sessionsPage;sessionsPageSize=validPageSize(next.sessionsPagination?.pageSize,sessionsPageSize);sessionsLoading=false;
     if(stateNeedsPageData()){if(renderPage)render();return await refresh(renderPage,'',{preserveRequestsPage});}
     if(tab==='overview')void loadOverviewCost();if(renderPage&&(!automaticScope||changed))render();else if(tab==='accounts'&&!dialogOpen())void loadExtraPool();
@@ -392,6 +428,7 @@ function showShell(){
 }
 
 function setTab(next){
+ if(admin&&managementIdentity?.business_available===false){render();return;}
   if(sending)return toast('请等待当前请求完成后再切换页面');
   if(next==='usage')next=['sessions','requests'].includes(tab)?tab:'sessions';
   if(next==='system')next=['history','playground'].includes(tab)?tab:'guide';
@@ -432,6 +469,13 @@ document.addEventListener('toggle',event=>{if(event.target.matches?.('.member-bu
 document.addEventListener('scroll',event=>{if(event.target.matches?.('.member-controls'))positionMemberBulkMenu(document.querySelector('.member-bulk-menu[open]'));},true);
 window.addEventListener?.('resize',()=>positionMemberBulkMenu(document.querySelector('.member-bulk-menu[open]')));
 function memberManagementActions(){return `<div class="actions member-management-actions">${state.capabilities?.memberTypes?button('member-types','使用类型管理','secondary')+button('member-batch-history','配置记录','secondary'):''}${button('create-member','＋ 创建员工 Key','primary')}</div>`;}
+function memberLimitSummary(row,data){
+ if(!row.usage_limits?.enabled)return '未开启限额';
+ const usage=Array.isArray(row.limit_usage)?row.limit_usage:[];
+ if(!usage.length)return `<small>${data?.usagePending?'剩余额度加载中':'剩余额度获取失败'}</small>`;
+ const note=data?.usageError||membersRefreshStale?'更新失败，保留上次结果':data?.usagePending||membersLoading?'更新中':'';
+ return usage.map(rule=>`<small>${esc(rule.model)} · ${esc(memberLimitWindowLabel(rule.hours))}<br>上限 ${referenceMoney(Number(rule.limit_usd))}／${Number(rule.unresolved)>0?`${fmt(rule.unresolved)}条请求未完成计价，剩余额度暂不可算（当前模型请求受限）`:rule.remaining_usd!==null&&rule.remaining_usd!==undefined&&Number.isFinite(Number(rule.remaining_usd))?'剩余 '+referenceMoney(Number(rule.remaining_usd)):'剩余额度获取失败'}${note?`<span class="hint"> · ${note}</span>`:''}</small>`).join('');
+}
 function memberKeyExpiration(row){
  if(row.key_count===0)return '无 Key';const value=row.key_expiration;if(!value)return '<span class="muted">未加载</span>';
  const expiryDate=t=>new Date(t).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false});const notes=[];if(value.expired)notes.push('已过期 '+fmt(value.expired)+' 个');if(value.permanent)notes.push('永久 '+fmt(value.permanent)+' 个');
@@ -442,9 +486,9 @@ function memberKeyExpiration(row){
 }
 function pagedMembersSection(){
   const rowGuarded=membersLoading||membersRefreshStale,data=membersData,rows=data?.rows||[],pagination=data?.pagination,types=data?.types||[];
-  const filters=`<div class="toolbar member-filters"><input id="members-search" maxlength="100" value="${esc(memberFilters.q)}" placeholder="搜索员工名称" aria-label="搜索员工名称"><select id="members-type" aria-label="使用类型"><option value="">全部类型</option><option value="unclassified" ${memberFilters.typeId==='unclassified'?'selected':''}>未分类</option>${types.map(type=>`<option value="${esc(type.id)}" ${memberFilters.typeId===type.id?'selected':''}>${esc(type.code+' · '+type.name)}</option>`).join('')}</select><select id="members-status" aria-label="员工状态"><option value="">全部状态</option><option value="enabled" ${memberFilters.status==='enabled'?'selected':''}>已启用</option><option value="disabled" ${memberFilters.status==='disabled'?'selected':''}>已停用</option></select></div>`;
+  const filters=`<div class="toolbar member-filters"><input id="members-search" maxlength="100" value="${esc(memberFilters.q)}" placeholder="搜索员工名称" aria-label="搜索员工名称"><select id="members-type" aria-label="使用类型"><option value="">全部类型</option><option value="unclassified" ${memberFilters.typeId==='unclassified'?'selected':''}>未分类</option>${types.map(type=>`<option value="${esc(type.id)}" ${memberFilters.typeId===type.id?'selected':''}>${esc(typeOptionLabel(type))}</option>`).join('')}</select><select id="members-status" aria-label="员工状态"><option value="">全部状态</option><option value="enabled" ${memberFilters.status==='enabled'?'selected':''}>已启用</option><option value="disabled" ${memberFilters.status==='disabled'?'selected':''}>已停用</option></select></div>`;
   const selection=`<div class="toolbar member-bulk-bar"><details class="member-bulk-menu"><summary>批量操作${memberSelection.size?`（${fmt(memberSelection.size)} 人）`:''}</summary><div class="member-bulk-options">${button('members-select-page','选择／取消本页','secondary','',rowGuarded||!rows.length)}${button('members-select-all','选择全部筛选结果 '+fmt(pagination?.total||0)+' 人','secondary','',rowGuarded||!pagination?.total)}${button('members-clear-selection','清空选择','text-button','',!memberSelection.size)}${button('members-configure-selected','配置已选员工','secondary','',rowGuarded||!memberSelection.size)}${state?.capabilities?.memberActions?button('members-access-disable','停用已选员工','text-button danger','',rowGuarded||!memberSelection.size)+button('members-access-enable','恢复已选员工','text-button','',rowGuarded||!memberSelection.size):''}${memberFilters.typeId&&memberFilters.typeId!=='unclassified'?button('members-configure-type','配置此类型全部员工','secondary','',rowGuarded):''}</div></details>${state?.capabilities?.memberActions?button('access-history','访问操作记录','secondary'):''}</div>`;
-  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>选择</th><th>员工／使用类型</th><th>Key 数量</th><th>Key 到期时间</th><th>共享限额与剩余</th><th>参考用量（USD）</th><th>状态／最近使用</th><th>管理</th></tr></thead><tbody>${rows.map(row=>`<tr><td><input type="checkbox" data-action="members-toggle-select" data-id="${esc(row.id)}" aria-label="选择${esc(row.name)}" ${memberSelection.has(row.id)?'checked':''} ${rowGuarded?'disabled':''}></td><td><strong>${esc(row.name)}</strong><small>${row.usage_type_code?esc(row.usage_type_code+' · '+row.usage_type_name):'未分类'}</small></td><td>${fmt(row.key_count)} 个</td><td>${memberKeyExpiration(row)}</td><td>${row.usage_limits.enabled?(data?.usagePending?'<small>—</small>':data?.usageError?'<small>未加载</small>':(row.limit_usage||[]).map(rule=>`<small>${esc(rule.model)} · ${esc(memberLimitWindowLabel(rule.hours))}<br>上限 ${referenceMoney(Number(rule.limit_usd))}／剩余 ${rule.unresolved?'待核对':referenceMoney(Number(rule.remaining_usd))}</small>`).join('')):'未开启限额'}</td><td aria-busy="${!!data?.usagePending}">${data?.usagePending?'—':data?.usageError?'未加载':`近7天 ${referenceTotal(row.standard)}<small>近12小时 ${referenceTotal(row.standard_12h)}</small>`}</td><td>${row.enabled?'<span class="badge">启用</span>':'<span class="badge off">停用</span>'}<small>${data?.usagePending?'—':data?.usageError?'未加载':date(row.last_seen)}</small></td><td>${button('member-detail','管理','table-button',row.id,membersLoading)}</td></tr>`).join('')}</tbody></table></div>`:data?empty('没有符合条件的员工'):'';
+  const table=rows.length?`<div class="table-wrap"><table><thead><tr><th>选择</th><th>员工／使用类型</th>${globalDepartmentView()?'<th>所属团队</th>':''}<th>Key 数量</th><th>Key 到期时间</th><th>共享限额与剩余</th><th>参考用量（USD）</th><th>状态／最近使用</th><th>管理</th></tr></thead><tbody>${rows.map(row=>`<tr><td><input type="checkbox" data-action="members-toggle-select" data-id="${esc(row.id)}" aria-label="选择${esc(row.name)}" ${memberSelection.has(row.id)?'checked':''} ${rowGuarded?'disabled':''}></td><td><strong>${esc(row.name)}</strong><small>${row.usage_type_code?esc(row.usage_type_code+' · '+row.usage_type_name):'未分类'}</small></td>${globalDepartmentView()?`<td>${esc(row.department_name??'归属待核对')}</td>`:''}<td>${fmt(row.key_count)} 个</td><td>${memberKeyExpiration(row)}</td><td>${memberLimitSummary(row,data)}</td><td aria-busy="${!!data?.usagePending}">${data?.usagePending?'—':data?.usageError?'未加载':`近7天 ${referenceTotal(row.standard)}<small>近12小时 ${referenceTotal(row.standard_12h)}</small>`}</td><td>${row.enabled?'<span class="badge">启用</span>':'<span class="badge off">停用</span>'}<small>${data?.usagePending?'—':data?.usageError?'未加载':date(row.last_seen)}</small></td><td>${button('member-detail','管理','table-button',row.id,membersLoading)}</td></tr>`).join('')}</tbody></table></div>`:data?empty('没有符合条件的员工'):'';
   return `<div class="page-toolbar member-controls">${filters}${selection}${memberManagementActions()}</div>`+panel('员工列表',loadingRegion(table+(pagination?`<div class="pager">${button('members-page','上一页','secondary',pagination.page-1,membersLoading||pagination.page<=1)}<span>第 ${pagination.page}／${pagination.totalPages} 页 · 共 ${fmt(pagination.total)} 人</span>${button('members-page','下一页','secondary',pagination.page+1,membersLoading||pagination.page>=pagination.totalPages)}<select id="members-page-size" aria-label="每页员工数">${PAGE_SIZES.map(size=>`<option value="${size}" ${memberFilters.pageSize===size?'selected':''}>${size}人／页</option>`).join('')}</select></div>`:'<select id="members-page-size" aria-label="每页员工数"><option>20</option></select>'),membersLoading,'正在读取员工列表…','members-results'));
 }
 async function selectFilteredMembers(){
@@ -472,7 +516,7 @@ async function openPagedFixedSession(accountId,q='',page=1){
   }catch(error){if(typeCurrent(loading))$('#modal-content').innerHTML=`<h2>员工未能载入</h2><p>${esc(error.message)}</p><div class="dialog-actions">${button('create-fixed-session','重试','secondary',accountId)}${button('close','关闭','primary')}</div>`;}
 }
 
-function memberTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>员工 / Key及有效期</th><th>设备</th><th>最近使用</th><th>状态</th><th>管理</th></tr></thead><tbody>${rows.map(m=>`<tr><td class="member-identity"><div class="member-cell"><span class="avatar">${esc(m.name.slice(0,1))}</span><strong>${esc(m.name)}</strong></div>${m.usage_type_code?`<small>${esc(m.usage_type_code)} · ${esc(m.usage_type_name)}</small>`:state?.capabilities?.memberTypes?'<small>未分类</small>':''}<div class="member-keys">${(state.keys||[]).filter(k=>k.member_id===m.id).map(k=>`<div class="member-key"><div class="mono">${keyDisplay(k)}</div><small>${k.expires?'到期：'+beijingDate(k.expires)+'（北京时间）':'永久有效'} · ${!k.enabled?'已停用':!m.enabled?'员工已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</small></div>`).join('')||'<small>暂无 Key</small>'}</div></td><td>${esc(deviceSummary(m))}</td><td>${date(m.last_seen)}</td><td>${m.enabled?'<span class="badge">启用</span>':'<span class="badge off">已停用</span>'}</td><td>${button('member-detail','管理','table-button',m.id)}</td></tr>`).join('')}</tbody></table></div>`:empty('还没有员工。创建第一个 Key，开始使用。');}
+function memberTable(rows){return rows.length?`<div class="table-wrap"><table><thead><tr><th>员工 / Key及有效期</th>${globalDepartmentView()?'<th>所属团队</th>':''}<th>设备</th><th>最近使用</th><th>状态</th><th>管理</th></tr></thead><tbody>${rows.map(m=>`<tr><td class="member-identity"><div class="member-cell"><span class="avatar">${esc(m.name.slice(0,1))}</span><strong>${esc(m.name)}</strong></div>${m.usage_type_code?`<small>${esc(m.usage_type_code)} · ${esc(m.usage_type_name)}</small>`:state?.capabilities?.memberTypes?'<small>未分类</small>':''}<div class="member-keys">${(state.keys||[]).filter(k=>k.member_id===m.id).map(k=>`<div class="member-key"><div class="mono">${keyDisplay(k)}</div><small>${k.expires?'到期：'+beijingDate(k.expires)+'（北京时间）':'永久有效'} · ${!k.enabled?'已停用':!m.enabled?'员工已停用':k.expires&&k.expires<=Date.now()?'已过期':'可用'}</small></div>`).join('')||'<small>暂无 Key</small>'}</div></td>${globalDepartmentView()?`<td>${esc(m.department_name??'归属待核对')}</td>`:''}<td>${esc(deviceSummary(m))}</td><td>${date(m.last_seen)}</td><td>${m.enabled?'<span class="badge">启用</span>':'<span class="badge off">已停用</span>'}</td><td>${button('member-detail','管理','table-button',m.id)}</td></tr>`).join('')}</tbody></table></div>`:empty('还没有员工。创建第一个 Key，开始使用。');}
 function requestIdentity(r){
   const deviceId=typeof r.device_id==='string'&&r.device_id.trim()?r.device_id:'';
   return {member:r.member_name||'未记录员工',account:r.account_name||(r.account_id?'账号名称未记录':'未记录账号'),model:r.model||'未记录模型',
@@ -629,7 +673,7 @@ function bindRequestFilters(){
   for(const field of requestFilterFields())$(`#requests-${field}`).onchange=e=>{requestsFilters[field]=e.target.value;if(field==='outcome')requestsFilters.status='';if(field==='member')delete requestsFilters.member_missing;if(field==='model')delete requestsFilters.model_missing;requestsFilters.page=1;void loadRequests();};
   if($('#requests-page-size'))$('#requests-page-size').onchange=e=>{requestsFilters.pageSize=Number(e.target.value);requestsFilters.page=1;void loadRequests();};
 }
-function connectionTabs(){return `<div class="actions record-tabs connection-tabs" aria-label="系统管理分类">${[['guide','接入说明'],['test','请求测试'],['history','系统操作历史']].map(([value,label])=>button('connection-view',label,(tab==='history'?value==='history':connectionView===value)?'primary':'secondary',value,sending)).join('')}${admin&&tab==='playground'&&connectionView==='guide'?button('download-access-guide','下载接入文档','secondary'):''}</div>`;}
+function connectionTabs(){return `<div class="actions record-tabs connection-tabs" aria-label="系统管理分类">${[['guide','接入说明'],['test','请求测试'],['history','系统操作历史'],...(managementIdentity?.role==='super_admin'?[['departments','部门管理']]:[])].map(([value,label])=>button('connection-view',label,(tab==='history'?value==='history':connectionView===value)?'primary':'secondary',value,sending)).join('')}${admin&&tab==='playground'&&connectionView==='guide'?button('download-access-guide','下载接入文档','secondary'):''}</div>`;}
 function historyName(id){return historyData?.accounts?.find(a=>a.id===id)?.name||state?.accounts?.find(a=>a.id===id)?.name||id||'—';}
 function weightsText(weights){return weights?Object.entries(weights).map(([id,n])=>historyName(id)+' '+weightPercent(n)).join('；')||'自动模式':'此前值未记录';}
 function historyText(r){
@@ -878,6 +922,7 @@ async function loadOverviewCost(){
  finally{if(overviewCostController===controller){overviewCostController=null;const target=$('#overview-cost-chart');if(!target&&admin&&tab==='overview'&&!overviewType&&epoch===authEpoch&&key===overviewCostScope())render();if(target&&admin&&tab==='overview'&&!overviewType&&epoch===authEpoch&&key===overviewCostScope()){target.innerHTML=overviewCostChart();for(const bar of target.querySelectorAll?.('[data-height]')||[])bar.style.height=bar.dataset.height+'%';}}}
 }
 function render(){
+  if(admin&&managementIdentity?.business_available===false){showShell();$('#content').inert=false;$('#content').innerHTML='<section class="panel"><p>当前团队已停用</p>'+button('department-picker','团队管理','primary')+'</section>';return;}
   if(admin)syncPageReadFeedback();
   if(!admin&&tab!=='playground'){showLogin();return;}
   if(admin&&state){showShell();document.querySelectorAll('[data-tab]').forEach(el=>el.classList.toggle('active',el.dataset.tab===navigationTab()));}
@@ -890,6 +935,7 @@ function render(){
   if(tab!=='accounts')stopExtraPool();
   showShell();document.querySelectorAll('[data-tab]').forEach(el=>el.classList.toggle('active',el.dataset.tab===navigationTab()));const crumb=$('#crumb');if(crumb)crumb.textContent=labels[tab];
   const showGuide=tab==='playground'&&admin&&connectionView==='guide';
+  const showDepartments=tab==='playground'&&admin&&managementIdentity?.role==='super_admin'&&connectionView==='departments';
   updatePageReadFeedback(false);renderedPageScope=pageScope();$('#content').inert=false;$('#content').setAttribute?.('aria-busy','false');
   let html='';
   if(tab==='overview'){
@@ -915,15 +961,17 @@ function render(){
     if(recordView==='recordings')html+=recordingAdminSection();
   }
   if(tab==='history')html=heading('SYSTEM MANAGEMENT','系统管理','')+connectionTabs()+historySection();
-  if(tab==='playground'&&!showGuide){
+  if(tab==='playground'&&!showGuide&&!showDepartments){
     html=heading('SYSTEM MANAGEMENT',admin?'系统管理':'接入与测试','')+(admin?connectionTabs():'')+`<div class="chat-layout"><section class="panel"><div class="chat-controls"><h2>连接设置</h2><label>员工 API Key<input id="test-key" type="password" autocomplete="off" placeholder="hg_…" value="${esc(testKey)}" ${sending?'disabled':''}></label><button class="secondary" id="check-key">查看近7天用量</button><div id="my-quota" class="details-line"></div><label>模型<select id="chat-model" ${sending?'disabled':''}><option value="codex" ${chatModel==='codex'?'selected':''}>Codex</option><option value="claude" ${chatModel==='claude'?'selected':''}>Claude</option>${[...new Set([...platformModels,...(state?.accounts||[]).filter(a=>a.auth_mode==='platform'&&a.enabled&&a.state==='ready').flatMap(a=>JSON.parse(a.platform_models||'[]').map(m=>a.kind+'/'+m))])].map(m=>`<option value="${esc(m)}" ${chatModel===m?'selected':''}>${esc(platformModelLabel(m))}</option>`).join('')}</select></label><div class="notice">仅测试文本对话，不执行代码或访问工作文件。</div>${button('clear-chat','＋ 新建会话','text-button')}<p class="hint mono">${chatSession?esc(chatSession):'尚未创建会话'}</p><p class="hint">${chatModel.includes('/')?'刷新页面会清空聊天记录，无法恢复。':'刷新页面会清空显示；保留 session_id 可继续上下文。'}</p></div></section><section class="panel"><div class="panel-heading"><h2>对话测试</h2><span class="hint">${chatSession?'会话已绑定':'新会话'}</span></div><div class="chat-log" id="chat-log">${renderChat()}</div><form class="composer" id="chat-form"><textarea id="prompt" placeholder="输入测试问题" aria-label="消息" required ${sending?'disabled':''}>${esc(draft)}</textarea><div class="composer-bottom"><span class="hint">${sending?'正在等待回复，最长约 2 分钟…':'每次请求会消耗真实订阅额度'}</span><button class="primary" ${sending?'disabled':''}>${sending?'处理中…':'发送请求 ↗'}</button></div></form></section></div>`;
   }
+  if(showDepartments)html=connectionTabs()+panel('部门管理',departmentManagementContext());
   if(showGuide)html=heading('SYSTEM MANAGEMENT','系统管理','')+connectionTabs();
   if(showGuide)html+=`<details class="guide-notice"><summary>使用前告知：平台可能记录设备及对话信息</summary>${accessDataNotice()}</details>`+panel('Codex Windows / WSL 接入',codexGuide(state.endpoint));
   if(showGuide)html+=panel('image2 图片生成与编辑（测试接入）',imageGuide(state.endpoint));
+  if(globalDepartmentView()&&!['history','playground'].includes(tab))html=`<div class="scope-notice"><span>全局视图 · 业务配置请进入所属团队</span>${button('department-business-picker','选择团队','text-button')}</div>`+html;
   $('#content').innerHTML=html;syncLoadingRegions();document.querySelectorAll('[data-height]').forEach(el=>el.style.height=el.dataset.height+'%');document.querySelectorAll('[data-width]').forEach(el=>el.style.width=el.dataset.width+'%');
   bindHistoryForm();bindRequestFilters();bindTypeStatistics();bindRecordingAdmin();bindPackagePool();void loadOverviewCost();
-  if(tab==='playground'&&!showGuide){$('#chat-form').onsubmit=sendChat;$('#check-key').onclick=checkKey;$('#test-key').oninput=e=>{testKey=e.target.value;$('#my-quota').textContent='';};$('#prompt').oninput=e=>draft=e.target.value;$('#chat-model').onchange=e=>{if(sending)return;chatModel=e.target.value;chat=[];chatSession='';chatOwner='';render();};$('#chat-log').scrollTop=$('#chat-log').scrollHeight;}
+  if(tab==='playground'&&!showGuide&&!showDepartments){$('#chat-form').onsubmit=sendChat;$('#check-key').onclick=checkKey;$('#test-key').oninput=e=>{testKey=e.target.value;$('#my-quota').textContent='';};$('#prompt').oninput=e=>draft=e.target.value;$('#chat-model').onchange=e=>{if(sending)return;chatModel=e.target.value;chat=[];chatSession='';chatOwner='';render();};$('#chat-log').scrollTop=$('#chat-log').scrollHeight;}
   if(tab==='sessions'&&!sessionSnapshotExpired()&&state.capabilities?.sessionFilters)$('#session-filter-form').onsubmit=async event=>{event.preventDefault();if(sessionsLoading)return;const form=new FormData(event.target);sessionsFilters=Object.fromEntries(['q','type','account','status'].map(key=>[key,String(form.get(key)||'').trim()]));sessionsPage=1;sessionsLoading=true;render();await refresh();};
   if(tab==='sessions'&&!sessionSnapshotExpired()){$('#session-page-size').onchange=async e=>{if(sessionsLoading)return;sessionsPageSize=Number(e.target.value);sessionsPage=1;sessionsLoading=true;render();await refresh();};}
   if(tab==='requests'&&recordView==='usage'){$('#request-filter').onchange=e=>{requestFilter=e.target.value;if(pagedPeople()){keyUsagePage=1;void loadKeyUsage();}else render();};}
@@ -1024,15 +1072,15 @@ async function platformLoginFlow(identifier){
 }
 async function loginAccountFlow(identifier){
   const account=state.accounts.find(x=>x.id===identifier),epoch=authEpoch;let popup;
-  if(account.kind==='codex')try{popup=window.open('about:blank','_blank');if(popup)popup.opener=null;}catch{}
+  if(account.kind==='codex')try{popup=window.open('about:blank','_blank');if(popup){popup.opener=null;popup.document.title='正在获取官方授权';popup.document.body.textContent='正在获取官方授权，请稍候…';}}catch{}
   modal('<h2>正在获取官方授权…</h2>');
-  const view=loginView;
+  let view=loginView;
   try{
     const result=await api('/api/admin/accounts/'+identifier+'/login','POST',{});
     if(!admin||epoch!==authEpoch||view!==loginView){popup?.close();return;}
     if(result.type==='browser'){popup?.close();close();await refresh();return toast('请在运行 Harbor 的本机浏览器完成官方登录');}
     if(!validDeviceLogin(result))throw Error('官方授权信息无效，请重新登录');
-    loginDialog(account,result);if(popup&&!popup.closed)popup.location.replace(result.verificationUrl);
+    loginDialog(account,result);view=loginView;if(popup&&!popup.closed)popup.location.replace(result.verificationUrl);
     await refresh();
   }catch(e){popup?.close();if(admin&&epoch===authEpoch&&view===loginView){modal(`<h2>官方登录未能启动</h2><div class="inline-error">${esc(e.message)}</div><div class="dialog-actions">${button('cancel-login','取消登录','secondary',identifier)}${button('close','关闭','secondary')}</div>`);}throw e;}
 }
@@ -1105,6 +1153,7 @@ function typeWindowSummary(configuration){return !configuration?'待配置':conf
 function typeModelSummary(models){return models===null?'全部允许':Array.isArray(models)?models.join('、'):'待配置';}
 function typeCurrent(view){return admin&&view.epoch===authEpoch&&view.dialog===dialogVersion&&dialogOpen();}
 async function openUsageTypes(mode='list',identifier=''){
+ if(globalDepartmentView())return chooseBusinessDepartment();
   modal('<h2>使用类型</h2><p>正在读取默认配置…</p>',true);const view={epoch:authEpoch,dialog:dialogVersion},controller=new AbortController();typeController=controller;
   try{
     const catalog=await api('/api/admin/member-types','GET',undefined,'',controller.signal);if(!typeCurrent(view))return;
@@ -1203,6 +1252,7 @@ function showUsageTypeChange(identifier,types){
 const batchReasons={execution_interrupted:'后台执行中断，尚未完成，可重试',configuration_changed:'员工配置或Key集合已变化，未覆盖',member_removed:'员工已移除',template_changed:'目标类型或模板已变化，请重新预览',configuration_failed:'员工配置保存失败，可只重试失败项',admin_cancelled:'管理员取消剩余操作'};
 const batchStates={preview:'待确认预览',queued:'已受理 · 等待Worker或执行中',completed:'执行结束',cancelled:'已取消剩余操作',pending:'等待执行',success:'已应用',unchanged:'配置不变',skipped:'已跳过',failed:'失败'};
 async function configureMemberBatch(scope,targetId='',{overwriteExceptions=true}={}){
+ if(globalDepartmentView())return chooseBusinessDepartment();
   modal('<h2>应用员工配置</h2><p>正在读取类型默认…</p>',true);const loading={epoch:authEpoch,dialog:dialogVersion},controller=new AbortController();typeController=controller;
   try{const catalog=await api('/api/admin/member-types','GET',undefined,'',controller.signal);if(!typeCurrent(loading))return;let view;
     formModal('预览并应用员工配置',scope.type_id?'范围为此类型全部未删除员工，不受员工搜索条件缩小。':'只处理选定员工。预览将固定员工、Key及配置版本，执行时发生变化的对象跳过。',`<label>目标类型与默认<select name="batch_type" required><option value="">请选择</option>${catalog.types.filter(type=>type.enabled).map(type=>`<option value="${esc(type.id)}" ${type.id===targetId?'selected':''}>${esc(type.code+' · '+type.name)}</option>`).join('')}</select></label><label>模型权限<select name="batch_models"><option value="apply">应用目标默认</option><option value="keep">保留原配置</option></select></label><label>员工共享限额<select name="batch_limits"><option value="apply">应用目标默认</option><option value="keep">保留原配置</option></select></label><label>员工使用类型<select name="batch_classify"><option value="keep">保留当前类型</option><option value="apply">同时改为目标类型</option></select></label><label>个人及Key例外<select name="batch_overwrite"><option value="overwrite" ${overwriteExceptions?'selected':''}>应用目标默认，覆盖个人及Key例外</option><option value="keep" ${overwriteExceptions?'':'selected'}>保留个人及Key例外，这些项目不应用目标默认</option></select></label><p class="hint">默认将所选模型权限与共享限额应用到员工及其Key；选择保留例外时，对应项目保持原值。请逐项核对预览后确认。</p>`,async form=>{
@@ -1312,7 +1362,8 @@ let typeStatisticsData=null,typeStatisticsLoading=false,typeStatisticsController
 let typeStatisticsFilters={type:'',member:'',model:'',status:'',groupBy:'type',page:1,pageSize:20},overviewStatisticsFilters={type:'',member:'',model:'',status:'',groupBy:'type',page:1,pageSize:20};
 function activeTypeStatisticsFilters(){return tab==='overview'?overviewStatisticsFilters:typeStatisticsFilters;}
 const businessOutcomeLabels={ok:'成功',failed:'失败',queued:'排队中',running:'执行中',cancelled:'取消',rejected:'拒绝',interrupted:'中断',unknown:'结果未知'};
-function typeOptions(selected='',all='全部使用类型',{current=false}={}){const fixed=current?[['unclassified','未分类']]:[['unclassified','未分类（新请求）'],['historical_unknown','历史类型未知']],rows=[...typeCatalog.map(row=>[row.id,row.code+' · '+row.name]),...fixed];if(selected&&!rows.some(row=>row[0]===selected))rows.push([selected,'已选类型 '+selected]);return `<option value="">${esc(all)}</option>${rows.map(([value,label])=>`<option value="${esc(value)}" ${selected===value?'selected':''}>${esc(label)}</option>`).join('')}`;}
+function typeOptionLabel(row){return row.code+' · '+row.name+(globalDepartmentView()?' · '+(row.department_name??'团队归属待核对'):'');}
+function typeOptions(selected='',all='全部使用类型',{current=false}={}){const fixed=current?[['unclassified','未分类']]:[['unclassified','未分类（新请求）'],['historical_unknown','历史类型未知']],rows=[...typeCatalog.map(row=>[row.id,typeOptionLabel(row)]),...fixed];if(selected&&!rows.some(row=>row[0]===selected))rows.push([selected,'已选类型 '+selected]);return `<option value="">${esc(all)}</option>${rows.map(([value,label])=>`<option value="${esc(value)}" ${selected===value?'selected':''}>${esc(label)}</option>`).join('')}`;}
 function stopTypeStatistics(){typeStatisticsController?.abort();typeStatisticsVersion++;typeStatisticsLoading=false;}
 function typeStatisticsScope(){return admin&&state?.capabilities?.typeStatistics?(tab==='overview'&&overviewType?'overview:'+overviewType:tab==='requests'&&recordView==='types'?'types':''):'';}
 let typeCatalogPending=null;
@@ -1548,7 +1599,7 @@ function updateAccountManagement(identifier,version){if(accountManagementId===id
 
 function packageAccountRows(){const f=accountPoolFilters;return state.accounts.filter(account=>{const quota=packageQuota(account),exhausted=account.route_block==='quota_exhausted'||quota?.limitReached||quota?.windows?.some(window=>window.absolute?.source==='official'?window.absolute.remaining===0:window.used>=100),issue=account.last_error||account.quota_error||account.route_block||account.package?.recognition?.status==='conflict'||packagePolicyState().enabled&&account.package?.mode==='unknown';return (!f.q||account.name.toLocaleLowerCase().includes(f.q.toLocaleLowerCase()))&&(!f.platform||account.kind===f.platform)&&(!f.package||(f.package==='kind:api'?apiAccount(account):f.package==='kind:unknown'?account.package_selection?.mode!=='selected'&&!apiAccount(account):account.package_selection?.template_id===f.package.replace(/^template:/,'')))&&(!f.status||(f.status==='disabled'?!account.enabled:f.status==='enabled'?!!account.enabled:account.state===f.status&&!!account.enabled))&&(!f.quota||(f.quota==='unknown'?!apiAccount(account)&&packageQuotaStale(quota):f.quota==='exhausted'?!!exhausted:!apiAccount(account)&&!packageQuotaStale(quota)&&!exhausted))&&(!f.issue||!!issue);});}
 function packageOfficialWindowMarkup(window){const absolute=window.absolute,hasAbsolute=absolute?.source==='official'&&Number.isFinite(absolute.remaining)&&absolute.remaining>=0&&typeof absolute.unit==='string';return `<small>${packageNumber(window.minutes/60)}小时窗口 · ${Number.isFinite(window.used)?'剩余 '+packageNumber(100-window.used)+'%':'比例未知'}${hasAbsolute?'<br>官方绝对剩余量 '+packageNumber(absolute.remaining)+' '+esc(absolute.unit):''}<br>重置 ${beijingDate(window.reset)}</small>`;}
-function packageEffectiveWeight(weight){const strategy=state.balancing?.strategy;if(strategy?.source==='legacy'||strategy?.source==='legacy_compatibility'&&!strategy.effective)return '原兼容策略（不使用百分比）';return weightPercent(weight?.effective);}
+function packageEffectiveWeight(weight,strategy=state.balancing?.strategy){if(strategy?.source==='legacy'||strategy?.source==='legacy_compatibility'&&!strategy.effective)return '原兼容策略（不使用百分比）';return weightPercent(weight?.effective);}
 function accountQuotaSummary(account){
  if(account.auth_mode==='platform')return '<span class="hint">独立文本通道</span>';
  if(apiAccount(account))return '<span class="hint">余额未提供</span>';
@@ -1557,7 +1608,8 @@ function accountQuotaSummary(account){
 }
 function accountWeightSummary(account){
  if(account.auth_mode==='platform')return '独立通道';
- if(apiAccount(account))return weightPercent(account.api_weight||0);
+ if(account.routing_weight)return packageEffectiveWeight(account.routing_weight,account.routing_weight.strategy);
+ if(apiAccount(account))return weightPercent(account.api_weight);
  const weight=state.balancing?.weights?.accounts.find(row=>row.id===account.id);
  return state.capabilities?.accountPackages?packageEffectiveWeight(weight):weightPercent(weight?.effective);
 }
@@ -1574,7 +1626,7 @@ function accountEntitlementSummary(account){
 
 function packagePoolTable(){
  const rows=packageAccountRows(),totalPages=Math.max(1,Math.ceil(rows.length/accountPoolFilters.pageSize)),showPackage=!!state.capabilities?.accountPackages&&packagePolicyState().enabled&&state.accounts.some(account=>!apiAccount(account)&&account.auth_mode!=='platform');accountPoolFilters.page=Math.min(accountPoolFilters.page,totalPages);const page=accountPoolFilters.page,visible=rows.slice((page-1)*accountPoolFilters.pageSize,page*accountPoolFilters.pageSize);
- return `<div class="table-wrap account-pool-wrap"><table class="account-pool-table"><thead><tr><th>账户／状态</th>${showPackage?'<th>套餐</th>':''}<th>官方额度与重置</th><th>额外额度／重置卡</th><th>生效权重</th><th>近7天参考USD</th><th>管理</th></tr></thead><tbody>${visible.map(account=>`<tr><td data-label="账户"><strong>${esc(account.name)}</strong><small>${esc(platformNames[account.kind]||account.kind)} · ${esc(account.auth_mode==='platform'?'独立文本通道':apiAccount(account)?'API Key':'订阅')}</small>${account.kind==='codex'&&!apiAccount(account)&&account.subscription_monthly_usd!=null?'<small>订阅 '+referenceMoney(account.subscription_monthly_usd)+'/月</small>':''}<div class="account-status-line">${account.enabled?badge(account.state):'<span class="badge off">已停用</span>'}${accountIssueBadge(account)}</div></td>${showPackage?`<td data-label="套餐">${esc(packageSelectionLabel(account))}</td>`:''}<td data-label="官方额度">${accountQuotaSummary(account)}</td><td data-label="额外额度／重置卡">${accountEntitlementSummary(account)}</td><td data-label="生效权重">${esc(accountWeightSummary(account))}</td><td data-label="参考USD">${referenceTotal(account.standard)}${coverageMarkup(account.standard)}</td><td data-label="管理"><div class="account-table-actions">${button('manage-account','管理','secondary',account.id)}</div></td></tr>`).join('')}</tbody></table></div>${!visible.length?empty('没有符合筛选的账号'):''}<div class="pager">${button('account-pool-page','上一页','secondary',page-1,page<=1)}<span>第 ${page}／${totalPages} 页 · ${fmt(rows.length)} 个账户</span>${button('account-pool-page','下一页','secondary',page+1,page>=totalPages)}${pageSizeControl('accounts',accountPoolFilters.pageSize)}</div>`;
+ return `<div class="table-wrap account-pool-wrap"><table class="account-pool-table"><thead><tr><th>账户／状态</th>${showPackage?'<th>套餐</th>':''}<th>官方额度与重置</th><th>额外额度／重置卡</th><th>生效权重</th><th>近7天参考USD</th><th>管理</th></tr></thead><tbody>${visible.map(account=>`<tr><td data-label="账户"><strong>${esc(account.name)}</strong><small>${esc(platformNames[account.kind]||account.kind)} · ${esc(account.auth_mode==='platform'?'独立文本通道':apiAccount(account)?'API Key':'订阅')}</small>${account.kind==='codex'&&!apiAccount(account)&&account.subscription_monthly_usd!=null?'<small>订阅 '+referenceMoney(account.subscription_monthly_usd)+'/月</small>':''}<div class="account-status-line">${account.enabled?badge(account.state):'<span class="badge off">已停用</span>'}${accountIssueBadge(account)}</div></td>${showPackage?`<td data-label="套餐">${esc(packageSelectionLabel(account))}</td>`:''}<td data-label="官方额度">${accountQuotaSummary(account)}</td><td data-label="额外额度／重置卡">${accountEntitlementSummary(account)}</td><td data-label="生效权重">${esc(accountWeightSummary(account))}${globalDepartmentView()&&account.routing_weight?`<small>${esc(account.routing_weight.department_name||'团队归属待核对')} · 团队内权重</small>`:''}</td><td data-label="参考USD">${referenceTotal(account.standard)}${coverageMarkup(account.standard)}</td><td data-label="管理"><div class="account-table-actions">${button('manage-account','管理','secondary',account.id)}</div></td></tr>`).join('')}</tbody></table></div>${!visible.length?empty('没有符合筛选的账号'):''}<div class="pager">${button('account-pool-page','上一页','secondary',page-1,page<=1)}<span>第 ${page}／${totalPages} 页 · ${fmt(rows.length)} 个账户</span>${button('account-pool-page','下一页','secondary',page+1,page>=totalPages)}${pageSizeControl('accounts',accountPoolFilters.pageSize)}</div>`;
 }
 function accountPoolActions(){return `<div class="actions account-pool-toolbar">${button('account-pool-settings','分配与均衡','secondary')}${button('create-account','＋ 添加账户','primary')}</div>`;}
 function bindBalancingForm(settings,transfers,weightedReadOnly){
@@ -1590,26 +1642,33 @@ function bindBalancingForm(settings,transfers,weightedReadOnly){
  };
  save.onclick=async()=>{if(busy||mainSaving||!current())return;busy=true;save.disabled=true;times.disabled=true;status.className='hint';status.textContent='正在保存…';try{const result=await api('/api/admin/balancing/schedule','PATCH',{times:parse(times.value),expected_version:scheduleVersion});if(!current())return;if(!Number.isSafeInteger(result.version)||!Array.isArray(result.times))throw Error('时点保存结果无效，请重新读取');scheduleVersion=result.version;savedTimes=result.times;times.value=result.times.join('，');$('#balancing-transfer-title').textContent='执行时点：'+result.times.join('、');status.textContent='时点已保存';const refreshed=await refresh(false);if(!current())return;if(!refreshed)status.textContent='时点已保存，状态刷新失败';}catch(error){if(current()){status.className='inline-error';status.textContent=error.message;}}finally{busy=false;if(current()){save.disabled=false;times.disabled=false;}}};
 }
-function accountAllocationTabs(active){return `<div class="account-allocation-tabs" role="group" aria-label="账号池全局配置">${button('routing-weights','订阅权重',active==='weights'?'primary':'secondary')}${button('api-weights','API 人工占比',active==='api'?'primary':'secondary')}${button('balancing-settings','均衡规则',active==='balancing'?'primary':'secondary')}${button('routing-explanation','调度依据','text-button')}${state.capabilities?.accountPackages&&packagePolicyState().enabled?button('package-policy','既有容量策略','text-button'):''}</div>`;}
+function accountAllocationTabs(active){return `<div class="account-allocation-tabs" role="group" aria-label="分配与均衡">${button('routing-weights','订阅权重',active==='weights'?'primary':'secondary')}${button('api-weights','API 人工占比',active==='api'?'primary':'secondary')}${button('balancing-settings','均衡规则',active==='balancing'?'primary':'secondary')}${button('routing-explanation','调度依据','text-button')}${state.capabilities?.accountPackages&&packagePolicyState().enabled?button('package-policy','既有容量策略','text-button'):''}</div>`;}
 function openAccountPoolSettings(){return openSubscriptionWeights();}
-function openSubscriptionWeights(){
-      const w=state.balancing?.weights;
-      if(!w){modal(`<h2>账号池全局设置</h2>${accountAllocationTabs('weights')}<p class="hint">请先刷新账号状态</p>`);return;}
-      const accounts=state.accounts.filter(a=>a.kind==='codex'&&!apiAccount(a));
-      if(!accounts.length){modal(`<h2>账号池全局设置</h2>${accountAllocationTabs('weights')}<p class="hint">暂无 Codex 订阅账号</p>`);return;}
+async function openSubscriptionWeights(){
+      if(globalDepartmentView())return chooseBusinessDepartment();
+      let weightState=state;
+      if(managementIdentity||!weightState?.balancing?.weights){
+        modal('<h2>分配与均衡</h2><p>正在读取当前团队的账号与权重…</p>');const epoch=authEpoch,version=dialogVersion;
+        try{const data=await api('/api/admin/state?view=accounts&people=none');if(!admin||authEpoch!==epoch||dialogVersion!==version||!dialogOpen())return;
+          if(!Array.isArray(data.accounts)||!Array.isArray(data.balancing?.weights?.accounts)||!data.balancing.weights.configuration)throw Error('未取得当前团队的权重配置');weightState=data;
+        }catch(error){if(admin&&authEpoch===epoch&&dialogVersion===version&&dialogOpen())modal(`<h2>分配与均衡</h2><p class="inline-error">${esc(error.message)}</p>${button('routing-weights','重新读取当前团队权重','primary')}`);return;}
+      }
+      const w=weightState.balancing.weights;
+      const accounts=weightState.accounts.filter(a=>a.kind==='codex'&&!apiAccount(a));
+      if(!accounts.length){modal(`<h2>分配与均衡</h2>${accountAllocationTabs('weights')}<p class="hint">暂无 Codex 订阅账号</p>`);return;}
       const cfg=w.configuration;
       const seeds=accounts.map(a=>({a,value:cfg.mode==='manual'?cfg.weights[a.id]||0:w.accounts.find(x=>x.id===a.id)?.automatic}));
       if(cfg.mode!=='manual'){
         const sum=seeds.reduce((n,x)=>n+(x.value||0),0);let left=10000;
         for(let i=0;i<seeds.length;i++){const bp=i===seeds.length-1?left:Math.min(left,Math.round((sum?(seeds[i].value||0)/sum:1/seeds.length)*10000));seeds[i].value=bp/100;left-=bp;}
       }
-      return formModal('账号池全局设置','',`<h3>Codex 账号池权重</h3><p class="hint">权重合计须为100%，保持至下次定时调整。</p>${!state.balancing.settings.weighted&&!packagePolicyState().enabled?'<p class="hint">新权重尚未开启；请先在负载均衡中开启，临时设置才会生效。</p>':''}${seeds.map(x=>`<label>${esc(x.a.name)}（系统 ${esc(weightPercent(w.accounts.find(r=>r.id===x.a.id)?.automatic))}）<input name="weight_${esc(x.a.id)}" type="number" min="0" max="100" step="0.01" value="${x.value}" required></label>`).join('')}<p class="hint">${cfg.mode==='manual'&&cfg.expires?'下次定时调整：'+date(cfg.expires):'定时调整关闭时，手动比例持续保留'}</p>${button('routing-auto','恢复自动','secondary')}`,async (f,formCurrent)=>{const weights=Object.fromEntries(accounts.map(a=>[a.id,Number(f.get('weight_'+a.id))]));await api('/api/admin/balancing/weights','PATCH',{mode:'manual',weights,expected_version:cfg.version});if(!formCurrent())return;close();await refresh();toast('临时权重已保存');},{headerActions:accountAllocationTabs('weights')});
+      return formModal('分配与均衡',managementIdentity?'当前团队：'+esc(departmentViewName||departmentView):'',`<h3>Codex 账号池权重</h3><p class="hint">权重合计须为100%，保持至下次定时调整。</p>${!weightState.balancing.settings.weighted&&!packagePolicyState().enabled?'<p class="hint">新权重尚未开启；请先在负载均衡中开启，临时设置才会生效。</p>':''}${seeds.map(x=>`<label>${esc(x.a.name)}（系统 ${esc(weightPercent(w.accounts.find(r=>r.id===x.a.id)?.automatic))}）<input name="weight_${esc(x.a.id)}" type="number" min="0" max="100" step="0.01" value="${x.value}" required></label>`).join('')}<p class="hint">${cfg.mode==='manual'&&cfg.expires?'下次定时调整：'+date(cfg.expires):'定时调整关闭时，手动比例持续保留'}</p><button type="button" class="secondary" data-action="routing-auto" data-weight-version="${cfg.version}">恢复自动</button>`,async (f,formCurrent)=>{const weights=Object.fromEntries(accounts.map(a=>[a.id,Number(f.get('weight_'+a.id))]));await api('/api/admin/balancing/weights','PATCH',{mode:'manual',weights,expected_version:cfg.version});if(!formCurrent())return;close();await refresh();toast('临时权重已保存');},{headerActions:accountAllocationTabs('weights')});
 }
 function openApiWeights(identifier=''){
  const accounts=state.accounts.filter(apiAccount),selected=accounts.find(a=>a.id===identifier)||accounts[0];
- if(!selected){modal(`<h2>账号池全局设置</h2>${accountAllocationTabs('api')}<p class="hint">暂无 API Key 账号</p>`);return;}
+ if(!selected){modal(`<h2>分配与均衡</h2>${accountAllocationTabs('api')}<p class="hint">暂无 API Key 账号</p>`);return;}
  const rows=`<div class="table-wrap"><table class="api-allocation-table"><thead><tr><th>API 账号</th><th>人工新会话占比</th><th>操作</th></tr></thead><tbody>${accounts.map(a=>`<tr><td>${esc(a.name)}</td><td>${esc(weightPercent(a.api_weight||0))}</td><td>${button('api-weights',a.id===selected.id?'正在编辑':'编辑','text-button',a.id)}</td></tr>`).join('')}</tbody></table></div>`;
- formModal('账号池全局设置','',`${rows}<h3>修改 ${esc(selected.name)}</h3><label>人工新会话占比（%）<input name="api_weight" type="number" min="0" max="100" step="0.01" value="${selected.api_weight||0}" required></label><p class="hint">API 占比合计不超过100%，保存后持续生效。</p>`,async(f,current)=>{await api('/api/admin/accounts/'+selected.id,'PATCH',{api_weight:Number(f.get('api_weight'))});if(!current())return;await refresh();if(!current())return;openApiWeights(selected.id);toast('API 人工占比已保存');},{headerActions:accountAllocationTabs('api'),cancelAction:'account-pool-settings'});
+ formModal('分配与均衡','',`${rows}<h3>修改 ${esc(selected.name)}</h3><label>人工新会话占比（%）<input name="api_weight" type="number" min="0" max="100" step="0.01" value="${selected.api_weight||0}" required></label><p class="hint">API 占比合计不超过100%，保存后持续生效。</p>`,async(f,current)=>{await api('/api/admin/accounts/'+selected.id,'PATCH',{api_weight:Number(f.get('api_weight'))});if(!current())return;await refresh();if(!current())return;openApiWeights(selected.id);toast('API 人工占比已保存');},{headerActions:accountAllocationTabs('api'),cancelAction:'account-pool-settings'});
 }
 
 function packagePoolSection(){const f=accountPoolFilters;return `<div class="page-toolbar account-pool-controls"><div class="toolbar account-pool-filters"><input id="account-pool-search" value="${esc(f.q)}" maxlength="100" placeholder="搜索账户名称" aria-label="搜索账户名称"><select id="account-pool-platform" aria-label="平台"><option value="">全部平台</option>${[...new Set(state.accounts.map(account=>account.kind))].map(kind=>`<option value="${esc(kind)}" ${f.platform===kind?'selected':''}>${esc(platformNames[kind]||kind)}</option>`).join('')}</select><select id="account-pool-package" aria-label="套餐"><option value="">全部套餐</option><option value="kind:api" ${f.package==='kind:api'?'selected':''}>按量API</option><option value="kind:unknown" ${f.package==='kind:unknown'?'selected':''}>未知／兼容容量待配</option>${(packageCatalog?.items||[]).map(item=>`<option value="template:${esc(item.id)}" ${f.package==='template:'+item.id?'selected':''}>${esc(item.definition.name)}</option>`).join('')}</select><select id="account-pool-status" aria-label="账户状态">${[['','全部状态'],['enabled','已启用'],['disabled','已停用'],['ready','已连接'],['offline','未登录'],['degraded','待检查']].map(([value,label])=>`<option value="${value}" ${f.status===value?'selected':''}>${label}</option>`).join('')}</select><select id="account-pool-quota" aria-label="官方额度">${[['','全部额度'],['known','已知且未耗尽'],['exhausted','已知耗尽'],['unknown','未知／待刷新']].map(([value,label])=>`<option value="${value}" ${f.quota===value?'selected':''}>${label}</option>`).join('')}</select><label class="check-row"><input id="account-pool-issue" type="checkbox" ${f.issue?'checked':''}>仅异常</label></div>${accountPoolActions()}</div>${panel('账户列表',`<div id="account-pool-results">${loadingRegion(packagePoolTable(),pageRefreshing(),'正在读取账号状态…')}</div>`)}`;}
@@ -1641,6 +1700,7 @@ function renderPackagePreview(view){if(packagePreviewView!==view||!packageCurren
 async function applyPackagePreview(){const view=packagePreviewView;if(!view||!packageCurrent(view)||view.busy||view.error||view.applied)return;if(view.data.expires<=Date.now()){view.error='预览已过期';renderPackagePreview(view);return;}view.busy=true;renderPackagePreview(view);try{const value=await api('/api/admin/account-packages/previews/'+encodeURIComponent(view.data.id)+'/apply','POST',{},'',view.controller.signal);if(packagePreviewView!==view||!packageCurrent(view))return;view.applied=value;view.error='';await refresh(false);if(packageCurrent(view)){const catalog=await api('/api/admin/account-packages','GET',undefined,'',view.controller.signal);if(packageCurrent(view))packageCatalog=catalog;}}catch(error){if(packagePreviewView===view&&packageCurrent(view))view.error=error.message;}finally{view.busy=false;if(packagePreviewView===view&&packageCurrent(view))renderPackagePreview(view);}}
 async function returnPackagePreviewDraft(){const view=packagePreviewView;if(!view||!packageCurrent(view)||view.busy)return;const draft=view.draft;modal('<h2>套餐容量与固定版本</h2><div id="package-editor-content"></div>',true);const next={epoch:authEpoch,dialog:dialogVersion,controller:new AbortController(),id:draft.id,version:draft.version,draft:draft.draft,targets:new Set(draft.targets),overwrites:new Set(draft.overwrites),targetPage:0,error:'草稿已保留；如模板版本已变化，请核对当前版本后再重新预览。',busy:false};packageEditorView=next;renderPackageEditor(next);}
 async function openSubscriptionPrice(accountId){
+ if(globalDepartmentView())return chooseBusinessDepartment('package-account',accountId);
  const account=state.accounts.find(row=>row.id===accountId);if(!account||apiAccount(account))return toast('API Key 无订阅月费');
  modal('<h2>订阅月费</h2><div id="subscription-price-content">正在读取…</div>');
  const view={epoch:authEpoch,dialog:dialogVersion,controller:new AbortController(),accountId,busy:false};packageAccountView=view;
@@ -1822,13 +1882,14 @@ document.addEventListener('click',async e=>{
   try{
     if(managementSecretPending&&(action==='close'||action.startsWith('department-')))return toast('请等待管理 Key 生成完成');
     if(action.startsWith('department-'))return await departmentAction(action,identifier);
+    if(globalDepartmentView()&&departmentBusinessActions.has(action))return await chooseBusinessDepartment(action,identifier);
     if(action==='download-access-guide')return downloadAccessGuide();
     if(action==='download-platform-guide')return downloadPlatformGuide();
     if(action==='account-pool-settings')return openAccountPoolSettings();
     if(action==='retry-workspace')return await refresh();
     if(action.startsWith('extra-'))return await handleExtraAction(action,identifier);
     if(action.startsWith('pricing-'))return await pricingAction(action,identifier);
-    if(action==='connection-view'){if(sending)return toast('请等待当前请求完成');if(!admin||!['guide','test','history'].includes(identifier))return;if(identifier==='history')return setTab('history');if(dialogNeedsCleanup||dialogOpen())close();navigationVersion++;connectionView=identifier;if(tab!=='playground')return setTab('playground');render();return;}
+    if(action==='connection-view'){if(sending)return toast('请等待当前请求完成');if(!admin||!['guide','test','history',...(managementIdentity?.role==='super_admin'?['departments']:[])].includes(identifier))return;if(identifier==='history')return setTab('history');if(dialogNeedsCleanup||dialogOpen())close();navigationVersion++;connectionView=identifier;if(tab!=='playground')return setTab('playground');render();return;}
     if(action==='request-statistics-tab'){if(!['list','model','member_name'].includes(identifier)||tab!=='requests'||recordView!=='requests')return;if(requestStatisticsTab===identifier)return;if(dialogNeedsCleanup||dialogOpen())close();navigationVersion++;requestStatisticsTab=identifier;const visible=new Set(requestFilterFields());let changed=false;for(const field of ['member','model','type','device','outcome','status'])if(!visible.has(field)&&requestsFilters[field]){requestsFilters[field]='';changed=true;}for(const [flag,field] of [['member_missing','member'],['model_missing','model']])if(!visible.has(field)&&requestsFilters[flag]){delete requestsFilters[flag];changed=true;}if(changed||requestsLoading||identifier==='list'&&requestsData?.listLoaded===false||identifier!=='list'&&!requestsData?.summary)return await loadRequests('',{preservePage:!changed});render();return;}
     if(action==='request-group-page'){if(tab!=='requests'||recordView!=='requests'||requestsLoading)return;const [name,value]=identifier.split(':'),page=Number(value);if(!['model','member_name'].includes(name)||name!==requestStatisticsTab||!Number.isInteger(page)||page<1)return;const rows=name==='model'?requestsData?.byModel:requestsData?.byMember;if(!rows||page>Math.max(1,Math.ceil(rows.length/requestGroupPageSizes[name])))return;requestGroupPages[name]=page;render();return;}
     if(action==='requests-reload')return await loadRequests();
@@ -1974,7 +2035,7 @@ document.addEventListener('click',async e=>{
     if(action==='routing-weights')return openSubscriptionWeights();
     if(action==='api-weights')return openApiWeights(identifier);
     if(action==='routing-auto'){
-      const cfg=state.balancing.weights.configuration;await api('/api/admin/balancing/weights','PATCH',{mode:'auto',expected_version:cfg.version});if(!actionCurrent())return;close();await refresh();return toast('已恢复自动权重');
+      const version=Number(el.dataset.weightVersion);if(!Number.isSafeInteger(version)||version<0)throw Error('请重新打开权重设置');await api('/api/admin/balancing/weights','PATCH',{mode:'auto',expected_version:version});if(!actionCurrent())return;close();await refresh();return toast('已恢复自动权重');
     }
     if(action==='transfer-schedule'){
       const transfers=state.balancing?.transfers;if(!transfers)return;
@@ -1986,7 +2047,7 @@ document.addEventListener('click',async e=>{
     }
     if(action==='balancing-settings'){
       const b=state.balancing?.settings||{failover:false,nightly:false,quietMinutes:30},last=state.balancing?.lastRun,transfers=state.balancing?.transfers,weightedReadOnly=!!(state?.capabilities?.accountPackages&&packagePolicyState().enabled);
-      formModal('负载均衡','',`<label>按24小时额度预算分配<select name="weighted" ${weightedReadOnly?'disabled':''}><option value="false" ${!b.weighted?'selected':''}>关闭（原策略）</option><option value="true" ${b.weighted?'selected':''}>开启</option></select></label>${weightedReadOnly?'<p class="notice">当前由既有容量策略管理，此项只读。</p>':''}<label>登录失效自动切换<select name="failover"><option value="false" ${!b.failover?'selected':''}>关闭</option><option value="true" ${b.failover?'selected':''}>开启</option></select></label><label>${'定时自动调整'}<select name="nightly"><option value="false" ${!b.nightly?'selected':''}>关闭</option><option value="true" ${b.nightly?'selected':''}>开启</option></select></label>${transfers?`<details class="balancing-transfer-editor"><summary id="balancing-transfer-title">执行时点：${esc(transfers.times.join('、'))}</summary><label>每天执行时点（北京时间）<input id="balancing-transfer-times" value="${esc(transfers.times.join('，'))}" placeholder="02:00，10:00"></label><button id="balancing-transfer-save" type="button" class="secondary">保存时点</button><p id="balancing-transfer-status" class="hint" role="status" aria-live="polite">下一时点：${beijingDate(transfers.next)}</p></details>`:''}<label>静默期（分钟）<input name="quietMinutes" type="number" min="1" max="960" value="${b.quietMinutes}" required></label><p class="hint">最近执行：${last?esc(last.day)+' · '+esc(({completed:'已完成',failed:'失败',interrupted:'已中断',running:'执行中'})[last.status]||last.status):'尚未执行'}</p>${button('balancing-preview','预览分配（不修改绑定）','secondary')}`,async (f,formCurrent)=>{await api('/api/admin/balancing','PATCH',{...(!weightedReadOnly?{weighted:f.get('weighted')==='true'}:{}),failover:f.get('failover')==='true',nightly:f.get('nightly')==='true',quietMinutes:Number(f.get('quietMinutes'))});if(!formCurrent())return;await refresh();if(!formCurrent())return;openAccountPoolSettings();toast('负载均衡设置已保存');},{cancelAction:'account-pool-settings',headerActions:accountAllocationTabs('balancing')});bindBalancingForm(b,transfers,weightedReadOnly);return;
+      formModal('负载均衡','',`<label>按24小时额度预算分配<select name="weighted" ${weightedReadOnly?'disabled':''}><option value="false" ${!b.weighted?'selected':''}>关闭（原策略）</option><option value="true" ${b.weighted?'selected':''}>开启</option></select></label>${weightedReadOnly?'<p class="notice">当前由既有容量策略管理，此项只读。</p>':''}<label>登录失效自动切换<select name="failover"><option value="false" ${!b.failover?'selected':''}>关闭</option><option value="true" ${b.failover?'selected':''}>开启</option></select></label><label>${'定时自动调整'}<select name="nightly"><option value="false" ${!b.nightly?'selected':''}>关闭</option><option value="true" ${b.nightly?'selected':''}>开启</option></select></label>${transfers?`<details class="balancing-transfer-editor"><summary id="balancing-transfer-title">执行时点：${esc(transfers.times.join('、'))}</summary><label>每天执行时点（北京时间）<input id="balancing-transfer-times" value="${esc(transfers.times.join('，'))}" placeholder="02:00，10:00"></label><button id="balancing-transfer-save" type="button" class="secondary">保存时点</button><p id="balancing-transfer-status" class="hint" role="status" aria-live="polite">下一时点：${beijingDate(transfers.next)}</p></details>`:''}<label>静默期（分钟）<input name="quietMinutes" type="number" min="1" max="960" value="${b.quietMinutes}" required></label><p class="hint">最近执行：${last?esc(last.day)+' · '+esc(({completed:'已完成',failed:'失败',interrupted:'已中断',running:'执行中'})[last.status]||last.status):'尚未执行'}</p>${button('balancing-preview','预览分配（不修改绑定）','secondary')}`,async (f,formCurrent)=>{await api('/api/admin/balancing','PATCH',{...(!weightedReadOnly?{weighted:f.get('weighted')==='true'}:{}),failover:f.get('failover')==='true',nightly:f.get('nightly')==='true',quietMinutes:Number(f.get('quietMinutes'))});if(!formCurrent())return;await refresh();if(!formCurrent())return;await openAccountPoolSettings();toast('负载均衡设置已保存');},{cancelAction:'account-pool-settings',headerActions:accountAllocationTabs('balancing')});bindBalancingForm(b,transfers,weightedReadOnly);return;
     }
     if(action==='planning-new')return openPlanningPreview();
     if(action==='planning-status')return pollPlanningPreview(planningPreview);

@@ -18,16 +18,16 @@ const databaseUrl=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!databa
 const at=Date.parse('2026-11-13T12:00:00+08:00'),clock=()=>at;
 const boundaryContext='x'.repeat(2047-Buffer.byteLength(JSON.stringify({kind:'context_object',object_id:'a'.repeat(36),context_kind:'history',content:{text:''}})));
 const config=name=>{const url=new URL(databaseUrl);if(name)url.pathname='/'+name;return {connectionString:url.href,allowPlaintextLocalNetwork:true,poolSize:4};};
-async function fixture(t){
+async function fixture(t,{own=false}={}){
  const root=new PostgresStore(config()),name='harbor_dept_export_'+randomUUID().replaceAll('-','');await root.query('CREATE DATABASE '+name);const store=new PostgresStore(config(name));
  t.after(async()=>{await store.close();await root.query('DROP DATABASE '+name);await root.close();});
  await store.migrate({recordingContext:true,recordingContextIndex:true});await store.initializePricing();await migrateDepartmentIsolation(store,{apply:true});
  const issuer=createDepartmentScopeIssuer(),superAdmin=issuer.superAdmin({credentialId:'synthetic-root',credentialVersion:0});let superEnabled=true;
  const departments=createPostgresDepartments(store,{issuer,clock,authorizeSuperAdmin:({credentialId,credentialVersion})=>superEnabled&&credentialId===superAdmin.credential_id&&credentialVersion===superAdmin.credential_version?superAdmin:null});
- const scopes={global:superAdmin},keys={},departmentRows={},requests={a:[],b:[]},key=randomBytes(32),recordings=new RecordingStore(store,{encryptionKey:key,clock}),contexts=new RecordingContextStore(store,{encryptionKey:key,clock});
- for(const suffix of ['a','b']){
-  const department=await departments.createDepartment(superAdmin,{name:'合成部门'+suffix});departmentRows[suffix]=department;
-  const issued=await departments.issueManagementKey(superAdmin,department.id,{label:'合成管理员'+suffix});keys[suffix]=issued;scopes[suffix]=await departments.authenticateManagementKey(issued.secret);
+ const scopes={global:superAdmin},keys={},departmentRows={},requests={a:[],b:[],own:[]},key=randomBytes(32),recordings=new RecordingStore(store,{encryptionKey:key,clock}),contexts=new RecordingContextStore(store,{encryptionKey:key,clock});
+ for(const suffix of ['a','b',...(own?['own']:[])]){
+  const department=suffix==='own'?await departments.getDepartment(superAdmin,'department-default'):await departments.createDepartment(superAdmin,{name:'合成部门'+suffix});departmentRows[suffix]=department;
+  const issued=await departments.issueManagementKey(superAdmin,department.id,{label:'合成管理员'+suffix});keys[suffix]=issued;scopes[suffix]=suffix==='own'?issuer.forDepartment(superAdmin,department.id):await departments.authenticateManagementKey(issued.secret);
   await store.run("INSERT INTO harbor.members(id,name,created,department_id) VALUES($1,'合成员工',$2,$3)",'member-'+suffix,at,department.id);
   await store.run("INSERT INTO harbor.accounts(id,name,home,department_id) VALUES($1,'合成账号','synthetic',$2)",'account-'+suffix,department.id);
   await store.run("INSERT INTO harbor.sessions(id,member_id,account_id,created,updated,protocol,department_id) VALUES($1,$2,$3,$4,$4,'responses',$5)",'session-'+suffix,'member-'+suffix,'account-'+suffix,at,department.id);
@@ -74,20 +74,25 @@ test('部门导出贯穿真实队列、正文与上下文，跨部门详情下�
  await f.enqueue();const page=await f.backend.exports.list(new URLSearchParams({limit:'1'}),{scope:f.scopes.a});assert.ok(page.next_cursor);
  await assert.rejects(f.backend.exports.list(new URLSearchParams({before:page.next_cursor,limit:'1'}),{scope:f.scopes.b}),{code:'recording_export_cursor_invalid'});
 });
-test('显式超管全局导出包含各部门标识，部门身份不能下载全局产物',integration,async t=>{
- const f=await fixture(t),global=await f.enqueue(f.scopes.global);await f.execute();const rows=(await f.download(global.id,f.scopes.global)).trim().split('\n').map(JSON.parse);
- assert.deepEqual(new Set(rows.filter(row=>row.kind==='request').map(row=>row.department_id)),new Set([f.departmentRows.a.id,f.departmentRows.b.id]));assert.ok(rows.every(row=>typeof row.department_id==='string'));
- await assert.rejects(f.download(global.id,f.scopes.a),{code:'recording_export_not_found'});
- const csv=await f.enqueue(f.scopes.global,false);await f.execute();const text=await f.download(csv.id,f.scopes.global);assert.match(text,/^"department_id",/);assert.ok(text.includes(f.departmentRows.a.id)&&text.includes(f.departmentRows.b.id));assert.ok(text.split('\r\n')[0].endsWith('"export_scope"'));assert.ok(text.includes('""view"":""global""'));
- const list=await f.backend.exports.list(new URLSearchParams(),{scope:f.scopes.global});assert.ok(list.items.every(row=>row.export_scope));
- f.disableSuper();await assert.rejects(f.download(global.id,f.scopes.global),error=>error.status===403);
+test('超管全局与其他团队导出拒绝且不留产物，默认团队JSONL和CSV完整导出',integration,async t=>{
+ const f=await fixture(t,{own:true});
+ for(const scope of [f.scopes.global,f.issuer.forDepartment(f.scopes.global,f.departmentRows.a.id)])for(const includeBody of [true,false])await assert.rejects(f.enqueue(scope,includeBody),{code:'department_forbidden'});
+ assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_exports')).n,0);
+ assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind='recording.export'")).n,0);
+ const exported=await f.enqueue(f.scopes.own);await f.execute();const rows=(await f.download(exported.id,f.scopes.own)).trim().split('\n').map(JSON.parse);
+ assert.deepEqual(new Set(rows.filter(row=>row.kind==='request').map(row=>row.department_id)),new Set(['department-default']));assert.ok(rows.some(row=>row.kind==='context_object'));
+ assert.ok(rows.every(row=>row.department_id==='department-default'));assert.ok(rows.filter(row=>row.kind==='request').every(row=>f.requests.own.includes(row.request_id)&&row.export_scope.view==='department'));
+ await assert.rejects(f.download(exported.id,f.scopes.a),{code:'recording_export_not_found'});
+ const csv=await f.enqueue(f.scopes.own,false);await f.execute();const text=await f.download(csv.id,f.scopes.own);assert.match(text,/^"department_id",/);assert.ok(text.includes('department-default'));assert.ok(!text.includes(f.departmentRows.a.id)&&!text.includes(f.departmentRows.b.id));assert.ok(text.split('\r\n')[0].endsWith('"export_scope"'));assert.ok(text.includes('""view"":""department""'));
+ const list=await f.backend.exports.list(new URLSearchParams(),{scope:f.scopes.own});assert.ok(list.items.every(row=>row.export_scope.department_id==='department-default'));
+ f.disableSuper();await assert.rejects(f.download(exported.id,f.scopes.own),error=>error.status===403);
 });
-test('上下文临界大小计算包含部门字段，部门与全局导出分片均可重组且不超预算',integration,async t=>{
- const f=await fixture(t);
- for(const scope of [f.scopes.a,f.scopes.global]){
+test('上下文临界大小计算包含部门字段，部门负责人和默认团队超管导出分片均可重组且不超预算',integration,async t=>{
+ const f=await fixture(t,{own:true});
+ for(const scope of [f.scopes.a,f.scopes.own]){
   const exported=await f.enqueue(scope);await f.execute();const lines=(await f.download(exported.id,scope)).trimEnd().split('\n'),fragments=new Map();
   for(const line of lines){assert.ok(Buffer.byteLength(line)+1<=2048);const row=JSON.parse(line);if(row.kind!=='context_object_fragment')continue;const list=fragments.get(row.object_id)??[];list.push(row);fragments.set(row.object_id,list);}
-  assert.equal(fragments.size,scope.view==='global'?2:1);
+  assert.equal(fragments.size,1);
   for(const parts of fragments.values()){
    parts.sort((a,b)=>a.part-b.part);assert.equal(parts.at(-1).last,true);const decoded=JSON.parse(Buffer.from(parts.map(row=>row.data).join(''),'base64').toString());
    assert.equal(decoded.content.text,boundaryContext);assert.ok(parts.every(row=>row.department_id===decoded.department_id));

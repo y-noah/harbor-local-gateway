@@ -26,7 +26,7 @@ async function fixture(t){
  const request=randomUUID();await store.run("INSERT INTO harbor.members(id,name,created,department_id) VALUES('synthetic-worker-member','合成员工',$1,$2)",Date.now(),department.id);await store.run("INSERT INTO harbor.requests(id,member_id,started,ended,status,business_status,ip,model,department_id) VALUES($1,'synthetic-worker-member',$2,$2,'ok','ok','synthetic','synthetic',$3)",request,Date.now(),department.id);const recordings=new RecordingStore(store,{encryptionKey:key});await recordings.start(request);await recordings.append(request,[{sourceKey:'synthetic-user',kind:'user',provenance:'client',content:{text:'合成Worker正文'}}]);await recordings.finish(request,{state:'complete'});
  const options={database:database(name),dataDir,env:{},recording:{enabled:true,storage:{probe:async()=>[{total:10000000000,free:9000000000}]}},runtime:{pollMs:100}};
  const create=async changes=>{const worker=await createPostgresWorker({...options,...changes});workers.push(worker);return worker;};
- return {store,dataDir,settings,config,create,options,departments,department,management,scope,superAdmin,request};
+ return {store,dataDir,settings,config,create,options,departments,department,management,scope,superAdmin,ownSuperAdmin:issuer.forDepartment(superAdmin,'department-default'),request};
 }
 test('部门Worker使用同库actor执行真实索引导出及startup，未适配任务不运行',integration,async t=>{
  const f=await fixture(t),worker=await f.create(),exported=await worker.recordingBackend.exports.enqueue({include_body:true,format:'jsonl',filters:{}},{scope:f.scope});worker.start();
@@ -36,7 +36,9 @@ test('部门Worker使用同库actor执行真实索引导出及startup，未适�
  let body='';for await(const chunk of worker.recordingBackend.download(exported.id,{scope:f.scope}))body+=chunk;assert.ok(body.includes('合成Worker正文'));
 });
 test('部门Worker后台导出复验管理Key撤销与settings密码变更，不写正文产物',integration,async t=>{
- const f=await fixture(t),worker=await f.create(),departmentExport=await worker.recordingBackend.exports.enqueue({include_body:true,format:'jsonl',filters:{}},{scope:f.scope}),rootExport=await worker.recordingBackend.exports.enqueue({include_body:true,format:'jsonl',filters:{}},{scope:f.superAdmin});
+ const f=await fixture(t),worker=await f.create(),departmentExport=await worker.recordingBackend.exports.enqueue({include_body:true,format:'jsonl',filters:{}},{scope:f.scope});
+ await assert.rejects(worker.recordingBackend.exports.enqueue({include_body:true,format:'jsonl',filters:{}},{scope:f.superAdmin}),{code:'department_forbidden'});
+ const rootExport=await worker.recordingBackend.exports.enqueue({include_body:true,format:'jsonl',filters:{}},{scope:f.ownSuperAdmin});
  await f.departments.revokeManagementKey(f.superAdmin,f.department.id,f.management.key.id,{expected_version:0});await writeFile(f.settings,JSON.stringify({adminPasswordHash:passwordHash('synthetic-new-root')}),{mode:0o600});worker.start();
  for(const id of [departmentExport.id,rootExport.id]){await until(async()=>(await f.store.get('SELECT attempts FROM harbor.background_jobs WHERE id=$1',id)).attempts>0);assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_export_chunks WHERE export_id=$1',id)).n,0);}
  await until(()=>worker.status().failed>=2);assert.ok(worker.status().failed>=2);
