@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,readdir,copyFile,cp,symlink,rm,appendFile,lstat,writeFile} from 'node:fs/promises';
+import {mkdtemp,mkdir,readdir,copyFile,cp,symlink,rm,appendFile,readFile,lstat,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
@@ -17,6 +17,7 @@ test('B-shaped package leaves native overlay empty and its verified host project
   for(const name of await readdir(join(source,'migrations')))if(name.endsWith('.sql'))await copyFile(join(source,'migrations',name),join(root,'migrations',name));
   for(const name of ['public/index.html','public/app.js','public/style.css','clients/image-mcp.mjs','clients/harbor.example.toml'])await copyFile(join(source,name),join(root,name));
   for(const name of await readdir(join(source,'tools/capacity')))if(/\.(mjs|py|c)$/.test(name))await copyFile(join(source,'tools/capacity',name),join(root,'ci/storage-operator-tools',name));
+  await cp(join(source,'third-party/codex-models'),join(root,'third-party/codex-models'),{recursive:true});
   await symlink(join(source,'node_modules'),join(root,'node_modules'),'dir');await assert.rejects(lstat(join(root,'tools/capacity')),{code:'ENOENT'});
   process.env.HARBOR_IMAGE_REVISION='a'.repeat(40);const manifest=await imageManifest({create:true,rootDirectory:root});assert.match(manifest.files['storage-receiver-candidate-signal.py'],/^[a-f0-9]{64}$/);await appendFile(join(root,'storage-receiver-candidate-signal.py'),'\n# altered safety helper\n');await assert.rejects(imageManifest({rootDirectory:root}),/manifest mismatch/);await copyFile(join(source,'storage-receiver-candidate-signal.py'),join(root,'storage-receiver-candidate-signal.py'));await rm(join(root,'storage-receiver-candidate-signal.py'));await assert.rejects(imageManifest({rootDirectory:root}),{code:'ENOENT'});await copyFile(join(source,'storage-receiver-candidate-signal.py'),join(root,'storage-receiver-candidate-signal.py'));await mkdir(join(root,'tools'),{recursive:true});await cp(join(root,'ci/storage-operator-tools'),join(root,'tools/capacity'),{recursive:true});assert.equal((await verifyOperatorToolsProjection({rootDirectory:root})).operatorToolsProjectionVerified,true);
   for(const name of ['key-consumption-policy.sql','recording-retention-unlimited.sql']){
@@ -24,6 +25,13 @@ test('B-shaped package leaves native overlay empty and its verified host project
    await appendFile(join(root,path),'\n-- altered optional migration\n');await assert.rejects(imageManifest({rootDirectory:root}),/manifest mismatch/);
    await copyFile(join(source,path),join(root,path));assert.equal((await imageManifest({rootDirectory:root})).revision,'a'.repeat(40));
    await rm(join(root,path));await assert.rejects(imageManifest({rootDirectory:root}),/manifest mismatch/);await copyFile(join(source,path),join(root,path));
+  }
+  for(const name of ['models.json','source.json','LICENSE.txt']){
+   const path='third-party/codex-models/'+name;assert.match(manifest.files[path],/^[a-f0-9]{64}$/);
+   assert.deepEqual(await readFile(join(root,path)),await readFile(join(source,path)));
+   await appendFile(join(root,path),'\nchanged asset\n');await assert.rejects(imageManifest({rootDirectory:root}),/manifest mismatch/);
+   await copyFile(join(source,path),join(root,path));await rm(join(root,path));await assert.rejects(imageManifest({rootDirectory:root}),{code:'ENOENT'});
+   await copyFile(join(source,path),join(root,path));assert.equal((await imageManifest({rootDirectory:root})).revision,'a'.repeat(40));
   }
   const entries=['storage-operator-context.mjs','storage-activation-issuer.mjs','storage-operator-backup.mjs','storage-activation-deploy.mjs'],program='await Promise.all('+JSON.stringify(entries.map(name=>pathToFileURL(join(root,name)).href))+'.map(value=>import(value)));console.log(JSON.stringify({imported:4}));';const result=await execute(process.execPath,['--input-type=module','-e',program],{timeout:15000,maxBuffer:65536});assert.equal(JSON.parse(result.stdout).imported,4);
   await appendFile(join(root,'tools/capacity/owned-runtime.mjs'),'\n// altered execution projection\n');await assert.rejects(verifyOperatorToolsProjection({rootDirectory:root}),/projection differs/);assert.equal((await imageManifest({rootDirectory:root})).revision,'a'.repeat(40));
