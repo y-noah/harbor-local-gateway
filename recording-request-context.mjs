@@ -1,4 +1,4 @@
-import {recordingInputProtocolTypes,observeRecordingInputShape} from './recording-input-diagnostics.mjs';
+import {observeRecordingInputShape} from './recording-input-diagnostics.mjs';
 import {sanitizeRecord,recordRedactionSummary,redactRecordParts,restoreAuthenticatedRecord,sensitiveRecordField,boundedRecordText} from './record-redaction.mjs';
 import {safeToolOutput} from './conversation-capture.mjs';
 import {recordingAttachment} from './recording-attachment.mjs';
@@ -6,7 +6,9 @@ import {recordingLiteral} from './recording-literal.mjs';
 import {recordingTextMetadata,finalizeRecordingTokens} from './recording-text-metadata.mjs';
 
 const media=new Set(['image','image_url','input_image','output_image','input_file','file','audio','input_audio','output_audio']);
-const itemTypes=new Set(recordingInputProtocolTypes.filter(type=>type!=='reasoning'));
+// Parser support is independent of diagnostic recognition: observing a new
+// protocol must not admit it through the generic field walker below.
+const itemTypes=new Set(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output','item_reference','compaction']);
 const textTypes=new Set(['text','input_text','output_text','summary_text','refusal']);
 const scalarFields=new Set(['role','id','call_id','name','namespace','status','channel','phase','tool_call_id','input','arguments','code','container_id','server_label','approval_request_id','reason']);
 const toolItems=new Set(['function_call','custom_tool_call','function_call_output','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output']);

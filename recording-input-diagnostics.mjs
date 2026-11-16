@@ -1,6 +1,9 @@
 import {AppError} from './store.mjs';
 
-export const recordingInputProtocolTypes=Object.freeze(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output','item_reference','compaction','reasoning']);
+// Diagnostic-only recognition is not parser support. Codex rust-v0.167.2:
+// https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/protocol/src/models.rs#L1094
+// agent_message.content may contain encrypted children; never inspect them here.
+export const recordingInputProtocolTypes=Object.freeze(['message','additional_tools','function_call','function_call_output','custom_tool_call','custom_tool_call_output','shell_call','shell_call_output','apply_patch_call','apply_patch_call_output','code_interpreter_call','mcp_call','mcp_list_tools','mcp_approval_request','mcp_approval_response','web_search_call','file_search_call','computer_call','computer_call_output','item_reference','compaction','reasoning','agent_message']);
 const protocols=new Set(recordingInputProtocolTypes),roles=new Set(['user','assistant','system','developer','tool']);
 const fields=Object.freeze(['type','role','content','input','output','call_id','tools','encrypted_content','summary']);
 const shapes=new Set(['null','array','object','string','number','boolean','undefined','other']);

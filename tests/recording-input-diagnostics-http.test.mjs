@@ -24,7 +24,7 @@ async function fixture(t,{enabled,env={},contextEnabled=true,maxRequests=2,ttlMs
  const cookie=await login('synthetic-admin'),call=(path,{body,selected=false,auth=cookie,extra={}}={})=>fetch(origin+path,{method:body===undefined?'GET':'POST',headers:{cookie:auth,...(selected?{'x-harbor-department':'department-default'}:{}),...(body===undefined?{}:{'content-type':'application/json'}),...extra},...(body===undefined?{}:{body:JSON.stringify(body)})});
  const create=await call('/api/admin/members',{selected:true,body:{name:'合成结构诊断员工',quota:null,expires:null,allowed_models:null}});assert.equal(create.status,201);const member=await create.json();
  await store.run("INSERT INTO harbor.accounts(id,name,home,state,department_id) VALUES($1,'合成上游','synthetic-home','ready','department-default')",randomUUID());
- const send=async()=>{const r=await fetch(origin+'/v1/responses',{method:'POST',headers:{authorization:'Bearer '+member.secret,'content-type':'application/json','x-harbor-recording-input-diagnostics':'1'},body:JSON.stringify({model:'gpt-6.1-sol',stream:false,input:[{type:'synthetic_private_type',content:'synthetic private user text',input:'synthetic private parameters',api_key:'synthetic-private-key'}],recording_input_diagnostics:true})});assert.equal(r.status,200);assert.equal((await r.json()).output[0].content[0].text,'synthetic model output');await app.buffer.flush();};
+ const send=async(input=[{type:'synthetic_private_type',content:'synthetic private user text',input:'synthetic private parameters',api_key:'synthetic-private-key'}])=>{const r=await fetch(origin+'/v1/responses',{method:'POST',headers:{authorization:'Bearer '+member.secret,'content-type':'application/json','x-harbor-recording-input-diagnostics':'1'},body:JSON.stringify({model:'gpt-6.1-sol',stream:false,input,recording_input_diagnostics:true})});assert.equal(r.status,200);assert.equal((await r.json()).output[0].content[0].text,'synthetic model output');await app.buffer.flush();};
  return {app,store,origin,cookie,call,login,member,send,calls:()=>calls,advance:n=>{now+=n;}};
 }
 for(const enabled of [false,true])test('真实PG/HTTP输入结构诊断 '+(enabled?'开启仅超管global可见并遵守请求数与TTL':'关闭无新增字段且客户端不能开启'),integration,async t=>{
@@ -42,6 +42,15 @@ for(const enabled of [false,true])test('真实PG/HTTP输入结构诊断 '+(enabl
   await f.send();await f.send();const capped=await(await f.call('/api/admin/recordings/status')).json();assert.equal(capped.input_shape_diagnostics.requests,2);assert.equal(capped.input_shape_diagnostics.groups[0].count,2);assert.equal(capped.input_shape_diagnostics.state,'request_limit');
   f.advance(10);const expired=await(await f.call('/api/admin/recordings/status')).json();assert.equal(expired.input_shape_diagnostics.state,'expired');assert.equal(expired.input_shape_diagnostics.groups[0].count,2);assert.equal(f.calls(),3);
  }
+});
+test('真实PG/HTTP识别agent_message诊断但上下文仍partial，身份正文和任意字段不进入摘要',integration,async t=>{
+ const f=await fixture(t,{enabled:true});
+ await f.send([{type:'agent_message',author:'synthetic author',recipient:'synthetic recipient',content:[{type:'input_text',text:'synthetic agent content'}],auxiliary:'synthetic auxiliary value'}]);
+ const response=await f.call('/api/admin/recordings/status');assert.equal(response.status,200);
+ const status=await response.json();assert.equal(status.input_shape_diagnostics.groups[0].type,'agent_message');assert.equal(status.input_shape_diagnostics.groups[0].has_content,true);
+ for(const value of ['synthetic author','synthetic recipient','synthetic agent content','auxiliary','synthetic auxiliary value'])assert.ok(!JSON.stringify(status.input_shape_diagnostics).includes(value));
+ const row=await f.store.get('SELECT business_status,recording_state,recording_reason FROM harbor.requests');
+ assert.equal(row.business_status,'ok');assert.equal(row.recording_state,'partial');assert.equal(row.recording_reason,'capture_failed');assert.equal(f.calls(),1);
 });
 test('环境启用与构造关闭、上下文关闭组合不会绕过关闭行为',integration,async t=>{
  for(const options of [{enabled:false,env:{HARBOR_RECORDING_INPUT_DIAGNOSTICS:'1'}},{env:{HARBOR_RECORDING_INPUT_DIAGNOSTICS:'1'},contextEnabled:false}])await t.test(JSON.stringify(options),async t=>{
