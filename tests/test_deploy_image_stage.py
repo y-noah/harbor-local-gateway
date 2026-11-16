@@ -349,6 +349,15 @@ class ImageStageTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 1);self.assertEqual(stderr.getvalue(), 'Harbor deployment failed: Refused\n')
             self.assertEqual(stdout.getvalue(), '');self.assertEqual(json.loads(log.call_args.args[1])['code'], 'image_stage_disk_budget')
 
+    def test_wrapper_installed_cli_rejection_uses_structured_safe_error(self):
+        source = (ROOT / 'ci/deploy-wrapper.py').read_text()
+        config = {**CONFIG, 'port': 8092, 'storage_engine': 'postgres', 'entry_installed_release': True}
+        with self.wrapper_stage_context('deploy-entry-postgres', Mock(), config) as (log, openlog, stderr, stdout):
+            with self.assertRaises(SystemExit) as caught:exec(compile(source, 'deploy-wrapper.py', 'exec'), {'__name__': '__main__'})
+            self.assertEqual(caught.exception.code, 1)
+            self.assertEqual(json.loads(stderr.getvalue()), {'event': 'harbor_deployment_failure', 'phase': 'request', 'code': 'deployment_failed', 'exceptionType': 'ValueError'})
+            self.assertEqual(stdout.getvalue(), '');log.assert_not_called();openlog.assert_not_called()
+
     def test_wrapper_status_does_not_acquire_the_import_or_deployment_lock(self):
         module = Mock();module.handle.return_value = {'phase': 'importing'}
         payload = {'action': 'image-stage-status'}

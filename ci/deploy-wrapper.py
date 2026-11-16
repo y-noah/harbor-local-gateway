@@ -342,6 +342,7 @@ def storage_deployment(config,image,archive,action,lock_fd):
     deployment_progress('host_finish','completed')
     return result
 
+_STRUCTURED_DEPLOYMENT_ERRORS=False
 _DEPLOYMENT_PHASE='request'
 _DEPLOYMENT_PHASE_STARTED=time.monotonic()
 def deployment_progress(phase,state):
@@ -349,7 +350,7 @@ def deployment_progress(phase,state):
     if phase not in ['host_prepare','host_finish','receive_image'] or state not in ['started','completed','retained']:raise ValueError('Deployment progress is invalid')
     if state=='started':_DEPLOYMENT_PHASE_STARTED=time.monotonic()
     _DEPLOYMENT_PHASE=phase
-    print(json.dumps({'event':'harbor_deployment_phase','phase':phase,'state':state,'elapsedMs':max(0,int((time.monotonic()-_DEPLOYMENT_PHASE_STARTED)*1000))}),file=sys.stderr,flush=True)
+    if _STRUCTURED_DEPLOYMENT_ERRORS:print(json.dumps({'event':'harbor_deployment_phase','phase':phase,'state':state,'elapsedMs':max(0,int((time.monotonic()-_DEPLOYMENT_PHASE_STARTED)*1000))}),file=sys.stderr,flush=True)
 
 def deployment_error(error):
     value=getattr(error,'deployment_diagnostic',None)
@@ -363,6 +364,8 @@ def deployment_error(error):
     return {'event':'harbor_deployment_failure',**diagnostic}
 
 def main():
+    global _STRUCTURED_DEPLOYMENT_ERRORS
+    _STRUCTURED_DEPLOYMENT_ERRORS=False
     os.umask(0o077)
     request=sys.stdin.buffer.readline(4097)
     if len(request)>4096:raise ValueError('Deployment request is too large')
@@ -371,6 +374,9 @@ def main():
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o600:raise ValueError('Deployment configuration must be root-owned 0600')
     config=json.loads(Path(CONFIG).read_text())
     if not isinstance(payload,dict):raise ValueError('Only a deployment request is allowed')
+    # Image staging and legacy deployment retain their existing CLI contract.
+    # Structured progress/errors belong only to the explicit installed release.
+    _STRUCTURED_DEPLOYMENT_ERRORS=isinstance(config,dict) and config.get('entry_installed_release') is True and payload.get('action')=='deploy-entry-postgres'
     if payload.get('action') in ('prepare-image','image-stage-status','image-stage-plan'):
         module=None
         try:
@@ -428,5 +434,5 @@ if __name__=='__main__':
     try:
         main()
     except Exception as error:
-        print(json.dumps(deployment_error(error),sort_keys=True),file=sys.stderr)
+        print(json.dumps(deployment_error(error),sort_keys=True) if _STRUCTURED_DEPLOYMENT_ERRORS else 'Harbor deployment failed: '+type(error).__name__,file=sys.stderr)
         sys.exit(1)
