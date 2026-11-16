@@ -40,7 +40,11 @@ test('部门空套餐目录不阻断Codex仅月费和API创建，仍拒绝API附
  assert.equal((await f.call('a','/api/admin/accounts','POST',{name:'合成API',auth_mode:'openai_api',api_key:'sk-'+'y'.repeat(40),package:{template_id:null}})).status,400);
  assert.equal((await f.call('a','/api/admin/accounts/'+api+'/package','PATCH',{expected_revision:0,template_id:null})).status,400);
  assert.equal((await f.call('a','/api/admin/accounts/'+b+'/package')).status,404);
- assert.equal((await f.call('root','/api/admin/account-packages/policy','PATCH',{enabled:true,expected_version:0})).status,403);
+ const before=await f.store.all('SELECT * FROM harbor.department_settings WHERE department_id=ANY($1::text[]) ORDER BY department_id,name',[f.rows.a.id,f.rows.b.id]);
+ assert.equal((await f.call('root','/api/admin/account-packages/policy','PATCH',{enabled:true,expected_version:0})).status,200);
+ assert.equal((await f.store.get("SELECT value FROM harbor.department_settings WHERE department_id='department-default' AND name='account_package_policy'")).value.enabled,true);
+ for(const scope of ['global',f.rows.a.id])assert.equal((await f.call('root','/api/admin/account-packages/policy','PATCH',{enabled:false,expected_version:1},scope)).status,403);
+ assert.deepEqual(await f.store.all('SELECT * FROM harbor.department_settings WHERE department_id=ANY($1::text[]) ORDER BY department_id,name',[f.rows.a.id,f.rows.b.id]),before);
 });
 test('套餐目录、选择、覆盖预览和模板版本只作用于本部门，原actor固定',integration,async t=>{
  const f=await fixture(t),a=await create(f,'a'),b=await create(f,'b'),pa=await preview(f,'a',[a]),pb=await preview(f,'b',[b]);

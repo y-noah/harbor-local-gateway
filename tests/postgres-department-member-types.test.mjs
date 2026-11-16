@@ -20,12 +20,16 @@ async function fixture(t){
  const call=async(label,path='/api/admin/member-types',method='GET',payload,department)=>{const response=await fetch('http://127.0.0.1:'+server.address().port+path,{method,headers:{cookie:cookies[label],...(department?{'x-harbor-department':department}:{}),'content-type':'application/json'},...(payload?{body:JSON.stringify(payload)}:{})});return {status:response.status,value:await response.json()};};
  return {store,departments,rows,keys,superAdmin,call};
 }
-test('真实管理HTTP类型目录与并发新建按部门独立，跨部门管理和全局写拒绝',integration,async t=>{
+test('真实管理HTTP类型目录与并发新建按部门独立，超管默认部门写与跨部门拒绝',integration,async t=>{
  const f=await fixture(t),a=await f.call('a'),b=await f.call('b');assert.equal(a.status,200);assert.ok(a.value.types.length>0);assert.ok(a.value.types.every(row=>row.department_id===f.rows.a.id));assert.ok(b.value.types.every(row=>row.department_id===f.rows.b.id));
  const [first,second,other]=await Promise.all([f.call('a',undefined,'POST',{name:'合成自定义一'}),f.call('a',undefined,'POST',{name:'合成自定义二'}),f.call('b',undefined,'POST',{name:'合成自定义一'})]);assert.ok([first,second,other].every(result=>result.status===201));assert.notEqual(first.value.code,second.value.code);assert.ok([first.value.code,second.value.code].includes(other.value.code));
  assert.equal((await f.call('a','/api/admin/member-types/'+other.value.id,'PATCH',{name:'越界',expected_version:0})).status,404);assert.equal((await f.call('a','/api/admin/member-types/'+other.value.id+'/templates')).status,404);
- assert.equal((await f.call('root',undefined,'POST',{name:'未选择部门'})).status,403);assert.equal((await f.call('root',undefined,'POST',{name:'合成超管新建'},f.rows.a.id)).status,201);
- const global=await f.call('root');assert.ok(global.value.types.some(row=>row.department_id===f.rows.a.id));assert.ok(global.value.types.some(row=>row.department_id===f.rows.b.id));
+ const rootCreated=await f.call('root',undefined,'POST',{name:'合成默认部门类型'});assert.equal(rootCreated.status,201);assert.equal((await f.store.get('SELECT department_id FROM harbor.member_types WHERE id=$1',rootCreated.value.id)).department_id,'department-default');
+ const countsBefore=await f.store.all('SELECT department_id,count(*)::int count FROM harbor.member_types GROUP BY department_id ORDER BY department_id');
+ for(const department of ['global',f.rows.a.id,f.rows.b.id])assert.equal((await f.call('root',undefined,'POST',{name:'拒绝越界创建'},department)).status,403);
+ assert.deepEqual(await f.store.all('SELECT department_id,count(*)::int count FROM harbor.member_types GROUP BY department_id ORDER BY department_id'),countsBefore);
+ const own=await f.call('root');assert.equal(own.status,200);assert.ok(own.value.types.length>0);assert.ok(own.value.types.every(row=>row.department_id==='department-default'));assert.ok(own.value.types.some(row=>row.id===rootCreated.value.id));
+ for(const department of ['global',f.rows.a.id,f.rows.b.id])assert.equal((await f.call('root',undefined,'GET',undefined,department)).status,403);
  await f.departments.revokeManagementKey(f.superAdmin,f.rows.a.id,f.keys.a.key.id,{expected_version:0});assert.equal((await f.call('a')).status,401);assert.equal((await f.call('b')).status,200);
 });
 test('真实HTTP模板按部门写入与恢复，历史统一20/50/100，模型目录不借其他部门账号',integration,async t=>{
