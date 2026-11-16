@@ -64,10 +64,13 @@ test('全局归属缺失或迟到不打开业务表单，未选部门写在fetch
  await page.run("api('/api/admin/pricing','PATCH',{})");assert.equal(page.calls.at(-1).options.headers['X-Harbor-Department'],'global');
  page.run("departmentView='department-b'");await page.run("api('/api/admin/accounts/account-a/subscription','PATCH',{monthly_usd:200,expected_version:0})");assert.equal(page.calls.at(-1).options.headers['X-Harbor-Department'],'department-b');
 });
-test('所属团队列仅全局超管显示真实服务端名称并转义，不在团队视图额外取名称',async()=>{
- const page=await ui();page.run(root+"state={capabilities:{},keys:[]};globalThis.rows=[{id:'member-a',name:'合成员工',department_id:'department-a',department_name:'服务端<A>',enabled:1}]");
- assert.match(page.run('memberTable(rows)'),/<th>所属团队<\/th>/);assert.match(page.run('memberTable(rows)'),/服务端&lt;A&gt;/);
- page.run("departmentView='department-a'");assert.doesNotMatch(page.run('memberTable(rows)'),/所属团队|服务端&lt;A&gt;/);assert.equal(page.calls.length,0);
+test('员工分页与兼容列表在所有范围均不展示所属团队列或团队名称',async()=>{
+ const page=await ui();page.run(root+"state={capabilities:{},keys:[]};globalThis.rows=[{id:'member-a',name:'合成员工',department_id:'department-a',department_name:'服务端团队A',enabled:1,key_count:0}];membersData={rows,types:[],pagination:{page:1,pageSize:20,total:1,totalPages:1}}");
+ for(const scope of ['global','department-a']){
+  page.run('departmentView='+JSON.stringify(scope));
+  for(const markup of [page.run('memberTable(rows)'),page.run('pagedMembersSection()')]){assert.doesNotMatch(markup,/所属团队|服务端团队A|归属待核对/);assert.match(markup,/合成员工/);assert.equal((markup.match(/<th>/g)||[]).length,(markup.match(/<td(?:[ >])/g)||[]).length);}
+ }
+ assert.equal(page.calls.length,0);
 });
 test('全局同码类型筛选显示服务端团队，不按code合并不同类型，团队视图标签保持简洁',async()=>{
  const page=await ui();page.run(root+"typeCatalog=[{id:'type-a',code:'A',name:'研发',department_name:'真实团队甲'},{id:'type-b',code:'A',name:'研发',department_name:'真实团队乙'}]");

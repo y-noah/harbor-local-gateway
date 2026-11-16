@@ -75,7 +75,7 @@ test('轻总览切到会话页立即补全状态，迟到响应不能覆盖其�
   const page=await ui(path=>{paths.push(path);return new Promise(resolve=>pending.push(()=>resolve(response(path.includes('view=overview')?compact:full))));});
   page.run('admin=true;state='+JSON.stringify(compact)+';tab="overview";render();globalThis.previousContent=document.querySelector("#content").innerHTML;setTab("sessions");');
   assert.ok(paths.some(path=>path.startsWith('/api/admin/state?')&&!path.includes('view=overview')));
-  assert.equal(page.node('#content').innerHTML,page.run('previousContent'));assert.doesNotMatch(page.node('#content').innerHTML,/loading-mask/);
+  assert.notEqual(page.node('#content').innerHTML,page.run('previousContent'));assert.match(page.node('#content').innerHTML,/page-loading-placeholder/);assert.doesNotMatch(page.node('#content').innerHTML,/overview-controls|loading-mask/);
   page.run('setTab("overview")');pending.shift()();pending.shift()();await new Promise(setImmediate);
   assert.equal(page.run('state.view'),'overview');
   page.run('setTab("sessions")');pending.shift()();await new Promise(setImmediate);
@@ -125,7 +125,7 @@ test('会话自动刷新失败显示旧结果提示，相同数据恢复也解�
 test('会话快照可在轻总览刷新后恢复展示，保留其他页面需要完整状态的标记',async()=>{
  const base={...handoffSnapshot(),capabilities:{sessionFilters:true,pagedMembers:true},sessionsPagination:{page:2,pageSize:25,total:26,totalPages:2}},compact={...base,view:'overview',sessions:[]};delete compact.sessionsPagination;let reads=0;
  const page=await ui(()=>++reads===1?response(base):reads===2?response(compact):response({error:{message:'合成返回失败'}},503));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsPage=2;sessionsFilters={q:"Alice",type:"",account:"",status:""};');await page.run('refresh()');page.run('setTab("overview")');await page.run('refresh()');page.run('setTab("sessions")');await new Promise(setImmediate);
- assert.equal(page.run('state.view'),'overview');assert.equal(page.run('sessionsFilters.q'),'Alice');assert.equal(page.run('sessionsPage'),2);assert.match(page.node('#content').innerHTML,/id="session-filter-form"/);assert.match(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.doesNotMatch(page.node('#content').innerHTML,/id="state-page-results"/);page.run('tab="accounts";render()');assert.match(page.node('#content').innerHTML,/synthetic-client/);assert.doesNotMatch(page.node('#content').innerHTML,/正在读取/);
+ assert.equal(page.run('state.view'),'overview');assert.equal(page.run('sessionsFilters.q'),'Alice');assert.equal(page.run('sessionsPage'),2);assert.match(page.node('#content').innerHTML,/id="session-filter-form"/);assert.match(page.node('#content').innerHTML,/读取失败，正在显示上次结果/);assert.doesNotMatch(page.node('#content').innerHTML,/id="state-page-results"/);page.run('tab="accounts";render()');assert.doesNotMatch(page.node('#content').innerHTML,/synthetic-client/);assert.match(page.node('#content').innerHTML,/page-loading-placeholder/);assert.doesNotMatch(page.node('#content').innerHTML,/正在读取/);
 });
 test('已筛选账号从账号池移除后选项仍保留，避免界面误显示为全部账号',async()=>{
  const base={...handoffSnapshot(),capabilities:{sessionFilters:true},accounts:[],sessionsPagination:{page:1,pageSize:25,total:1,totalPages:1}};const page=await ui(()=>response(base));page.run('admin=true;state='+JSON.stringify(base)+';tab="sessions";sessionsFilters={q:"",type:"",account:"removed-account",status:""};');await page.run('refresh()');assert.match(page.node('#content').innerHTML,/value="removed-account" selected>已选账号/);assert.equal(page.run('sessionsConfirmedFilters.account'),'removed-account');
@@ -335,7 +335,7 @@ test('logout clears history cache and a pending history page cannot restore priv
 test('系统操作历史归入系统管理，离开页面使迟到历史失效且不归入使用数据',async()=>{
  let release;const paths=[],page=await ui(path=>{paths.push(path);return new Promise(resolve=>release=()=>resolve(response({accounts:[],rows:[],pagination:{page:1,total:0,totalPages:1}})));});
  page.run('admin=true;state='+JSON.stringify({...snapshot(),keys:[]})+';tab="history";');
- page.run('tab="overview";render();tab="history"');const previous=page.node('#content').innerHTML;const pending=page.run('loadHistory()');assert.equal(page.run('historyLoading'),true);assert.equal(page.node('#content').innerHTML,previous);assert.doesNotMatch(previous,/正在读取/);assert.ok(!page.run('recordTabs()').includes('data-id="history"'));
+ page.run('tab="overview";render();tab="history"');const previous=page.node('#content').innerHTML;const pending=page.run('loadHistory()');assert.equal(page.run('historyLoading'),true);assert.notEqual(page.node('#content').innerHTML,previous);assert.match(page.node('#content').innerHTML,/connection-tabs/);assert.doesNotMatch(page.node('#content').innerHTML,/overview-controls/);assert.doesNotMatch(previous,/正在读取/);assert.ok(!page.run('recordTabs()').includes('data-id="history"'));
  page.run('setTab("accounts")');release();await pending;
  assert.equal(page.run('historyData'),null);assert.equal(page.run('historyLoading'),false);assert.equal(paths.length,1);assert.ok(paths[0].startsWith('/api/admin/history?'));
 });
@@ -1293,11 +1293,11 @@ test('账号专用视图保留账号与精确费用，切页重新取对应状�
  const page=await ui(path=>{paths.push(path);if(path.startsWith('/api/admin/state'))return new Promise(resolve=>pending.push(()=>resolve(response(path.includes('view=accounts')?accounts:base))));return response({});});
  page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";render();globalThis.previousContent=document.querySelector("#content").innerHTML;setTab("accounts")');
  assert.ok(paths.includes('/api/admin/state?people=none&view=accounts'));
- assert.equal(page.node('#content').innerHTML,page.run('previousContent'));assert.doesNotMatch(page.node('#content').innerHTML,/loading-mask/);
+ assert.notEqual(page.node('#content').innerHTML,page.run('previousContent'));assert.match(page.node('#content').innerHTML,/page-loading-placeholder/);assert.doesNotMatch(page.node('#content').innerHTML,/overview-controls|loading-mask/);
  pending.shift()();await new Promise(setImmediate);
  assert.equal(page.run('state.view'),'accounts');assert.match(page.node('#content').innerHTML,/合成轻视图账号/);assert.match(page.node('#content').innerHTML,/\$12\.34/);
  assert.equal(page.run('Object.hasOwn(state,"totals")'),false);
- page.run('setTab("overview")');assert.ok(paths.at(-1).includes('view=overview'));assert.match(page.node('#content').innerHTML,/合成轻视图账号/);
+ page.run('setTab("overview")');assert.ok(paths.at(-1).includes('view=overview'));assert.doesNotMatch(page.node('#content').innerHTML,/合成轻视图账号/);assert.match(page.node('#content').innerHTML,/page-loading-placeholder/);
  pending.shift()();await new Promise(setImmediate);assert.equal(page.run('state.view'),'overview');assert.match(page.node('#content').innerHTML,/17/);
 });
 
@@ -1858,7 +1858,7 @@ test('state成功而必要请求或历史失败时保留失败状态，重试列
  for(const view of ['requests','history'])for(const cold of [false,true]){
   let failing=true;const base={...snapshot(),keys:[]},request={summary:{requests:19,active:0},rows:[],models:[],members:[],byModel:[],byMember:[],pagination:{page:1,pageSize:20,total:19,totalPages:1}},history={accounts:[],rows:[],pagination:{page:1,pageSize:20,total:17,totalPages:1}},page=await ui(path=>path.startsWith('/api/admin/state')?response(base):failing?response({error:{message:'合成必要列表失败'}},503):response(view==='history'?history:request));
   page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";render();tab='+JSON.stringify(view)+';recordView="requests";');if(!cold)page.run(view==='history'?'historyData='+JSON.stringify(history)+';render()':'requestsData='+JSON.stringify(request)+';render()');const before=page.node('#content').innerHTML;
-  await page.run('refresh()');assert.match(page.run('pageReadError'),/合成必要列表失败/);assert.match(page.node('#connection').textContent,/失败|异常/);assert.equal(page.node('#content').innerHTML.replace(/aria-busy="(?:true|false)"|\binert\b/g,''),before.replace(/aria-busy="(?:true|false)"|\binert\b/g,''));assert.doesNotMatch(page.node('#content').innerHTML,/正在读取/);failing=false;assert.equal(await page.run('refresh()'),true);assert.equal(page.run('pageReadError'),'');assert.equal(page.node('#connection').textContent,'服务在线');assert.match(page.node('#content').innerHTML,view==='history'?/系统操作历史/:/19/);
+  await page.run('refresh()');assert.match(page.run('pageReadError'),/合成必要列表失败/);assert.match(page.node('#connection').textContent,/失败|异常/);if(!cold)assert.equal(page.node('#content').innerHTML.replace(/aria-busy="(?:true|false)"|\binert\b/g,''),before.replace(/aria-busy="(?:true|false)"|\binert\b/g,''));else{assert.doesNotMatch(page.node('#content').innerHTML,/overview-controls/);assert.match(page.node('#page-read-feedback').innerHTML,/重试/);}assert.doesNotMatch(page.node('#content').innerHTML,/正在读取/);failing=false;assert.equal(await page.run('refresh()'),true);assert.equal(page.run('pageReadError'),'');assert.equal(page.node('#connection').textContent,'服务在线');assert.match(page.node('#content').innerHTML,view==='history'?/系统操作历史/:/19/);
  }
 });
 
@@ -2000,4 +2000,14 @@ test('员工列表独立用量使用list profile，元数据和缓存筛选范�
   assert.equal(page.run('memberDataScopes.get(membersData).includes("usage_profile")'),false);
   if(metadata){await page.run('loadMembersUsage(membersData,memberParams().toString(),authEpoch)');assert.equal(new URL(paths.at(-1),'http://test').searchParams.get('usage_profile'),'list');}
  }
+});
+
+test('跨工作区待加载立即移除旧账号表，仅保留新页导航和一处加载反馈，失败不恢复旧表',async()=>{
+ const page=await ui(()=>response({})),base={...snapshot(),view:'accounts',capabilities:{sessionStateView:true},accounts:[{id:'old-account',name:'旧账号标识',kind:'codex',enabled:1,state:'ready'}]};page.run('admin=true;state='+JSON.stringify(base)+';tab="accounts";render()');assert.match(page.node('#content').innerHTML,/account-pool-results|旧账号标识/);
+ page.run('tab="sessions";render()');assert.doesNotMatch(page.node('#content').innerHTML,/account-pool-results|旧账号标识|account-pool-filters|data-loading-mask/);assert.match(page.node('#content').innerHTML,/data-action="record-view"/);assert.match(page.node('#content').innerHTML,/page-loading-placeholder/);assert.match(page.node('#page-read-feedback').innerHTML,/正在加载/);assert.equal(page.node('#content').inert,false);
+ page.run('failPageRead(Error("合成会话读取失败"),"state");render()');assert.doesNotMatch(page.node('#content').innerHTML,/account-pool-results|旧账号标识/);assert.match(page.node('#page-read-feedback').innerHTML,/合成会话读取失败|重试/);assert.match(page.node('#content').innerHTML,/data-action="record-view"/);
+});
+test('同页面等待仍保留旧表，已有局部遮罩时不重复显示顶部加载提示',async()=>{
+ const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";renderedPageScope="accounts:";');page.node('#content').innerHTML='<div id="account-pool-results" class="data-refresh-region" aria-busy="true">保留旧账号表</div>';page.node('#content').querySelector=selector=>selector==='.data-refresh-region[aria-busy="true"]'?{}:null;
+ page.run('preservePageWhileReading()');assert.match(page.node('#content').innerHTML,/保留旧账号表/);assert.equal(page.node('#page-read-feedback').hidden,true);page.run('failPageRead(Error("合成读取失败"),"state")');assert.equal(page.node('#page-read-feedback').hidden,false);assert.match(page.node('#page-read-feedback').innerHTML,/合成读取失败|重试/);
 });
