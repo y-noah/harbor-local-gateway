@@ -1,3 +1,4 @@
+import {syntheticCodexProfile} from './codex-model-profile-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomUUID,randomBytes} from 'node:crypto';
@@ -41,7 +42,7 @@ async function fixture(run,{install=true,policy='inherit',allowed=null,reader=tr
   })().catch(error=>{if(res.headersSent){res.destroy();return;}res.statusCode=error.status||500;res.end(JSON.stringify({code:error.code}));});});await listen(server);
   const origin='http://127.0.0.1:'+server.address().port,call=(path='/v1/models',headers={})=>fetch(origin+path,{headers:{authorization:'Bearer '+member.secret,...headers}});
   const account=async({mode='subscription',weight=25,enabled=1,state='ready',block=null,last=0,models=[{slug:'synthetic-model'}]}={})=>{
-   const id=randomUUID();catalogs.set(id,models);const quota=JSON.stringify({checked:at,windows:[{id:'primary',minutes:300,used:10,reset:at+18000000}]});
+   const id=randomUUID();catalogs.set(id,Array.isArray(models)&&mode==='subscription'?models.map(syntheticCodexProfile):models);const quota=JSON.stringify({checked:at,windows:[{id:'primary',minutes:300,used:10,reset:at+18000000}]});
    await store.run('INSERT INTO harbor.accounts(id,name,home,auth_mode,api_weight,enabled,state,route_block,last_used,quota_json) VALUES($1,$2,$1,$3,$4,$5,$6,$7,$8,$9)',id,'合成目录来源',mode,mode==='openai_api'?weight:0,enabled,state,block,last,quota);return id;
   };
   const setPolicy=(consumption_policy,version)=>admin.handle('/api/admin/keys/'+member.keyId,'PATCH',{consumption_policy,expected_consumption_policy_version:version});
@@ -62,7 +63,7 @@ test('me returns only server-owned source policy/version, ignores caller hints a
 test('inherit preserves the old latest-subscription/mixed-API directory and never calls explicit routing',integration,async()=>{
  for(const install of [false,true])await fixture(async f=>{
   await f.account({last:1,models:[{slug:'old-subscription'}]});const recent=await f.account({last:2,models:[{slug:'recent-subscription'}]}),api=await f.account({mode:'openai_api',weight:0,models:[{slug:'manual-api'}]});
-  const response=await f.call(),value=await response.json();assert.equal(response.status,200);assert.deepEqual(value.data.map(row=>row.id),['codex','claude','recent-subscription','manual-api']);assert.deepEqual(new Set(f.seen),new Set([recent,api]));assert.equal(f.sourceCalls.length,0);assert.deepEqual(value.catalog_status,{complete:true,sources:{total:2,successful:2,failed:0,changed:0}});assert.ok(value.models.every(model=>!Object.hasOwn(model,'consumption_sources')));
+  const response=await f.call(),value=await response.json();assert.equal(response.status,200);assert.deepEqual(value.data.map(row=>row.id),['codex','claude','recent-subscription','manual-api']);assert.deepEqual(new Set(f.seen),new Set([recent,api]));assert.equal(f.sourceCalls.length,0);assert.equal(value.catalog_status.complete,true);assert.deepEqual(value.catalog_status.sources,{total:2,successful:2,failed:0,changed:0});assert.deepEqual(value.catalog_status.model_metadata.missing.map(m=>m.slug),['manual-api']);assert.ok(value.models.every(model=>!Object.hasOwn(model,'consumption_sources')));
  },{install});
 });
 test('explicit only policies use real routing source groups and retain model permission intersection',integration,()=>fixture(async f=>{
@@ -73,14 +74,14 @@ test('explicit only policies use real routing source groups and retain model per
 test('api-first directory observes both sources without claiming fallback protocol support or hiding partial failure',integration,()=>fixture(async f=>{
  const api=await f.account({mode:'openai_api',weight:100,models:new Error('synthetic provider failure')}),sub=await f.account({models:[{slug:'common'},{slug:'subscription-only'}]});
  const response=await f.call(),value=await response.json();assert.equal(response.status,200);assert.equal(value.catalog_status.complete,false);assert.equal(value.catalog_status.source_support.api.failed,1);assert.equal(value.catalog_status.source_support.subscription.successful,1);assert.equal(value.catalog_status.fallback_compatibility,'unknown');assert.ok(value.models.every(model=>model.fallback_compatibility==='unknown'&&model.consumption_sources[0]==='subscription'));assert.deepEqual(new Set(f.seen),new Set([api,sub]));
- await f.store.run('UPDATE harbor.accounts SET api_weight=80 WHERE id=$1',api);const replacement=await f.account({mode:'openai_api',weight:10,models:[{slug:'common'},{slug:'api-only'}]});const next=await(await f.call('/v1/codex/models')).json();assert.deepEqual(next.models.find(model=>model.slug==='common').consumption_sources,['api','subscription']);assert.equal(next.models.find(model=>model.slug==='common').fallback_compatibility,'unknown');assert.ok(f.seen.includes(replacement));assert.equal(next.catalog_status.complete,false);
+ await f.store.run('UPDATE harbor.accounts SET api_weight=80 WHERE id=$1',api);const replacement=await f.account({mode:'openai_api',weight:10,models:[{slug:'common'},{slug:'api-only'}]});const next=await(await f.call('/v1/codex/models')).json();assert.equal(next.models.some(model=>model.slug==='common'),false);assert.deepEqual(next.catalog_status.model_metadata.missing.find(model=>model.slug==='common').consumption_sources,['api','subscription']);assert.ok(f.seen.includes(replacement));assert.equal(next.catalog_status.complete,false);
  assert.equal(JSON.stringify(next).includes(api),false);assert.equal(JSON.stringify(next).includes(sub),false);
 },{policy:'api_first'}));
 test('explicit candidates never include zero-weight, disabled, blocked or manually excluded accounts',integration,()=>fixture(async f=>{
  const good=await f.account({models:[{slug:'allowed-subscription'}]}),zero=await f.account({models:[{slug:'zero-subscription'}]}),off=await f.account({enabled:0,models:[{slug:'disabled-subscription'}]}),api=await f.account({mode:'openai_api',weight:100,models:[{slug:'allowed-api'}]});
  await f.account({mode:'openai_api',weight:0,models:[{slug:'zero-api'}]});await f.account({mode:'openai_api',enabled:0,models:[{slug:'disabled-api'}]});await f.account({mode:'openai_api',block:'login_expired',models:[{slug:'blocked-api'}]});
  await f.router.saveSettings({weighted:true});await f.router.saveWeights({mode:'manual',weights:{[good]:100,[zero]:0,[off]:0},expected_version:0});
- const response=await f.call(),value=await response.json();assert.equal(response.status,200);assert.deepEqual(new Set(value.models.map(row=>row.slug)),new Set(['allowed-subscription','allowed-api']));assert.deepEqual(new Set(f.seen),new Set([good,api]));
+ const response=await f.call(),value=await response.json();assert.equal(response.status,200);assert.deepEqual(new Set(value.data.map(row=>row.id)),new Set(['allowed-subscription','allowed-api']));assert.deepEqual(new Set(f.seen),new Set([good,api]));
 },{policy:'api_first'}));
 test('source-policy version changes during provider IO reject the late catalog without expanding sources',integration,()=>fixture(async f=>{
  const gate=deferred(),api=await f.account({mode:'openai_api',models:async()=>{await gate.promise;return [{slug:'api-only'}];}});await f.account({models:[{slug:'subscription-only'}]});const pending=f.call();
@@ -92,7 +93,7 @@ test('removing source weight during provider IO is rechecked and a newly availab
 },{policy:'api_only'}));
 test('new candidates cannot consume the fixed catalog source budget during send-time revalidation',integration,()=>fixture(async f=>{
  const gate=deferred(),api=await f.account({mode:'openai_api',models:async()=>{await gate.promise;return [{slug:'fixed-source'}];}}),pending=f.call();
- try{await condition(()=>f.seen.includes(api));await f.account({mode:'openai_api',models:[{slug:'new-unread-source'}]});gate.resolve();const response=await pending;assert.equal(response.status,200);const value=await response.json();assert.deepEqual(value.models.map(model=>model.slug),['fixed-source']);assert.deepEqual(value.catalog_status.sources,{total:1,successful:1,failed:0,changed:0});assert.deepEqual(f.seen,[api]);}finally{gate.resolve();await pending.catch(()=>{});}
+ try{await condition(()=>f.seen.includes(api));await f.account({mode:'openai_api',models:[{slug:'new-unread-source'}]});gate.resolve();const response=await pending;assert.equal(response.status,200);const value=await response.json();assert.deepEqual(value.data.map(model=>model.id),['fixed-source']);assert.deepEqual(value.models,[]);assert.equal(value.catalog_status.model_metadata.missing[0].slug,'fixed-source');assert.deepEqual(value.catalog_status.sources,{total:1,successful:1,failed:0,changed:0});assert.deepEqual(f.seen,[api]);}finally{gate.resolve();await pending.catch(()=>{});}
 },{policy:'api_only',catalogOptions:{maxSources:1}}));
 test('MCP download works without model sources/reader and policy versions are rechecked before bytes leave',integration,()=>fixture(async f=>{
  const gate=deferred(),original=f.store.authenticate.bind(f.store);let calls=0;f.store.authenticate=async(...args)=>{if(++calls===3)await gate.promise;return original(...args);};

@@ -1,0 +1,36 @@
+{
+  "provider": "openai",
+  "version": "0.167.2",
+  "tag": "rust-v0.167.2",
+  "url": "https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/models-manager/models.json",
+  "sha256": "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10",
+  "license": "Apache-2.0",
+  "notice": "Copyright OpenAI. 原始公开模型目录未经修改；完整许可见 LICENSE.txt。元数据只描述客户端配置，不授予账号可用性、模型权限或来源权限。更新版本须核对官方来源并使用对应真实 CLI 验证，不自动在线更新。",
+  "contract_sources": [
+    {
+      "url": "https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/protocol/src/openai_models.rs",
+      "sha256": "d38767cc1f05750c73e5aa265e22413098f4de740df2075733baf38e9eb70c84"
+    },
+    {
+      "url": "https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/protocol/src/openai_models/guardian_v2.rs",
+      "sha256": "bd23f24709694a16d3e5f436fe959e2e8eae44a94b23c9bef59a449c98d55250"
+    },
+    {
+      "url": "https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/protocol/src/openai_models/access_programs.rs",
+      "sha256": "bbd3bbfe18fe12263d432ae9906e7d67cf03986f5331915a165bbca3c982e3bc"
+    },
+    {
+      "url": "https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/protocol/src/openai_models/incremental_tools.rs",
+      "sha256": "506904d09fcfb4d74377f08cbb187ee8967f19d1130dc816bcd63fb9d97d763f"
+    },
+    {
+      "url": "https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/protocol/src/openai_models/memento_v2.rs",
+      "sha256": "919308017fa011d98d4aba6aff749e45fe5292c5a40f0670a9a2e9c748e655ca"
+    },
+    {
+      "url": "https://github.com/openai/codex/blob/rust-v0.167.2/codex-rs/protocol/src/openai_models/guardian.rs",
+      "sha256": "596c981da7221de5e5567fd26ef15194c6baa768226a64160da6b9b4b12c674b"
+    }
+  ],
+  "contract_note": "codex-model-profile-contract.mjs 按以上公开 Rust 类型逐字段转录，仅校验已知类型，不改写或补造原始字段；未知 JSON 字段沿 CLI 默认规则保留。"
+}

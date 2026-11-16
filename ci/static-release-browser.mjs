@@ -18,7 +18,8 @@ const navigationFor=html=>[...html.toString().matchAll(/<button\b[^>]*\bdata-tab
 const marker=(html,revision)=>revision===bundle.backend_revision?html:Buffer.from(html.toString().replace(/<html(?=\s|>)/i,`<html data-harbor-static-revision="${revision}"`));
 const previousHtml=bundle.sources.map(row=>marker(decode(row.files['index.html']),row.revision)).find(html=>hash(html)===bundle.before['index.html']);assert.ok(previousHtml,'Previous index must be retained');
 try{
- const archive=execFileSync('git',['archive','--format=tar',bundle.backend_revision,'--','*.mjs','migrations','public','clients','package.json','package-lock.json'],{maxBuffer:64*1024*1024});
+ const metadataPath='third-party/codex-models',metadata=execFileSync('git',['ls-tree','--name-only',bundle.backend_revision,'--',metadataPath],{encoding:'utf8'}).trim()===metadataPath?[metadataPath]:[];
+ const archive=execFileSync('git',['archive','--format=tar',bundle.backend_revision,'--','*.mjs','migrations','public','clients',...metadata,'package.json','package-lock.json'],{maxBuffer:64*1024*1024});
  execFileSync('python3',['-c','import tarfile,sys,io; archive=tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read())); members=archive.getmembers(); assert all(not m.name.startswith("/") and ".." not in m.name.split("/") and (m.isfile() or m.isdir()) for m in members); archive.extractall(sys.argv[1])',root],{input:archive});
  await symlink(resolve('node_modules'),join(root,'node_modules'),'dir');
  const {createGateway}=await import(pathToFileURL(join(root,'server.mjs')));
