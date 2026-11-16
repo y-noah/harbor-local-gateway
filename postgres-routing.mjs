@@ -11,18 +11,20 @@ import {automaticWeights,balanceSettings,routingAutoState,routingDistribution,ro
 const failure=(status,message,code)=>{throw new AppError(status,message,code);};
 // The pre-admission handoff lookup and transactional router must use exactly
 // the same client identity precedence and trusted employee ownership checks.
-export async function findPostgresResponseSession(store,member,payload,headers={},{lock=false,scope}={}){
+export async function findPostgresResponseSession(store,member,payload,headers={},{lock=false,scope,catalog=false}={}){
   const access=createRoutingDepartments(store),department=await access.resolve(scope,{member,write:lock,employeeOnly:true});
   const clientId=headers['thread-id']||headers['session-id']||headers.session_id||headers['x-codex-thread-id']||payload.prompt_cache_key;
   if(clientId!==undefined&&(typeof clientId!=='string'||!clientId.length))failure(400,'客户端会话标识无效','invalid_session');
   const clientKey=clientId?hash(clientId):null,clientSessionId=typeof clientId==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientId)?clientId:null;
   const fixed=headers['x-harbor-session'];
   if(fixed!==undefined&&(typeof fixed!=='string'||!/^[a-zA-Z0-9-]{1,80}$/.test(fixed)))failure(400,'固定会话标识无效','invalid_session');
-  const suffix=lock?' FOR UPDATE':'';
+  // catalog is an internal read-only lookup option, never read from request data.
+  // GET may inspect an unclaimed binding; POST must still supply its client identity.
+  const suffix=lock?' FOR UPDATE':catalog?' FOR SHARE':'';
   const session=fixed?await store.get("SELECT * FROM harbor.sessions WHERE id=$1 AND member_id=$2 AND protocol='responses'"+suffix,fixed,member.id):clientKey?await store.get("SELECT * FROM harbor.sessions WHERE member_id=$1 AND protocol='responses' AND client_key=$2"+suffix,member.id,clientKey):null;
   if(session)access.same(department,session);
   if(fixed&&!session)failure(404,'固定会话不存在或不属于该员工','session_not_found');
-  if(fixed&&(!clientKey||session.client_key&&session.client_key!==clientKey))failure(409,'固定绑定已用于另一条客户端对话，请创建新的固定会话','session_route_conflict');
+  if(fixed&&(!clientKey&&!catalog||clientKey&&session.client_key&&session.client_key!==clientKey))failure(409,'固定绑定已用于另一条客户端对话，请创建新的固定会话','session_route_conflict');
   return {session,clientKey,clientSessionId,fixed};
 }
 // Every routing writer uses this transaction-scoped lock. It covers allocation
@@ -39,6 +41,7 @@ export function createPostgresConsumptionRoutingScope({accountIds,source,rebind=
   if(!['api','subscription'].includes(source)||!(accountIds instanceof Set)||[...accountIds].some(value=>typeof value!=='string'||!value.length)||typeof rebind!=='boolean'||typeof resumeSession!=='boolean'||resumeSession&&!expectedSession||excludeRequestId!==null&&typeof excludeRequestId!=='string'||expectedSession!==null&&(!expectedSession.id||!expectedSession.account_id||!Number.isSafeInteger(expectedSession.route_version)))failure(503,'来源路由约束无效','consumption_scope_invalid');
   const token=Object.freeze({});consumptionScopes.set(token,{accountIds:new Set(accountIds),source,rebind,resumeSession,expectedSession:expectedSession&&{id:expectedSession.id,account_id:expectedSession.account_id,route_version:expectedSession.route_version},excludeRequestId});return token;
 }
+export const usablePinnedApiAccount=account=>account?.auth_mode==='openai_api'&&['ready','degraded'].includes(account.state)&&!account.route_block;
 export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),isStopping=()=>false,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
   const access=createRoutingDepartments(store,{clock}),packages=createPostgresAccountPackages(store,{clock});
   const write=(name,value,scope)=>access.write(scope,name,value);
@@ -88,7 +91,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
       if(!account||!account.enabled||!['ready','degraded'].includes(account.state)&&!account.route_block)failure(503,'会话绑定账号不可用，请新建客户端任务','session_account_unavailable');
       const api=account.auth_mode==='openai_api',blocked=account.route_block&&(api||account.route_block!=='quota_exhausted');
       if(blocked&&!routing.settings.failover)failure(503,'绑定账号已阻断，自动切换未开启','session_account_blocked');
-      const pinnedApi=api&&['ready','degraded'].includes(account.state)&&!account.route_block;
+      const pinnedApi=usablePinnedApiAccount(account);
       const ownExtra=routing.extraView.decisions.get(account.id)?.decision,authorizedExtra=ownExtra?.allowed===true&&ownExtra.mode==='manual_extra',extraDenied=['extra','blocked'].includes(routing.extraView.classifications.get(account.id)?.mode)&&routing.extraView.classifications.get(account.id)?.reason!=='package_scope_mismatch'&&!authorizedExtra;
       const positive=authorizedExtra&&routing.distribution.subscriptionMode!=='manual'||(routing.distribution.mode==='fallback'?routing.distribution.eligible.some(a=>a.id===account.id):routing.distribution.weights.get(account.id)>0);
       const packageScope=routing.packagePolicy.enabled&&routing.distribution.system.packages?.items.find(item=>item.id===account.id);if(packageScope?.reason==='package_scope_mismatch')failure(409,'当前会话账号的套餐不适用于此模型或协议，请选择兼容模型或新建会话','package_scope_mismatch');

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {randomUUID,randomBytes} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import http from 'node:http';
+import {hash} from '../store.mjs';
 import {PostgresStore} from '../postgres-store.mjs';
 import {createPostgresMemberAdmin} from '../postgres-member-admin.mjs';
 import {createPostgresDeviceAccess} from '../postgres-device-access.mjs';
@@ -116,3 +117,56 @@ test('legacy me保留member与Key交集，不以ready Key桶计入错配或无�
  const sqls=[],original=f.store.query.bind(f.store);f.store.query=(sql,args)=>{sqls.push(sql);return original(sql,args);};
  const response=await f.call('/api/me');assert.equal(response.status,200);assert.deepEqual(await response.json(),before);assert.ok(!sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));
 }));
+
+const pinnedSession=async(f,account,member=f.member.memberId)=>{const id=randomUUID();await f.store.run("INSERT INTO harbor.sessions(id,member_id,account_id,protocol,created,updated) VALUES($1,$2,$3,'responses',$4,$4)",id,member,account,f.at);return id;};
+test('fixed API catalogs honor zero weight without claiming client identity or expanding automatic candidates',integration,async()=>{
+ for(const policy of ['inherit','api_only','api_first'])await fixture(async f=>{
+  const account=await f.account({mode:'openai_api',weight:0,models:[{slug:'gpt-6.1-sol'}]}),session=await pinnedSession(f,account),headers={'x-harbor-session':session};
+  const before=await f.store.get('SELECT * FROM harbor.sessions WHERE id=$1',session),settings=await f.store.all('SELECT * FROM harbor.gateway_settings ORDER BY name');
+  if(policy!=='inherit')assert.deepEqual((await(await f.call()).json()).data,[]);
+  const response=await f.call('/v1/codex/models',headers),value=await response.json();assert.equal(response.status,200);assert.deepEqual(value.models.map(m=>m.slug),['gpt-6.1-sol']);assert.deepEqual(Object.fromEntries(Object.entries(value.models[0]).filter(([name])=>!['consumption_sources','protocol_compatibility','fallback_compatibility'].includes(name))),JSON.parse(readFileSync(new URL('../third-party/codex-models/models.json',import.meta.url))).models.find(model=>model.slug==='gpt-6.1-sol'));
+  assert.deepEqual(await f.store.get('SELECT * FROM harbor.sessions WHERE id=$1',session),before);assert.deepEqual(await f.store.all('SELECT * FROM harbor.gateway_settings ORDER BY name'),settings);assert.equal((await f.store.get('SELECT api_weight FROM harbor.accounts WHERE id=$1',account)).api_weight,0);
+  assert.deepEqual((await f.router.catalogCandidates({policy:'api_only'})).candidates,[]);
+  await f.store.run('UPDATE harbor.sessions SET client_key=$1 WHERE id=$2',hash('claimed-client'),session);
+  assert.equal((await f.call('/v1/codex/models',headers)).status,200);
+  assert.equal((await f.call('/v1/codex/models',{...headers,'thread-id':'claimed-client'})).status,200);
+  const conflict=await f.call('/v1/models',{...headers,'thread-id':'another-client'});assert.equal(conflict.status,409);assert.equal((await conflict.json()).code,'session_route_conflict');
+ },{policy,allowed:['gpt-6.1-sol']});
+});
+test('fixed catalogs reject foreign sessions, malformed hints, policy conflicts and unavailable accounts before upstream IO',integration,()=>fixture(async f=>{
+ const account=await f.account({mode:'openai_api',weight:0}),session=await pinnedSession(f,account),headers={'x-harbor-session':session};
+ for(const hint of ['../invalid',randomUUID()])assert.ok([400,404].includes((await f.call('/v1/models',{'x-harbor-session':hint})).status));
+ const other=(await f.admin.handle('/api/admin/members','POST',{name:'另一合成员工',quota:null,expires:null})).value;
+ const foreign=await pinnedSession(f,account,other.memberId);assert.equal((await f.call('/v1/models',{'x-harbor-session':foreign})).status,404);
+ assert.deepEqual((await(await f.call('/v1/models?session='+session,{'x-harbor-account-id':account,'x-harbor-consumption-policy':'inherit'})).json()).data,[]);
+ for(const [column,value,restore] of [['enabled',0,1],['state','error','ready'],['route_block','quota_exhausted',null],['removed_at',f.at,null]]){
+  await f.store.run('UPDATE harbor.accounts SET '+column+'=$1 WHERE id=$2',value,account);assert.equal((await f.call('/v1/models',headers)).status,503);await f.store.run('UPDATE harbor.accounts SET '+column+'=$1 WHERE id=$2',restore,account);
+ }
+ await f.store.run('UPDATE harbor.sessions SET enabled=0 WHERE id=$1',session);assert.equal((await f.call('/v1/models',headers)).status,403);await f.store.run('UPDATE harbor.sessions SET enabled=1 WHERE id=$1',session);
+ await f.setPolicy('subscription_only',0);assert.equal((await f.call('/v1/models',headers)).status,409);assert.deepEqual(f.seen,[]);
+},{policy:'api_only'}));
+test('fixed catalog revalidates binding, source generation and Key policy after upstream IO',integration,async()=>{
+ for(const mutation of ['binding','route','epoch','disabled','removed','blocked','key'])await fixture(async f=>{
+  const gate=deferred(),account=await f.account({mode:'openai_api',weight:0,models:async()=>{await gate.promise;return [{slug:'gpt-6.1-sol'}];}}),other=await f.account({mode:'openai_api',weight:0}),session=await pinnedSession(f,account),pending=f.call('/v1/codex/models',{'x-harbor-session':session});
+  try{await condition(()=>f.seen.includes(account));
+   if(mutation==='binding')await f.store.run('UPDATE harbor.sessions SET account_id=$1,route_version=route_version+1 WHERE id=$2',other,session);
+   if(mutation==='route')await f.store.run('UPDATE harbor.sessions SET route_version=route_version+1 WHERE id=$1',session);
+   if(mutation==='epoch')await f.store.run('UPDATE harbor.accounts SET route_epoch=route_epoch+1 WHERE id=$1',account);
+   if(mutation==='disabled')await f.store.run('UPDATE harbor.accounts SET enabled=0 WHERE id=$1',account);
+   if(mutation==='removed')await f.store.run('UPDATE harbor.accounts SET removed_at=$1 WHERE id=$2',f.at,account);
+   if(mutation==='blocked')await f.store.run("UPDATE harbor.accounts SET route_block='quota_exhausted' WHERE id=$1",account);
+   if(mutation==='key')await f.admin.handle('/api/admin/keys/'+f.member.keyId,'PATCH',{allowed_models:['other-model'],expected_model_policy_version:0});
+   gate.resolve();const response=await pending;assert.ok([409,503].includes(response.status),mutation+': '+response.status);assert.deepEqual(f.seen,[account]);
+  }finally{gate.resolve();await pending.catch(()=>{});}
+ },{policy:'api_only'});
+});
+
+test('fixed catalog and account disable share routing lock order without holding locks across upstream IO',integration,()=>fixture(async f=>{
+ const account=await f.account({mode:'openai_api',weight:0}),target=await f.account({mode:'openai_api',weight:100,models:[{slug:'gpt-6.1-sol'}]}),session=await pinnedSession(f,account),gate=deferred(),locked=deferred(),original=f.store.get.bind(f.store);let pending,disabling;
+ f.store.get=async(sql,...args)=>{const result=await original(sql,...args);if(sql==='SELECT * FROM harbor.accounts WHERE id=$1 AND removed_at IS NULL FOR UPDATE'&&args[0]===account){locked.resolve();await gate.promise;}return result;};
+ try{
+  disabling=f.router.disableAccount(account);await locked.promise;pending=f.call('/v1/codex/models',{'x-harbor-session':session});
+  let waiting;await condition(async()=>{waiting=await original("SELECT wait_event FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND state='active' LIMIT 1");return !!waiting;});assert.equal(waiting.wait_event,'advisory');gate.resolve();
+  assert.equal((await disabling).moved,1);assert.equal((await pending).status,200);assert.equal((await original('SELECT account_id FROM harbor.sessions WHERE id=$1',session)).account_id,target);assert.deepEqual(f.seen,[target]);
+ }finally{gate.resolve();await Promise.allSettled([disabling,pending].filter(Boolean));f.store.get=original;}
+},{policy:'api_first'}));

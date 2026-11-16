@@ -40,6 +40,11 @@ export function createPostgresConsumptionRouting(store,{router,clock=Date.now,sc
     const view=await router.catalogCandidates({at:clock(),policy:snapshot.consumption_policy,model:payload.model,protocol:options.protocol??'responses',scope:options.scope});
     if(session)access.same(department,session);
     let source=sourceOverride;
+    if(!source&&identity.fixed){
+      const bound=await store.get('SELECT * FROM harbor.accounts WHERE id=$1 AND removed_at IS NULL',session.account_id);
+      if(!bound)fail('session_account_unavailable','会话绑定账号不可用',503);access.same(department,bound);
+      source=assertConsumptionSource(snapshot.consumption_policy,bound);
+    }
     if(!source){
       if(snapshot.consumption_policy==='api_only')source='api';
       else if(snapshot.consumption_policy==='subscription_only')source='subscription';

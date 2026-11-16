@@ -31,7 +31,7 @@ async function fixture(t){
  upstream=http.createServer(async(req,res)=>{const id=req.url.slice(1);seen.push(id);if(gate)await gate;res.setHeader('Content-Type','application/json');res.end(JSON.stringify(models.get(id)??[]));});await listen(upstream);
  backend=createPostgresClientCatalog(store,{clock,maxSources:2,deviceAccess:devices,sourceAccounts:async opts=>{sourceCalls.push(opts);if(malicious){const account=await store.get('SELECT * FROM harbor.accounts WHERE id=$1',apiB);return {policy:opts.policy,candidates:[{source:'api',account}]};}return router.catalogCandidates(opts);},transportForAccount:async account=>({models:async()=>{assert.equal(store.context.getStore(),undefined,'上游目录IO不可持有数据库事务');return (await fetch('http://127.0.0.1:'+upstream.address().port+'/'+account.id)).json();}})});
  server=http.createServer((req,res)=>{void(async()=>{if(req.url==='/api/me'){const secret=String(req.headers.authorization??'').replace(/^Bearer /,''),member=await store.authenticate(secret,{at});await devices.authorize(member,req);const value=await self(secret,{scope:store.departmentScope(member)});res.setHeader('Content-Type','application/json');res.end(JSON.stringify(value));return;}if(!await backend.handle(req,res)){res.statusCode=404;res.end();}})().catch(error=>{res.statusCode=error.status??500;res.end(JSON.stringify({code:error.code}));});});await listen(server);
- const call=(path='/v1/codex/models',secret=ma.secret)=>fetch('http://127.0.0.1:'+server.address().port+path,{headers:{authorization:'Bearer '+secret}}),setPolicy=async policy=>{const current=await policies.read(ma.keyId);await policies.set(ma.keyId,{consumption_policy:policy,expected_consumption_policy_version:current.consumption_policy_version},{scope:scopeA});};
+ const call=(path='/v1/codex/models',secret=ma.secret,headers={})=>fetch('http://127.0.0.1:'+server.address().port+path,{headers:{authorization:'Bearer '+secret,...headers}}),setPolicy=async policy=>{const current=await policies.read(ma.keyId);await policies.set(ma.keyId,{consumption_policy:policy,expected_consumption_policy_version:current.consumption_policy_version},{scope:scopeA});};
  return {store,reader,admin,departments,superAdmin,a,b,scopeA,scopeB,ma,mb,apiA,subA,apiB,subB,seen,sourceCalls,call,setPolicy,self,at,addAccount,gate:value=>{gate=value;},malicious:value=>{malicious=value;}};
 }
 test('inherit目录只访问自己部门源，另一部门账号不挤占容量，两种格式与固定MCP均可用',integration,async t=>{
@@ -115,4 +115,12 @@ for(const drift of ['quota-marker','quota-permission','runtime-role'])test('api/
   await assert.rejects(self(f.ma.secret),{code:'department_restart_required'});assert.ok(!sqls.some(sql=>/pg_proc|pg_constraint/.test(sql)),'drift rejection must use live guards rather than full attestation');await restore();restore=null;sqls.length=0;
   assert.deepEqual(await self(f.ma.secret),expected);assert.ok(!sqls.some(sql=>/pg_proc|pg_constraint/.test(sql)),'restored access must retain the warm path');
  }finally{await restore?.();await queue.close();await restricted.close();}
+});
+
+test('固定零权重API目录只读且拒绝跨员工、跨部门与上游期间部门权限变化',integration,async t=>{
+ const f=await fixture(t);await f.setPolicy('api_first');await f.store.run('UPDATE harbor.accounts SET api_weight=0 WHERE id=$1',f.apiA);
+ const session=randomUUID();await f.store.run("INSERT INTO harbor.sessions(id,member_id,department_id,account_id,protocol,created,updated) VALUES($1,$2,$3,$4,'responses',$5,$5)",session,f.ma.memberId,f.a.id,f.apiA,f.at);
+ const headers={'x-harbor-session':session,'x-harbor-department-id':f.b.id};const response=await f.call('/v1/models',f.ma.secret,headers);assert.equal(response.status,200);assert.deepEqual(new Set((await response.json()).data.map(m=>m.id)),new Set(['api-a','common-model']));assert.deepEqual(f.seen,[f.apiA]);assert.equal((await f.store.get('SELECT client_key FROM harbor.sessions WHERE id=$1',session)).client_key,null);
+ assert.equal((await f.call('/v1/models',f.mb.secret,headers)).status,404);
+ let release;f.gate(new Promise(resolve=>{release=resolve;}));const pending=f.call('/v1/models',f.ma.secret,headers);await condition(()=>f.seen.length===2);await f.store.run('UPDATE harbor.departments SET enabled=false,version=version+1 WHERE id=$1',f.a.id);release();assert.notEqual((await pending).status,200);assert.deepEqual(f.seen,[f.apiA,f.apiA]);
 });

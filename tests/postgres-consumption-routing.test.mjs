@@ -45,3 +45,16 @@ test('source-specific round robin keeps both API weights while subscription and 
  assert.equal(seen.filter(account=>account===f.api).length,6);assert.equal(seen.filter(account=>account===api2).length,6);
  assert.ok(await f.store.get("SELECT value FROM harbor.gateway_settings WHERE name='routing_schedule'"));
 });
+
+test('api-first fixed zero-weight API keeps its approved source while ordinary new sessions remain ineligible',options,async t=>{
+ const f=await fixture(t);await f.set('api_first');await f.store.run('UPDATE harbor.accounts SET api_weight=0 WHERE id=$1',f.api);
+ const id=randomUUID();await f.store.run("INSERT INTO harbor.sessions(id,member_id,account_id,protocol,created,updated) VALUES($1,$2,$3,'responses',$4,$4)",id,f.member.id,f.api,f.at);
+ await assert.rejects(f.resolve(),{code:'consumption_api_unavailable'});
+ await assert.rejects(f.resolve(f.payload,{'x-harbor-session':id}),{code:'session_route_conflict'});
+ const headers={...f.headers,'x-harbor-session':id},route=await f.resolve(f.payload,headers);assert.equal(route.account.id,f.api);assert.equal(route.consumption.consumption_source,'api');assert.equal(route.consumption.fallback,false);
+ assert.equal((await f.store.get('SELECT api_weight FROM harbor.accounts WHERE id=$1',f.api)).api_weight,0);assert.equal((await f.router.catalogCandidates({policy:'api_only'})).candidates.length,0);
+ await assert.rejects(f.resolve(f.payload,{...headers,'thread-id':'another-thread'}),{code:'session_route_conflict'});
+ await f.set('subscription_only');await assert.rejects(f.resolve(f.payload,headers),{code:'consumption_source_conflict'});
+ await f.set('api_first');await f.store.run("UPDATE harbor.accounts SET route_block='quota_exhausted' WHERE id=$1",f.api);await assert.rejects(f.resolve(f.payload,headers));
+ assert.equal((await f.store.get('SELECT account_id FROM harbor.sessions WHERE id=$1',id)).account_id,f.api);
+});
