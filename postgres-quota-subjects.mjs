@@ -27,12 +27,7 @@ const expectedConstraints=[
 const fail=(code='quota_subject_contract_invalid',status=503)=>{throw new AppError(status,'供应方共享额度暂不能安全核对，请稍后重试',code);};
 const source=async()=>{const sql=await readFile(migration,'utf8');return {sql,checksum:createHash('sha256').update(sql).digest('hex')};};
 const lock=store=>store.query("SELECT pg_advisory_xact_lock(hashtextextended('harbor-quota-subject-coordination-v1',0))");
-const subjectRequests=`SELECT r.id,r.ended,r.usage_unknown,r.input,r.output FROM harbor.requests r WHERE r.quota_subject_ref=$1
-  UNION ALL SELECT r.id,r.ended,r.usage_unknown,r.input,r.output FROM harbor.quota_subject_accounts qb JOIN harbor.requests r ON r.account_id=qb.account_id
-  WHERE qb.subject_ref=$1 AND r.quota_subject_ref IS NULL AND r.quota_ordinary IS DISTINCT FROM FALSE AND r.quota_account_identity_epoch IS NOT NULL AND r.quota_account_identity_epoch=qb.identity_epoch
-  UNION ALL SELECT r.id,r.ended,r.usage_unknown,r.input,r.output FROM harbor.quota_subject_accounts qb JOIN harbor.requests r ON r.account_id=qb.account_id
-  WHERE qb.subject_ref=$1 AND r.quota_subject_ref IS NULL AND r.quota_ordinary IS DISTINCT FROM FALSE AND r.ended IS NULL AND r.status IN ('queued','running')
-  AND NOT EXISTS(SELECT 1 FROM harbor.quota_subject_accounts known WHERE known.account_id=r.account_id AND known.identity_epoch=r.quota_account_identity_epoch)`;
+
 
 export async function verifyQuotaSubjectAvailability(store){
   const marker=await store.get('SELECT value FROM harbor.gateway_settings WHERE name=$1',setting);
@@ -113,7 +108,6 @@ async function latchDenial(store,subject,ended){
   await store.run('UPDATE harbor.quota_subjects SET snapshot=$1,denial_at=GREATEST(denial_at,$3) WHERE ref=$2',snapshot,subject.ref,ended);
   subject.snapshot=snapshot;subject.denial_at=Math.max(subject.denial_at??0,ended);
 }
-const integer=value=>{const n=Number(value);if(!Number.isSafeInteger(n)||n<0)fail('quota_subject_accounting_unknown');return n;};
 function ordinarySnapshot(snapshot){
   return {checked:snapshot.checked,windows:snapshot.windows,remaining:snapshot.remaining,ordinaryUsageAllowed:snapshot.ordinaryUsageAllowed,limitReached:snapshot.limitReachedType==='rate_limit_reached',limitReachedType:snapshot.limitReachedType==='rate_limit_reached'?'rate_limit_reached':null};
 }
@@ -169,18 +163,15 @@ export function createPostgresQuotaSubjects(store,{identity,clock=Date.now}={}){
   }
   async function check(request,account,subject){
     if(!subject?.shared)return;
-    // Real request terminal facts are the only permit state machine. Unknown
-    // execution remains held until a trusted later snapshot covers its end.
-    const pending=await store.get(`SELECT 1 FROM (${subjectRequests}) r WHERE r.id<>$2 AND (r.ended IS NULL OR (r.usage_unknown<>0 AND ($3::bigint IS NULL OR r.ended>=$3) AND NOT EXISTS(SELECT 1 FROM harbor.quota_subject_confirmations c WHERE c.request_id=r.id AND c.subject_ref=$1))) LIMIT 1`,subject.ref,request.id,subject.checked_from);
-    if(pending)fail('shared_supplier_quota_busy',429);
-    if(subject.scope==='account_metered_bucket'){
-      if(!subject.snapshot)fail('shared_supplier_quota_unknown',429);
-      const used=await store.get(`SELECT COALESCE(SUM(r.input+r.output),0)::text tokens FROM (${subjectRequests}) r WHERE r.id<>$2 AND r.ended>=$3 AND r.usage_unknown=0`,subject.ref,request.id,subject.checked_from);
-      const calibration=await store.get('SELECT MIN(a.tokens_per_percent) n FROM harbor.quota_subject_accounts b JOIN harbor.accounts a ON a.id=b.account_id AND a.quota_identity_epoch=b.identity_epoch WHERE b.subject_ref=$1 AND a.tokens_per_percent>0',subject.ref);
-      const capacity=accountCapacity({...account,quota_json:JSON.stringify(subject.snapshot),token_budget:null,budget_used:0,since_check_tokens:integer(used.tokens),tokens_per_percent:calibration.n??account.tokens_per_percent},0,0,clock());
-      if(!capacity.eligible)fail('shared_supplier_quota_unavailable',429);
+    // Shared identity is accounting evidence, not a local execution semaphore.
+    // Missing/stale snapshots, in-flight/unknown usage and token estimates cannot
+    // prove provider exhaustion. Preserve those facts and let the provider decide.
+    if(subject.scope==='account_metered_bucket'&&subject.snapshot){
+      const capacity=accountCapacity({...account,quota_json:JSON.stringify(subject.snapshot),token_budget:null,budget_used:0,since_check_tokens:0},0,0,clock());
+      if(!capacity.eligible&&(capacity.source==='official_denied'||capacity.source==='official'&&capacity.remaining===0))fail('shared_supplier_quota_unavailable',429);
     }
   }
+
   async function admit(requestId,account,{mode,replaceConfirmedUnused=false}={}){
     if(!await installed(store))return {coordinated:false};
     await transaction();const request=await store.get('SELECT * FROM harbor.requests WHERE id=$1',requestId),current=await store.get('SELECT * FROM harbor.accounts WHERE id=$1',account.id);

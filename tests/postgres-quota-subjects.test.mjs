@@ -64,47 +64,48 @@ test('部分DDL和同名弱化约束不能伪装成已验证主体合同',integr
 test('跨部门相同可信桶共用许可，单绑定和未知仍走原行为',integration,async t=>{
   const f=await fixture(t,{departments:true}),a=await f.account('a',{department:'department-a'}),b=await f.account('b',{department:'department-b'}),unknown=await f.account('unknown',{department:'department-b'});
   await f.bind(a);await f.request('single-1',a);await f.request('single-2',a);assert.equal((await f.admit('single-1',a)).coordinated,true);assert.equal((await f.admit('single-2',a)).coordinated,true);
-  await f.bind(b);await f.request('b-request',b);await assert.rejects(f.admit('b-request',b),{code:'shared_supplier_quota_busy'});
+  await f.bind(b);await f.request('b-request',b);assert.equal((await f.admit('b-request',b)).coordinated,true);
   await f.request('unknown-request',unknown);assert.equal((await f.admit('unknown-request',unknown)).coordinated,false);
   await assert.rejects(f.admit('b-request',a),{code:'quota_subject_request_binding_conflict'});
   assert.equal((await f.store.get("SELECT account_id FROM harbor.requests WHERE id='b-request'")).account_id,b.id);
 });
 
-test('同时受理只一方取得共享许可，已知取消和真实终态立即释放且重结算不重复消费',integration,async t=>{
+test('同时受理双方保留共享归属且均可派发，已知取消和真实终态立即释放且重结算不重复消费',integration,async t=>{
   const f=await fixture(t),a=await f.account('a'),b=await f.account('b');await f.bind(a);await f.bind(b);
   const accept=(id,account)=>f.store.transaction(async()=>{await f.request(id,account);return f.subjects.admit(id,account);});
-  const results=await Promise.allSettled([accept('r-a',a),accept('r-b',b)]);assert.equal(results.filter(r=>r.status==='fulfilled').length,1);
+  const results=await Promise.allSettled([accept('r-a',a),accept('r-b',b)]);assert.equal(results.filter(r=>r.status==='fulfilled').length,2);
   const winner=results[0].status==='fulfilled'?'r-a':'r-b',loser=winner==='r-a'?'r-b':'r-a',target=loser==='r-a'?a:b;
-  await f.store.finish(winner,{status:'cancelled',usageKnown:true,input:0,output:0});assert.equal((await accept(loser,target)).coordinated,true);
+  await f.store.finish(winner,{status:'cancelled',usageKnown:true,input:0,output:0});assert.equal((await f.admit(loser,target)).coordinated,true);
   await f.store.finish(loser,{status:'ok',usageKnown:true,input:100,output:10});await f.store.finish(loser,{status:'ok',usageKnown:true,input:999,output:999});
   assert.equal((await f.store.get('SELECT input+output n FROM harbor.requests WHERE id=$1',loser)).n,110);
 });
 
-test('未知执行保留许可，刷新起点不覆盖查询期间完成的未知消耗',integration,async t=>{
+test('未知执行保留未知事实但不阻断后续调用',integration,async t=>{
   const f=await fixture(t),a=await f.account('a'),b=await f.account('b');await f.bind(a);await f.bind(b);await f.request('unknown',a);await f.admit('unknown',a);
   await f.store.run("UPDATE harbor.requests SET ended=$1,status='unknown',usage_unknown=1 WHERE id='unknown'",f.now());await f.request('next',b);
-  await assert.rejects(f.admit('next',b),{code:'shared_supplier_quota_busy'});
-  const started=f.now();f.advance(10);await f.bind(b,{checkedFrom:started});await assert.rejects(f.admit('next',b),{code:'shared_supplier_quota_busy'});
+  assert.equal((await f.admit('next',b)).coordinated,true);
+  const started=f.now();f.advance(10);await f.bind(b,{checkedFrom:started});assert.equal((await f.admit('next',b)).coordinated,true);
   f.advance(1);await f.bind(b);assert.equal((await f.admit('next',b)).coordinated,true);
+  assert.equal((await f.store.get("SELECT usage_unknown FROM harbor.requests WHERE id='unknown'")).usage_unknown,1);
 });
 
-test('共享新快照保留查询期间已知消耗，不把各部门百分比相加',integration,async t=>{
+test('共享已知消耗保留原记录，不以token估算强制拒绝',integration,async t=>{
   const f=await fixture(t),a=await f.account('a'),b=await f.account('b');await f.bind(a,{used:99});await f.bind(b,{used:99});
   await f.request('spent',a);await f.admit('spent',a);await f.store.run("UPDATE harbor.requests SET ended=$1,status='ok',input=10001,usage_unknown=0 WHERE id='spent'",f.now());await f.request('next',b);
-  await assert.rejects(f.admit('next',b),{code:'shared_supplier_quota_unavailable'});
-  const queryStart=f.now();f.advance(5);await f.bind(b,{used:99,checkedFrom:queryStart});await assert.rejects(f.admit('next',b),{code:'shared_supplier_quota_unavailable'});
+  assert.equal((await f.admit('next',b)).coordinated,true);
+  const queryStart=f.now();f.advance(5);await f.bind(b,{used:99,checkedFrom:queryStart});assert.equal((await f.admit('next',b)).coordinated,true);
   f.advance(1);await f.bind(b,{used:90});assert.equal((await f.admit('next',b)).coordinated,true);
 });
 
 test('同一API凭据协调而不同凭据不推断同项目；重登不改已冻结请求主体',integration,async t=>{
   const f=await fixture(t),a=await f.account('a',{apiDigest:'a'.repeat(64)}),b=await f.account('b',{apiDigest:'a'.repeat(64)}),c=await f.account('c',{apiDigest:'b'.repeat(64)});
-  await f.request('a-request',a);await f.admit('a-request',a);await f.request('b-request',b);await assert.rejects(f.admit('b-request',b),{code:'shared_supplier_quota_busy'});
+  await f.request('a-request',a);await f.admit('a-request',a);await f.request('b-request',b);assert.equal((await f.admit('b-request',b)).coordinated,true);
   await f.request('c-request',c);await f.admit('c-request',c);
   const saved=(await f.store.get("SELECT quota_subject_ref FROM harbor.requests WHERE id='a-request'")).quota_subject_ref;
   await f.store.run("UPDATE harbor.accounts SET route_epoch=route_epoch+1,api_secret_digest=$1 WHERE id='a'",'c'.repeat(64));
   const changed=await f.store.get("SELECT * FROM harbor.accounts WHERE id='a'");await f.request('new-identity',changed);await f.admit('new-identity',changed);
   assert.equal((await f.store.get("SELECT quota_subject_ref FROM harbor.requests WHERE id='a-request'")).quota_subject_ref,saved);
-  await assert.rejects(f.admit('b-request',b),{code:'shared_supplier_quota_busy'});
+  assert.equal((await f.admit('b-request',b)).coordinated,true);
 });
 
 test('人工额外额度不冒认为普通桶，公共请求DTO不泄露内部主体',integration,async t=>{
@@ -121,8 +122,8 @@ test('真实额度恢复与停用再启用保持主体，只有身份变更使�
   t.after(async()=>{quotas.stop();await queue.close();await quotas.close();await admin.close();});
   await quotas.refresh(a,{force:true});await quotas.refresh(b,{force:true});await f.request('running-other',b);await f.admit('running-other',b);
   await router.block(await quotas.load(a.id),'quota_exhausted');const before=await quotas.load(a.id);assert.equal((await quotas.refresh(before,{force:true})).refreshed,true);
-  const recovered=await quotas.load(a.id);assert.ok(recovered.route_epoch>before.route_epoch);assert.equal(recovered.quota_identity_epoch,0);await f.request('after-recover',recovered);await assert.rejects(f.admit('after-recover',recovered),{code:'shared_supplier_quota_busy'});
-  await admin.handle('/api/admin/accounts/'+a.id,'PATCH',{enabled:false});await admin.handle('/api/admin/accounts/'+a.id,'PATCH',{enabled:true});const enabled=await quotas.load(a.id);await f.request('after-enable',enabled);await assert.rejects(f.admit('after-enable',enabled),{code:'shared_supplier_quota_busy'});
+  const recovered=await quotas.load(a.id);assert.ok(recovered.route_epoch>before.route_epoch);assert.equal(recovered.quota_identity_epoch,0);await f.request('after-recover',recovered);assert.equal((await f.admit('after-recover',recovered)).coordinated,true);
+  await admin.handle('/api/admin/accounts/'+a.id,'PATCH',{enabled:false});await admin.handle('/api/admin/accounts/'+a.id,'PATCH',{enabled:true});const enabled=await quotas.load(a.id);await f.request('after-enable',enabled);assert.equal((await f.admit('after-enable',enabled)).coordinated,true);
   const frozen=(await f.store.get("SELECT quota_subject_ref FROM harbor.requests WHERE id='running-other'")).quota_subject_ref;
   await f.store.transaction(()=>invalidateQuotaSubjectIdentity(f.store,a.id));const changed=await quotas.load(a.id);await f.request('new-identity',changed);assert.equal((await f.admit('new-identity',changed)).coordinated,false);
   assert.equal((await f.store.get("SELECT quota_subject_ref FROM harbor.requests WHERE id='running-other'")).quota_subject_ref,frozen);
@@ -148,16 +149,16 @@ test('查询开始后的新拒绝不能被该查询较早生成的正向快照�
 
 test('首次识别纳入同代际未知在途，重登后旧代际映射仍保留但不改历史ref',integration,async t=>{
   const f=await fixture(t),a=await f.account('a'),b=await f.account('b');await f.request('already-running',a);assert.equal((await f.admit('already-running',a)).coordinated,false);
-  await f.bind(a);await f.bind(b);await f.request('next',b);await assert.rejects(f.admit('next',b),{code:'shared_supplier_quota_busy'});
+  await f.bind(a);await f.bind(b);await f.request('next',b);assert.equal((await f.admit('next',b)).coordinated,true);
   const unknown=await f.store.get("SELECT quota_subject_ref,quota_account_identity_epoch,quota_ordinary FROM harbor.requests WHERE id='already-running'");assert.deepEqual(unknown,{quota_subject_ref:null,quota_account_identity_epoch:0,quota_ordinary:true});
   await f.store.transaction(()=>invalidateQuotaSubjectIdentity(f.store,a.id));const changed=await f.store.get('SELECT * FROM harbor.accounts WHERE id=$1',a.id);await f.bind(changed,{backend:'fixture-other-backend'});
-  await assert.rejects(f.admit('next',b),{code:'shared_supplier_quota_busy'});assert.equal((await f.store.get("SELECT quota_subject_ref FROM harbor.requests WHERE id='already-running'")).quota_subject_ref,null);
+  assert.equal((await f.admit('next',b)).coordinated,true);assert.equal((await f.store.get("SELECT quota_subject_ref FROM harbor.requests WHERE id='already-running'")).quota_subject_ref,null);
   await f.store.finish('already-running',{status:'ok',usageKnown:true,input:10},f.now());assert.equal((await f.admit('next',b)).coordinated,true);
 });
 
 test('管理员仅释放本部门已终态未知请求许可，原用量保留且重试只记一次事实与审计',integration,async t=>{
   const f=await fixture(t,{departments:true}),a=await f.account('a',{department:'department-a',apiDigest:'a'.repeat(64)}),b=await f.account('b',{department:'department-b',apiDigest:'a'.repeat(64)});
-  await f.request('unknown-api',a);await f.admit('unknown-api',a);await f.store.finish('unknown-api',{status:'unknown',usageKnown:false},f.now());await f.request('waiting-b',b);await assert.rejects(f.admit('waiting-b',b),{code:'shared_supplier_quota_busy'});
+  await f.request('unknown-api',a);await f.admit('unknown-api',a);await f.store.finish('unknown-api',{status:'unknown',usageKnown:false},f.now());await f.request('waiting-b',b);assert.equal((await f.admit('waiting-b',b)).coordinated,true);
   const issuer=createDepartmentScopeIssuer(),root=issuer.superAdmin({credentialId:'synthetic-confirmation-root',credentialVersion:0}),departments=createPostgresDepartments(f.store,{issuer,clock:f.now}),keyA=await departments.issueManagementKey(root,'department-a',{label:'合成A'}),keyB=await departments.issueManagementKey(root,'department-b',{label:'合成B'}),scopeA=await departments.authenticateManagementKey(keyA.secret),scopeB=await departments.authenticateManagementKey(keyB.secret),admin=createPostgresQuotaConfirmation(f.store,{clock:f.now}),body={confirmed:true,statement:'upstream_finished',reason:'已核实上游任务结束'};
   const original=await f.store.get("SELECT status,business_status,usage_unknown,input,output,manual_cost_atoms,ended FROM harbor.requests WHERE id='unknown-api'");
   await assert.rejects(admin.confirm('unknown-api',body,{scope:scopeB}),{code:'department_object_not_found'});await assert.rejects(admin.confirm('unknown-api',body,{scope:JSON.parse(JSON.stringify(scopeA))}),{code:'department_scope_required'});
@@ -256,4 +257,13 @@ test('消耗尝试结算与同员工主体受理并发不死锁，保留部门�
   assert.equal((await f.store.finish('settling',result,f.now())).settled,false);
   assert.deepEqual(await f.store.get("SELECT m.used member_used,k.used key_used,a.budget_used account_used FROM harbor.members m JOIN harbor.keys k ON k.member_id=m.id CROSS JOIN harbor.accounts a WHERE m.id='lock-member' AND a.id='lock-account'"),{member_used:3,key_used:3,account_used:3});
  }
+});
+
+test('共享快照缺失、过期及不可估计不阻断，官方明确拒绝仍阻断',integration,async t=>{
+ const f=await fixture(t),a=await f.account('a'),b=await f.account('b');await f.bind(a);await f.bind(b);await f.request('next',b);
+ for(const snapshot of [null,{checked:f.now()-600000,remaining:0,windows:[]},{checked:f.now(),remaining:50,windows:[{used:50,reset:f.now()-1}]}]){
+  await f.store.run('UPDATE harbor.quota_subjects SET snapshot=$1,checked=$2,checked_from=$2',snapshot,snapshot?f.now():null);
+  assert.equal((await f.admit('next',b)).coordinated,true);assert.equal((await f.store.transaction(()=>f.subjects.beforeDispatch('next'))).coordinated,true);
+ }
+ f.advance(2);await f.bind(b,{permission:false});await assert.rejects(f.admit('next',b),{code:'shared_supplier_quota_unavailable'});await assert.rejects(f.store.transaction(()=>f.subjects.beforeDispatch('next')),{code:'shared_supplier_quota_unavailable'});
 });

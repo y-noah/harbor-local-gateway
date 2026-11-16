@@ -95,11 +95,11 @@ test('rebind rollback acknowledgement loss settles the original API attempt only
 test('unreadable rebind outcome keeps a resolvable encrypted receipt until database recovery',integration,async t=>{const f=await fixture(t),control=loseRebindCommit(f.store,{holdReads:true});f.state.restoreDatabase=control.restore;const result=await f.send();assert.notEqual(result.status,200);assert.equal(result.data.error.code,'consumption_rebind_commit_unconfirmed');assert.equal(f.calls.length,1);assert.equal(result.headers.get('x-harbor-consumption-source'),'api');assert.equal(result.headers.get('x-harbor-fallback'),'false');assert.equal(f.metering.status().queued,1);control.restore();await f.metering.flush();assert.equal(f.metering.status().queued,0);const row=await f.store.get('SELECT * FROM harbor.requests WHERE id=$1',result.headers.get('x-harbor-request-id'));assert.notEqual(row.ended,null);assert.equal(row.account_id,f.accountId);assert.equal(row.consumption_attempts.length,2);assert.equal(row.consumption_attempts[0].state,'rejected');assert.equal(row.consumption_attempts[1].dispatched,false);assert.equal(row.consumption_source,'api');assert.equal(row.consumption_fallback,false);assert.equal(f.handler.status().execution.active,0);});
 
 
-test('shared trusted subscription bucket rejects concurrent HTTP execution without rebinding or replay',integration,async t=>{
+test('shared trusted subscription bucket allows concurrent HTTP execution without rebinding or replay',integration,async t=>{
  const f=await fixture(t,{second:true,api:false,policy:'subscription_only',subjectCoordination:true});await f.bindSubject(f.accountId);await f.bindSubject(f.otherId);
  const gate=deferred();f.state.sourceGate=gate;const first=f.send();await until(()=>f.calls.length===1);
- try{const second=await f.send();assert.equal(second.status,429);assert.equal(second.data.error.code,'shared_supplier_quota_busy');assert.equal(f.calls.length,1);}finally{gate.resolve();f.state.sourceGate=null;}
- assert.equal((await first).status,200);assert.equal((await f.send()).status,200);assert.equal(f.calls.length,2);
+ let second;try{second=f.send();await until(()=>f.calls.length===2);}finally{gate.resolve();f.state.sourceGate=null;}
+ assert.equal((await first).status,200);assert.equal((await second).status,200);assert.equal((await f.send()).status,200);assert.equal(f.calls.length,3);
 });
 
 test('same API credential permit is safely replaced after proven zero-execution quota fallback',integration,async t=>{
@@ -127,15 +127,15 @@ test('first trusted subject discovery includes a real upstream request already r
  const f=await fixture(t,{second:true,api:false,policy:'subscription_only',subjectCoordination:true}),gate=deferred();t.after(()=>gate.resolve());f.state.sourceGate=gate;
  const first=f.send();await until(()=>f.calls.length===1);const inflight=await f.store.get("SELECT id,quota_subject_ref,quota_account_identity_epoch,quota_ordinary FROM harbor.requests WHERE ended IS NULL");assert.equal(inflight.quota_subject_ref,null);assert.equal(inflight.quota_ordinary,true);
  await f.bindSubject(f.accountId);await f.bindSubject(f.otherId);
- try{const second=await f.send();assert.equal(second.status,429);assert.equal(second.data.error.code,'shared_supplier_quota_busy');assert.equal(f.calls.length,1);}finally{gate.resolve();f.state.sourceGate=null;}
- assert.equal((await first).status,200);assert.equal((await f.send()).status,200);assert.equal(f.calls.length,2);assert.equal((await f.store.get('SELECT quota_subject_ref FROM harbor.requests WHERE id=$1',inflight.id)).quota_subject_ref,null);
+ let second;try{second=f.send();await until(()=>f.calls.length===2);}finally{gate.resolve();f.state.sourceGate=null;}
+ assert.equal((await first).status,200);assert.equal((await second).status,200);assert.equal((await f.send()).status,200);assert.equal(f.calls.length,3);assert.equal((await f.store.get('SELECT quota_subject_ref FROM harbor.requests WHERE id=$1',inflight.id)).quota_subject_ref,null);
 });
 
 
 test('real HTTP administrator confirms upstream completion without rewriting unknown usage or billing',integration,async t=>{
  const f=await fixture(t,{subjectCoordination:true,policy:'api_only',admin:true});f.state.apiStatus=0;f.state.omitUsage=true;await f.store.run('UPDATE harbor.accounts SET api_secret_digest=$1 WHERE id=$2','a'.repeat(64),f.apiId);
  const first=await f.send();assert.equal(first.status,200);const id=first.headers.get('x-harbor-request-id'),before=await f.store.get('SELECT status,usage_unknown,input,output,manual_cost_atoms FROM harbor.requests WHERE id=$1',id);assert.equal(before.usage_unknown,1);
- const peer=randomUUID();await f.store.run("INSERT INTO harbor.accounts(id,name,home,state,auth_mode,api_secret_digest) VALUES($1,'合成共享Key',$1,'ready','openai_api',$2)",peer,'a'.repeat(64));const seed=randomUUID();await f.store.run("INSERT INTO harbor.requests(id,account_id,started,status,ip) VALUES($1,$2,$3,'queued','synthetic')",seed,peer,Date.now());await assert.rejects(f.store.transaction(()=>f.subjects.admit(seed,{id:peer,route_epoch:0})),{code:'shared_supplier_quota_busy'});await f.store.finish(seed,{status:'cancelled',usageKnown:true});const stillBlocked=await f.send();assert.equal(stillBlocked.status,429);assert.equal(f.calls.length,1);
+ const peer=randomUUID();await f.store.run("INSERT INTO harbor.accounts(id,name,home,state,auth_mode,api_secret_digest) VALUES($1,'合成共享Key',$1,'ready','openai_api',$2)",peer,'a'.repeat(64));const seed=randomUUID();await f.store.run("INSERT INTO harbor.requests(id,account_id,started,status,ip) VALUES($1,$2,$3,'queued','synthetic')",seed,peer,Date.now());assert.equal((await f.store.transaction(()=>f.subjects.admit(seed,{id:peer,route_epoch:0}))).coordinated,true);await f.store.finish(seed,{status:'cancelled',usageKnown:true});const next=await f.send();assert.equal(next.status,200);assert.equal(f.calls.length,2);
  const endpoint=f.origin+'/api/admin/requests/'+id+'/confirm-upstream-ended',body={confirmed:true,statement:'upstream_finished',reason:'已人工核实上游完成'};
  const unauth=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});assert.equal(unauth.status,401);
  const detail=await(await fetch(f.origin+'/api/admin/requests/'+id,{headers:{authorization:'Bearer synthetic-admin'}})).json();assert.equal(detail.can_confirm_upstream,true);assert.doesNotMatch(JSON.stringify(detail),/quota_subject_ref|quota_account_identity_epoch|quota_ordinary/);
