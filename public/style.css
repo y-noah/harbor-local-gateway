@@ -124,7 +124,7 @@
 @media(max-width:1100px){#session-filter-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:760px){#session-filter-form{grid-template-columns:minmax(0,1fr)}.member-bulk-bar>span{flex-basis:auto}.overview-filters>.hint{padding:0}.overview-page .chart{height:220px}}
 /* 筛选区保持单行；窄屏横向滚动，避免条件被挤到下一行。 */
-.filter-grid,.history-filters,.recording-query-form .history-filters,.type-statistics-filters,.member-filters,.account-pool-filters,#session-filter-form{display:grid;grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:minmax(160px,1fr);align-items:end;overflow-x:auto;max-width:100%;min-width:0;padding-bottom:6px}.filter-grid-actions{grid-column:auto;align-self:end;flex-wrap:nowrap}.filter-grid>label,.history-filters>label{white-space:nowrap}.filter-grid input,.filter-grid select,.history-filters input,.history-filters select{height:44px}.account-pool-filters .check-row{min-width:100px;align-self:end;min-height:44px;align-items:center}.toolbar:has(>select):not(.member-filters):not(.account-pool-filters){flex-wrap:nowrap;overflow-x:auto;max-width:100%}.toolbar:has(>select)>select{flex:1 0 160px;min-width:160px}.toolbar:has(>select)>button{flex-shrink:0;white-space:nowrap}
+.filter-grid,.history-filters,.recording-query-form .history-filters,.type-statistics-filters,.member-filters,.account-pool-filters,#session-filter-form{display:grid;grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:minmax(160px,1fr);align-items:end;overflow-x:auto;max-width:100%;min-width:0;padding-bottom:6px}.filter-grid-actions{grid-column:auto;align-self:end;flex-wrap:nowrap}.filter-grid>label,.history-filters>label{white-space:nowrap}.filter-grid input,.filter-grid select,.history-filters input,.history-filters select{height:44px}.account-pool-filters .check-row{min-width:100px;align-self:end;min-height:44px;align-items:center}.toolbar:has(>select):not(.member-filters):not(.account-pool-filters){flex-wrap:nowrap;overflow-x:auto;max-width:100%}.toolbar:has(>select):not(.member-filters):not(.account-pool-filters)>select{flex:1 0 160px;min-width:160px}.toolbar:has(>select)>button{flex-shrink:0;white-space:nowrap}
 
 /* 筛选控件与批量操作共用一行，菜单不受筛选横向滚动区域裁剪。 */
 select:not([multiple]):not([size]){appearance:none;padding-right:38px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%23506459' stroke-width='1.5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center}
@@ -248,6 +248,7 @@ body{font-size:17.6px}
 
 /* 数据区加载反馈不覆盖分类导航，也不清空已有数据。 */
 .page-read-feedback{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;margin-bottom:12px;border:1px solid var(--line);border-radius:8px;background:#f4f7f3;color:#53695d}
+.page-read-feedback>span{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}.page-read-feedback>button{flex:0 0 auto;white-space:nowrap}
 .page-read-feedback[hidden]{display:none}
 .data-loading-mask{display:none;position:absolute;inset:0;z-index:2;align-items:flex-start;justify-content:center;padding:32px 16px;background:#ffffffb8;color:#53695d;pointer-events:auto}
 .data-refresh-region[aria-busy=true]{min-height:100px}
