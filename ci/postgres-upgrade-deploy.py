@@ -695,11 +695,11 @@ def run_upgrade(image,config,api,ticket,entry):
  if proof.get('usage_rollup_cascade_contract') is not None:
   deployment_progress('usage_plan')
   cascade=load(Path(__file__).with_name('postgres-usage-cascade.py'),'runtime_upgrade_usage_cascade')
-  pg_api['usage_cascade_release']=cascade.UsageCascadeRelease(api=api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path)
+  pg_api['usage_cascade_release']=cascade.UsageCascadeRelease(api=pg_api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path)
  if department_contract(proof)==DEPARTMENT_CONTRACT:
   deployment_progress('department_plan')
   department=load(Path(__file__).with_name('postgres-department-release.py'),'runtime_upgrade_department')
-  pg_api['department_release']=department.DepartmentRelease(api=api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path,source_proofs=department_sources)
+  pg_api['department_release']=department.DepartmentRelease(api=pg_api,entry=entry,ticket=ticket,active=active,gateway=gateway,worker=worker,image=image,proof=proof,record=record,path=path,source_proofs=department_sources)
  target=approval(ticket);activation_state='pending'
  def activation(action,requested):
   nonlocal activation_state

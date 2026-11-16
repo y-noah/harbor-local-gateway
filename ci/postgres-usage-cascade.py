@@ -13,13 +13,19 @@ def need(ok,code):
     if not ok:raise RuntimeError('usage_cascade_'+code)
 
 def unstarted_maintenance_task(row,name,image_id,program,action,require=need):
+    require(row is not None,'maintenance_creation_pending')
     config=(row or {}).get('Config',{});host=(row or {}).get('HostConfig',{});state=(row or {}).get('State',{})
     require(row is not None and re.fullmatch('[a-f0-9]{64}',row.get('Id','')) and row.get('Name')=='/'+name and row.get('Image')==image_id and config.get('Image')==image_id and config.get('Labels',{}).get('com.harbor.maintenance')==name and config.get('Entrypoint')==['node'] and config.get('Cmd')==[program,action] and config.get('User')=='node' and host.get('ReadonlyRootfs') is True and host.get('NetworkMode')=='host' and host.get('CapDrop')==['ALL'] and host.get('SecurityOpt')==['no-new-privileges'] and host.get('PidsLimit')==64 and host.get('Memory')==512*1024*1024 and host.get('NanoCpus')==500000000 and host.get('Tmpfs')=={'/tmp':'rw,noexec,nosuid,size=16m'} and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_creation_identity')
     require(state.get('Running') is False and state.get('Pid')==0 and state.get('Status')=='created' and state.get('StartedAt')=='0001-01-01T00:00:00Z' and not any(state.get(k) for k in ['Paused','Restarting','Dead','OOMKilled']),'maintenance_creation_unconfirmed')
     return row['Id']
 
 def create_maintenance_task(api,args,name,image_id,program,action,require=need):
-    try:created=subprocess.run(args,capture_output=True,timeout=30)
+    # run_upgrade forwards its validated preflight budget. Keep the existing
+    # configuration contract for legacy/direct callers as well; SQL execution
+    # and installation retain their separate budgets.
+    timeout=api.get('postgres_preflight_timeout_seconds',30)
+    require(type(timeout) is int and 30<=timeout<=300,'maintenance_creation_budget')
+    try:created=subprocess.run(args,capture_output=True,timeout=timeout)
     except subprocess.TimeoutExpired:
         # The client lost only the acknowledgement. Reconcile this same task;
         # never send another create or adopt a process that already started.
@@ -105,15 +111,21 @@ class UsageCascadeRelease:
         self.api=api;self.entry=entry;self.ticket=copy.deepcopy(ticket);self.active=copy.deepcopy(active);self.sources=[generation(gateway),generation(worker)];self.image=image;self.image_id=api['inspect_image'](image)['Id'];self.record=record;self.path=path;self.receipt=None;self.plan=None;self.uncertain=False
         need(self.image_id in [ticket['to']['configDigest'],ticket['to']['manifestDigest']],'candidate_image')
         self.connection,self.manifest=owner_transport(entry,ticket,gateway)
-        witness=None;process=None
-        try:
+        process=None
+        def plan_input():
+            nonlocal process
+            # Slow Docker creation must not consume the live DB witness lease.
+            # Recheck the approved source immediately before opening it.
             self.check_active();self.check_sources(stopped=False)
             process=subprocess.Popen(['/usr/bin/docker','exec','--interactive',gateway['Id'],'node','--input-type=module','--eval',RUNTIME_WITNESS],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout,selectors.EVENT_READ);need(selector.select(15),'runtime_witness_timeout')
                 raw=process.stdout.readline(4097);need(len(raw)<=4096 and raw.endswith(b'\n'),'runtime_witness_budget');witness=json.loads(raw)
             need(isinstance(witness,dict) and set(witness)=={'databaseOid','currentRoleOid','sessionRoleOid','backendPid'} and witness['databaseOid']==ticket['database']['oid'] and witness['currentRoleOid']==self.manifest['runtimeOid'],'runtime_witness_database')
-            self.plan=self.command('cascade-plan',{'runtimeWitness':witness})
+            return {'runtimeWitness':witness}
+        try:
+            self.check_active();self.check_sources(stopped=False)
+            self.plan=self.command('cascade-plan',plan_input)
             if self.plan.get('installed',True):need(self.plan['binding']['runtimeOid']==self.manifest['runtimeOid'] and self.plan.get('coreOwnerRole')==self.manifest['owner'],'plan_manifest_role_binding')
             self.check_sources(stopped=False);self.check_active()
         finally:
@@ -149,6 +161,7 @@ class UsageCascadeRelease:
             cid,reconciled=create_maintenance_task(self.api,args,name,self.image_id,'/app/postgres-usage-rollups-cli.mjs',action)
             row=self.api['inspect_container'](cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
             if reconciled:need(unstarted_maintenance_task(row,name,self.image_id,'/app/postgres-usage-rollups-cli.mjs',action)==cid,'maintenance_container_changed')
+            if callable(cascade):cascade=cascade()
             payload=json.dumps({'connection':self.connection,'cascade':cascade}).encode();need(len(payload)<=131072,'maintenance_input_budget')
             start_attempted=True
             result=subprocess.run(['/usr/bin/docker','start','--attach','--interactive',cid],input=payload,capture_output=True,timeout=75)

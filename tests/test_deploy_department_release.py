@@ -22,9 +22,9 @@ class DepartmentReleaseTests(unittest.TestCase):
   for action,expected in [('install',300),('status',75),('plan',75)]:
    value=object.__new__(release.DepartmentRelease);value.image='synthetic';value.image_id='sha256:'+'b'*64;value.connection={};value.record={};value.save=Mock();value.install_timeout_seconds=300;cid='a'*64;observed=[]
    row={'Id':cid,'Image':value.image_id,'Config':{'Labels':{'com.harbor.maintenance':'harbor-department-release-synthetic'},'User':'node'},'HostConfig':{'ReadonlyRootfs':True,'NetworkMode':'host'},'Mounts':[],'State':{'Running':False,'Pid':0,'Status':'exited'}}
-   inspections=iter([row,row,None]);value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:next(inspections)}
+   inspections=iter([row,row,None]);value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:next(inspections),'postgres_preflight_timeout_seconds':180}
    def command(args,**kwargs):
-    if args[1]=='create':return types.SimpleNamespace(returncode=0,stdout=cid.encode(),stderr=b'')
+    if args[1]=='create':self.assertEqual(kwargs['timeout'],180);return types.SimpleNamespace(returncode=0,stdout=cid.encode(),stderr=b'')
     if args[1]=='start':observed.append(kwargs['timeout']);return types.SimpleNamespace(returncode=0,stdout=__import__('json').dumps({'action':action}).encode(),stderr=b'')
     return types.SimpleNamespace(returncode=0,stdout=b'',stderr=b'')
    with patch.object(release.uuid,'uuid4',return_value=types.SimpleNamespace(hex='synthetic')),patch.object(release.subprocess,'run',side_effect=command):self.assertEqual(value.command(action,{}),{'action':action})

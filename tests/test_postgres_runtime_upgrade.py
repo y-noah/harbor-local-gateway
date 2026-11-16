@@ -29,6 +29,22 @@ class RuntimeUpgradeTests(unittest.TestCase):
    entry=Mock()
    with self.subTest(value=value),patch.object(upgrade,'load',return_value=pg),self.assertRaises(ValueError):upgrade.run_upgrade(IMAGE,{**CONFIG,'postgres_preflight_timeout_seconds':value},{},ticket(),entry)
    entry.active_record.assert_not_called();entry.entry_state.assert_not_called()
+ def test_both_maintenance_transports_receive_validated_preflight_context(self):
+  with tempfile.TemporaryDirectory() as directory:
+   t=ticket();old=active();entry=Mock();entry.active_record.return_value=(old,{},Mock());entry.private_json.return_value=old
+   proof={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest'],'usage_rollup_cascade_contract':'v1','department_isolation_contract':upgrade.DEPARTMENT_CONTRACT,'department_isolation_installed':False}
+   composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.configuration.return_value=([],{});composition.image_proof.return_value=proof
+   cascade=SimpleNamespace(UsageCascadeRelease=Mock(return_value=object()));department=SimpleNamespace(DepartmentRelease=Mock(side_effect=RuntimeError('stop_before_drain')))
+   def load(path,name):
+    if Path(path).name=='postgres-usage-cascade.py':return cascade
+    if Path(path).name=='postgres-department-release.py':return department
+    return composition
+   api={'NAME':NAME,'STACK':'original_global_stack','inspect_container':Mock(),'inspect_image':Mock(),'postgres_preflight_timeout_seconds':999}
+   with patch.object(upgrade,'RELEASES',Path(directory)/'releases'),patch.object(upgrade,'load',side_effect=load),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),patch.object(upgrade,'consumption_upgrade_guard'),patch.object(upgrade,'department_upgrade_guard',return_value=[proof,proof]),patch.object(upgrade,'qualify_backup',return_value=None),patch.object(upgrade,'network_snapshot'),self.assertRaisesRegex(RuntimeError,'stop_before_drain'):
+    upgrade.run_upgrade(IMAGE,{**CONFIG,'postgres_preflight_timeout_seconds':180},api,t,entry)
+   context=cascade.UsageCascadeRelease.call_args.kwargs['api'];self.assertIs(context,department.DepartmentRelease.call_args.kwargs['api']);self.assertIsNot(context,api)
+   self.assertEqual(context['postgres_preflight_timeout_seconds'],180);self.assertEqual(context['STACK'],t['materialsDirectory']);self.assertEqual(api['postgres_preflight_timeout_seconds'],999)
+   entry.entry_state.assert_not_called();composition.deploy.assert_not_called()
  def test_source_preflight_failure_happens_before_entry_hold_or_composition(self):
   t=ticket();entry=Mock();entry.active_record.return_value=(active(),{},Mock());composition=Mock();composition.preflight_timeout_seconds.side_effect=pg.preflight_timeout_seconds;composition.configuration.return_value=([],{});composition.image_proof.return_value={'database_digest':t['databaseDigest'],'schema_digest':t['schemaDigest'],'device_ca_digest':t['deviceCaDigest'],'consumption_policy_contract':'v1'};composition.prepare_source_image_preflights.side_effect=pg.ShutdownUnconfirmed('source proof failed')
   with patch.object(upgrade,'load',return_value=composition),patch.object(upgrade,'verify_source'),patch.object(upgrade,'check_storage'),self.assertRaises(pg.ShutdownUnconfirmed):upgrade.run_upgrade(IMAGE,CONFIG,{'NAME':NAME,'inspect_container':Mock(),'inspect_image':Mock()},t,entry)

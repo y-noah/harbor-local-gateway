@@ -49,13 +49,17 @@ class DepartmentRelease(transport.UsageCascadeRelease):
         need(self.image_id in [ticket['to']['configDigest'],ticket['to']['manifestDigest']],'candidate_image')
         self.connection,self.manifest=transport.owner_transport(entry,ticket,gateway)
         process=None
-        try:
+        def plan_input():
+            nonlocal process
             self.check_active();self.check_sources(stopped=False)
             process=subprocess.Popen(['/usr/bin/docker','exec','--interactive',gateway['Id'],'node','--input-type=module','--eval',transport.RUNTIME_WITNESS],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout,selectors.EVENT_READ);need(selector.select(15),'runtime_witness_timeout');raw=process.stdout.readline(4097);need(len(raw)<=4096 and raw.endswith(b'\n'),'runtime_witness_budget');witness=json.loads(raw)
             expected={key:self.manifest[key] for key in ['owner','runtime','runtimeOid','databaseOid']}
-            self.plan=self.command('plan',{'expected':expected,'runtimeWitness':witness})
+            return {'expected':expected,'runtimeWitness':witness}
+        try:
+            self.check_active();self.check_sources(stopped=False)
+            self.plan=self.command('plan',plan_input)
             need(self.plan.get('contract')==CONTRACT and self.plan.get('installed') is proof['department_isolation_installed'],'marker_state_changed')
             if self.quota_supported:need(self.plan.get('quota_subject_contract')==QUOTA_CONTRACT and self.plan.get('quota_subject_installed') is proof['quota_subject_installed'],'quota_marker_state_changed')
             self.check_sources(stopped=False);self.check_active()
@@ -79,6 +83,7 @@ class DepartmentRelease(transport.UsageCascadeRelease):
             row=self.api['inspect_container'](cid);need(row and row['Id']==cid and row['Image']==self.image_id and row.get('Config',{}).get('Labels',{}).get('com.harbor.maintenance')==name and row['HostConfig'].get('ReadonlyRootfs') is True and row['HostConfig'].get('NetworkMode')=='host' and row.get('Config',{}).get('User')=='node' and all(m.get('Type')=='tmpfs' and m.get('Destination')=='/tmp' for m in row.get('Mounts',[])),'maintenance_container_changed')
             if reconciled:need(unstarted_task(row,name,self.image_id,action)==cid,'maintenance_container_changed')
             self.maintenance_unconfirmed=True
+            if callable(cascade):cascade=cascade()
             payload=json.dumps({'connection':self.connection,'cascade':cascade}).encode();need(len(payload)<=131072,'maintenance_input_budget')
             budget=getattr(self,'install_timeout_seconds',75) if action=='install' else 75
             start_attempted=True

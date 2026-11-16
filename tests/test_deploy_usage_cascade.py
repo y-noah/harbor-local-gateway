@@ -140,6 +140,73 @@ class UsageCascadeDeploymentTests(unittest.TestCase):
   with self.assertRaises(RuntimeError):release.check_sources(stopped=True)
 
 class SharedMaintenanceCreationTests(unittest.TestCase):
+ def test_real_constructors_open_witness_after_slow_create_and_close_on_factory_failures(self):
+  import copy,io
+  from contextlib import nullcontext
+  from types import SimpleNamespace
+  import test_deploy_department_release as department
+  for cls,original,action in self.cases():
+   for delay,failure in [(150,None),(300,None),(150,'source_changed'),(150,'active_changed'),(150,'witness_read'),(300,'creation_pending')]:
+    with self.subTest(cls=cls.__name__,delay=delay,failure=failure):
+     clock=[0];events=[];processes=[];created=[];removed=[];row=copy.deepcopy(original);image_id=row['Image'];active={'approved':True}
+     gateway={'Id':'b'*64,'Image':'sha256:'+'d'*64,'Config':{},'HostConfig':{},'State':{'Running':True}};worker=copy.deepcopy(gateway);worker['Id']='c'*64
+     witness={'databaseOid':'1','currentRoleOid':'2','sessionRoleOid':'3','backendPid':'123'}
+     entry=SimpleNamespace(ACTIVE=Path('/unused/active.json'),private_json=lambda p:{} if p==Path('/etc/harbor-gateway-deploy.json') else active,save_json=Mock())
+     def inspect(name):
+      if name=='harbor':return gateway
+      if name=='harbor-worker':return worker
+      return row if created and not removed else None
+     api={'NAME':'harbor','inspect_image':lambda _: {'Id':image_id},'inspect_container':inspect,'postgres_preflight_timeout_seconds':300}
+     def open_witness(*args,**options):
+      events.append(('witness',clock[0]));process=SimpleNamespace(stdin=io.BytesIO(),stdout=io.BytesIO(json.dumps(witness).encode()+b'\n'),stderr=io.BytesIO(),opened_at=clock[0],wait=Mock(return_value=0),kill=Mock());processes.append(process);return process
+     def run(args,**options):
+      operation=args[1];events.append((operation,clock[0]))
+      if operation=='create':
+       self.assertEqual(options['timeout'],300);clock[0]+=delay
+       if failure=='creation_pending':raise subprocess.TimeoutExpired('synthetic create',300)
+       created.append(True)
+       if failure=='source_changed':gateway['Config']['changed']=True
+       if failure=='active_changed':active['approved']=False
+       return SimpleNamespace(returncode=0,stdout=row['Id'].encode(),stderr=b'')
+      if operation=='start':
+       self.assertEqual(options['timeout'],75);self.assertEqual(len(processes),1);process=processes[0]
+       payload=json.loads(options['input']);self.assertEqual(payload['cascade']['runtimeWitness'],witness)
+       clock[0]+=74;self.assertFalse(process.stdin.closed);self.assertLess(clock[0]-process.opened_at,120)
+       row['State']={'Running':False,'Pid':0,'Status':'exited'}
+       result={'action':action,'installed':False,'safe':True,'contract':department.release.CONTRACT}
+       return SimpleNamespace(returncode=0,stdout=json.dumps(result).encode(),stderr=b'')
+      self.assertEqual(operation,'rm')
+      if failure:self.assertNotIn('--force',args)
+      removed.append(True);return SimpleNamespace(returncode=0)
+     transport=cascade if cls is cascade.UsageCascadeRelease else department.release.transport
+     selector=Mock();selector.select.return_value=[] if failure=='witness_read' else [(None,None)]
+     proof={'usage_rollup_cascade_contract':'v1','department_isolation_contract':department.release.CONTRACT,'department_isolation_installed':False}
+     arguments={'api':api,'entry':entry,'ticket':{'to':{'configDigest':image_id,'manifestDigest':'sha256:'+'f'*64},'database':{'oid':'1'}},'active':active,'gateway':gateway,'worker':worker,'image':'approved-image','proof':proof,'record':{},'path':Path('/unused')}
+     if cls is not cascade.UsageCascadeRelease:arguments['source_proofs']=[proof,proof]
+     with patch.object(transport,'owner_transport',return_value=({}, {'owner':'approved_owner','runtime':'approved_runtime','runtimeOid':'2','databaseOid':'1'})),patch.object(cascade.uuid,'uuid4',return_value=SimpleNamespace(hex='synthetic')),patch.object(subprocess,'run',side_effect=run),patch.object(subprocess,'Popen',side_effect=open_witness),patch.object(cascade.selectors,'DefaultSelector',side_effect=lambda:nullcontext(selector)):
+      if failure:
+       with self.assertRaisesRegex(RuntimeError,'source_generation_changed' if failure=='source_changed' else 'active_changed' if failure=='active_changed' else 'runtime_witness_timeout' if failure=='witness_read' else 'maintenance_creation_pending'):cls(**arguments)
+      else:cls(**arguments)
+     operations=[event[0] for event in events]
+     self.assertEqual(operations.count('create'),1)
+     if failure=='creation_pending':self.assertEqual(operations,['create']);self.assertFalse(processes)
+     elif failure in ['source_changed','active_changed']:self.assertEqual(operations,['create','rm']);self.assertFalse(processes)
+     elif failure=='witness_read':self.assertEqual(operations,['create','witness','rm'])
+     else:self.assertEqual(operations,['create','witness','start','rm']);self.assertEqual(processes[0].opened_at,delay)
+     for process in processes:
+      self.assertTrue(process.stdin.closed);self.assertTrue(process.stdout.closed);self.assertTrue(process.stderr.closed);process.wait.assert_called_once_with(timeout=5);process.kill.assert_not_called()
+ def test_create_budget_uses_existing_preflight_configuration_contract(self):
+  from types import SimpleNamespace
+  cid='a'*64
+  for api in [{},{'postgres_preflight_timeout_seconds':30},{'postgres_preflight_timeout_seconds':180},{'postgres_preflight_timeout_seconds':300}]:
+   expected=pg.preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30))
+   with self.subTest(api=api),patch.object(subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=cid.encode())) as run:
+    self.assertEqual(cascade.create_maintenance_task(api,['synthetic'],'name','image','program','action'),(cid,False));self.assertEqual(run.call_args.kwargs['timeout'],expected);run.assert_called_once()
+  for invalid in [None,True,False,0,29,301,30.0,'180',{},[]]:
+   with self.subTest(invalid=invalid),patch.object(subprocess,'run') as run:
+    with self.assertRaises(ValueError):pg.preflight_timeout_seconds(invalid)
+    with self.assertRaisesRegex(RuntimeError,'maintenance_creation_budget'):cascade.create_maintenance_task({'postgres_preflight_timeout_seconds':invalid},['synthetic'],'name','image','program','action')
+    run.assert_not_called()
  def cases(self):
   import test_deploy_department_release as department
   for cls,prefix,program,action in [(cascade.UsageCascadeRelease,'harbor-usage-cascade-','/app/postgres-usage-rollups-cli.mjs','cascade-plan'),(department.release.DepartmentRelease,'harbor-department-release-','/app/postgres-department-release.mjs','plan')]:
@@ -152,11 +219,11 @@ class SharedMaintenanceCreationTests(unittest.TestCase):
     with self.subTest(cls=cls.__name__,before_start_failure=before_start_failure):
      import copy
      row=copy.deepcopy(original);value=object.__new__(cls);value.image='synthetic';value.image_id=row['Image'];value.connection={'oversized':'x'*131072} if before_start_failure else {};value.record={};value.save=Mock();ops=[];removed=[]
-     value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:None if removed else row}
+     value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:None if removed else row,'postgres_preflight_timeout_seconds':180}
      def run(args,**options):
       ops.append(args[1]);self.assertNotIn('kill',ops)
-      if args[1]=='create':self.assertEqual(options['timeout'],30);raise subprocess.TimeoutExpired('synthetic create',30)
-      if args[1]=='start':row['State']={'Running':False,'Pid':0,'Status':'exited'};return SimpleNamespace(returncode=0,stdout=json.dumps({'action':action}).encode(),stderr=b'')
+      if args[1]=='create':self.assertEqual(options['timeout'],180);raise subprocess.TimeoutExpired('synthetic create',180)
+      if args[1]=='start':self.assertEqual(options['timeout'],75);row['State']={'Running':False,'Pid':0,'Status':'exited'};return SimpleNamespace(returncode=0,stdout=json.dumps({'action':action}).encode(),stderr=b'')
       self.assertEqual(args[1],'rm');self.assertEqual(args[-1],row['Id'])
       if before_start_failure:self.assertNotIn('--force',args)
       removed.append(row['Id']);return SimpleNamespace(returncode=0)
@@ -181,7 +248,7 @@ class SharedMaintenanceCreationTests(unittest.TestCase):
      value.api={'inspect_image':lambda _: {'Id':value.image_id},'inspect_container':lambda _:row}
      def run(args,**options):ops.append(args[1]);self.assertEqual(args[1],'create');raise subprocess.TimeoutExpired('synthetic create',30)
      with patch.object(cascade.uuid,'uuid4',return_value=SimpleNamespace(hex='synthetic')),patch.object(subprocess,'run',side_effect=run):
-      with self.assertRaises(RuntimeError):value.command(action,{})
+      with self.assertRaisesRegex(RuntimeError,'maintenance_creation_pending' if row is None else 'maintenance_creation_(identity|unconfirmed)'):value.command(action,{})
       with self.assertRaisesRegex(RuntimeError,'maintenance_process_unconfirmed'):value.command(action,{})
      self.assertEqual(ops,['create']);self.assertTrue(value.maintenance_unconfirmed)
  def test_both_transports_recheck_reconciled_task_before_start(self):
