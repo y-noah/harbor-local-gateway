@@ -2040,3 +2040,13 @@ test('离页后的迟到查询失败不会弹全局toast或覆盖当前页错误
   page.run('admin=true;state='+JSON.stringify(base)+';'+setup+';toast("操作已保存")');const pending=page.run(read);assert.ok(release,source);page.run('setTab("overview")');release();await pending;await new Promise(setImmediate);assert.equal(page.run('tab'),'overview');assert.equal(page.run('pageReadError'),'',source);assert.doesNotMatch(page.node('#page-read-feedback').innerHTML,/late-page-read/);assert.equal(page.node('#toast').textContent,'操作已保存',source);
  }
 });
+
+test('统计查询失败后切换或重选统计Tab会重读而不是被旧汇总锁住',async()=>{
+ for(const target of ['model','member_name']){
+  let fail=false;const paths=[],data={rows:[],pagination:{page:1,pageSize:20,total:0,totalPages:1},summary:{requests:0,standard:{}},byModel:[],byMember:[],models:[],members:[]};
+  const page=await ui(path=>{paths.push(path);return fail?response({error:{message:'synthetic statistics failure'}},504):response(data);});
+  page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="requests";recordView="requests";');await page.run('loadRequests()');fail=true;await page.click('request-statistics-tab','model');
+  page.run('requestsFilters.model="changed-model";');await page.run('loadRequests()');assert.equal(page.run('pageDataReady()'),false);
+  fail=false;const before=paths.length;await page.click('request-statistics-tab',target);assert.equal(paths.length,before+1);assert.match(paths.at(-1),/view=summary/);assert.equal(page.run('pageDataReady()'),true);assert.equal(page.run('requestStatisticsTab'),target);assert.equal(page.run('pageReadError'),'');assert.match(page.node('#content').innerHTML,new RegExp('aria-selected="true" data-action="request-statistics-tab" data-id="'+target+'"'));
+ }
+});
