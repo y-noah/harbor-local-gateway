@@ -2011,3 +2011,16 @@ test('同页面等待仍保留旧表，已有局部遮罩时不重复显示顶�
  const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="accounts";renderedPageScope="accounts:";');page.node('#content').innerHTML='<div id="account-pool-results" class="data-refresh-region" aria-busy="true">保留旧账号表</div>';page.node('#content').querySelector=selector=>selector==='.data-refresh-region[aria-busy="true"]'?{}:null;
  page.run('preservePageWhileReading()');assert.match(page.node('#content').innerHTML,/保留旧账号表/);assert.equal(page.node('#page-read-feedback').hidden,true);page.run('failPageRead(Error("合成读取失败"),"state")');assert.equal(page.node('#page-read-feedback').hidden,false);assert.match(page.node('#page-read-feedback').innerHTML,/合成读取失败|重试/);
 });
+
+test('平台离线指南分两部分覆盖按角色上手与模型demo，不带内部资料或运行私密数据',async()=>{
+ const page=await ui(()=>response({}));page.run('admin=true;state={endpoint:"https://gateway.example.test/v1",accounts:[{api_key:"sk-synthetic-private-upstream"}],keys:[{full_key:"hg_synthetic_private_employee"}]};');const html=page.run('platformGuideDocument(state.endpoint)');
+ for(const text of ['第一部分：从登录到完成首次使用','第二部分：模型选择与初始化 demo','管理员完成第1—3步','普通员工领取员工 Key 后从第4步开始','团队／管理员登录密钥','员工访问 Key','上游 OpenAI 官方 API Key','Codex 订阅','检查Key','API 人工占比','Windows PowerShell','WSL / Bash','model_catalog_json','Harbor 连接成功','Hello, Harbor','GPT-6.1 Sol','GPT-6 Astra','GPT-6.1 Terra','GPT-6 Luna','GPT-6 Sol','2026-10-29','反馈→确认→保存→检索','模型共享限额','image2 图片生成与编辑'])assert.ok(html.includes(text),text);
+ assert.match(html,/npm\.cmd --version[\s\S]*npm\.cmd install -g @openai\/codex[\s\S]*codex\.cmd --version/);assert.ok(html.includes('无需放宽系统执行策略'));assert.match(html,/cd harbor-codex-demo\ncodex\.cmd/);
+ for(const text of ['Node.js 官方下载页','24.x LTS','.msi','重新打开一个PowerShell','uname -m','x86_64','aarch64','Linux安装步骤','Codex 官方下载与安装入口','桌面安装不等于WSL已安装CLI','npm --version'])assert.ok(html.includes(text),text);
+ assert.ok(html.indexOf('使用前告知')<html.indexOf('第一部分：从登录到完成首次使用'));assert.ok(html.indexOf('第一部分：从登录到完成首次使用')<html.indexOf('第二部分：模型选择与初始化 demo'));
+ assert.match(html,/<td>429／达到模型共享限额<\/td><td>[^<]*重置窗口/);assert.match(html,/<td>409／剩余额度暂不可算<\/td><td>[^<]*缺计量或缺费率/);
+ assert.match(html,/default-src 'none'/);assert.doesNotMatch(html,/<script|<iframe|<img|<link|gitlab|resources\/company|sk-synthetic-private-upstream|hg_synthetic_private_employee|173\.208|sichuang/i);assert.doesNotMatch(html,/<(?:form|input|button)\b/);assert.match(html,/C:&#92;Users&#92;YOUR_USER&#92;\.codex&#92;harbor-models\.json/);
+ for(const link of html.matchAll(/href="([^"]+)"/g))assert.ok(link[1].startsWith('#')||link[1].startsWith('https://developers.openai.com/')||link[1]==='https://nodejs.org/en/download'||link[1]==='https://openai.com/codex/',link[1]);
+ await page.click('download-platform-guide');assert.equal(page.downloads.at(-1),'Harbor-平台说明.html');assert.equal(page.node('#modal').open,false);
+ assert.throws(()=>page.run('platformGuideDocument("https://user:private@gateway.example.test/v1")'));assert.throws(()=>page.run('platformGuideDocument("https://gateway.example.test/v1?key=private")'));
+});
