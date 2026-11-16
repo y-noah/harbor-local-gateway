@@ -68,6 +68,10 @@ def inspect(name):
     result=docker('inspect',name,check=False,timeout=10)
     return json.loads(result.stdout)[0] if result.returncode==0 else None
 
+class ContainerInspectionUnavailable(RuntimeError):
+    container_inspection_retryable = True
+
+
 DOCKER_INSPECT_SOCKET = Path('/run/docker.sock')
 DOCKER_INSPECT_TIMEOUT = 10
 DOCKER_INSPECT_MAX_BYTES = 4 * 1024 * 1024
@@ -115,6 +119,8 @@ def docker_container_read(name):
         connection.sock = peer
         connection.request('GET', '/containers/' + name + '/json', headers={'Accept': 'application/json'})
         response = connection.getresponse()
+        if response.status not in (200, 404):
+            raise RuntimeError('Container existence is not verified')
         raw = response.read(DOCKER_INSPECT_MAX_BYTES + 1)
         if expired.is_set() or time.monotonic() >= deadline:
             raise TimeoutError('Container inspection deadline exceeded')
@@ -125,6 +131,8 @@ def docker_container_read(name):
         return response.status, json.loads(raw)
     except (OSError, http.client.HTTPException, UnicodeError, json.JSONDecodeError) as error:
         # Do not expose daemon response bodies, credentials or container Env.
+        if expired.is_set() or isinstance(error, TimeoutError):
+            raise ContainerInspectionUnavailable('Container inspection timed out') from None
         raise RuntimeError('Container inspection is not verified') from None
     finally:
         timer.cancel()

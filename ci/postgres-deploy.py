@@ -108,12 +108,24 @@ def record_shutdown_diagnostic(stack,rows):
         failure.diagnostic_write_failed=True
         raise failure from error
 
-def container_inspection(api,target,rows):
-    try:return api['inspect_container'](target)
-    except Exception as error:
+def container_inspection(api,target,rows,*,retry_deadline=None):
+    def fail(error=None,expired=False):
         rows.append({'container':target,'outcome':'unknown','reason':'container_inspection_failed'})
         record_shutdown_diagnostic(api['STACK'],rows)
-        raise ShutdownUnconfirmed('PostgreSQL container inspection failed; composition retained') from error
+        failure=ShutdownUnconfirmed('PostgreSQL container inspection failed; composition retained')
+        if expired:failure.deployment_code='preflight_observation_timeout'
+        raise failure from error
+    while True:
+        if retry_deadline is not None and time.monotonic()>=retry_deadline:fail(expired=True)
+        try:value=api['inspect_container'](target)
+        except Exception as error:
+            retryable=getattr(error,'container_inspection_retryable',False) is True
+            if retryable and retry_deadline is not None and time.monotonic()<retry_deadline:
+                time.sleep(min(.25,max(0,retry_deadline-time.monotonic())))
+                continue
+            fail(error,expired=retryable and retry_deadline is not None)
+        if retry_deadline is not None and time.monotonic()>=retry_deadline:fail(expired=True)
+        return value
 
 def image_inspection(api,target,rows):
     try:
@@ -316,7 +328,7 @@ def registered_image_proof(api,image,common,candidate):
     value=read(path) if path.exists() else None
     def owned(row):
         return bool(row and row.get('Name')=='/'+value['name'] and row.get('Image')==candidate['Id'] and row.get('Config',{}).get('Image')==image and row['Config'].get('Cmd')==['node','/app/ci/postgres-preflight.mjs'] and row['Config'].get('Labels',{}).get('com.aistrong.project')==api['NAME'] and row['Config']['Labels'].get('com.harbor.preflight')=='true' and row['Config']['Labels'].get('com.harbor.preflight-nonce')==value['nonce'] and (not value.get('containerId') or row.get('Id')==value['containerId']) and preflight_shape_matches(row,candidate,spec))
-    def inspect():return container_inspection(api,value['name'],[])
+    def inspect(deadline=None):return container_inspection(api,value['name'],[],retry_deadline=deadline)
     def checkpoint(phase,**fields):
         value.update(phase=phase,**fields);save(path,value)
     if value is not None:
@@ -356,7 +368,7 @@ def registered_image_proof(api,image,common,candidate):
         checkpoint('created',containerId=row['Id']);preflight_progress(api,'preflight_create','completed')
     timeout=preflight_timeout_seconds(api.get('postgres_preflight_timeout_seconds',30))
     deadline=time.monotonic()+timeout
-    row=inspect()
+    row=inspect(deadline)
     if not owned(row):raise preflight_failure('preflight_start_identity_unknown')
     state=row.get('State',{})
     if state.get('Status')=='created':
@@ -370,7 +382,7 @@ def registered_image_proof(api,image,common,candidate):
     elif value.get('phase') not in ['start_requested','execution_unknown']:
         raise preflight_failure('preflight_unexpected_execution')
     while True:
-        row=inspect()
+        row=inspect(deadline)
         if not owned(row):raise preflight_failure('preflight_execution_identity_changed')
         state=row.get('State',{});observed=state.get('Status','unknown')
         if any(state.get(key) for key in ['Paused','Restarting','Dead','OOMKilled']):
