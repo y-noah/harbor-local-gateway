@@ -1,6 +1,6 @@
 import {createPostgresJobs} from './postgres-jobs.mjs';
 import {recordingContextConfiguration} from './recording-context-configuration.mjs';
-import {createDepartmentScopeIssuer,requireDepartmentScope} from './department-access.mjs';
+import {createDepartmentScopeIssuer,requireDepartmentScope,defaultDepartmentId} from './department-access.mjs';
 import {createPostgresDepartments,verifyDepartmentIsolationAvailability} from './postgres-departments.mjs';
 import {verifyDepartmentKeySecretsAvailability} from './postgres-department-key-secrets.mjs';
 import {createPostgresDepartmentHttp} from './postgres-department-http.mjs';
@@ -205,7 +205,7 @@ export async function createPostgresGateway(options={}){
     const departments=createPostgresDepartments(store,{issuer:scopeIssuer,clock,encryptionKey:key,keySecretsInstalled:departmentKeySecretsInstalled,authorizeSuperAdmin:credential=>auth.authorizeSuperAdmin(credential)});
     auth=createAdminAuth(config,{clock,scopeIssuer,...(departmentInstalled?{departmentKeys:{authenticate:departments.authenticateManagementKey,validate:departments.validateManagementSession}}:{})});
     const departmentHttp=createPostgresDepartmentHttp({auth,departments,issuer:scopeIssuer,installed:departmentInstalled,readBody:requestBodies.read});
-    const publicIdentity=async identity=>{const department=identity.view==='department'?await departments.getDepartment(identity,identity.department_id):null;return {role:identity.role,view:identity.view,department_id:identity.department_id,department_name:department?.name??null,...(department?{business_available:department.enabled}:{})};};
+    const publicIdentity=async identity=>{const department=identity.view==='department'?await departments.getDepartment(identity,identity.department_id):null;return {role:identity.role,view:identity.view,department_id:identity.department_id,department_name:department?.name??null,...(identity.role==='super_admin'?{home_department_id:defaultDepartmentId}:{}),...(department?{business_available:department.enabled}:{})};};
     const router=createPostgresRouter(store,{clock,extraRuntime}),limits=createPostgresMemberLimits(store,{clock}),readRouter=createPostgresRouter(queryStore,{clock});
     const consumptionRouting=createPostgresConsumptionRouting(store,{router,clock,schemaAvailable:consumptionSchemaAvailable}),readConsumptionRouting=createPostgresConsumptionRouting(queryStore,{router:readRouter,clock,schemaAvailable:consumptionReadSchemaAvailable});
     const consumptionFeatureReady=()=>{if(!consumptionSchemaAvailable||!consumptionReadSchemaAvailable)return false;const readiness=handler?.status().consumptionRouting;return readiness?.configured===true&&readiness?.sourceAccounts===true;};

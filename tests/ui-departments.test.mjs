@@ -15,8 +15,8 @@ test('legacy uses no view header, department admin ignores stored selector and h
  const page=await ui();await page.run("api('/api/admin/state')");assert.equal(page.calls[0].options.headers['X-Harbor-Department'],undefined);
  page.storage.set('harbor.department-view',JSON.stringify({id:'other-department',name:'其他部门'}));page.run("admin=true;applyManagementIdentity({role:'department_admin',department_id:'department-a',department_name:'合成部门A'});showShell()");await page.run("api('/api/admin/state')");assert.equal(page.calls.at(-1).options.headers['X-Harbor-Department'],'department-a');assert.match(page.node('#department-context').innerHTML,/合成部门A/);assert.doesNotMatch(page.node('#department-context').innerHTML,/department-picker/);assert.doesNotMatch(page.run('managementSettings()'),/pricing-settings|data-action="backup"/);
 });
-test('超管业务固定服务端所属团队，旧选择与切换动作不能改变读取或写入范围',async()=>{
- const page=await ui(()=>response({ok:true}));page.storage.set('harbor.department-view',JSON.stringify({id:'department-b'}));page.run("admin=true;applyManagementIdentity({role:'super_admin',department_id:'department-a',department_name:'团队A'});state={private:'same-team'}");
+test('普通管理员不能通过缓存或切换动作改变读取写入范围',async()=>{
+ const page=await ui(()=>response({ok:true}));page.storage.set('harbor.department-view',JSON.stringify({id:'department-b'}));page.run("admin=true;applyManagementIdentity({role:'department_admin',department_id:'department-a',department_name:'团队A'});state={private:'same-team'}");
  await page.run("api('/api/admin/state')");page.run("switchDepartment('department-b','团队B')");await page.run("api('/api/admin/members','POST',{})");
  assert.ok(page.calls.every(call=>call.options.headers['X-Harbor-Department']==='department-a'));assert.equal(page.run('departmentView'),'department-a');assert.equal(page.run('state.private'),'same-team');assert.equal(page.reloads(),0);assert.equal(page.storage.has('harbor.department-view'),false);
 });
@@ -39,7 +39,7 @@ test('overview labels accurately distinguish a department from the global compan
 });
 test('侧栏只保留范围，部门管理分类仅超管可见且整块内容位于系统管理',async()=>{
  const page=await ui();page.run(root+"showShell()");assert.match(page.node('#department-context').innerHTML,/范围：全局视图/);assert.doesNotMatch(page.node('#department-context').innerHTML,/超级管理员|department-picker|业务操作/);
- assert.match(page.run('connectionTabs()'),/部门管理/);assert.match(page.run('departmentManagementContext()'),/超级管理员|department-picker/);
+ assert.match(page.run('connectionTabs()'),/部门管理/);assert.match(page.run('departmentManagementContext()'),/<table>.*团队名称/);assert.doesNotMatch(page.run('departmentManagementContext()'),/department-picker/);
  page.run("applyManagementIdentity({role:'department_admin',department_id:'department-a',department_name:'合成团队A'})");assert.doesNotMatch(page.run('connectionTabs()'),/部门管理/);assert.equal(page.run('departmentManagementContext()'),'');
 });
 test('全局新建和员工批量配置在输入前选择团队，不提交预览或业务写请求',async()=>{
@@ -108,7 +108,7 @@ test('超管团队管理独立使用global范围，业务读写始终留在服�
 test('默认团队停用仍保持超管会话与团队恢复入口，不循环读取业务数据',async()=>{
  const page=await ui();page.run("admin=true;applyManagementIdentity({role:'super_admin',department_id:'department-a',department_name:'团队A',business_available:false});state=null;render()");
  assert.match(page.node('#content').innerHTML,/当前团队已停用/);assert.match(page.node('#content').innerHTML,/department-picker/);await page.run('refresh()');assert.equal(page.calls.length,0);assert.equal(page.run('admin'),true);
- await page.click('department-picker');assert.equal(page.calls.at(-1).options.headers['X-Harbor-Department'],'global');assert.match(page.node('#modal-content').innerHTML,/部门管理/);assert.equal(page.run('admin'),true);
+ await page.click('department-picker');assert.equal(page.calls.at(-1).options.headers['X-Harbor-Department'],'global');assert.match(page.node('#content').innerHTML,/<table>.*团队名称/);assert.equal(page.node('#modal').open,false);assert.equal(page.run('admin'),true);
 });
 
 test('停用团队导航与直接业务读取均在fetch前拒绝，团队恢复接口仍可用',async()=>{
@@ -143,3 +143,65 @@ test('会话页恢复首请求显式sessions视图并保留非空筛选，控件
  page.run("admin=true;applyManagementIdentity({role:'super_admin',department_id:'department-a',business_available:false});state=null;tab='sessions';sessionsFilters={q:'精确查询',type:'',account:'',status:'enabled'}");await page.run('openDepartments()');await page.run("departmentAction('department-edit','department-a')");page.run("globalThis.FormData=class{get(key){return key==='enabled'?'true':'团队A'}}");await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {};}}});page.run('close();render()');
  assert.equal(paths.length,1);const params=new URL(paths[0],'http://test').searchParams;assert.equal(params.get('view'),'sessions');assert.equal(params.get('session_q'),'精确查询');assert.equal(params.get('session_status'),'enabled');assert.equal(page.run('sessionsConfirmedFilters.q'),'精确查询');assert.equal(page.run('sessionsConfirmedFilters.status'),'enabled');assert.match(page.node('#content').innerHTML,/value="精确查询"/);assert.match(page.node('#content').innerHTML,/matched-filter-client/);assert.doesNotMatch(page.node('#content').innerHTML,/unfiltered-client/);assert.equal(page.run('pageDataReady()'),true);
 });
+
+ test('部门页直接载入表格，分页替换行且关闭编辑后页面数据保留',async()=>{
+ const page=await ui(path=>response({rows:[{id:path.includes('after_id')?'b':'a',name:path.includes('after_id')?'合成乙':'合成甲',enabled:true,management_keys:2,version:1}],next:path.includes('after_id')?null:{created:1,id:'a'}}));
+ page.run(root+"tab='playground';connectionView='departments';render()");await new Promise(setImmediate);
+ assert.match(page.node('#content').innerHTML,/<table>.*合成甲/);assert.doesNotMatch(page.node('#content').innerHTML,/department-picker|每个部门独立/);assert.equal(page.node('#modal').open,false);
+ await page.run("departmentAction('department-page-next','')");assert.match(page.calls.at(-1).path,/after_id=a/);assert.match(page.node('#content').innerHTML,/合成乙/);assert.doesNotMatch(page.node('#content').innerHTML,/合成甲/);
+ await page.run("departmentAction('department-edit','b')");assert.match(page.node('#modal-content').innerHTML,/合成乙/);page.run('close();render()');assert.match(page.node('#content').innerHTML,/合成乙/);
+ await page.run("loadDepartmentPage({size:50,reset:true})");assert.equal(page.calls.at(-1).path,'/api/admin/departments?limit=50');assert.equal(page.run('departmentPage.cursors.length'),1);
+ });
+ test('部门列表旧登录的迟到响应不展示给新身份，失败保留表格并提供重试',async()=>{
+ let finish;const page=await ui(()=>new Promise(resolve=>finish=resolve));page.run(root+"tab='playground';connectionView='departments'");const pending=page.run('loadDepartmentPage()');page.run("authEpoch++;applyManagementIdentity({role:'department_admin',department_id:'other'});tab='overview'");finish(response({rows:[{id:'a',name:'旧身份内容'}],next:null}));await pending;assert.doesNotMatch(page.node('#content').innerHTML,/旧身份内容/);
+ const failed=await ui(()=>{throw Error('合成读取失败')});failed.run(root+"tab='playground';connectionView='departments'");await failed.run('loadDepartmentPage()');assert.match(failed.node('#content').innerHTML,/<table>/);assert.match(failed.node('#content').innerHTML,/合成读取失败.*department-page-retry/);assert.equal(failed.run('departmentPage.loading'),false);
+ });
+
+test('团队页新建保存回表，管理Key生成和撤销同步主表计数',async()=>{
+ let count=0,created=false;
+ const page=await ui((path,options)=>{
+  if(options.method==='POST'){
+   if(path.endsWith('/management-keys')){count++;return response({secret:'synthetic-management-secret'});}
+   if(path.endsWith('/revoke')){count--;return response({});}
+   created=true;return response({});
+  }
+  if(path.includes('/management-keys'))return response({rows:[{id:'key-a',label:'合成用途',enabled:true,version:1}],next:null});
+  return response({rows:[{id:'a',name:created?'新建合成团队':'合成团队',enabled:true,management_keys:count,version:1}],next:null});
+ });
+ page.run(root+"tab='playground';connectionView='departments'");await page.run('loadDepartmentPage()');
+ await page.run("departmentAction('department-create','')");await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {};}}});
+ assert.equal(page.node('#modal').open,false);assert.match(page.node('#content').innerHTML,/新建合成团队/);
+ await page.run("openDepartmentKeys('a')");assert.match(page.node('#modal-content').innerHTML,/新建合成团队 · 管理 Key/);
+ await page.run("departmentAction('department-key-create','a')");await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {};}}});await new Promise(setImmediate);
+ assert.equal(page.run('departmentPage.rows[0].management_keys'),1);assert.match(page.node('#modal-content').innerHTML,/管理 Key 已生成/);
+ await page.run("openDepartmentKeys('a')");await page.run("departmentAction('department-key-revoke','key-a')");await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {};}}});await new Promise(setImmediate);
+ assert.equal(page.run('departmentPage.rows[0].management_keys'),0);assert.match(page.node('#modal-content').innerHTML,/新建合成团队 · 管理 Key/);
+ });
+
+test('超管进入团队采用可信回执、清空旧缓存并能返回自己的团队',async()=>{
+ let target='b';const snapshot=recoverySnapshot('overview');
+ const page=await ui(path=>response(path.startsWith('/api/admin/state')?snapshot:{rows:[],next:null}),{session:()=>response({authenticated:true,identity:{role:'super_admin',department_id:target,department_name:'服务端'+target,home_department_id:'a',business_available:true}})});
+ page.run("admin=true;applyManagementIdentity({role:'super_admin',department_id:'a',department_name:'团队A',home_department_id:'a'});state={private:'旧团队'};membersData={private:'旧员工'};requestsData={private:'旧请求'};pageStateCache.set('old',{private:1});memberFilters.q='旧搜索';globalThis.oldRead=new AbortController();adminReads.add(oldRead)");
+ await page.run("switchDepartment('b')");assert.equal(page.run('departmentView'),'b');assert.equal(page.run('departmentViewName'),'服务端b');assert.equal(page.run('oldRead.signal.aborted'),true);assert.equal(page.run('membersData'),null);assert.equal(page.run('requestsData'),null);assert.equal(page.run('memberFilters.q'),'');assert.equal(page.run("pageStateCache.has('old')"),false);
+ assert.match(page.run('departmentSidebar()'),/返回自己的团队/);assert.equal(page.calls.find(call=>call.path.startsWith('/api/admin/state')).options.headers['X-Harbor-Department'],'b');
+ target='a';await page.run("departmentAction('department-home','')");assert.equal(page.run('departmentView'),'a');assert.doesNotMatch(page.run('departmentSidebar()'),/返回自己的团队/);
+ });
+test('团队切换拒绝停用和错配回执，旧登录迟到回执不改变新登录',async()=>{
+ let value={role:'super_admin',department_id:'b',business_available:false},finish;
+ const page=await ui(()=>response({}),{session:()=>new Promise(resolve=>finish=()=>resolve(response({authenticated:true,identity:value})))});
+ page.run("admin=true;applyManagementIdentity({role:'super_admin',department_id:'a'});state={private:'A'}");let pending=page.run("switchDepartment('b')");finish();await pending;assert.equal(page.run('departmentView'),'a');assert.equal(page.run('state.private'),'A');
+ value={role:'super_admin',department_id:'c',business_available:true};pending=page.run("switchDepartment('b')");finish();await pending;assert.equal(page.run('departmentView'),'a');
+ value={role:'super_admin',department_id:'b',business_available:true};pending=page.run("switchDepartment('b')");page.run("authEpoch++;applyManagementIdentity({role:'department_admin',department_id:'new'});state={private:'new'}");finish();await pending;assert.equal(page.run('departmentView'),'new');assert.equal(page.run('state.private'),'new');
+ });
+
+test('切换确认期间离开页面会丢弃迟到回执，不覆盖之后的导航',async()=>{
+ let finish;const page=await ui(()=>response({}),{session:()=>new Promise(resolve=>finish=()=>resolve(response({authenticated:true,identity:{role:'super_admin',department_id:'b',business_available:true}})))});
+ page.run("admin=true;applyManagementIdentity({role:'super_admin',department_id:'a'});state={private:'A'}");const pending=page.run("switchDepartment('b')");page.run("navigationVersion++;tab='accounts'");finish();await pending;assert.equal(page.run('departmentView'),'a');assert.equal(page.run('tab'),'accounts');assert.equal(page.run('scopeTransitioning'),false);
+ });
+
+for(const available of [true,false])test(`部门页面全局刷新只重读当前列表页，本团队可用=${available}`,async()=>{
+ let revision=0;const page=await ui(path=>response({rows:[{id:'b',name:'合成'+(++revision),enabled:true,management_keys:0}],next:null}));
+ page.run(root+"managementIdentity={...managementIdentity,business_available:"+available+"};tab='playground';connectionView='departments'");
+ await page.run("loadDepartmentPage({cursors:[null,{created:1,id:'a'}],size:50})");const before=page.calls.length;await page.node('#refresh').onclick();
+ assert.equal(page.calls.length,before+1);assert.equal(page.calls.at(-1).path,'/api/admin/departments?limit=50&after_created=1&after_id=a');assert.equal(page.calls.at(-1).options.headers['X-Harbor-Department'],'global');assert.match(page.node('#content').innerHTML,/合成2/);assert.equal(page.run('departmentPage.cursors.length'),2);assert.equal(page.node('#refresh').disabled,false);
+ });

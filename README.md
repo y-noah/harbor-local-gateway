@@ -894,7 +894,7 @@ PostgreSQL与原SQLite共用费率配置校验、官方解析及不可变版本�
 
 部门隔离不在应用启动时自动安装。`migrateDepartmentIsolation(store,{apply:true,runtimeRole})` 由受控数据库 owner 执行；同一校验和绑定 `department-isolation.sql`、`department-account-packages.sql` 和 `department-extra-usage.sql`。原员工、Key、账号、会话、历史与模板保留在默认部门，不清零消耗；原实例须在安装后重新启动，旧进程不能继续按全局模式操作。当前代码验证不代表现网已安装，正式发布与回退资格仍待验收，不能直接回退到不认识部门身份的旧版本。
 
-超管继续用管理密码登录，在部门管理中创建部门并签发独立部门管理 Key。部门管理员用此 Key 登录原后台，只能访问本部门。超管默认全局查看，写入业务配置前需选择具体部门；`X-Harbor-Department` 只选择超管已有权限范围，员工及部门管理员不能借此换部门。部门管理接口为 `GET/POST /api/admin/departments`、`PATCH /api/admin/departments/:id`、`GET/POST /api/admin/departments/:id/management-keys` 和 `POST /api/admin/departments/:id/management-keys/:keyId/revoke`；修改、停用和撤销携带最新 `expected_version`，管理 Key 明文只在签发时返回。
+超管继续用管理密码登录，在部门管理中创建部门并签发独立部门管理 Key。部门管理员用此 Key 登录原后台，只能访问本部门。超管登录默认进入自己的默认团队，可在部门管理表格点击“进入团队”管理指定启用团队，并从侧栏返回自己的团队；普通部门管理员仍固定为自身部门。进入前以 `GET /api/auth/session` 核验目标团队，服务端仅在已认证为超管后接受 `X-Harbor-Department` 的显式团队选择，每次业务请求均核对团队启用状态并签发可信范围，global业务请求拒绝。切换清空上一团队的缓存、筛选和弹窗并中止旧读取；未选择团队的请求及重新加载页面回到默认团队。后台任务保留入队时的团队，按当前管理凭据和团队状态重新授权，不跟随页面切换。团队管理接口单独校验平台管理权限。部门管理接口为 `GET/POST /api/admin/departments`、`PATCH /api/admin/departments/:id`、`GET/POST /api/admin/departments/:id/management-keys` 和 `POST /api/admin/departments/:id/management-keys/:keyId/revoke`；修改、停用和撤销携带最新 `expected_version`。安装管理 Key 加密扩展后，新 Key 可由超管通过 `POST /api/admin/departments/:id/management-keys/:keyId/reveal` 再次查看或复制，正文只在该显式响应中返回，不进入普通列表或审计；部门管理员不能回读。扩展启用前签发的旧 Key 保持有效，但仅有摘要，无法恢复原文，也不会自动轮换。
 
 部门账号、模型权限、员工类型、共享限额、用量查询、正文与导出、额外额度及套餐配置均保留部门归属。订阅账号仍只需填写月费，API Key 独立添加。夜间任务按部门规划和换绑；管理 Key 撤销或部门停用后，旧任务不能启动新派发或迁移，已运行请求仍按原部门结算。停用后再启用不恢复旧管理会话或旧任务权限，员工与单个 Key 自身的启停状态保留。
 

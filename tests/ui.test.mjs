@@ -751,22 +751,22 @@ test('R2 member limit loading shows retry/close for network and HTTP errors and 
 });
 
 
-test('支持完整页的服务一次读取明细与汇总并保留分页快照和统计水位',async()=>{
+test('支持完整页的服务仍优先读取明细并兼容已有汇总响应',async()=>{
  const calls=[],data={snapshot:'stable',watermark:'same-read',watermarkKind:'postgres_visibility',observedAt:1234,pagination:{page:2,pageSize:20,total:41,totalPages:3,nextCursor:'next'},rows:[],summary:{requests:41,success:40,active:0,average_ms:1,standard:{total:2}},byModel:[],byMember:[],models:['synthetic-model'],members:[]};
  const page=await ui(path=>{calls.push(new URL(path,'http://localhost'));return response(data);});page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';requestsFilters.page=2;requestsFilters.pageSize=20;requestsPageSnapshot='stable';requestsCursors=new Map([[2,'previous']]);");
  await page.run("loadRequests('',{preservePage:true})");await new Promise(setImmediate);
- assert.equal(calls.length,1);assert.equal(calls[0].searchParams.get('view'),'all');assert.equal(calls[0].searchParams.get('snapshot'),'stable');assert.equal(calls[0].searchParams.get('cursor'),'previous');assert.equal(page.run('requestsFilters.page'),2);assert.equal(page.run('requestsCursors.get(3)'),'next');assert.equal(page.run('requestsData.statisticsAt'),1234);assert.equal(page.run('requestsData.statisticsWatermark'),'same-read');assert.equal(page.run('requestsData.statisticsWatermarkKind'),'postgres_visibility');assert.match(page.node('#content').innerHTML,/title="统计时间/);assert.doesNotMatch(page.node('#content').innerHTML,/不同读取快照|汇总独立加载中/);
+ assert.equal(calls.length,1);assert.equal(calls[0].searchParams.get('view'),'list');assert.equal(calls[0].searchParams.get('snapshot'),'stable');assert.equal(calls[0].searchParams.get('cursor'),'previous');assert.equal(page.run('requestsFilters.page'),2);assert.equal(page.run('requestsCursors.get(3)'),'next');assert.equal(page.run('requestsData.statisticsAt'),1234);assert.equal(page.run('requestsData.statisticsWatermark'),'same-read');assert.equal(page.run('requestsData.statisticsWatermarkKind'),'postgres_visibility');assert.match(page.node('#content').innerHTML,/title="统计时间/);assert.doesNotMatch(page.node('#content').innerHTML,/不同读取快照|汇总独立加载中/);
 });
 
 test('完整页服务的模型统计仍直接读取summary而不加载明细',async()=>{
  const calls=[],page=await ui(path=>{calls.push(new URL(path,'http://localhost'));return response({snapshot:'stats',observedAt:1,summary:{requests:0,success:0,active:0,average_ms:0,standard:{}},byModel:[],byMember:[],models:[],members:[]});});page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';requestStatisticsTab='model';");await page.run('loadRequests()');assert.equal(calls.length,1);assert.equal(calls[0].searchParams.get('view'),'summary');assert.equal(page.run('requestsData.listLoaded'),false);
 });
 
-test('完整页的JSON或代理HTML服务端错误仅降级一次且保留独立明细与汇总',async()=>{
- for(const proxyHtml of [false,true]){
-  const calls=[];let releaseSummary;const page=await ui(path=>{const view=new URL(path,'http://localhost').searchParams.get('view');calls.push(view);if(view==='all')return proxyHtml?{ok:false,status:502,json:async()=>{throw SyntaxError('synthetic HTML');}}:response({error:{message:'synthetic unavailable'}},503);if(view==='list')return response({snapshot:'fallback',watermark:1,pagination:{page:1,pageSize:20,total:3,totalPages:1},rows:[]});return new Promise(resolve=>releaseSummary=()=>resolve(response({summary:{requests:3,success:3,active:0,average_ms:1,standard:{}},byModel:[],byMember:[],models:[],members:[],observedAt:2,watermark:1})));});
-  page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';");await page.run('loadRequests()');assert.deepEqual(calls,['all','list','summary']);assert.match(page.node('#content').innerHTML,/共 3 条/);assert.match(page.node('#content').innerHTML,/汇总独立加载中/);releaseSummary();await new Promise(setImmediate);assert.equal(page.run('requestsData.summary.requests'),3);assert.equal(page.run('requestsPageSnapshot'),'fallback');assert.deepEqual(calls,['all','list','summary']);
- }
+test('完整页能力不阻塞明细，慢汇总独立完成并沿用列表快照',async()=>{
+ const calls=[];let releaseSummary;const page=await ui(path=>{const query=new URL(path,'http://localhost').searchParams;calls.push(query);if(query.get('view')==='list')return response({snapshot:'stable-list',watermark:1,pagination:{page:1,pageSize:20,total:3,totalPages:1},rows:[{id:'visible-row',started:1,status:'ok',model:'visible-model'}]});assert.equal(query.get('view'),'summary');return new Promise(resolve=>releaseSummary=()=>resolve(response({summary:{requests:3,success:3,active:0,average_ms:1,standard:{}},byModel:[],byMember:[],models:[],members:[],observedAt:2,watermark:1})));});
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{requestPageSummary:true}})+";tab='requests';recordView='requests';");await page.run('loadRequests()');
+ assert.deepEqual(calls.map(q=>q.get('view')),['list','summary']);assert.equal(calls[1].get('snapshot'),'stable-list');assert.equal(page.run('requestsLoading'),false);assert.match(page.node('#content').innerHTML,/visible-model/);assert.match(page.node('#content').innerHTML,/共 3 条/);assert.match(page.node('#content').innerHTML,/汇总独立加载中/);
+ releaseSummary();await new Promise(setImmediate);assert.equal(page.run('requestsData.summary.requests'),3);assert.equal(page.run('requestsData.rows[0].id'),'visible-row');assert.equal(page.run('requestsPageSnapshot'),'stable-list');assert.equal(calls.length,2);
 });
 
 test('完整页的权限筛选或网络错误不盲目降级',async()=>{
@@ -1181,9 +1181,9 @@ test('请求明细与汇总先于慢全局状态完成且不重复读取',async(
 });
 
 
-test('鉴权成功保留登录卡至真实首屏就绪，不显示空壳或读取占位',async()=>{
+test('鉴权成功立即进入工作空间并显示等待反馈，不滞留取消登录卡',async()=>{
  let release;const page=await ui(path=>path==='/api/auth/login'?response({ok:true}):new Promise(resolve=>release=resolve));page.node('#admin-input').value='synthetic';const submit={disabled:false};const pending=page.node('#login-form').onsubmit({preventDefault(){},submitter:submit});await new Promise(setImmediate);
- assert.equal(page.run('admin'),true);assert.equal(page.node('#shell').classList.values.has('hidden'),true);assert.equal(page.node('#login').classList.values.has('hidden'),false);assert.equal(page.run('state'),null);assert.equal(page.node('#content').innerHTML,'');assert.equal(page.node('#login-cancel').hidden,false);assert.equal(page.node('#admin-input').value,'');
+ assert.equal(page.run('admin'),true);assert.equal(page.node('#shell').classList.values.has('hidden'),false);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.equal(page.run('state'),null);assert.equal(page.node('#content').innerHTML,'');assert.equal(page.node('#page-read-feedback').hidden,false);assert.match(page.node('#page-read-feedback').innerHTML,/正在加载/);assert.equal(page.node('#admin-input').value,'');
  release(response(snapshot()));await pending;assert.equal(submit.disabled,false);assert.match(page.node('#content').innerHTML,/最近 7 天请求/);assert.equal(page.run('tab'),'overview');
 });
 test('登录成功附带总览时直接使用同份数据，避免重复状态请求',async()=>{
@@ -2048,5 +2048,27 @@ test('统计查询失败后切换或重选统计Tab会重读而不是被旧汇�
   page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="requests";recordView="requests";');await page.run('loadRequests()');fail=true;await page.click('request-statistics-tab','model');
   page.run('requestsFilters.model="changed-model";');await page.run('loadRequests()');assert.equal(page.run('pageDataReady()'),false);
   fail=false;const before=paths.length;await page.click('request-statistics-tab',target);assert.equal(paths.length,before+1);assert.match(paths.at(-1),/view=summary/);assert.equal(page.run('pageDataReady()'),true);assert.equal(page.run('requestStatisticsTab'),target);assert.equal(page.run('pageReadError'),'');assert.match(page.node('#content').innerHTML,new RegExp('aria-selected="true" data-action="request-statistics-tab" data-id="'+target+'"'));
+ }
+});
+
+test('首页普通刷新不会取消同一身份与时间窗口的慢消耗查询',async()=>{
+ const pending=[],base={...snapshot(),capabilities:{overviewCost:true},usageWindow:{start:Date.UTC(2026,10,1),end:Date.UTC(2026,10,8)}};
+ const page=await ui((path,options)=>new Promise(resolve=>pending.push({path,signal:options.signal,resolve})));
+ page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";render();');
+ assert.match(page.node('#content').innerHTML,/id="overview-cost-chart"/);assert.match(page.node('#content').innerHTML,/正在加载消耗统计/);
+ page.run('overviewCostRevision++;state.totals.requests++;void loadOverviewCost();');
+ assert.equal(pending.length,1);assert.equal(pending[0].signal.aborted,false);
+ pending[0].resolve(response({view:'overview-cost',usageWindow:base.usageWindow,daily:[{day:'2026-11-01',standard:{total:12}}]}));await new Promise(setImmediate);
+ assert.match(page.node('#overview-cost-chart').innerHTML,/\$12\.00/);assert.equal(page.run('overviewCostController'),null);
+});
+
+test('首页消耗窗口或登录身份变化仍取消旧查询且不接受迟到结果',async()=>{
+ for(const change of ['state.usageWindow={start:Date.UTC(2026,10,2),end:Date.UTC(2026,10,9)}','authEpoch++']){
+  const pending=[],base={...snapshot(),capabilities:{overviewCost:true},usageWindow:{start:Date.UTC(2026,10,1),end:Date.UTC(2026,10,8)}};
+  const page=await ui((path,options)=>new Promise(resolve=>pending.push({signal:options.signal,resolve})));
+  page.run('admin=true;state='+JSON.stringify(base)+';tab="overview";');const old=page.run('loadOverviewCost()');page.run(change);const current=page.run('loadOverviewCost()');
+  assert.equal(pending[0].signal.aborted,true);assert.equal(pending.length,2);
+  pending[0].resolve(response({view:'overview-cost',usageWindow:base.usageWindow,daily:[{day:'2026-11-01',standard:{total:999}}]}));await old;assert.equal(page.run('overviewCostData'),null);
+  const window=page.run('state.usageWindow');pending[1].resolve(response({view:'overview-cost',usageWindow:window,daily:[]}));await current;assert.equal(page.run('overviewCostData.daily.length'),0);
  }
 });

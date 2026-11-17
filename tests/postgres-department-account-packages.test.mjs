@@ -43,8 +43,10 @@ test('部门空套餐目录不阻断Codex仅月费和API创建，仍拒绝API附
  const before=await f.store.all('SELECT * FROM harbor.department_settings WHERE department_id=ANY($1::text[]) ORDER BY department_id,name',[f.rows.a.id,f.rows.b.id]);
  assert.equal((await f.call('root','/api/admin/account-packages/policy','PATCH',{enabled:true,expected_version:0})).status,200);
  assert.equal((await f.store.get("SELECT value FROM harbor.department_settings WHERE department_id='department-default' AND name='account_package_policy'")).value.enabled,true);
- for(const scope of ['global',f.rows.a.id])assert.equal((await f.call('root','/api/admin/account-packages/policy','PATCH',{enabled:false,expected_version:1},scope)).status,403);
+ assert.equal((await f.call('root','/api/admin/account-packages/policy','PATCH',{enabled:false,expected_version:1},'global')).status,403);
  assert.deepEqual(await f.store.all('SELECT * FROM harbor.department_settings WHERE department_id=ANY($1::text[]) ORDER BY department_id,name',[f.rows.a.id,f.rows.b.id]),before);
+ assert.equal((await f.call('root','/api/admin/account-packages/policy','PATCH',{enabled:true,expected_version:0},f.rows.a.id)).status,200);assert.equal((await f.store.get("SELECT value FROM harbor.department_settings WHERE department_id=$1 AND name='account_package_policy'",f.rows.a.id)).value.enabled,true);
+ assert.deepEqual(await f.store.all('SELECT * FROM harbor.department_settings WHERE department_id=$1 ORDER BY department_id,name',f.rows.b.id),before.filter(row=>row.department_id===f.rows.b.id));
 });
 test('套餐目录、选择、覆盖预览和模板版本只作用于本部门，原actor固定',integration,async t=>{
  const f=await fixture(t),a=await create(f,'a'),b=await create(f,'b'),pa=await preview(f,'a',[a]),pb=await preview(f,'b',[b]);

@@ -74,9 +74,9 @@ test('部门导出贯穿真实队列、正文与上下文，跨部门详情下�
  await f.enqueue();const page=await f.backend.exports.list(new URLSearchParams({limit:'1'}),{scope:f.scopes.a});assert.ok(page.next_cursor);
  await assert.rejects(f.backend.exports.list(new URLSearchParams({before:page.next_cursor,limit:'1'}),{scope:f.scopes.b}),{code:'recording_export_cursor_invalid'});
 });
-test('超管全局与其他团队导出拒绝且不留产物，默认团队JSONL和CSV完整导出',integration,async t=>{
+test('超管全局导出拒绝，指定团队及默认团队JSONL和CSV隔离导出',integration,async t=>{
  const f=await fixture(t,{own:true});
- for(const scope of [f.scopes.global,f.issuer.forDepartment(f.scopes.global,f.departmentRows.a.id)])for(const includeBody of [true,false])await assert.rejects(f.enqueue(scope,includeBody),{code:'department_forbidden'});
+ for(const scope of [f.scopes.global])for(const includeBody of [true,false])await assert.rejects(f.enqueue(scope,includeBody),{code:'department_forbidden'});
  assert.equal((await f.store.get('SELECT COUNT(*) n FROM harbor.recording_exports')).n,0);
  assert.equal((await f.store.get("SELECT COUNT(*) n FROM harbor.background_jobs WHERE kind='recording.export'")).n,0);
  const exported=await f.enqueue(f.scopes.own);await f.execute();const rows=(await f.download(exported.id,f.scopes.own)).trim().split('\n').map(JSON.parse);
@@ -85,6 +85,7 @@ test('超管全局与其他团队导出拒绝且不留产物，默认团队JSONL
  await assert.rejects(f.download(exported.id,f.scopes.a),{code:'recording_export_not_found'});
  const csv=await f.enqueue(f.scopes.own,false);await f.execute();const text=await f.download(csv.id,f.scopes.own);assert.match(text,/^"department_id",/);assert.ok(text.includes('department-default'));assert.ok(!text.includes(f.departmentRows.a.id)&&!text.includes(f.departmentRows.b.id));assert.ok(text.split('\r\n')[0].endsWith('"export_scope"'));assert.ok(text.includes('""view"":""department""'));
  const list=await f.backend.exports.list(new URLSearchParams(),{scope:f.scopes.own});assert.ok(list.items.every(row=>row.export_scope.department_id==='department-default'));
+ const entered=f.issuer.forDepartment(f.scopes.global,f.departmentRows.a.id),foreign=await f.enqueue(entered);await f.execute();const foreignRows=(await f.download(foreign.id,entered)).trim().split('\n').map(JSON.parse);assert.ok(foreignRows.every(row=>row.department_id===f.departmentRows.a.id));await assert.rejects(f.download(foreign.id,f.scopes.own),{code:'recording_export_not_found'});
  f.disableSuper();await assert.rejects(f.download(exported.id,f.scopes.own),error=>error.status===403);
 });
 test('上下文临界大小计算包含部门字段，部门负责人和默认团队超管导出分片均可重组且不超预算',integration,async t=>{

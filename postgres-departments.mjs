@@ -333,9 +333,9 @@ export function createPostgresDepartments(store,{issuer,clock=Date.now,authorize
    return issuer.system({purpose:kind,departmentId});
   }
   if(role!=='super_admin'&&role!=='department_admin'||global&&(role!=='super_admin'||kind!=='recording.export')||systemGlobalKinds.has(kind))denied();
-  // Persisted actors retain their original scope. Old global or cross-team
-  // super-admin work cannot acquire the administrator's new business scope.
-  if(role==='super_admin'&&(global||departmentId!==defaultDepartmentId))denied();
+  // Super-admin work retains its explicit original department; switching the
+  // browser cannot turn a persisted job into global or another team's work.
+  if(role==='super_admin'&&global)denied();
   if(!global&&!await store.get('SELECT id FROM harbor.departments WHERE id=$1 AND enabled'+(lock?' FOR SHARE':''),departmentId))denied();
   if(role==='department_admin'){
    const key=await store.get('SELECT id FROM harbor.department_admin_keys WHERE id=$1 AND department_id=$2 AND version=$3 AND enabled AND revoked_at IS NULL'+(lock?' FOR SHARE':''),credentialId,departmentId,credentialVersion);if(!key)denied();

@@ -27,8 +27,10 @@ function pagination(params){
 export function createPostgresDepartmentHttp({auth,departments,issuer,installed,readBody}={}){
  if(typeof installed!=='boolean'||!auth||typeof auth.context!=='function'||typeof auth.revalidateScope!=='function'||!departments||typeof departments.getDepartment!=='function'||typeof issuer?.forDepartment!=='function'||typeof readBody!=='function')throw new AppError(503,'部门HTTP入口未配置完整','department_http_configuration');
  const contexts=new WeakMap(),managementContexts=new WeakMap();
- async function businessIdentity(base,{allowDisabled=false}={}){
-  const trusted=requireDepartmentScope(base,{allowGlobal:true}),departmentId=trusted.role==='super_admin'?defaultDepartmentId:trusted.department_id;
+ async function businessIdentity(base,{allowDisabled=false,selected=null}={}){
+  const trusted=requireDepartmentScope(base,{allowGlobal:true});
+  if(selected==='global'||trusted.role!=='super_admin'&&selected!==null&&selected!==trusted.department_id)denied();
+  const departmentId=trusted.role==='super_admin'?(selected??defaultDepartmentId):trusted.department_id;
   const scope=trusted.role==='super_admin'?issuer.forDepartment(trusted,departmentId):trusted;
   const department=await departments.getDepartment(scope,departmentId);if(!department.enabled&&!allowDisabled)denied();return scope;
  }
@@ -37,7 +39,7 @@ export function createPostgresDepartmentHttp({auth,departments,issuer,installed,
   if(!base)throw new AppError(401,'请先输入管理密钥登录','admin_required');
   const scope=requireDepartmentScope(base,{allowGlobal:true});
   if(!installed){if(selected!==null||scope.role!=='super_admin')throw new AppError(503,'部门隔离尚未启用','department_unavailable');return undefined;}
-  if(!management){const identity=await businessIdentity(scope);if(selected!==null&&selected!==identity.department_id)denied();return identity;}
+  if(!management)return businessIdentity(scope,{selected});
   if(scope.role==='department_admin'){
    if(selected!==null&&selected!==scope.department_id)denied();
    return scope;
@@ -51,8 +53,7 @@ export function createPostgresDepartmentHttp({auth,departments,issuer,installed,
  }
  async function sessionIdentity(req){
   const base=await auth.context(req);if(!base)return null;
-  const identity=await businessIdentity(base,{allowDisabled:base.role==='super_admin'}),selected=selection(req);
-  if(selected!==null&&selected!==identity.department_id)denied();return identity;
+  return businessIdentity(base,{allowDisabled:base.role==='super_admin',selected:selection(req)});
  }
  function managementContext(req){let pending=managementContexts.get(req);if(!pending){pending=resolveContext(req,{management:true});managementContexts.set(req,pending);}return pending;}
  async function revalidate(req,scope){

@@ -51,12 +51,13 @@ test('真实HTTP部门管理只由超管执行，选择头不能提升部门权�
   assert.equal((await call('/api/admin/departments',{cookie:departmentCookie})).status,403);
   assert.equal((await call('/api/admin/departments/'+b.value.id+'/management-keys',{cookie:departmentCookie,method:'POST',body:{label:'forbidden'}})).status,403);
   const selected=await call('/scope',{cookie});assert.equal(selected.value.department_id,'department-default');assert.equal(selected.value.role,'super_admin');
-  assert.equal((await call('/scope',{cookie,department:a.value.id})).status,403);
+  const entered=await call('/scope',{cookie,department:a.value.id});assert.equal(entered.status,200);assert.equal(entered.value.department_id,a.value.id);assert.equal((await call('/scope',{cookie})).value.department_id,'department-default');
   assert.equal((await call('/scope',{cookie,department:'global'})).status,403);
   assert.equal((await call('/api/admin/departments',{cookie,department:a.value.id,method:'POST',body:{name:'forbidden-global-write'}})).status,403);
   const revoked=await call('/api/admin/departments/'+a.value.id+'/management-keys/'+issued.value.key.id+'/revoke',{cookie,method:'POST',body:{expected_version:issued.value.key.version}});assert.equal(revoked.status,200);
   assert.equal((await call('/scope',{cookie:departmentCookie})).status,401);
   assert.equal((await call('/api/admin/departments',{cookie})).value.rows.length,3);
+  await call('/api/admin/departments/'+b.value.id,{cookie,method:'PATCH',body:{expected_version:0,enabled:false}});assert.equal((await call('/scope',{cookie,department:b.value.id})).status,403);assert.equal((await call('/scope',{cookie,department:'unknown-team'})).status,404);
  }finally{if(server)await new Promise(resolve=>server.close(resolve));await store?.close();if(created)await admin.query('DROP DATABASE '+database);await admin.close();}
 });
 
@@ -92,6 +93,13 @@ test('真实网关隔离部门首屏、员工及模型调用归属，拒跨部�
   const superLogin=await call('/api/auth/login',{method:'POST',body:{password:'synthetic-super',includeOverview:true}});assert.equal(superLogin.status,200);assert.ok(superLogin.value.initialState);
   const ownDefault=await call('/api/admin/members',{cookie:superLogin.cookie});assert.equal(ownDefault.status,200);assert.equal(JSON.stringify(ownDefault.value).includes('A的员工'),false);assert.equal(JSON.stringify(ownDefault.value).includes('B的员工'),false);
   const defaultMember=await call('/api/admin/members',{cookie:superLogin.cookie,method:'POST',body:{name:'默认团队员工',quota:null,expires:null}});assert.equal(defaultMember.status,201);assert.equal((await store.get('SELECT department_id FROM harbor.members WHERE id=$1',defaultMember.value.memberId)).department_id,'department-default');
+  const enteredA=await call('/api/auth/session',{cookie:superLogin.cookie,department:a.id});assert.equal(enteredA.status,200);assert.equal(enteredA.value.identity.department_id,a.id);assert.equal(enteredA.value.identity.home_department_id,'department-default');
+  const superA=await call('/api/admin/members',{cookie:superLogin.cookie,department:a.id});assert.equal(superA.status,200);assert.ok(JSON.stringify(superA.value).includes('A的员工'));assert.equal(JSON.stringify(superA.value).includes('B的员工'),false);
+  assert.equal((await call('/api/admin/members/'+memberB.value.memberId,{cookie:superLogin.cookie,department:a.id})).status,404);
+  const managedA=await call('/api/admin/members',{cookie:superLogin.cookie,department:a.id,method:'POST',body:{name:'超管指定A创建',quota:null,expires:null}});assert.equal(managedA.status,201);assert.equal((await store.get('SELECT department_id FROM harbor.members WHERE id=$1',managedA.value.memberId)).department_id,a.id);
+  const superPlan=await call('/api/admin/balancing/plans',{cookie:superLogin.cookie,department:a.id,method:'POST',body:{}});assert.equal(superPlan.status,202,JSON.stringify(superPlan.value));assert.equal((await store.get('SELECT department_id FROM harbor.background_jobs WHERE id=$1',superPlan.value.id)).department_id,a.id);
+  assert.equal((await call('/api/auth/session',{cookie:superLogin.cookie})).value.identity.department_id,'department-default');
+  assert.equal((await call('/api/auth/session',{cookie:loginA.cookie,department:b.id})).status,403);
   assert.equal((await call('/api/admin/pricing',{cookie:loginA.cookie})).status,403);
   assert.equal((await call('/api/admin/pricing',{cookie:superLogin.cookie,department:a.id})).status,403);
   const devices=await call('/api/admin/devices',{cookie:loginA.cookie});assert.equal(devices.status,200,JSON.stringify(devices.value));
