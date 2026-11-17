@@ -1,5 +1,6 @@
 import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
 import {canonicalMeteringDiagnostic} from './request-metering-diagnostic.mjs';
+import {requestPricingDiagnostic} from './request-pricing-diagnostic.mjs';
 import {AppError,requestPhases,usageWindow} from './store.mjs';
 import seed from './pricing-data.mjs';
 import {modelReleaseRegistry,modelReleaseSetting} from './model-release-dates.mjs';
@@ -21,9 +22,11 @@ export async function postgresRequestObservation(store,id,at=Date.now(),{scope}=
     if(!row||time<window.start||time>=window.end)throw new AppError(404,'请求记录不存在或超出近7天可见范围');
     let phases;try{phases=JSON.parse(row.phase_history);}catch{}
     const timeline=(Array.isArray(phases)?phases:[]).filter(p=>p&&requestPhases.has(p.phase)&&Number.isSafeInteger(p.at)).map(({phase,at})=>({phase,at}));
-    const value=decorateReferenceRequest(row,publicUsage(await store.quote(row)),window.start);
+    const quote=await store.quote(row),projection=await store.get('SELECT state,revision,input_atoms::text,output_atoms::text,cached_atoms::text,adjustment_atoms::text,total_atoms::text FROM harbor.request_prices WHERE request_id=$1',row.id);
+    const book=quote.state==='unpriced'&&quote.revision?await store.pricingBook(quote.revision):undefined;
+    const value=decorateReferenceRequest(row,publicUsage(quote),window.start),pricingDiagnostic=requestPricingDiagnostic({request:row,quote,projection,book});
     return {...value,...await quotaConfirmationView(store,row,{canManage:authorization===null||authorization.view==='department'}),error:row.error?sanitizeRecord(row.error,{maxBytes:2048}):null,phase_history:undefined,observedAt:at,streamTiming:canonicalStreamTiming(Array.isArray(phases)?phases.at(-1)?.stream_timing:undefined)??null,
-      meteringDiagnostic:canonicalMeteringDiagnostic(Array.isArray(phases)?phases.at(-1)?.metering:undefined),timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??row.ended??at)-p.at)}))};
+      meteringDiagnostic:canonicalMeteringDiagnostic(Array.isArray(phases)?phases.at(-1)?.metering:undefined),pricingDiagnostic,timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??row.ended??at)-p.at)}))};
   },{level:'REPEATABLE READ',readOnly:true});
 }
 
