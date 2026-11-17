@@ -84,11 +84,11 @@ test('轻总览切到会话页立即补全状态，迟到响应不能覆盖其�
   assert.equal(page.run('state.view'),undefined);assert.doesNotMatch(page.node('#content').innerHTML,/正在读取页面数据/);
 });
 
-test('首屏轻状态到达前切页只补读一次完整状态，失败后可重试',async()=>{
+test('首屏轻状态到达前切页立即独立读取当前页，失败后可重试',async()=>{
   const compact={...pagedSnapshot(),view:'overview',accounts:[],daily:[],requests:[],sessions:[],totals:{requests:0,success:0}},full={...pagedSnapshot(),accounts:[],daily:[],requests:[],totals:{requests:0,success:0}};
   let release,reads=0;
   const page=await ui(path=>{if(!path.startsWith('/api/admin/state'))return response({});reads++;if(reads===1)return new Promise(resolve=>release=()=>resolve(response(compact)));return reads===2?response({error:{message:'合成临时失败'}},503):response(full);});
-  page.run('admin=true;state=null;tab="overview";');const first=page.run('refresh()');page.run('setTab("sessions")');assert.equal(reads,1);release();await first;
+  page.run('admin=true;state=null;tab="overview";');const first=page.run('refresh()');page.run('setTab("sessions")');assert.equal(reads,2);release();await first;await new Promise(setImmediate);
   assert.equal(reads,2);assert.match(page.node('#page-read-feedback').innerHTML,/合成临时失败/);assert.match(page.node('#page-read-feedback').innerHTML,/重试/);assert.equal(page.run('pageRefreshing()'),false);
   await page.click('retry-workspace');assert.equal(reads,3);assert.equal(page.run('state.view'),undefined);assert.match(page.node('#content').innerHTML,/近7天活动会话/);
 });
@@ -1230,8 +1230,8 @@ test('首屏state的401仍退回登录，迟到登录结果不能覆盖新的认
  let release;const late=await ui(()=>new Promise(resolve=>release=resolve));const pending=late.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});late.run('authEpoch++;showLogin();');release(response({ok:true}));await pending;assert.equal(late.run('admin'),false);assert.equal(late.node('#shell').classList.values.has('hidden'),true);
 });
 test('首屏读取中切页保持当前页面，退出后迟到state不能重显shell',async()=>{
- let release;const page=await ui(path=>path==='/api/auth/login'||path==='/api/auth/logout'?response({ok:true}):new Promise(resolve=>release=resolve));const pending=page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});await new Promise(setImmediate);page.run('setTab("accounts")');release(response(snapshot()));await pending;assert.match(page.node('#content').innerHTML,/账户列表/);assert.equal(page.run('tab'),'accounts');assert.doesNotMatch(page.node('#content').innerHTML,/最近 7 天请求/);
- page.run('state=null');const stale=page.run('refresh()');await page.node('#logout').onclick();release(response(snapshot()));await stale;assert.equal(page.run('admin'),false);assert.equal(page.run('state'),null);assert.equal(page.node('#shell').classList.values.has('hidden'),true);
+ const reads=[];const page=await ui((path,options)=>path==='/api/auth/login'||path==='/api/auth/logout'?response({ok:true}):new Promise(resolve=>reads.push({resolve,signal:options.signal})));const pending=page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});await new Promise(setImmediate);page.run('setTab("accounts")');assert.equal(reads.length,2);assert.equal(reads[0].signal.aborted,true);reads[1].resolve(response(snapshot()));await new Promise(setImmediate);reads[0].resolve(response({...snapshot(),accounts:[{id:'stale-account'}]}));await pending;assert.match(page.node('#content').innerHTML,/账户列表/);assert.equal(page.run('tab'),'accounts');assert.equal(page.run('state.accounts.length'),0);assert.doesNotMatch(page.node('#content').innerHTML,/最近 7 天请求/);
+ page.run('state=null');const stale=page.run('refresh()');await page.node('#logout').onclick();reads.at(-1).resolve(response(snapshot()));await stale;assert.equal(page.run('admin'),false);assert.equal(page.run('state'),null);assert.equal(page.node('#shell').classList.values.has('hidden'),true);
 });
 test('账号异常使用可聚焦摘要，完整错误保留且不再展示重复权益入口',async()=>{
  const value=packageSnapshot();value.capabilities.extraUsage=true;value.balancing.strategy.package_policy.enabled=false;value.accounts[0].last_error='合成错误详情';value.accounts[0].route_block='quota_exhausted';const page=await ui(()=>response({rows:[]}));page.run('admin=true;state='+JSON.stringify(value)+';tab="accounts";render()');const html=page.node('#content').innerHTML;assert.match(html,/tabindex="0" title="合成错误详情/);assert.match(html,/需检查/);assert.doesNotMatch(html,/<th>套餐<\/th>|class="error-line"|自动参考/);await page.click('manage-account','account-a');assert.match(page.node('#modal-content').innerHTML,/合成错误详情/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/data-action="extra-account"/);
@@ -2347,4 +2347,25 @@ test('登录HTML初始禁止原生提交且不使用GET携带密码',()=>{
 
 test('会话恢复超时呈现可重试错误，不显示登录或授权后台',async()=>{
  const page=await ui((_path,options)=>new Promise((_resolve,reject)=>options.signal.addEventListener('abort',()=>reject(Object.assign(Error('aborted'),{name:'AbortError'})))),{restore:true});const timeout=page.timers.find(timer=>timer.delay===30000&&timer.active);assert.ok(timeout);timeout.fn();await new Promise(setImmediate);assert.equal(page.run('admin'),false);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.match(page.node('#auth-restore-message').textContent,/未能恢复登录状态/);assert.equal(page.node('#auth-restore-retry').hidden,false);
+});
+
+test('首次概览未完成时切到账号池立即读取轻量元数据并拒绝旧页迟到结果',async()=>{
+ const metadata=accountMetadataSnapshot(),calls=[];let release;const page=await ui((path,options)=>{calls.push({path,signal:options.signal});if(path.includes('view=overview'))return new Promise(resolve=>release=resolve);return response(path.includes('accounts-meta')?metadata:accountDetailSnapshot(metadata));});
+ page.run('admin=true;state=null;applyManagementIdentity({role:"super_admin",department_id:"synthetic-team"});tab="overview";');const initial=page.run('refresh()');await new Promise(setImmediate);page.run('setTab("accounts")');await new Promise(setImmediate);
+ assert.equal(calls[0].signal.aborted,true);assert.ok(calls.some(call=>call.path.includes('view=accounts-meta')));assert.ok(calls.every(call=>new URL(call.path,'http://local').searchParams.has('view')));assert.equal(page.run('state.accounts[0].id'),'account-one');
+ release(response({...snapshot(),view:'overview',accounts:[{id:'stale',name:'旧概览'}]}));await initial;assert.equal(page.run('state.accounts[0].id'),'account-one');assert.match(page.node('#content').innerHTML,/合成账号最新名称/);
+});
+test('无首屏状态的现代身份直接进入账号池或会话始终显式限定视图',async()=>{
+ for(const [tab,view] of [['accounts','accounts-meta'],['sessions','sessions']]){const calls=[],page=await ui(path=>{calls.push(path);return response({error:{message:'合成元数据暂不可读'}},503);});page.run('admin=true;state=null;applyManagementIdentity({role:"department_admin",department_id:"synthetic-team"});tab='+JSON.stringify(tab));await page.run('refresh()');assert.equal(calls.length,1);assert.equal(new URL(calls[0],'http://local').searchParams.get('view'),view);assert.equal(page.run('state'),null);assert.match(page.node('#content').innerHTML,/合成元数据暂不可读|读取失败|重试/);}
+});
+test('超管本团队登录复用同一身份返回的初始概览，不重复等待统计',async()=>{
+ const identity={role:'super_admin',department_id:'synthetic-home',home_department_id:'synthetic-home'},initialState={...snapshot(),keys:[],sessions:[],audit:[],view:'overview',peopleLoaded:false,capabilities:{pagedMembers:true}},calls=[];
+ const page=await ui(path=>{calls.push(path);if(path==='/api/auth/login')return response({ok:true,identity,initialState});throw Error('不应重复读取初始概览');});await page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});assert.deepEqual(calls,['/api/auth/login']);assert.equal(page.run('departmentView'),'synthetic-home');assert.equal(page.run('state.view'),'overview');
+});
+test('没有部门身份的旧后端仍按既有协议读取账号，不假造能力',async()=>{
+ const calls=[],page=await ui(path=>{calls.push(path);return response(snapshot());});page.run('admin=true;state=null;tab="accounts";');await page.run('refresh()');assert.equal(calls.length,1);assert.equal(new URL(calls[0],'http://local').searchParams.has('view'),false);assert.equal(page.run('state.capabilities'),undefined);
+});
+test('登录返回概览与当前团队不一致时重新读取，不复用其他团队数据',async()=>{
+ const identity={role:'super_admin',department_id:'synthetic-a'},initialState={...snapshot(),keys:[],sessions:[],audit:[],view:'overview',peopleLoaded:false,accounts:[{id:'private-a'}]},calls=[];
+ const page=await ui(path=>{calls.push(path);return response(path==='/api/auth/login'?{ok:true,identity,initialState}:{...snapshot(),view:'overview',peopleLoaded:false,accounts:[]});});page.run('verifyManagementView=async()=>{departmentView="synthetic-b";}');await page.node('#login-form').onsubmit({preventDefault(){},submitter:{disabled:false}});assert.equal(calls.length,2);assert.equal(page.run('state.accounts.length'),0);assert.equal(page.run('departmentView'),'synthetic-b');
 });
