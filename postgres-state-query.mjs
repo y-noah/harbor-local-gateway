@@ -162,17 +162,19 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         const rows=sessions.length?await store.all(`WITH selected_requests AS MATERIALIZED (
             SELECT id,session_id,price_version FROM harbor.requests
             WHERE session_id=ANY($3::text[]) AND usage_at>=$1 AND usage_at<$2 AND ${requestDepartment}
+          ), selected_prices AS MATERIALIZED (
+            -- Batch this page's IDs so the price primary key can visit them in
+            -- index order, without flattening into a historical price scan.
+            SELECT p.request_id,p.state,p.revision,${fields.map(field=>`p.${field}_atoms`).join(',')}
+            FROM harbor.request_prices p
+            WHERE p.request_id=ANY(ARRAY(SELECT id FROM selected_requests))
           ), source AS (
             SELECT r.session_id,CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
               CASE WHEN ${validPrice} THEN p.revision END revision,
               ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
             FROM selected_requests r
-            -- Keep price reads tied to this page's requests. A flattened join
-            -- can otherwise scan all historical prices even after pagination.
-            LEFT JOIN LATERAL (
-              SELECT p.state,p.revision,${fields.map(field=>`p.${field}_atoms`).join(',')}
-              FROM harbor.request_prices p WHERE p.request_id=r.id OFFSET 0
-            ) p ON TRUE LEFT JOIN harbor.pricing_versions v ON v.id=r.price_version
+            LEFT JOIN selected_prices p ON p.request_id=r.id
+            LEFT JOIN harbor.pricing_versions v ON v.id=r.price_version
           ), partial AS MATERIALIZED (
             SELECT session_id,revision,${referencePartialAggregateSql({standardOnly:true})} FROM source GROUP BY session_id,revision
           ) SELECT session_id,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY session_id`,...args):[];
