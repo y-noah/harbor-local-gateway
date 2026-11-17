@@ -1,8 +1,12 @@
 import {createHash} from 'node:crypto';
 import {AppError,usageWindow} from './store.mjs';
-import {fields,validPrice,joins,aggregate,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
+import {fields,validPrice,aggregate,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 import {createQueryDepartments,departmentPredicate,queryDepartmentIdentity} from './postgres-query-departments.mjs';
+
+// Keep price reads bounded by the filtered request window. OFFSET 0 prevents
+// pull-up into a hash join that scans prices from unrelated historical requests.
+const joins=` LEFT JOIN LATERAL (SELECT state,revision,${fields.map(field=>field+'_atoms').join(',')} FROM harbor.request_prices WHERE request_id=r.id OFFSET 0) p ON TRUE LEFT JOIN harbor.pricing_versions v ON v.id=r.price_version`;
 
 const states=new Set(['queued','running','ok','failed','unknown','interrupted','cancelled','rejected']);
 const invalid=(message='使用类型统计筛选无效')=>{throw new AppError(400,message,'type_statistics_invalid');};
