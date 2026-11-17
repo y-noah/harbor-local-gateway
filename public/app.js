@@ -321,7 +321,7 @@ async function departmentAction(action,id){
   else modal(`<h2>此 Key 无法回读</h2><p class="hint">${result.reason==='not_stored'?'此历史 Key 未保存可恢复的原文，请使用已有副本，或按需生成并替换。':result.reason==='storage_not_enabled'?'当前环境尚未启用安全回读存储，请联系管理员配置。':'未取得可回读的 Key，请重新读取。'}</p>${button('department-keys','返回列表','secondary',view.id)}`);
   return;
  }
- if(action==='department-key-copy'){const secret=$('#department-secret')?.textContent;if(secret)await navigator.clipboard.writeText(secret);return toast('已复制管理 Key');}
+ if(action==='department-key-copy'){const secret=$('#department-secret')?.textContent;if(!secret)throw Error('管理 Key 尚未加载，请重新打开后复制');await copyKey(secret,'管理 Key');return toast('已复制管理 Key');}
  if(action==='department-key-revoke'){const row=view?.rows.find(row=>row.id===id),departmentId=view?.id;if(!row||view.kind!=='keys')return;return formModal('撤销管理 Key',`确认撤销「${esc(row.label)}」？相关管理会话将失效。`,'',async(_f,current)=>{await api('/api/admin/departments/'+encodeURIComponent(departmentId)+'/management-keys/'+encodeURIComponent(id)+'/revoke','POST',{expected_version:row.version});if(current()){if(departmentPageActive())void loadDepartmentPage();await openDepartmentKeys(departmentId);}});}
 }
 
@@ -2128,7 +2128,7 @@ document.addEventListener('click',async e=>{
     if(action==='member-devices')return openDevices(identifier);
     if(action==='key-devices'){const key=knownKey(identifier);if(key)return openDevices(key.member_id,key.id);return;}
     if(action==='device-return-member')return memberDetail(identifier);
-    if(action==='device-copy-invite'){const value=$('#device-invitation')?.dataset.copyValue;if(value){await navigator.clipboard.writeText(value);toast('邀请已复制');}return;}
+    if(action==='device-copy-invite'){const value=$('#device-invitation')?.dataset.copyValue;if(!value)throw Error('设备邀请尚未加载，请重新打开后复制');await copyKey(value,'设备邀请');toast('邀请已复制');return;}
     if(action==='device-reload')return loadDevices(deviceView);
     if(action==='device-page'){const view=deviceView;if(!deviceCurrent(view)||view.loading||view.busy||view.error)return;view.page=Number(identifier);return loadDevices(view);}
     if(action==='device-key-policy')return editKeyDevicePolicy();
