@@ -34,8 +34,10 @@ test('账号HTTP独立目录、月费版本、API管理及跨部门拒绝',integ
  for(const suffix of ['check','quota','login','subscription'])assert.equal((await f.call('a','/api/admin/accounts/'+b+'/'+suffix,suffix==='subscription'?'GET':'POST',suffix==='subscription'?undefined:{})).status,404);
  const rootCreated=await f.call('root',undefined,'POST',{name:'合成默认部门账号'});assert.equal(rootCreated.status,201);assert.equal((await f.store.get('SELECT department_id FROM harbor.accounts WHERE id=$1',rootCreated.value.id)).department_id,'department-default');
  const countsBefore=await f.store.all('SELECT department_id,count(*)::int count FROM harbor.accounts GROUP BY department_id ORDER BY department_id');
- for(const department of ['global',f.rows.a.id,f.rows.b.id])assert.equal((await f.call('root',undefined,'POST',{name:'拒绝越界创建'},department)).status,403);
+ assert.equal((await f.call('root',undefined,'POST',{name:'拒绝全局创建'},'global')).status,403);
+ for(const department of ['global',f.rows.b.id])assert.equal((await f.call('a',undefined,'POST',{name:'拒绝越界创建'},department)).status,403);
  assert.deepEqual(await f.store.all('SELECT department_id,count(*)::int count FROM harbor.accounts GROUP BY department_id ORDER BY department_id'),countsBefore);
+ for(const department of [f.rows.a.id,f.rows.b.id]){const selected=await f.call('root',undefined,'POST',{name:'超管指定团队账号'},department);assert.equal(selected.status,201);assert.equal((await f.store.get('SELECT department_id FROM harbor.accounts WHERE id=$1',selected.value.id)).department_id,department);}
  const path='/api/admin/accounts/'+a+'/subscription';assert.deepEqual((await f.call('a',path)).value,{monthly_usd:20,version:1});assert.equal((await f.call('a',path,'PATCH',{monthly_usd:25,expected_version:1})).status,200);assert.equal((await f.call('a',path,'PATCH',{monthly_usd:30,expected_version:1})).status,409);
  assert.equal((await f.call('a','/api/admin/accounts/'+api+'/check','POST',{})).status,200);assert.equal((await f.store.get('SELECT state FROM harbor.accounts WHERE id=$1',api)).state,'ready');
  await f.store.run("UPDATE harbor.accounts SET state='ready' WHERE id=ANY($1::text[])",[a,b]);assert.equal((await f.call('a','/api/admin/accounts/'+a+'/quota','POST',{})).status,200);assert.equal((await f.store.get('SELECT quota_json FROM harbor.accounts WHERE id=$1',b)).quota_json,null);

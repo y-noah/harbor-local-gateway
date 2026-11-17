@@ -13,7 +13,7 @@ import {createPostgresDepartmentHttp} from '../postgres-department-http.mjs';
 
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需独立真实PG入口':false,timeout:60000};
 function options(database){const value=new URL(url);if(database)value.pathname='/'+database;return {connectionString:value.href,allowPlaintextLocalNetwork:true,poolSize:3};}
-test('旧管理员业务固定默认团队，团队管理不授权跨团队业务、正文或导出',integration,async()=>{
+test('超管显式切换团队保持单团队业务归属，默认团队和部门管理员边界不变',integration,async()=>{
  const name='business_boundary_'+randomUUID().replaceAll('-',''),admin=new PostgresStore(options()),directory=await mkdtemp(join(tmpdir(),'harbor-business-boundary-'));let store,app;
  try{
   await admin.query('CREATE DATABASE '+name);store=new PostgresStore(options(name));await store.migrate();await migrateDepartmentIsolation(store,{apply:true});
@@ -29,18 +29,22 @@ test('旧管理员业务固定默认团队，团队管理不授权跨团队业�
   const call=async(path,{cookie,method='GET',body,department}={})=>{const response=await fetch(origin+path,{method,headers:{...(cookie?{Cookie:cookie}:{}),...(department?{'X-Harbor-Department':department}:{}),...(body!==undefined?{'Content-Type':'application/json'}:{})},...(body!==undefined?{body:JSON.stringify(body)}:{})});return {status:response.status,value:await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]};};
   const login=await call('/api/auth/login',{method:'POST',body:{password:'synthetic-super',includeOverview:true}});assert.equal(login.status,200);assert.equal(login.value.identity.role,'super_admin');assert.equal(login.value.identity.view,'department');assert.equal(login.value.identity.department_id,defaultDepartmentId);assert.deepEqual(login.value.initialState.accounts.map(row=>row.id),['account-own']);const cookie=login.cookie;
   const session=await call('/api/auth/session',{cookie});assert.equal(session.value.identity.department_id,defaultDepartmentId);
-  const status=await call('/api/admin/status',{cookie});assert.equal(status.status,200);assert.deepEqual(Object.keys(status.value).sort(),['eventLoop','ownership','storage']);assert.equal((await call('/api/admin/status',{cookie,department:other.id})).status,403);
+  const status=await call('/api/admin/status',{cookie});assert.equal(status.status,200);assert.deepEqual(Object.keys(status.value).sort(),['eventLoop','ownership','storage']);assert.equal((await call('/api/admin/status',{cookie,department:other.id})).status,200);
   const teams=await call('/api/admin/departments',{cookie});assert.equal(teams.status,200);assert.ok(teams.value.rows.some(row=>row.id===other.id));assert.ok(teams.value.rows.every(row=>!Object.hasOwn(row,'members')&&!Object.hasOwn(row,'accounts')));
   assert.equal((await call('/api/admin/departments/'+other.id+'/management-keys',{cookie})).status,200);
   const teamCreated=await call('/api/admin/departments',{cookie,method:'POST',body:{name:'可管理新团队'}});assert.equal(teamCreated.status,201);
   const own=await call('/api/admin/state?view=accounts&people=none',{cookie});assert.equal(own.status,200);assert.deepEqual(own.value.accounts.map(row=>row.id),['account-own']);assert.ok(own.value.balancing);
   const requests=await call('/api/admin/requests',{cookie});assert.equal(requests.status,200);assert.equal(JSON.stringify(requests.value).includes('foreign'),false);
   const members=await call('/api/admin/members?view=list',{cookie});assert.equal(members.status,200);assert.equal(JSON.stringify(members.value).includes('foreign'),false);
-  for(const path of ['/api/admin/state?view=accounts&people=none','/api/admin/requests','/api/admin/members?view=list','/api/admin/requests/request-foreign/recording','/api/admin/recordings/exports'])for(const department of ['global',other.id])assert.equal((await call(path,{cookie,department})).status,403,path);
+  for(const path of ['/api/admin/state?view=accounts&people=none','/api/admin/requests','/api/admin/members?view=list','/api/admin/requests/request-foreign/recording','/api/admin/recordings/exports'])assert.equal((await call(path,{cookie,department:'global'})).status,403,path);
+  const selected=await call('/api/admin/state?view=accounts&people=none',{cookie,department:other.id});assert.equal(selected.status,200);assert.deepEqual(selected.value.accounts.map(row=>row.id),['account-foreign']);
+  const selectedIdentity=await call('/api/auth/session',{cookie,department:other.id});assert.equal(selectedIdentity.value.identity.department_id,other.id);assert.equal(selectedIdentity.value.identity.home_department_id,defaultDepartmentId);
+  for(const path of ['/api/admin/requests','/api/admin/members?view=list']){const result=await call(path,{cookie,department:other.id});assert.equal(result.status,200);assert.equal(JSON.stringify(result.value).includes('foreign'),true);assert.equal(JSON.stringify(result.value).includes('member-own'),false);}
+  assert.deepEqual((await call('/api/admin/state?view=accounts&people=none',{cookie})).value.accounts.map(row=>row.id),['account-own']);
   for(const path of ['/api/admin/members/member-foreign','/api/admin/members/member-foreign/device-policy','/api/admin/requests/request-foreign','/api/admin/requests/request-foreign/recording','/api/admin/requests/request-foreign/context','/api/admin/accounts/account-foreign/extra-usage'])assert.equal((await call(path,{cookie})).status,404,path);
   assert.equal((await call('/api/admin/members/member-foreign',{cookie,method:'PATCH',body:{name:'不得修改'}})).status,404);
-  assert.equal((await call('/api/admin/balancing/plans',{cookie,department:other.id,method:'POST',body:{}})).status,403);
-  assert.equal((await call('/api/admin/recordings/exports',{cookie,department:other.id,method:'POST',body:{include_body:false,format:'csv',filters:{}}})).status,403);
+  const selectedPlan=await call('/api/admin/balancing/plans',{cookie,department:other.id,method:'POST',body:{}});assert.equal(selectedPlan.status,202);assert.equal((await store.get('SELECT department_id FROM harbor.background_jobs WHERE id=$1',selectedPlan.value.id)).department_id,other.id);
+  const selectedExport=await call('/api/admin/recordings/exports',{cookie,department:other.id,method:'POST',body:{include_body:false,format:'csv',filters:{}}});assert.equal(selectedExport.status,202);assert.equal((await store.get('SELECT department_id FROM harbor.background_jobs WHERE id=$1',selectedExport.value.id)).department_id,other.id);
   assert.equal((await call('/api/admin/recordings/exports',{cookie,method:'POST',body:{include_body:false,format:'csv',filters:{department_id:other.id}}})).status,400);
   const departmentLogin=await call('/api/auth/login',{method:'POST',body:{password:otherKey.secret}});assert.equal(departmentLogin.value.identity.department_id,other.id);
   const foreignOwn=await call('/api/admin/state?view=accounts&people=none',{cookie:departmentLogin.cookie});assert.deepEqual(foreignOwn.value.accounts.map(row=>row.id),['account-foreign']);
@@ -48,7 +52,7 @@ test('旧管理员业务固定默认团队，团队管理不授权跨团队业�
   for(const suffix of ['', '/download'])assert.equal((await call('/api/admin/recordings/exports/'+encodeURIComponent(foreignExport.value.id)+suffix,{cookie})).status,404);
   const ownPlan=await call('/api/admin/balancing/plans',{cookie,method:'POST',body:{}});assert.equal(ownPlan.status,202);assert.equal((await store.get('SELECT department_id FROM harbor.background_jobs WHERE id=$1',ownPlan.value.id)).department_id,defaultDepartmentId);
   assert.equal((await call('/api/admin/departments',{cookie:departmentLogin.cookie})).status,403);
-  assert.equal((await call('/api/admin/state?view=accounts&people=none',{cookie:departmentLogin.cookie,department:defaultDepartmentId})).status,403);
+  for(const path of ['/api/admin/state?view=accounts&people=none','/api/admin/requests','/api/admin/members?view=list','/api/admin/requests/request-own/recording','/api/admin/recordings/exports'])for(const department of ['global',defaultDepartmentId])assert.equal((await call(path,{cookie:departmentLogin.cookie,department})).status,403,path);
   const reviewAuth=createAdminAuth({adminPasswordHash:passwordHash('synthetic-revalidate')},{scopeIssuer:issuer}),reviewResponse={headers:{},setHeader(name,value){this.headers[name]=value;}};reviewAuth.login('synthetic-revalidate',reviewResponse);
   const reviewRequest={headers:{cookie:reviewResponse.headers['Set-Cookie'].split(';')[0]}},reviewAccess=createPostgresDepartmentHttp({auth:reviewAuth,departments,issuer,installed:true,readBody:async()=>({})}),beforeDisable=await reviewAccess.context(reviewRequest);
   const defaultDepartment=await departments.getDepartment(root,defaultDepartmentId);await departments.updateDepartment(root,defaultDepartmentId,{enabled:false,expected_version:defaultDepartment.version});
