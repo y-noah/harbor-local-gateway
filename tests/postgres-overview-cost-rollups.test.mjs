@@ -34,6 +34,12 @@ test('首页七天消耗使用全部账号小时桶并补充无账号请求，�
    const total=['priced','mismatch','missing-book'].includes(state)?String(900719925474099312345n+BigInt(ordinal)):null;
    await store.run('INSERT INTO harbor.request_prices(request_id,state,revision,input_atoms,output_atoms,cached_atoms,adjustment_atoms,total_atoms,measured_at) VALUES($1,$2,$3,$4,5,1,-1,$5,$6)',id,['mismatch','missing-book','partial-atoms'].includes(state)?'priced':state,state==='mismatch'?'other':version,state==='partial-atoms'?'123':total,total,at);
   }
+  // Long-lived accounts must not scan their old hourly buckets for a seven-day
+  // chart. These real historical facts also exercise the normal rollup writer.
+  await store.run(`INSERT INTO harbor.requests(id,member_id,account_id,started,ended,status,ip)
+    SELECT 'old-'||n,'m',CASE WHEN n%2=0 THEN 'current' ELSE 'removed' END,
+      $1::bigint-n::bigint*86400000,$1::bigint-n::bigint*86400000,'failed','synthetic'
+    FROM generate_series(1,2000) n`,window.start);
   const original=store.all.bind(store);let rawSql;
   store.all=async(sql,...args)=>{if(sql.startsWith('WITH source AS (')&&sql.includes('SELECT day,'))rawSql=sql;return original(sql,...args);};
   const fallback=await reader.read({view:'overview-cost'}),full=await reader.read({people:'none'});assert.deepEqual(fallback.daily,full.daily);assert.ok(rawSql);
@@ -43,9 +49,17 @@ test('首页七天消耗使用全部账号小时桶并补充无账号请求，�
   assert.ok(sqls.some(sql=>sql.includes('harbor.usage_hour_buckets')));
   assert.ok(!sqls.some(sql=>/pg_advisory|pg_proc|pg_constraint/.test(sql)),'GET must reuse the attested extension');
   const bucketSql=sqls.find(sql=>sql.includes('harbor.usage_hour_buckets'));
-  const plan=await original('EXPLAIN (FORMAT JSON) '+bucketSql,window.start,window.end);
-  const predicates=[];function visit(node){for(const field of ['Index Cond','Filter','Join Filter','Recheck Cond'])if(node[field])predicates.push(node[field]);for(const child of node.Plans??[])visit(child);}visit(plan[0]['QUERY PLAN'][0].Plan);
+  await store.query('ANALYZE harbor.accounts');await store.query('ANALYZE harbor.usage_hour_buckets');
+  const plan=await original('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) '+bucketSql,window.start,window.end);
+  const predicates=[],bucketScans=[];function visit(node){if(node['Relation Name']==='usage_hour_buckets')bucketScans.push(node);for(const field of ['Index Cond','Filter','Join Filter','Recheck Cond'])if(node[field])predicates.push(node[field]);for(const child of node.Plans??[])visit(child);}visit(plan[0]['QUERY PLAN'][0].Plan);
   assert.ok(!/usage_at\)?\)?::numeric/.test(predicates.join('\n')),'range predicates must retain bigint time-index compatibility');
+  assert.ok(bucketScans.length>0);
+  for(const scan of bucketScans){
+   const condition=scan['Index Cond']??scan['Recheck Cond']??'';
+   assert.match(condition,/owner_id/,'lookup must bind the account before reading hourly history');
+   assert.match(condition,/hour_at >=/);assert.match(condition,/hour_at </);
+   assert.equal(scan['Rows Removed by Filter']??0,0,'old hours must be excluded by the index range');
+  }
   const canonical=rows=>rows.map(row=>({...row,revisions:row.revisions?.sort()??null}));
   for(const bounds of [[window.start+1,window.end-1],[window.start+100,window.start+1000],[window.start+100,window.start+3600001],[window.start,window.start],[-3600001,-1]]){
    assert.deepEqual(canonical(await original(bucketSql,...bounds)),canonical(await original(rawSql,...bounds)),'partial hour '+bounds);

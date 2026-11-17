@@ -37,10 +37,14 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
     if(query.cursor){const key=cursor(query.cursor);if(!key||key.snapshot!==snapshot||!Number.isSafeInteger(key.started)||typeof key.id!=='string'||!key.id.length||key.id.length>100||/[\x00-\x1f]/.test(key.id))invalid();extra.push(key.started,key.id);seek=` AND (r.started,r.id)<($${args.length+1},$${args.length+2})`;}
     const values=[...args,...extra,query.pageSize+1],limit='$'+values.length;
     if(!query.cursor)values.push((page-1)*query.pageSize);
+    // Select the bounded page before joining prices and display metadata.
+    // The outer joins are one-to-one and cannot change membership or ordering.
     const rows=await store.all(`SELECT r.*,m.name member_name,a.name account_name,p.state projected_state,p.model projected_model,
       p.model_source projected_source,p.revision projected_revision,v.id IS NOT NULL book_exists,${fields.map(f=>'p.'+f+'_atoms::text q_'+f).join(',')}
-      FROM harbor.requests r LEFT JOIN harbor.members m ON m.id=r.member_id LEFT JOIN harbor.accounts a ON a.id=r.account_id${joins}${where}${seek}
-      ORDER BY r.started DESC,r.id DESC LIMIT ${limit}${query.cursor?'':' OFFSET $'+values.length}`,...values);
+      FROM (SELECT r.* FROM harbor.requests r${where}${seek}
+        ORDER BY r.started DESC,r.id DESC LIMIT ${limit}${query.cursor?'':' OFFSET $'+values.length}) r
+      LEFT JOIN harbor.members m ON m.id=r.member_id LEFT JOIN harbor.accounts a ON a.id=r.account_id${joins}
+      ORDER BY r.started DESC,r.id DESC`,...values);
     const selected=rows.slice(0,query.pageSize),last=selected.at(-1),previews=readInputPreviews?await readInputPreviews(selected.map(row=>row.id),{scope:scope.authorization??undefined}):null;
     return {pagination:{page,pageSize:query.pageSize,total,totalPages,cursorMode:!!query.cursor,nextCursor:rows.length>query.pageSize?encode({snapshot,started:last.started,id:last.id}):null},rows:selected.map(r=>({...decorate(r,window.start),...previews?.get(r.id)}))};
   }

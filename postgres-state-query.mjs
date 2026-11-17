@@ -36,7 +36,7 @@ function validateSessionFilters({sessionQ='',sessionType='',sessionAccount='',se
 
 // Account buckets include historical owners. Requests without an account and
 // partial boundary hours stay on the original facts in the same read snapshot.
-const overviewCostRollupSql=({requestDepartment='TRUE',bucketDepartment='TRUE'}={})=>`WITH bounds AS (
+const overviewCostRollupSql=({requestDepartment='TRUE',accountDepartment='TRUE'}={})=>`WITH bounds AS (
   SELECT ceil($1::bigint::numeric/3600000)::bigint*3600000 first_hour,floor($2::bigint::numeric/3600000)::bigint*3600000 last_hour
 ), edges AS (
   SELECT e.from_at,e.to_at FROM bounds w CROSS JOIN LATERAL
@@ -68,9 +68,14 @@ const overviewCostRollupSql=({requestDepartment='TRUE',bucketDepartment='TRUE'}=
     CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.expired ELSE 0 END expired,
     CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.unmetered ELSE 0 END unmetered,
     ${fields.map(field=>`CASE WHEN b.revision=b.projected_revision AND v.id IS NOT NULL THEN b.${field} END ${field}`).join(',')}
-  FROM bounds w JOIN harbor.usage_hour_buckets b ON b.scope='account' AND b.hour_at>=w.first_hour AND b.hour_at<w.last_hour
+  FROM bounds w CROSS JOIN harbor.accounts a CROSS JOIN LATERAL (
+    -- Parameterize all lookup columns so old buckets and other owners do not
+    -- enter the aggregate. Removed accounts still own historical usage.
+    SELECT b.* FROM harbor.usage_hour_buckets b
+    WHERE b.scope='account' AND b.owner_id=a.id AND b.hour_at>=w.first_hour AND b.hour_at<w.last_hour OFFSET 0
+  ) b
   LEFT JOIN harbor.pricing_versions v ON v.id=b.revision
-  WHERE ${bucketDepartment}
+  WHERE ${accountDepartment}
 ) SELECT day,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY day ORDER BY day`;
 
 // The page identities and every usage dimension share one read snapshot. Only
@@ -105,8 +110,8 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       if(authorization!==null&&view==='full')await assertPostgresAuditScopes(store);
       if(view==='overview-cost'){
         const useRollups=await usageRollupsReady(store);
-        const args=[window.start,window.end],requestDepartment=departmentPredicate(authorization,'r',args),bucketDepartment=authorization?.view==='department'?'EXISTS(SELECT 1 FROM harbor.accounts a WHERE a.id=b.owner_id AND a.department_id=$3)':'TRUE';
-        const rows=await store.all(useRollups?overviewCostRollupSql({requestDepartment,bucketDepartment}):`WITH source AS (
+        const args=[window.start,window.end],requestDepartment=departmentPredicate(authorization,'r',args),accountDepartment=authorization?.view==='department'?'a.department_id=$3':'TRUE';
+        const rows=await store.all(useRollups?overviewCostRollupSql({requestDepartment,accountDepartment}):`WITH source AS (
           SELECT to_char(to_timestamp(r.usage_at/1000.0) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS day,
             CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
             CASE WHEN ${validPrice} THEN p.revision END revision,
@@ -152,7 +157,13 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
             SELECT r.session_id,CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
               CASE WHEN ${validPrice} THEN p.revision END revision,
               ${fields.map(field=>`CASE WHEN ${validPrice} THEN p.${field}_atoms END ${field}`).join(',')}
-            FROM selected_requests r${joins}
+            FROM selected_requests r
+            -- Keep price reads tied to this page's requests. A flattened join
+            -- can otherwise scan all historical prices even after pagination.
+            LEFT JOIN LATERAL (
+              SELECT p.state,p.revision,${fields.map(field=>`p.${field}_atoms`).join(',')}
+              FROM harbor.request_prices p WHERE p.request_id=r.id OFFSET 0
+            ) p ON TRUE LEFT JOIN harbor.pricing_versions v ON v.id=r.price_version
           ), partial AS MATERIALIZED (
             SELECT session_id,revision,${referencePartialAggregateSql({standardOnly:true})} FROM source GROUP BY session_id,revision
           ) SELECT session_id,${referenceRollupAggregateSql({standardOnly:true})} FROM partial GROUP BY session_id`,...args):[];
