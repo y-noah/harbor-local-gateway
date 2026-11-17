@@ -15,7 +15,7 @@ import {subscriptionMonthlyUsd} from './postgres-subscription-price.mjs';
 
 export function stateQuery(params){
   const value={sessionPage:1,sessionPageSize:25};
-  if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview','overview-cost','accounts','sessions'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
+  if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview','overview-cost','accounts','accounts-meta','sessions'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
   if(params.has('people')){if(params.getAll('people').length!==1||!['all','none'].includes(params.get('people')))throw new AppError(400,'员工加载模式无效');value.people=params.get('people');}
   for(const [name,field] of [['session_page','sessionPage'],['session_page_size','sessionPageSize']]){
     const entries=params.getAll(name);
@@ -101,7 +101,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
   }
   async function execute({sessionPage=1,sessionPageSize=25,people='all',view='full',sessionQ='',sessionType='',sessionAccount='',sessionStatus=''}={},authorization){
     validateSessionFilters({sessionQ,sessionType,sessionAccount,sessionStatus});sessionQ=sessionQ.trim();
-    if(!['full','overview','overview-cost','accounts','sessions'].includes(view))throw new AppError(400,'状态视图无效');
+    if(!['full','overview','overview-cost','accounts','accounts-meta','sessions'].includes(view))throw new AppError(400,'状态视图无效');
     if(!['all','none'].includes(people))throw new AppError(400,'员工加载模式无效');
     if(!Number.isSafeInteger(sessionPage)||sessionPage<1||!Number.isSafeInteger(sessionPageSize)||sessionPageSize<1||sessionPageSize>100)throw new AppError(400,'会话分页参数无效');
     const at=clock(),window=usageWindow(at),recentUsageWindow={start:at-12*3600000,end:at,hours:12};
@@ -176,7 +176,12 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       const supplierScopes=await quotaSubjectScopeHints(store,accounts.map(row=>row.id));
       const priceNames=accounts.filter(row=>row.kind==='codex'&&row.auth_mode==='subscription').map(row=>'subscription_monthly_usd:'+row.id);
       const subscriptionPrices=new Map((priceNames.length?await store.all('SELECT name,value FROM harbor.gateway_settings WHERE name=ANY($1::text[])',priceNames):[]).map(row=>[row.name,subscriptionMonthlyUsd(JSON.parse(row.value).monthly_usd)]));
-      const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,subscription_monthly_usd:subscriptionPrices.get('subscription_monthly_usd:'+row.id)??null,supplier_quota:supplierScopes.get(row.id),package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,standard:usage(row.id)}));
+      const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,subscription_monthly_usd:subscriptionPrices.get('subscription_monthly_usd:'+row.id)??null,supplier_quota:supplierScopes.get(row.id),package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,...(usage?{standard:usage(row.id)}:{})}));
+      // Metadata remains useful while historical usage and routing aggregates
+      // are pending. Omit those fields rather than publishing invented zeros.
+      if(view==='accounts-meta')return {view,usageMetric:referenceMetric,usageWindow:window,observedAt:at,peopleLoaded:false,
+        accounts:accountData(),accountPackagePolicy:packagePolicy,usagePending:accounts.length>0,
+        balancingPending:!!balancingReader&&(authorization===null||authorization.view==='department')};
       if(view==='accounts'){
         const useRollups=accounts.length&&await usageRollupsReady(store);
         const args=[window.start,window.end,accounts.map(row=>row.id)],requestDepartment=departmentPredicate(authorization,'r',args);

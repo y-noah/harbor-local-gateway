@@ -5,6 +5,8 @@ import vm from 'node:vm';
 
 const source=readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
 const snapshot=()=>({totals:{tokens:0,requests:0,success:0,reserved:0},accounts:[],members:[],daily:[],requests:[],busy:0,queue:0});
+const accountMetadataSnapshot=()=>({...snapshot(),view:'accounts-meta',usageWindow:{start:1000,end:2000},capabilities:{accountListMetadata:true,accountStateView:true,sessionStateView:true},accounts:[{id:'account-one',name:'合成账号最新名称',kind:'codex',auth_mode:'subscription',enabled:1,state:'ready',route_epoch:3,quota_json:JSON.stringify({windows:[{minutes:10080,used:20,reset:3000}]})}],usagePending:true,balancingPending:true,accountPackagePolicy:{enabled:false,version:4}});
+const accountDetailSnapshot=metadata=>({...metadata,view:'accounts',accounts:metadata.accounts.map(row=>({...row,standard:{total:42.5,requests:2,unmetered:0,unpriced:0}})),balancing:{settings:{weighted:true,failover:true,nightly:true,quietMinutes:5},transfers:{times:['12:00'],version:2,next:3000},strategy:{source:'hourly_percentage',package_policy:metadata.accountPackagePolicy},weights:{mode:'auto',configuration:{mode:'auto',version:2,weights:{}},accounts:metadata.accounts.map(row=>({id:row.id,effective:100,automatic:100}))}}});
 const response=(body,status=200)=>({ok:status<400,status,json:async()=>body});
 async function ui(fetcher,{restore=false}={}){
   const nodes=new Map(),handlers=new Map(),downloads=[],popups=[],timers=[],copied=[],intervals=[];
@@ -2070,5 +2072,78 @@ test('首页消耗窗口或登录身份变化仍取消旧查询且不接受迟�
   assert.equal(pending[0].signal.aborted,true);assert.equal(pending.length,2);
   pending[0].resolve(response({view:'overview-cost',usageWindow:base.usageWindow,daily:[{day:'2026-11-01',standard:{total:999}}]}));await old;assert.equal(page.run('overviewCostData'),null);
   const window=page.run('state.usageWindow');pending[1].resolve(response({view:'overview-cost',usageWindow:window,daily:[]}));await current;assert.equal(page.run('overviewCostData.daily.length'),0);
+ }
+});
+
+test('账号先显示元数据，慢费用不阻塞管理且不取消或重复自动刷新',async()=>{
+ const metadata=accountMetadataSnapshot(),pending=[],reads=[];const page=await ui((path,options)=>{reads.push(path);if(path.includes('view=accounts-meta'))return response(metadata);if(path.includes('view=accounts&'))return new Promise(resolve=>pending.push({resolve,signal:options.signal}));return response({...snapshot(),view:'overview',capabilities:metadata.capabilities,usageWindow:metadata.usageWindow});});
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),view:'overview',capabilities:metadata.capabilities,usageWindow:metadata.usageWindow})+';tab="accounts";');
+ assert.equal(await page.run('refresh()'),true);assert.equal(pending.length,1);assert.equal(page.run('stateNeedsPageData()'),false);assert.match(page.node('#content').innerHTML,/合成账号最新名称/);assert.match(page.node('#content').innerHTML,/费用与权重更新中/);assert.doesNotMatch(page.node('#content').innerHTML,/\$0\.00/);
+ await page.click('manage-account','account-one');assert.match(page.node('#modal-content').innerHTML,/合成账号最新名称/);await page.click('close');
+ await page.run('automaticRefresh()');await page.run('automaticRefresh()');assert.equal(reads.length,2);assert.equal(pending[0].signal.aborted,false);
+ const details=accountDetailSnapshot(metadata);details.accounts[0].name='旧名称不得覆盖';details.accounts[0].quota_json='旧快照';details.accounts.push({...details.accounts[0],id:'removed-account'});
+ pending[0].resolve(response(details));await new Promise(setImmediate);assert.equal(page.run('state.accounts.length'),1);assert.equal(page.run('state.accounts[0].name'),'合成账号最新名称');assert.equal(page.run('state.accounts[0].quota_json'),metadata.accounts[0].quota_json);assert.equal(page.run('state.accounts[0].standard.total'),42.5);assert.equal(page.run('state.usagePending'),false);assert.equal(page.run('state.balancingPending'),false);assert.match(page.node('#content').innerHTML,/\$42\.50/);
+});
+
+test('旧服务账号页沿用完整读取，不请求不存在的元数据视图',async()=>{
+ const metadata=accountMetadataSnapshot(),full=accountDetailSnapshot(metadata);delete full.capabilities.accountListMetadata;const calls=[],page=await ui(path=>{calls.push(path);return response(full);});page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:full.capabilities})+';tab="accounts";');await page.run('refresh()');assert.equal(calls.length,1);assert.match(calls[0],/view=accounts(?:&|$)/);assert.doesNotMatch(calls[0],/accounts-meta/);assert.equal(page.run('state.accounts[0].standard.total'),42.5);
+});
+
+test('账号费用失败保留账号且不记零，独立重试可恢复',async()=>{
+ const metadata=accountMetadataSnapshot(),pending=[];const page=await ui(path=>path.includes('accounts-meta')?response(metadata):new Promise(resolve=>pending.push(resolve)));page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:metadata.capabilities})+';tab="accounts";');await page.run('refresh()');pending[0](response({error:{message:'合成费用读取失败'}},503));await new Promise(setImmediate);
+ assert.equal(page.run('state.accounts.length'),1);assert.equal(page.run('Object.hasOwn(state.accounts[0],"standard")'),false);assert.match(page.node('#content').innerHTML,/合成费用读取失败/);assert.match(page.node('#content').innerHTML,/account-details-retry/);assert.doesNotMatch(page.node('#content').innerHTML,/\$0\.00/);
+ const retry=page.click('account-details-retry');assert.equal(pending.length,2);pending[1](response(accountDetailSnapshot(metadata)));await retry;assert.equal(page.run('accountDetailsError'),'');assert.equal(page.run('state.accounts[0].standard.total'),42.5);
+});
+
+test('账号元数据只保留同身份同窗口旧费用并显示待更新',async()=>{
+ for(const change of ['same','identity','window']){
+  const metadata=accountMetadataSnapshot(),full=accountDetailSnapshot(metadata);let release;const page=await ui(path=>path.includes('accounts-meta')?response(change==='window'?{...metadata,usageWindow:{start:2000,end:3000}}:metadata):new Promise(resolve=>release=resolve));
+  page.run('admin=true;state='+JSON.stringify(full)+';tab="accounts";cachePageState(state);'+(change==='identity'?'authEpoch++;':''));await page.run('refresh()');assert.equal(page.run('state.accounts[0].standard?.total'),change==='same'?42.5:undefined);assert.match(page.node('#content').innerHTML,/费用与权重更新中/);if(change==='same')assert.match(page.node('#content').innerHTML,/\$42\.50/);
+  release(response({error:{message:'合成终止读取'}},503));await new Promise(setImmediate);page.run('stopAccountDetails()');
+ }
+});
+
+test('账号旧费用响应在切页、换身份或更新元数据后均不能覆盖当前状态',async()=>{
+ for(const change of ['navigation','identity','metadata']){
+  let metadata=accountMetadataSnapshot();const pending=[],page=await ui((path,options)=>path.includes('accounts-meta')?response(metadata):path.includes('view=accounts&')?new Promise(resolve=>pending.push({resolve,signal:options.signal})):response({...snapshot(),view:'overview',capabilities:metadata.capabilities,usageWindow:metadata.usageWindow}));page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:metadata.capabilities})+';tab="accounts";');await page.run('refresh()');
+  if(change==='navigation')page.run('setTab("overview")');
+  if(change==='identity')page.run('authEpoch++;showLogin();admin=true;state='+JSON.stringify({...snapshot(),view:'overview',capabilities:metadata.capabilities,usageWindow:metadata.usageWindow})+';tab="overview";');
+  if(change==='metadata'){metadata={...metadata,accounts:[{...metadata.accounts[0],id:'account-new',name:'替换后的账号'}]};await page.run('refresh()');assert.equal(pending.length,2);}
+  assert.equal(pending[0].signal.aborted,true);pending[0].resolve(response(accountDetailSnapshot(accountMetadataSnapshot())));await new Promise(setImmediate);
+  if(change==='metadata'){assert.equal(page.run('state.accounts[0].id'),'account-new');assert.equal(page.run('state.accounts[0].standard'),undefined);pending[1].resolve(response(accountDetailSnapshot(metadata)));await new Promise(setImmediate);assert.equal(page.run('state.accounts[0].id'),'account-new');}else{assert.equal(page.run('tab'),'overview');assert.equal(page.run('state.accounts.length'),0);}
+ }
+});
+
+test('账号配置编辑重新核验完整配置，不能把元数据缺字段保存为关闭',async()=>{
+ for(const failure of [false,true]){
+  const metadata=accountMetadataSnapshot(),pending=[],page=await ui(path=>{assert.match(path,/view=accounts&people=none/);return new Promise(resolve=>pending.push(resolve));});page.run('admin=true;state='+JSON.stringify(metadata)+';tab="accounts";');const work=page.click('balancing-settings');assert.equal(pending.length,1);assert.doesNotMatch(page.node('#modal-content').innerHTML,/name="nightly"/);
+  pending[0](failure?response({error:{message:'配置未取得'}},503):response(accountDetailSnapshot(metadata)));await work;
+  if(failure){assert.match(page.node('#modal-content').innerHTML,/配置未取得/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/name="nightly"|<form/);}else{assert.match(page.node('#modal-content').innerHTML,/<option value="true" selected>开启<\/option>/);assert.match(page.node('#modal-content').innerHTML,/name="quietMinutes"[^>]*value="5"/);}
+ }
+});
+
+test('账号写操作取消旧费用响应，不能回写已变更账号状态',async()=>{
+ const metadata=accountMetadataSnapshot(),pending=[];const page=await ui((path,options)=>options.method==='PATCH'?response({ok:true}):path.includes('accounts-meta')?response(metadata):new Promise(resolve=>pending.push({resolve,signal:options.signal})));page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:metadata.capabilities})+';tab="accounts";');await page.run('refresh()');await page.run('api("/api/admin/accounts/account-one","PATCH",{enabled:false})');assert.equal(pending[0].signal.aborted,true);pending[0].resolve(response(accountDetailSnapshot(metadata)));await new Promise(setImmediate);assert.equal(page.run('state.accounts[0].standard'),undefined);assert.equal(page.run('accountDetailsController'),null);
+});
+
+test('账号元数据套餐策略优先于旧均衡缓存且缓存不能改绑登录身份',async()=>{
+ const metadata=accountMetadataSnapshot(),full=accountDetailSnapshot(metadata);const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(full)+';cachePageState(state);authEpoch++;cachePageState(state);globalThis.next='+JSON.stringify({...metadata,accountPackagePolicy:{enabled:true,version:9}})+';state=mergeAccountMetadata(next,state);');assert.equal(page.run('state.accounts[0].standard'),undefined);page.run('state.balancing='+JSON.stringify(full.balancing));assert.equal(page.run('packagePolicyState().enabled'),true);assert.equal(page.run('packagePolicyState().version'),9);
+});
+
+
+test('正文显式查询有局部等待反馈，首屏不查询，失败保留已有结果',async()=>{
+ let release;const page=await ui(()=>new Promise(resolve=>release=resolve));prepareRecordingAdmin(page);page.run('render()');assert.equal(release,undefined);assert.match(page.node('#content').innerHTML,/id="recording-results"[^>]*aria-busy="false"/);
+ page.run('recordingAdminFilters.q="合成"');const pending=page.run('loadRecordingAdminQuery(true)');assert.match(page.node('#content').innerHTML,/id="recording-results"[^>]*aria-busy="true"/);assert.match(page.node('#content').innerHTML,/data-loading-mask" role="status">正在加载/);
+ release(response(recordingSearchPage()));await pending;assert.match(page.node('#content').innerHTML,/合成中文问题/);const retry=page.run('loadRecordingAdminQuery(true)');assert.match(page.node('#content').innerHTML,/合成中文问题/);assert.match(page.node('#content').innerHTML,/id="recording-results"[^>]*aria-busy="true"/);release(response({error:{message:'合成正文暂时失败'}},503));await retry;assert.match(page.node('#content').innerHTML,/合成正文暂时失败/);assert.match(page.node('#content').innerHTML,/合成中文问题/);assert.match(page.node('#content').innerHTML,/id="recording-results"[^>]*aria-busy="false"/);
+});
+
+test('修改正文筛选取消在途查询，同时解除结果遮罩与旧结果禁用',async()=>{
+ let release,reads=0;const page=await ui(()=>{reads++;return new Promise(resolve=>release=resolve);});prepareRecordingAdmin(page);page.run('recordingAdminData='+JSON.stringify(recordingSearchPage())+';recordingAdminFilters.q="旧问题"');const work=page.run('loadRecordingAdminQuery(true)');let busy='true',inert=true;page.node('#recording-results').setAttribute=(name,value)=>{if(name==='aria-busy')busy=value;};page.node('#recording-results').querySelector=()=>({toggleAttribute(name,value){if(name==='inert')inert=value;}});page.run('recordingAdminFilters.q="新问题";invalidateRecordingQuery()');assert.equal(busy,'false');assert.equal(inert,false);assert.equal(reads,1);assert.equal(page.run('recordingAdminLoading'),false);release(response(recordingSearchPage({items:[]})));await work;assert.equal(page.run('recordingAdminData.items.length'),1);
+});
+
+
+test('账号详情在管理弹窗内完成，关闭后立即补绘金额或失败重试',async()=>{
+ for(const failure of [false,true]){
+  const metadata=accountMetadataSnapshot();let release;const page=await ui(path=>path.includes('accounts-meta')?response(metadata):new Promise(resolve=>release=resolve));page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:metadata.capabilities})+';tab="accounts";');await page.run('refresh()');await page.click('manage-account','account-one');const modal=page.node('#modal-content').innerHTML;release(failure?response({error:{message:'弹窗期间费用失败'}},503):response(accountDetailSnapshot(metadata)));await new Promise(setImmediate);assert.equal(page.node('#modal-content').innerHTML,modal);assert.equal(page.run('accountDetailsRenderPending'),true);await page.click('close');assert.equal(page.run('accountDetailsRenderPending'),false);if(failure){assert.match(page.node('#content').innerHTML,/弹窗期间费用失败/);assert.match(page.node('#content').innerHTML,/account-details-retry/);}else{assert.match(page.node('#content').innerHTML,/\$42\.50/);assert.doesNotMatch(page.node('#content').innerHTML,/费用与权重更新中/);}
  }
 });
