@@ -150,7 +150,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         let result;
         if(planPath[2]){
           const params=url.searchParams;if([...params.keys()].some(key=>!['section','after','limit'].includes(key))||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))throw new AppError(400,'规划分页参数无效','planning_query_invalid');
-          result=await queryQueue.run(()=>planningReader.page(planPath[1],{scope,section:params.get('section')??'moves',after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)}),{signal:bodySignal});
+          result=await queryQueue.run(()=>planningReader.page(planPath[1],{scope,section:params.get('section')??'moves',after:Number(params.get('after')??0),limit:Number(params.get('limit')??20)}),{signal:bodySignal});
         }else result=await queryQueue.run(()=>planningReader.status(planPath[1],{scope}),{signal:bodySignal});
         json(res,200,result);return true;
       }

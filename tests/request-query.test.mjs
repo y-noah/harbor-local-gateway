@@ -27,8 +27,8 @@ test('list view reads only the requested page and does not run a window quote or
   const all=store.all.bind(store),reads=[];store.all=(sql,...args)=>{const rows=all(sql,...args);if(sql.includes('FROM requests'))reads.push({sql,n:rows.length});return rows;};
   store.pricing.rawQuote=()=>{throw Error('list must not aggregate');};
   const result=requestsReader(store,query({view:'list',page:'3'}),at);
-  assert.equal(result.rows.length,25);assert.equal(result.pagination.total,130);assert.equal(result.pagination.page,3);assert.equal(result.summary,undefined);
-  assert.equal(reads.length,1);assert.equal(reads[0].n,25);assert.match(reads[0].sql,/LIMIT \? OFFSET \?/);
+  assert.equal(result.rows.length,20);assert.equal(result.pagination.total,130);assert.equal(result.pagination.page,3);assert.equal(result.summary,undefined);
+  assert.equal(reads.length,1);assert.equal(reads[0].n,20);assert.match(reads[0].sql,/LIMIT \? OFFSET \?/);
 });
 
 test('cursor handles tied times and late/backdated inserts including SQLite rowid reuse',t=>{
@@ -58,7 +58,7 @@ test('R1 removing already-read pages cannot hide unread cursor results',t=>{
     result=requestsReader(store,query({view:'list',page:String(page),snapshot,cursor:result.pagination.nextCursor}),at);
     assert.equal(result.pagination.page,page++);seen.push(...result.rows.map(r=>r.id));
   }
-  assert.equal(seen.length,75);assert.equal(new Set(seen).size,75);assert.equal(result.pagination.page,4);
+  assert.equal(seen.length,80);assert.equal(new Set(seen).size,80);assert.equal(result.pagination.page,5);
   assert.ok(seen.every(id=>!read.has(id)));
 });
 

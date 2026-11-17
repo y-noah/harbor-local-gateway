@@ -54,7 +54,7 @@ export function createPostgresMemberActions(store,{departmentActors,jobs=createP
       return {id:batchId,status:'preview',members:owners.length,keys:keyCount,operation,expires:at+ttlMs};
     },{level:'REPEATABLE READ'});
   }
-  async function detail(batchId,{after=0,limit=25,signal,scope}={}){
+  async function detail(batchId,{after=0,limit=20,signal,scope}={}){
     const authorization=await departments.resolve(scope);
     if(!Number.isSafeInteger(after)||after<0||!Number.isInteger(limit)||limit<1||limit>100)fail(400,'访问操作分页无效');
     return read(()=>readStore.transaction(async()=>{
@@ -103,14 +103,14 @@ export function createPostgresMemberActions(store,{departmentActors,jobs=createP
   }
   async function list(params,{signal,scope}={}){
     const authorization=await departments.resolve(scope);
-    if([...params.keys()].some(key=>!['before','limit'].includes(key)||params.getAll(key).length!==1)||params.has('before')&&!uuid(params.get('before'))||params.has('limit')&&!/^[1-9]\d*$/.test(params.get('limit')))fail(400,'访问操作记录分页无效');const limit=Number(params.get('limit')??25);if(!Number.isInteger(limit)||limit>100)fail(400,'访问操作记录分页无效');
+    if([...params.keys()].some(key=>!['before','limit'].includes(key)||params.getAll(key).length!==1)||params.has('before')&&!uuid(params.get('before'))||params.has('limit')&&!/^[1-9]\d*$/.test(params.get('limit')))fail(400,'访问操作记录分页无效');const limit=Number(params.get('limit')??20);if(!Number.isInteger(limit)||limit>100)fail(400,'访问操作记录分页无效');
     return read(()=>readStore.transaction(async()=>{const window=usageWindow(clock()),cursor=params.has('before')?await getBatch(readStore,params.get('before'),{departmentScope:authorization}):null,rows=await readStore.all(`SELECT b.id,b.created,b.status,b.direction,b.parent_id,b.operation,(SELECT COUNT(*) FROM harbor.member_action_items i WHERE i.batch_id=b.id) members FROM harbor.member_action_batches b WHERE ${authorization?.view==='department'?'b.department_id=$6 AND ':''}b.created>=$1 AND b.created<$2 AND ($3::bigint IS NULL OR (b.created,b.id)<($3,$4)) ORDER BY b.created DESC,b.id DESC LIMIT $5`,window.start,window.end,cursor?.created??null,cursor?.id??'',limit+1,...(authorization?.view==='department'?[authorization.department_id]:[])),items=rows.slice(0,limit);return {items,before:items.at(-1)?.id??null,has_more:rows.length>limit};},{level:'REPEATABLE READ',readOnly:true}),{signal});
   }
   async function handle(path,method,payload,params=new URLSearchParams(),{signal,scope}={}){
     if(path==='/api/admin/member-action-batches'&&method==='GET')return {status:200,value:await list(params,{signal,scope})};
     if(path==='/api/admin/member-action-batches/preview'&&method==='POST')return {status:201,value:await preview(payload,{scope})};
     const match=path.match(/^\/api\/admin\/member-action-batches\/([a-f0-9-]{36})(?:\/(execute|retry|undo))?$/);if(!match)return null;
-    if(method==='GET'&&!match[2]){if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'访问操作分页无效');return {status:200,value:await detail(match[1],{signal,scope,after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)})};}
+    if(method==='GET'&&!match[2]){if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'访问操作分页无效');return {status:200,value:await detail(match[1],{signal,scope,after:Number(params.get('after')??0),limit:Number(params.get('limit')??20)})};}
     if(method==='POST'&&match[2]){if(!object(payload,[])||Object.keys(payload).length)fail(400,'执行只能确认原固定预览，不能替换目标');return {status:match[2]==='execute'?202:201,value:await (match[2]==='execute'?submit(match[1],{scope}):derived(match[1],match[2],{scope}))};}
     if(method==='DELETE'&&!match[2])return {status:200,value:await cancel(match[1],{scope})};return null;
   }

@@ -760,6 +760,7 @@ test('PostgreSQL overview batches exact seven-day and twelve-hour usage, preserv
   legacy.run('UPDATE keys SET removed_at=? WHERE id=?',at,other.keyId);await store.run('UPDATE harbor.keys SET removed_at=$1 WHERE id=$2',at,other.keyId);
   await store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)','fixture-audit',at-1,'account.update','Bearer never-return-audit');
   const reader=createPostgresStateQueries(store,{clock:()=>at,encryptionKey:legacy.encryptionKey});t.after(()=>reader.close());
+  assert.equal((await reader.read()).sessionsPagination.pageSize,20);assert.equal((await reader.read({sessionPageSize:25})).sessionsPagination.pageSize,25);
   const value=await reader.read({sessionPageSize:2}),old=legacy.snapshot(at,{sessionPageSize:2});
   const compact=await reader.read({view:'overview'});
   assert.equal(compact.view,'overview');assert.deepEqual(compact.totals,{requests:value.totals.requests,success:value.totals.success});
@@ -796,7 +797,7 @@ test('PostgreSQL overview batches exact seven-day and twelve-hour usage, preserv
   await store.run('UPDATE harbor.members SET usage_type_id=NULL,usage_type_version=0 WHERE id=$1',member.memberId);
   assert.equal((await reader.read({people:'none',sessionType:'unclassified'})).sessionsPagination.total,4);
   for(const params of ['session_q=a&session_q=b','session_type=bad%27','session_account=bad%2Fid','session_status=active','session_q='+encodeURIComponent('x'.repeat(101)),'session_q=%00'])assert.throws(()=>stateQuery(new URLSearchParams(params)),{status:400});
-  assert.deepEqual(stateQuery(new URLSearchParams('session_q=%20hello%20&session_status=enabled')),{sessionPage:1,sessionPageSize:25,sessionQ:'hello',sessionStatus:'enabled'});
+  assert.deepEqual(stateQuery(new URLSearchParams('session_q=%20hello%20&session_status=enabled')),{sessionPage:1,sessionPageSize:20,sessionQ:'hello',sessionStatus:'enabled'});
   await assert.rejects(reader.read({sessionQ:null}),{status:400});
   await assert.rejects(reader.read({sessionPageSize:101}),{status:400});
   for(const params of ['session_page=0','session_page=1&session_page=2','session_page_size=101','session_page=9007199254740992'])assert.throws(()=>stateQuery(new URLSearchParams(params)),{status:400});

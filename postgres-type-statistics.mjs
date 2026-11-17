@@ -15,7 +15,7 @@ const names={group_by:'groupBy',page_size:'pageSize',model_missing:'modelMissing
 const allowed=new Set(['type','member','model','status','from','to','groupBy','page','pageSize','modelMissing','memberMissing']);
 function normalize(value={}){
   if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!allowed.has(key)))invalid();
-  const query={type:'',member:'',model:'',status:'',from:null,to:null,groupBy:'type',page:1,pageSize:25,modelMissing:false,memberMissing:false,...value};
+  const query={type:'',member:'',model:'',status:'',from:null,to:null,groupBy:'type',page:1,pageSize:20,modelMissing:false,memberMissing:false,...value};
   if([query.type,query.member,query.model,query.status,query.groupBy].some(v=>typeof v!=='string')||query.type&&!/^[a-zA-Z0-9-]{1,100}$/.test(query.type)&&!['unclassified','historical_unknown'].includes(query.type)||query.member&&!/^[a-zA-Z0-9-]{1,100}$/.test(query.member)||query.model.length>200||/[\x00-\x1f]/.test(query.model)||query.status&&!states.has(query.status)||!['type','model','member'].includes(query.groupBy))invalid();
   if(!Number.isSafeInteger(query.page)||query.page<1||query.page>1e7||!Number.isSafeInteger(query.pageSize)||query.pageSize<1||query.pageSize>100||[query.from,query.to].some(v=>v!==null&&(!Number.isSafeInteger(v)||v<0))||query.from!==null&&query.to!==null&&query.from>=query.to||typeof query.modelMissing!=='boolean'||typeof query.memberMissing!=='boolean'||query.modelMissing&&!!query.model||query.memberMissing&&!!query.member)invalid();
   return query;

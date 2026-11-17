@@ -132,9 +132,9 @@ test('request totals cover all pages, combine filters and keep users with identi
  for(let i=0;i<251;i++)store.run("INSERT INTO requests(id,member_id,started,ended,status,model,ip,input,output,cached,usage_unknown) VALUES(?,?,?,?,'ok',?,'fixture',10,2,3,?)",'request-'+String(i).padStart(3,'0'),i<201?member.memberId:other.memberId,at-1000,at,i%2?'gpt-6-sol':'gpt-6.1-sol',i===250?1:0);
  store.run("INSERT INTO requests(id,member_id,started,ended,status,model,ip,input) VALUES('expired',?, ?,?,'ok','old','fixture',999999)",member.memberId,window.start-1001,window.start-1);
  store.run("INSERT INTO requests(id,member_id,started,status,model,ip) VALUES('pending',?,?,'running','gpt-6.1-sol','fixture')",member.memberId,at);
- const all=read({});assert.equal(all.summary.requests,252);assert.equal(all.summary.standard.input_exact,'0.0036125');assert.equal(all.summary.standard.cached_exact,'0.0001125');assert.equal(all.summary.unmetered,1);assert.equal(all.summary.active,1);assert.equal(all.summary.average_ms,1000);assert.equal(all.byMember.length,2);assert.equal(all.members.length,2);assert.equal(all.rows.length,25);
+ const all=read({});assert.equal(all.summary.requests,252);assert.equal(all.summary.standard.input_exact,'0.0036125');assert.equal(all.summary.standard.cached_exact,'0.0001125');assert.equal(all.summary.unmetered,1);assert.equal(all.summary.active,1);assert.equal(all.summary.average_ms,1000);assert.equal(all.byMember.length,2);assert.equal(all.members.length,2);assert.equal(all.rows.length,20);
  const pages=Array.from({length:3},(_,i)=>read({page:String(i+1),page_size:'100'}));assert.equal(new Set(pages.flatMap(x=>x.rows.map(r=>r.id))).size,252);
  const filtered=read({member:member.memberId,model:'gpt-6.1-sol',status:'ok'});assert.equal(filtered.summary.requests,101);assert.equal(filtered.summary.standard.output_exact,'0.00202');assert.equal(filtered.byMember.length,1);assert.equal(filtered.byModel.length,1);assert.equal(filtered.members.length,2);assert.equal(filtered.models.length,2);
- assert.equal(read({model:"x' OR 1=1 --"}).summary.requests,0);assert.equal(read({page:'999'}).pagination.page,11);
+ assert.equal(read({model:"x' OR 1=1 --"}).summary.requests,0);assert.equal(read({page:'999'}).pagination.page,13);
  assert.ok(!JSON.stringify(all).includes(member.secret));
 });

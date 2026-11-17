@@ -40,7 +40,7 @@ test('会话状态预取消与排队取消不执行SQL，未取消请求保持�
  const first=f.reader.read({view:'sessions'});await f.entered.promise;
  const controller=new AbortController(),reason=Error('synthetic queued cancel'),second=assert.rejects(f.reader.read({view:'sessions'},{signal:controller.signal}),error=>error===reason);
  controller.abort(reason);await second;assert.equal(f.queue.status().active,1);assert.deepEqual(f.events,['begin','count']);
- f.release.resolve();const result=await first;assert.equal(result.sessions.length,1);assert.equal(result.sessions[0].request_count,0);assert.deepEqual(result.sessionsPagination,{page:1,pageSize:25,total:1,totalPages:1});assert.deepEqual(f.events,['begin','count','page','accounts','prices','commit']);await f.reader.close();
+ f.release.resolve();const result=await first;assert.equal(result.sessions.length,1);assert.equal(result.sessions[0].request_count,0);assert.deepEqual(result.sessionsPagination,{page:1,pageSize:20,total:1,totalPages:1});assert.deepEqual(f.events,['begin','count','page','accounts','prices','commit']);await f.reader.close();
 });
 
 test('部门身份解析期间取消，在解析完成后停止且不进入业务事务',{timeout:3000},async()=>{

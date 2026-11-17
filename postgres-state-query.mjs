@@ -16,7 +16,7 @@ import {subscriptionMonthlyUsd} from './postgres-subscription-price.mjs';
 const checkCancelled=signal=>{if(signal?.aborted)throw signal.reason??new AppError(499,'管理查询已取消','request_cancelled');};
 
 export function stateQuery(params){
-  const value={sessionPage:1,sessionPageSize:25};
+  const value={sessionPage:1,sessionPageSize:20};
   if(params.has('view')){if(params.getAll('view').length!==1||!['full','overview','overview-cost','accounts','accounts-meta','sessions'].includes(params.get('view')))throw new AppError(400,'状态视图无效');value.view=params.get('view');}
   if(params.has('people')){if(params.getAll('people').length!==1||!['all','none'].includes(params.get('people')))throw new AppError(400,'员工加载模式无效');value.people=params.get('people');}
   for(const [name,field] of [['session_page','sessionPage'],['session_page_size','sessionPageSize']]){
@@ -104,7 +104,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       checkCancelled(signal);
       return {sessions,page,total,totalPages};
   }
-  async function execute({sessionPage=1,sessionPageSize=25,people='all',view='full',sessionQ='',sessionType='',sessionAccount='',sessionStatus=''}={},authorization,signal){
+  async function execute({sessionPage=1,sessionPageSize=20,people='all',view='full',sessionQ='',sessionType='',sessionAccount='',sessionStatus=''}={},authorization,signal){
     validateSessionFilters({sessionQ,sessionType,sessionAccount,sessionStatus});sessionQ=sessionQ.trim();
     if(!['full','overview','overview-cost','accounts','accounts-meta','sessions'].includes(view))throw new AppError(400,'状态视图无效');
     if(!['all','none'].includes(people))throw new AppError(400,'员工加载模式无效');

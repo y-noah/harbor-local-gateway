@@ -11,7 +11,7 @@ export function requestsQuery(params,{usageTypes=false}={}){
     if(!/^[1-9]\d*$/.test(raw)||!Number.isSafeInteger(Number(raw))||Number(raw)>max)throw new AppError(400,'请求分页参数无效');
     return Number(raw);
   };
-  const result={member:params.get('member')||'',model:params.get('model')||'',status:params.get('status')||'',page:positive('page',1,1e7),pageSize:positive('page_size',25,100)};
+  const result={member:params.get('member')||'',model:params.get('model')||'',status:params.get('status')||'',page:positive('page',1,1e7),pageSize:positive('page_size',20,100)};
   result.view=params.get('view')||'all';result.snapshot=params.get('snapshot')||'';result.cursor=params.get('cursor')||'';
   if(!['all','list','summary'].includes(result.view)||[result.snapshot,result.cursor].some(v=>v.length>2048)||result.cursor&&!result.snapshot)throw new AppError(400,'请求查询参数无效');
   if(result.member&&!/^[a-zA-Z0-9-]{1,100}$/.test(result.member)||result.model.length>200||/[\x00-\x1f]/.test(result.model)||result.status&&!requestStatuses.has(result.status))throw new AppError(400,'请求筛选条件无效');

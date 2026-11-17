@@ -152,19 +152,19 @@ PG 开发入口新增“使用类型默认配置”：A—F 分别表示复杂�
 
 PG 类型卡片的“预览并应用到此类员工”和员工详情的“预览并应用配置”共用固定目标批次，可分别应用默认模型／共享限额、可选同时修改分类。批量入口默认保留个人自定义、保留的旧配置和来源不明配置；员工详情的“应用类型配置”默认覆盖该员工的模型与限额例外，也可手动改为保留。两种入口都先生成预览，再由管理员确认执行；预览列出个人及逐 Key 变化，未删除的停用 Key 仍保持停用。每名员工的多 Key 与个人限额同事务修改，既有消耗不清零、已派发请求继续完成；后续新 Key 沿员工已应用默认。
 
-接口为 `POST /api/admin/member-config-batches/preview`，指定 `scope:{type_id}`（此类型全部未删除员工）或 `scope:{member_ids:[...]}`（固定选定员工），以及目标 `type_id`、`expected_type_version` 和明确布尔值 `models/limits/classify/overwrite_exceptions`。只保存预览，不立即修改员工。`GET /api/admin/member-config-batches/:id?after=0&limit=25` 返回有界逐人前后配置、例外和结果，`POST .../:id/execute` 只接受空对象并异步受理，由独立 `npm run worker:postgres` 执行。执行核对类型、模板、员工配置版本及原 Key 集合；变化项跳过，不重新扩大目标。保存成功指配置、审计和结果已真实提交，受理成功不等于完成。
+接口为 `POST /api/admin/member-config-batches/preview`，指定 `scope:{type_id}`（此类型全部未删除员工）或 `scope:{member_ids:[...]}`（固定选定员工），以及目标 `type_id`、`expected_type_version` 和明确布尔值 `models/limits/classify/overwrite_exceptions`。只保存预览，不立即修改员工。`GET /api/admin/member-config-batches/:id?after=0&limit=20` 返回有界逐人前后配置、例外和结果，`POST .../:id/execute` 只接受空对象并异步受理，由独立 `npm run worker:postgres` 执行。执行核对类型、模板、员工配置版本及原 Key 集合；变化项跳过，不重新扩大目标。保存成功指配置、审计和结果已真实提交，受理成功不等于完成。
 
-`POST .../:id/retry` 只从失败项生成新预览，保留原目标与版本；`POST .../:id/undo` 只从已应用项生成撤销预览。确认执行撤销前核对应用后完整配置，后续改动的对象跳过；还原使用新的递增版本，不倒退版本或恢复历史用量。Worker 中断只恢复未完成项，不重复应用已提交项；重试耗尽在结果中明确显示，可重新预览未完成项。若全部员工已提交而作业终态丢失，重试提交原批次完成状态并返回 `no_retry_needed:true`，不创建空批次，也可直接生成撤销预览。`DELETE .../:id` 取消剩余项，已完成配置保留。员工页“配置记录”可重开近7天预览／结果，`GET /api/admin/member-config-batches?before=<上一页末ID>&limit=25` 分页读取；更早记录只保留数据库。只有当前打开且执行中的结果自动刷新，历史、预览和配置表单不轮询。
+`POST .../:id/retry` 只从失败项生成新预览，保留原目标与版本；`POST .../:id/undo` 只从已应用项生成撤销预览。确认执行撤销前核对应用后完整配置，后续改动的对象跳过；还原使用新的递增版本，不倒退版本或恢复历史用量。Worker 中断只恢复未完成项，不重复应用已提交项；重试耗尽在结果中明确显示，可重新预览未完成项。若全部员工已提交而作业终态丢失，重试提交原批次完成状态并返回 `no_retry_needed:true`，不创建空批次，也可直接生成撤销预览。`DELETE .../:id` 取消剩余项，已完成配置保留。员工页“配置记录”可重开近7天预览／结果，`GET /api/admin/member-config-batches?before=<上一页末ID>&limit=20` 分页读取；更早记录只保留数据库。只有当前打开且执行中的结果自动刷新，历史、预览和配置表单不轮询。
 
 批次结束后同步员工缓存；新增 Key 前重新读取员工默认，并提交可选 `expected_defaults_version`，服务端在员工锁内核验，变化返回409，继承时省略 `allowed_models`。原 API 未提供此版本仍保持兼容，页面不会因旧员工缓存误提交“不限制”。员工选择保留旧默认时，其继承 Key 也作为保留例外；只有明确覆盖才共同改用新默认。
 
-`012-member-config-batches.sql` 追加批次和逐人配置记录，001—011迁移不改；操作者沿现有单管理员登录记为 `admin`，不接受客户端指定。仅保存必要配置与内部 Key ID，不复制访问 Key、账号凭据或对话。服务端构造参数默认 `maxTargets=1000`、`maxKeysPerMember=1000`、`maxPreviewBytes=4MiB`、`pageBytes=256KiB`、`ttlMs=1小时`，分别支持1–10000、1–10000、1KiB–64MiB、1KiB–2MiB、1分钟–24小时；超限整份预览回滚，不默默省略对象。默认页面25项、最多100项，并受字节上限约束。配置由服务器构造，不由请求覆盖；旧版本无此 Worker 处理器，回退前应处理或取消未完成批次，已应用配置不会自动倒回。
+`012-member-config-batches.sql` 追加批次和逐人配置记录，001—011迁移不改；操作者沿现有单管理员登录记为 `admin`，不接受客户端指定。仅保存必要配置与内部 Key ID，不复制访问 Key、账号凭据或对话。服务端构造参数默认 `maxTargets=1000`、`maxKeysPerMember=1000`、`maxPreviewBytes=4MiB`、`pageBytes=256KiB`、`ttlMs=1小时`，分别支持1–10000、1–10000、1KiB–64MiB、1KiB–2MiB、1分钟–24小时；超限整份预览回滚，不默默省略对象。默认页面20项、最多100项，并受字节上限约束。配置由服务器构造，不由请求覆盖；旧版本无此 Worker 处理器，回退前应处理或取消未完成批次，已应用配置不会自动倒回。
 
-PG 员工页使用 `GET /api/admin/members?page=1&page_size=25&q=&type_id=&status=`，名称按字面子串搜索，类型可选目录 ID／`unclassified`，状态可选 `enabled/disabled`；默认25项、最多100项，服务端排序分页。行内显示员工当前类型、Key数量、默认模型与配置来源、精确滚动限额及剩余、近7天／12小时参考USD和最近使用。列表不读取或解密 Key 凭据。筛选／搜索变化清空选择，页大小与分页保留在当前页面状态；搜索防抖且取消旧请求，加载期间禁用旧范围操作。
+PG 员工页使用 `GET /api/admin/members?page=1&page_size=20&q=&type_id=&status=`，名称按字面子串搜索，类型可选目录 ID／`unclassified`，状态可选 `enabled/disabled`；默认20项、最多100项，服务端排序分页。行内显示员工当前类型、Key数量、默认模型与配置来源、精确滚动限额及剩余、近7天／12小时参考USD和最近使用。列表不读取或解密 Key 凭据。筛选／搜索变化清空选择，页大小与分页保留在当前页面状态；搜索防抖且取消旧请求，加载期间禁用旧范围操作。
 
 选择本页以稳定员工 ID 跨页累计；“选择全部筛选结果”通过 `GET /api/admin/members/selection` 固定当前条件下的ID与分类／默认版本，默认最多1000人，超限明确拒绝而非返回部分目标。批次 `scope.member_versions` 可同时携带这些版本；选择后分类／配置已变时，预览返回409要求重新选择，预览后发生变化仍按原逐人跳过规则。整类配置与已选员工配置入口分开，搜索条件不暗中缩小整类范围。
 
-`GET /api/admin/members/:id` 只返回单员工概要；`GET .../:id/keys?page=1&page_size=25` 才加载该员工当前页Key配置与完整凭据，沿现有管理员鉴权及加密验证，支持翻页和复制。`GET /api/admin/keys?page=1&page_size=25&q=&member_id=` 为“使用数据 → Key 用量”独立分页，只返回前缀及用量，不返回凭据；运行总览不再读取该明细。API固定会话选择员工也改用已启用员工分页搜索，不依赖全量员工或Key缓存。迟到结果不能替换新弹窗或其他页面，无新增全局轮询。
+`GET /api/admin/members/:id` 只返回单员工概要；`GET .../:id/keys?page=1&page_size=20` 才加载该员工当前页Key配置与完整凭据，沿现有管理员鉴权及加密验证，支持翻页和复制。`GET /api/admin/keys?page=1&page_size=20&q=&member_id=` 为“使用数据 → Key 用量”独立分页，只返回前缀及用量，不返回凭据；运行总览不再读取该明细。API固定会话选择员工也改用已启用员工分页搜索，不依赖全量员工或Key缓存。迟到结果不能替换新弹窗或其他页面，无新增全局轮询。
 
 页面读取 `/api/admin/state?people=none`，只保留公司总计、员工／Key数量和其他原状态，不读取员工或Key配置、也不解密凭据。未提供 `people` 的旧API保持完整状态格式，但服务端 `maxPeople` 默认1000（1–10000）限制员工与Key数量，超过返回 `state_people_capacity`，不能成为无上限旁路；此参数是构造期配置，客户端不能放宽。员工／Key页的单页响应默认最多512KiB（服务端构造参数 `pageBytes` 支持1KiB–2MiB），超限明确拒绝，不隐藏部分结果。013迁移只增加员工／Key排序与请求用量索引，001—012不改；分页关闭或回退仍保留数据，旧SQLite页面行为保持原样。
 

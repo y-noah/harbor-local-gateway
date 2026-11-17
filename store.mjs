@@ -247,7 +247,7 @@ export class Store {
       this.db.exec('COMMIT');
     } catch(e) {this.db.exec('ROLLBACK');throw e;}
   }
-  snapshot(at=now(),{sessionPage=1,sessionPageSize=25}={}) {
+  snapshot(at=now(),{sessionPage=1,sessionPageSize=20}={}) {
     if(!Number.isSafeInteger(sessionPage)||sessionPage<1||!Number.isSafeInteger(sessionPageSize)||sessionPageSize<1||sessionPageSize>100)throw new AppError(400,'会话分页参数无效');
     const window=this.pruneUsage(at),where='COALESCE(ended,started)>=? AND COALESCE(ended,started)<?',range=[window.start,window.end];
     const sessionFrom='FROM sessions s JOIN members m ON m.id=s.member_id JOIN accounts a ON a.id=s.account_id WHERE s.updated>=? AND s.updated<?';

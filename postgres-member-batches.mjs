@@ -76,7 +76,7 @@ export function createPostgresMemberBatches(store,{readStore=store,clock=Date.no
     const value=await target.get('SELECT * FROM harbor.member_config_batches WHERE id=$1 AND created>=$2 AND created<$3'+(departmentScope?.view==='department'?' AND department_id=$4':'')+(lock?' FOR UPDATE':''),batchId,window.start,window.end,...(departmentScope?.view==='department'?[departmentScope.department_id]:[]));
     if(!value)fail(404,'配置批次不存在或超出查询范围','member_batch_not_found');return value;
   }
-  async function status(batchId,{after=0,limit=25,signal,scope}={}){
+  async function status(batchId,{after=0,limit=20,signal,scope}={}){
     const authorization=await departments.resolve(scope);
     if(!Number.isSafeInteger(after)||after<0||!Number.isSafeInteger(limit)||limit<1||limit>100)fail(400,'配置批次分页无效');
     return read(()=>readStore.transaction(async()=>{
@@ -160,7 +160,7 @@ export function createPostgresMemberBatches(store,{readStore=store,clock=Date.no
     if(path==='/api/admin/member-config-batches'&&method==='GET'){
       const authorization=await departments.resolve(scope);
       if([...params.keys()].some(key=>!['before','limit'].includes(key)||params.getAll(key).length!==1)||params.has('before')&&!uuid(params.get('before'))||params.has('limit')&&!/^\d+$/.test(params.get('limit')))fail(400,'配置记录分页无效');
-      const limit=Number(params.get('limit')??25);if(!Number.isSafeInteger(limit)||limit<1||limit>100)fail(400,'配置记录分页无效');
+      const limit=Number(params.get('limit')??20);if(!Number.isSafeInteger(limit)||limit<1||limit>100)fail(400,'配置记录分页无效');
       return {status:200,value:await read(()=>readStore.transaction(async()=>{
         const window=usageWindow(clock()),cursor=params.has('before')?await batch(readStore,params.get('before'),{departmentScope:authorization}):null,rows=await readStore.all(`SELECT b.id,b.created,b.status,b.direction,b.parent_id,b.operation,
           (SELECT COUNT(*) FROM harbor.member_config_batch_items i WHERE i.batch_id=b.id) members
@@ -170,7 +170,7 @@ export function createPostgresMemberBatches(store,{readStore=store,clock=Date.no
     }
     if(path==='/api/admin/member-config-batches/preview'&&method==='POST')return {status:201,value:await preview(payload,{scope})};
     const match=path.match(/^\/api\/admin\/member-config-batches\/([a-f0-9-]{36})(?:\/(execute|retry|undo))?$/);if(!match)return null;
-    if(method==='GET'&&!match[2]){if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'配置批次分页无效');return {status:200,value:await status(match[1],{signal,scope,after:Number(params.get('after')??0),limit:Number(params.get('limit')??25)})};}
+    if(method==='GET'&&!match[2]){if([...params.keys()].some(key=>!['after','limit'].includes(key)||params.getAll(key).length!==1)||['after','limit'].some(key=>params.has(key)&&!/^\d+$/.test(params.get(key))))fail(400,'配置批次分页无效');return {status:200,value:await status(match[1],{signal,scope,after:Number(params.get('after')??0),limit:Number(params.get('limit')??20)})};}
     if(method==='POST'&&match[2]){if(!fields(payload,[])||Object.keys(payload).length)fail(400,'操作不接受替换预览目标');return {status:match[2]==='execute'?202:201,value:await (match[2]==='execute'?submit(match[1],{scope}):derived(match[1],match[2],{scope}))};}
     if(method==='DELETE'&&!match[2])return {status:200,value:await cancel(match[1],{scope})};return null;
   }
