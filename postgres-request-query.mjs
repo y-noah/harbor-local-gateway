@@ -7,16 +7,18 @@ import {createQueryDepartments,departmentPredicate,queryDepartmentIdentity} from
 
 const invalid=()=>{throw new AppError(400,'请求分页快照已失效，请刷新列表','invalid_request_snapshot');};
 const encode=value=>Buffer.from(JSON.stringify(value)).toString('base64url');
+const checkCancelled=signal=>{if(signal?.aborted)throw signal.reason??new AppError(499,'管理查询已取消','request_cancelled');};
 function cursor(value){try{if(typeof value!=='string'||value.length>2048||!/^[A-Za-z0-9_-]+$/.test(value))invalid();return JSON.parse(Buffer.from(value,'base64url'));}catch{invalid();}}
 export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs=3600000,maxSnapshots=4096,maxConcurrent=2,maxQueued=8,queueTimeoutMs=15000,queryQueue,businessOutcomes=false,readInputPreviews}={}){
   if(typeof businessOutcomes!=='boolean'||!Number.isSafeInteger(snapshotTtlMs)||snapshotTtlMs<60000||snapshotTtlMs>86400000||!Number.isInteger(maxSnapshots)||maxSnapshots<8||maxSnapshots>65536||!Number.isInteger(maxConcurrent)||maxConcurrent<1||maxConcurrent>8||!Number.isInteger(maxQueued)||maxQueued<0||maxQueued>64||!Number.isInteger(queueTimeoutMs)||queueTimeoutMs<100||queueTimeoutMs>60000)throw new AppError(503,'管理查询资源配置无效','query_configuration');
   const queue=queryQueue||createPostgresQueryQueue({maxConcurrent,maxQueued,queueTimeoutMs});
   const departments=createQueryDepartments(store);
-  async function scope(query,at,authorization){
+  async function scope(query,at,authorization,signal){
     const typeScope=typeStatisticsConditions({type:query.type||'',member:query.member||'',model:query.model||'',status:query.outcome||'',from:query.from??null,to:query.to??null,memberMissing:query.memberMissing??false,modelMissing:query.modelMissing??false},{at,departmentScope:authorization});
     const window=typeScope.window,extraFilters=[query.type||'',query.outcome||'',query.memberMissing??false,query.modelMissing??false,query.from??null,query.to??null,query.device||''],identity=JSON.stringify([query.member||'',query.model||'',query.status||'',...(extraFilters.some(value=>value!==''&&value!==false&&value!==null)?extraFilters:[])]);
     const scopeIdentity=queryDepartmentIdentity(authorization),filters=authorization===null?identity:JSON.stringify([scopeIdentity,identity]);
     const visible=(await store.get('SELECT pg_current_snapshot()::text visibility')).visibility;
+    checkCancelled(signal);
     let snapshot=query.snapshot,visibility;
     if(snapshot){
       if(!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(snapshot))invalid();
@@ -31,8 +33,9 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
     if(query.status){args.push(query.status);clauses.push('r.status=$'+args.length);}
     return {window,snapshot,args,authorization,where:' WHERE '+clauses.join(' AND '),observedAt:at,watermark:createHash('sha256').update(scopeIdentity+'\0'+visible).digest('hex').slice(0,24),watermarkKind:'postgres_visibility'};
   }
-  async function list(query,scope,total){
+  async function list(query,scope,total,signal){
     const {where,args,window,snapshot}=scope;if(total===undefined)total=(await store.get('SELECT COUNT(*) n FROM harbor.requests r'+where,...args)).n;
+    checkCancelled(signal);
     const totalPages=Math.max(1,Math.ceil(total/query.pageSize)),page=query.cursor?query.page:Math.min(query.page,totalPages),extra=[];let seek='';
     if(query.cursor){const key=cursor(query.cursor);if(!key||key.snapshot!==snapshot||!Number.isSafeInteger(key.started)||typeof key.id!=='string'||!key.id.length||key.id.length>100||/[\x00-\x1f]/.test(key.id))invalid();extra.push(key.started,key.id);seek=` AND (r.started,r.id)<($${args.length+1},$${args.length+2})`;}
     const values=[...args,...extra,query.pageSize+1],limit='$'+values.length;
@@ -45,10 +48,12 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
         ORDER BY r.started DESC,r.id DESC LIMIT ${limit}${query.cursor?'':' OFFSET $'+values.length}) r
       LEFT JOIN harbor.members m ON m.id=r.member_id LEFT JOIN harbor.accounts a ON a.id=r.account_id${joins}
       ORDER BY r.started DESC,r.id DESC`,...values);
+    checkCancelled(signal);
     const selected=rows.slice(0,query.pageSize),last=selected.at(-1),previews=readInputPreviews?await readInputPreviews(selected.map(row=>row.id),{scope:scope.authorization??undefined}):null;
+    checkCancelled(signal);
     return {pagination:{page,pageSize:query.pageSize,total,totalPages,cursorMode:!!query.cursor,nextCursor:rows.length>query.pageSize?encode({snapshot,started:last.started,id:last.id}):null},rows:selected.map(r=>({...decorate(r,window.start),...previews?.get(r.id)}))};
   }
-  async function statistics(query,scope){
+  async function statistics(query,scope,signal){
     const rows=await store.all(`WITH data AS (
       SELECT r.member_id,m.name member_name,COALESCE(NULLIF(r.billing_model,''),NULLIF(r.model,'')) chosen_model,${businessOutcomes?'r.business_status':'r.status'} status,r.started,r.ended,
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
@@ -60,6 +65,7 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
     SELECT GROUPING(chosen_model) g_model,GROUPING(member_id) g_member,chosen_model,member_id,MAX(member_name) member_name,
       ${referenceRollupAggregateSql()}
       FROM partial GROUP BY GROUPING SETS((),(chosen_model),(member_id))`,...scope.args);
+    checkCancelled(signal);
     const byModel=[],byMember=[];let summary;
     for(const row of rows){const value=aggregate(row);if(row.g_model&&row.g_member)summary=value;else if(!row.g_model)byModel.push({model:row.chosen_model,...value});else byMember.push({member_id:row.member_id,member_name:row.member_name,...value});}
     const sort=key=>(a,b)=>{const x=a.standard.total_exact===null?null:a.standard.total_exact,y=b.standard.total_exact===null?null:b.standard.total_exact;
@@ -68,20 +74,26 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
     byModel.sort(sort('model'));byMember.sort(sort('member_id'));
     const candidateArgs=[scope.window.start,scope.window.end],candidateDepartment=departmentPredicate(scope.authorization,'r',candidateArgs);
     const models=(await store.all("SELECT DISTINCT COALESCE(r.billing_model,r.model) model FROM harbor.requests r WHERE r.usage_at>=$1 AND r.usage_at<$2 AND "+candidateDepartment+" AND COALESCE(r.billing_model,r.model) IS NOT NULL AND COALESCE(r.billing_model,r.model)<>'' ORDER BY model",...candidateArgs)).map(r=>r.model);
+    checkCancelled(signal);
     const members=await store.all('SELECT m.id,m.name,m.removed_at FROM harbor.members m WHERE EXISTS(SELECT 1 FROM harbor.requests r WHERE r.member_id=m.id AND r.usage_at>=$1 AND r.usage_at<$2 AND '+candidateDepartment+') ORDER BY m.name,m.id',...candidateArgs);
+    checkCancelled(signal);
     return {summary,byModel,byMember,models,members};
   }
-  const execute=async(query,authorization)=>{
+  const execute=async(query,authorization,signal)=>{
+    checkCancelled(signal);
     const at=clock();
     // Cache cleanup is an autocommit READ COMMITTED statement, outside the
     // repeatable business read. Concurrent readers may delete the same expired
     // cache entries without turning routine eviction into serialization errors.
     if(!query.snapshot)await store.run(authorization===null?'DELETE FROM harbor.request_query_snapshots WHERE expires_at<=$1 OR id IN (SELECT id FROM harbor.request_query_snapshots WHERE expires_at>$1 ORDER BY created DESC,id DESC OFFSET $2)':'DELETE FROM harbor.request_query_snapshots WHERE scope_identity=$3 AND (expires_at<=$1 OR id IN (SELECT id FROM harbor.request_query_snapshots WHERE expires_at>$1 AND scope_identity=$3 ORDER BY created DESC,id DESC OFFSET $2))',at,maxSnapshots-1,...(authorization===null?[]:[queryDepartmentIdentity(authorization)]));
+    checkCancelled(signal);
     return store.transaction(async()=>{
-      const current=await scope(query,at,authorization),{args,where,authorization:privateScope,...metadata}=current;
-      const stats=query.view==='list'?null:await statistics(query,current);
-      return {...metadata,...(query.view==='summary'?{}:await list(query,current,stats?.summary.requests)),...(stats??{})};
+      checkCancelled(signal);
+      const current=await scope(query,at,authorization,signal),{args,where,authorization:privateScope,...metadata}=current;
+      checkCancelled(signal);
+      const stats=query.view==='list'?null:await statistics(query,current,signal);
+      return {...metadata,...(query.view==='summary'?{}:await list(query,current,stats?.summary.requests,signal)),...(stats??{})};
     },{level:'REPEATABLE READ'});
   };
-  return {read:(query,{signal,scope}={})=>{const input={...query};return queue.run(async()=>execute(input,await departments.resolve(scope)),{signal});},close:()=>queue.close(),status:()=>queue.status(),queue};
+  return {read:(query,{signal,scope}={})=>{const input={...query};return queue.run(async()=>execute(input,await departments.resolve(scope),signal),{signal});},close:()=>queue.close(),status:()=>queue.status(),queue};
 }

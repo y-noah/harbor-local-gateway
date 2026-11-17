@@ -34,3 +34,25 @@ test('overview and request queries share one admission budget and release it aft
   release();await first;await queue.close();assert.equal(states.status().active,0);
   const another=createPostgresQueryQueue();await assert.rejects(another.run(()=>{throw new AppError(503,'synthetic sync stop','fixture_stop');}),{code:'fixture_stop'});await another.close();assert.equal(another.status().active,0);
 });
+
+test('取消已执行请求后保留真实槽位，当前阶段结束即停止后续查询',{timeout:5000},async t=>{
+ for(const stage of ['cleanup','visibility','snapshot','count','rows','previews','statistics','models','members'])await t.test(stage,async()=>{
+  const controller=new AbortController(),reason=new AppError(499,'合成取消','request_cancelled'),calls=[];
+  let release,entered;const gate=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);
+  const step=async(name,value)=>{calls.push(name);if(name===stage){entered();await gate;}return value;};
+  const store=legacyStore({
+   run:async sql=>step(sql.startsWith('DELETE')?'cleanup':'snapshot'),
+   get:async sql=>sql.includes('pg_current_snapshot')?step('visibility',{visibility:'1:2:'}):step('count',{n:0}),
+   all:async sql=>step(sql.includes('WITH data AS')?'statistics':sql.startsWith('SELECT DISTINCT')?'models':sql.startsWith('SELECT m.id')?'members':'rows',[]),
+   transaction:async fn=>fn(),
+  });
+  const reader=createPostgresRequestQueries(store,{maxConcurrent:1,maxQueued:0,readInputPreviews:async()=>step('previews',new Map())});
+  const view=['statistics','models','members'].includes(stage)?'summary':'list';
+  const result=assert.rejects(reader.read({view,page:1,pageSize:20},{signal:controller.signal}),error=>error===reason);
+  try{
+   await started;controller.abort(reason);assert.equal(reader.status().active,1);
+   await assert.rejects(reader.read({view:'list',page:1,pageSize:20}),{code:'query_queue_full'});
+   const before=[...calls];release();await result;await reader.close();assert.deepEqual(calls,before);assert.equal(reader.status().active,0);
+  }finally{release();await result;await reader.close();}
+ });
+});
