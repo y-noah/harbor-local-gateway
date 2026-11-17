@@ -5,6 +5,10 @@ import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
 import {typeStatisticsConditions} from './postgres-type-statistics.mjs';
 import {createQueryDepartments,departmentPredicate,queryDepartmentIdentity} from './postgres-query-departments.mjs';
 
+// Keep summary price work proportional to the selected request window instead
+// of scanning the price table accumulated across all historical windows.
+const statisticsJoins=` LEFT JOIN LATERAL (SELECT state,revision,${fields.map(field=>field+'_atoms').join(',')} FROM harbor.request_prices WHERE request_id=r.id OFFSET 0) p ON TRUE LEFT JOIN harbor.pricing_versions v ON v.id=r.price_version`;
+
 const invalid=()=>{throw new AppError(400,'请求分页快照已失效，请刷新列表','invalid_request_snapshot');};
 const encode=value=>Buffer.from(JSON.stringify(value)).toString('base64url');
 const checkCancelled=signal=>{if(signal?.aborted)throw signal.reason??new AppError(499,'管理查询已取消','request_cancelled');};
@@ -59,7 +63,7 @@ export function createPostgresRequestQueries(store,{clock=Date.now,snapshotTtlMs
         CASE WHEN ${validPrice} THEN p.state ELSE 'unpriced' END price_state,
         r.price_version revision,
         ${fields.map(f=>`CASE WHEN ${validPrice} THEN p.${f}_atoms ELSE NULL END ${f}`).join(',')}
-      FROM harbor.requests r LEFT JOIN harbor.members m ON m.id=r.member_id${joins}${scope.where}
+      FROM harbor.requests r LEFT JOIN harbor.members m ON m.id=r.member_id${statisticsJoins}${scope.where}
     ),partial AS MATERIALIZED(SELECT chosen_model,member_id,MIN(member_name) member_name,revision,${referencePartialAggregateSql()}
       FROM data GROUP BY chosen_model,member_id,revision)
     SELECT GROUPING(chosen_model) g_model,GROUPING(member_id) g_member,chosen_model,member_id,MAX(member_name) member_name,
