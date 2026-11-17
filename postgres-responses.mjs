@@ -1,3 +1,4 @@
+import {canonicalMeteringDiagnostic,transportMeteringDiagnostic} from './request-metering-diagnostic.mjs';
 import {createRouteAdmissionWait} from './postgres-route-wait.mjs';
 import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
 import {requireDepartmentScope} from './department-access.mjs';
@@ -272,8 +273,12 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(failed&&typeof value.code==='string'&&/^[a-z][a-z0-9_]{0,79}$/.test(value.code))attempt.error_code=value.code;
     };
     const settle=async result=>{
+      const observed=canonicalMeteringDiagnostic(result.meteringDiagnostic),interruption=controller.signal.aborted?(controller.signal.reason?.code==='service_shutdown'?'gateway_shutdown':'client_cancelled'):'none';
+      const receivedUsage=dispatched&&result.usageKnown===true&&[result.input,result.output,result.cached??0].every(value=>Number.isSafeInteger(value)&&value>=0)&&(result.cached??0)<=result.input;
+      const meteringDiagnostic=observed?{...observed,...(interruption!=='none'?{interruption}:{})}:transportMeteringDiagnostic({usageKnown:result.usageKnown===true,usageState:receivedUsage?'valid':'missing',dispatched,interruption});
+      result={...result,meteringDiagnostic};
       settlementAttempted=true;await attemptPersistence;if(consumption?.schemaAvailable)result={...result,consumptionAttempts:consumptionSelection?[{...consumptionSelection.first_attempt}]:attemptSnapshot(),...(consumptionSelection?{consumptionSelection}:{})};const at=clock();
-      receipt.settlement={requestId,at,result:Object.fromEntries(['status','input','output','cached','usageKnown','actualModel','upstreamRequestId','consumptionAttempts','consumptionSelection','quotaSubjectDenial'].filter(key=>result[key]!==undefined).map(key=>[key,result[key]]))};
+      receipt.settlement={requestId,at,result:Object.fromEntries(['status','input','output','cached','usageKnown','actualModel','upstreamRequestId','consumptionAttempts','consumptionSelection','quotaSubjectDenial','meteringDiagnostic'].filter(key=>result[key]!==undefined).map(key=>[key,result[key]]))};
       try{await store.finish(requestId,result,at);await extraBoundary?.settle();return true;}
       catch{
         if(!meteringRecovery.settle(requestId,result,at))throw new AppError(503,'用量结算暂存已满，需管理员核对本次请求','metering_unavailable');

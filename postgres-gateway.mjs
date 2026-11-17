@@ -194,7 +194,7 @@ export async function createPostgresGateway(options={}){
     if(recovered.queued||recovered.files)throw new AppError(503,'关键计量暂存尚未恢复，禁止接纳新请求','metering_recovery_required');
     await buffer.flush();let interrupted=0;const recoveredAt=clock();
     for(;;){requireOwnership();const rows=await store.all("SELECT id FROM harbor.requests WHERE ended IS NULL AND status IN ('queued','running') AND pg_visible_in_snapshot(inserted_xid,$1::pg_snapshot) ORDER BY started,id LIMIT 100",startupVisibility);if(!rows.length)break;
-      for(const row of rows){requireOwnership();await store.finish(row.id,{status:'interrupted',usageKnown:false},recoveredAt);interrupted++;}
+      for(const row of rows){requireOwnership();await store.finish(row.id,{status:'interrupted',usageKnown:false,meteringDiagnostic:{version:1,reason:'startup_interrupted',terminal:'none',interruption:'startup',usage_known:false}},recoveredAt);interrupted++;}
     }
     for(;;){requireOwnership();const rows=await store.all("SELECT id FROM harbor.requests WHERE recording_state='pending' AND pg_visible_in_snapshot(inserted_xid,$1::pg_snapshot) ORDER BY id LIMIT 1000",startupVisibility);if(!rows.length)break;
       await store.run("UPDATE harbor.requests SET recording_state='partial',recording_reason=COALESCE(recording_reason,'process_interrupted') WHERE id=ANY($1::text[]) AND recording_state='pending'",rows.map(row=>row.id));

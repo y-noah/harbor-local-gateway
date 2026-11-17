@@ -1,3 +1,4 @@
+import {settlementMeteringDiagnostic} from './request-metering-diagnostic.mjs';
 import {createDepartmentScopeIssuer,requireDepartmentScope} from './department-access.mjs';
 import {verifyDepartmentIsolationAvailability,assertDepartmentIsolationReadiness} from './postgres-departments.mjs';
 import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
@@ -308,7 +309,7 @@ export class PostgresStore{
         const candidate=await this.#operationQuote({...next,price_version:active},books);if(candidate.state==='priced')next.price_version=active;
       }
       let history;try{history=JSON.parse(row.phase_history);}catch{}if(!Array.isArray(history))history=[];
-      const streamTiming=canonicalStreamTiming(result.streamTiming);history.push({phase:status,at,...(streamTiming?{stream_timing:streamTiming}:{})});
+      const streamTiming=canonicalStreamTiming(result.streamTiming),metering=settlementMeteringDiagnostic(result.meteringDiagnostic,result);history.push({phase:status,at,...(streamTiming?{stream_timing:streamTiming}:{}),...(metering?{metering}:{})});
       const settledRow=await this.get(`UPDATE harbor.requests SET ended=$1,status=$2,business_status=$2,input=$3,output=$4,cached=$5,usage_unknown=$6,billing_model=$7,price_version=$8,
         reserved=CASE WHEN $6=0 THEN 0 ELSE reserved END,phase=$2,phase_at=$1,phase_history=$9,upstream_request_id=COALESCE($11,upstream_request_id) WHERE id=$10 RETURNING *`,at,status,input,output,cached,next.usage_unknown,actualModel,next.price_version,JSON.stringify(history.slice(-32)),requestId,safeUpstreamRequestId(result.upstreamRequestId));
       const total=(BigInt(input)+BigInt(output)).toString();

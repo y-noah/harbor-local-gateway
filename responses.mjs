@@ -1,3 +1,4 @@
+import {responseUsageState,transportMeteringDiagnostic} from './request-metering-diagnostic.mjs';
 import {safeUpstreamRequestId} from './request-parameters.mjs';
 import {createStreamingStageObserver} from './streaming-stage-observer.mjs';
 import {readFileSync,lstatSync} from 'node:fs';
@@ -107,16 +108,10 @@ function failure(status){
   if(status===404)return new AppError(404,'上游模型或接口不存在','upstream_not_found');
   return new AppError(502,'上游服务暂不可用','upstream_error');
 }
-export function responseUsage(response){
-  const usage=response?.usage;
-  if(!usage||!['input_tokens','output_tokens'].every(k=>Number.isSafeInteger(usage[k])&&usage[k]>=0))return null;
-  const cached=usage.input_tokens_details?.cached_tokens??0;
-  if(!Number.isSafeInteger(cached)||cached<0||cached>usage.input_tokens)return null;
-  return {input:usage.input_tokens,output:usage.output_tokens,cached};
-}
+export function responseUsage(response){return responseUsageState(response).usage;}
 // Only inspect complete frames already delivered by the body reader. This is
 // failure-path metadata recovery, never a drain, replay or successful delivery.
-function receivedTerminalUsage(tail,{output,maxBytes,maxFrames}){
+function receivedTerminalFacts(tail,{output,maxBytes,maxFrames}){
   if(!tail||Buffer.byteLength(tail)>maxBytes)return null;
   let position=0,frames=0,terminal=null;
   try{
@@ -128,10 +123,13 @@ function receivedTerminalUsage(tail,{output,maxBytes,maxFrames}){
       if(!data||data==='[DONE]')continue;if(terminal)return null;
       output?.resize('sse:usage-recovery',frame.length*8+Buffer.byteLength(data));
       const event=JSON.parse(data);if(typeof event?.type!=='string'||!/^[-a-zA-Z0-9_.]+$/.test(event.type))return null;
-      if(event.type==='response.completed'){
-        const usage=event.response?.status==='completed'?responseUsage(event.response):null;
-        if(!usage)return null;terminal={usage,...(typeof event.response.model==='string'?{actualModel:event.response.model}:{})};
-      }else if(['response.failed','response.incomplete','error'].includes(event.type))return null;
+      if(['response.completed','response.failed','response.incomplete','error'].includes(event.type)){
+        const observed=responseUsageState(event.response),type=event.type==='response.completed'?'completed':event.type==='response.incomplete'?'incomplete':'failed';
+        // Observing a terminal and accepting its counters are separate facts.
+        // Preserve the original completed-only metering recovery qualification.
+        const usage=type==='completed'&&event.response?.status==='completed'?observed.usage:null;
+        terminal={terminal:type,usageState:observed.state,usage,...(typeof event.response?.model==='string'?{actualModel:event.response.model}:{})};
+      }
     }
     // A trailing partial frame is not a completed upstream terminal, even when
     // it happens to contain parseable JSON. Do not read again to complete it.
@@ -146,9 +144,9 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
   if(!Number.isSafeInteger(bufferedUsageMaxBytes)||bufferedUsageMaxBytes<0||bufferedUsageMaxBytes>512*1024*1024||!Number.isInteger(bufferedUsageMaxFrames)||bufferedUsageMaxFrames<1||bufferedUsageMaxFrames>65536)throw new AppError(503,'已接收用量恢复预算无效','upstream_configuration');
   if(!Number.isSafeInteger(maxJsonResponseBytes)||maxJsonResponseBytes<256||maxJsonResponseBytes>512*1024*1024)throw new AppError(503,'JSON响应读取上限无效','upstream_configuration');
   if(!Number.isSafeInteger(maxCatalogResponseBytes)||maxCatalogResponseBytes<256||maxCatalogResponseBytes>128*1024*1024||!Number.isInteger(maxCatalogEntries)||maxCatalogEntries<1||maxCatalogEntries>256)throw new AppError(503,'模型目录资源配置无效','upstream_configuration');
-  async function jsonResponse(response,output){
+  async function jsonResponse(response,output,onReadFailure){
     if(!response.body)throw new AppError(502,'上游工具响应为空','upstream_protocol');
-    try{return await readOutputJson(response,{maxBytes:maxJsonResponseBytes,output,prefix:'json'});}
+    try{return await readOutputJson(response,{maxBytes:maxJsonResponseBytes,output,prefix:'json',onReadFailure});}
     catch(error){if(error instanceof AppError)throw error;throw new AppError(502,'上游工具返回了无效或中断的JSON','upstream_protocol');}
   }
   const stages=createStreamingStageObserver(stageObserver);
@@ -174,28 +172,29 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
     try{result=await fetchImpl((apiKeyMode?'https://api.openai.com/v1':upstreamOrigin)+path,{method:payload?'POST':'GET',headers,body,signal,redirect:'error'});}
     catch{throw Object.assign(new AppError(502,'连接上游失败或请求已取消','upstream_connection'),{usageKnown:!payload});}
     observeTiming(timing,'headers');
-    if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?createApiQuotaRejection():[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{upstreamRequestId:safeUpstreamRequestId(result.headers.get('x-request-id')),usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
+    if(!result.ok){const details=await errorPayload(result);const classified=apiKeyMode&&result.status===401?Object.assign(new AppError(503,'官方API Key认证失效，请检查或更换Key','upstream_authentication'),{routeFailure:'login_expired'}):apiKeyMode&&result.status===429&&details?.error?.code==='insufficient_quota'?createApiQuotaRejection():[401,403,429].includes(result.status)?structuredFailure(details):null;throw Object.assign(classified||failure(result.status),{meteringUpstreamRejected:true,upstreamRequestId:safeUpstreamRequestId(result.headers.get('x-request-id')),usageKnown:!payload||(result.status>=400&&result.status<500&&result.status!==408)});}
     return result;
   }
   async function runJson({binary,home,path,payload,sessionId,signal,protocolHeaders,output,onPhase=()=>{},beforeDispatch,onDispatch=()=>{},timing}){
     if(apiKeyMode)throw Object.assign(new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route'),{usageKnown:true});
     if(!codexJsonRoutes.has(path))throw new AppError(404,'接口不存在');
-    const stage=stages.capture();let usage=null,actualModel,upstreamRequestId,dispatched=false;
+    const stage=stages.capture();let usage=null,actualModel,upstreamRequestId,dispatched=false,terminal='none',usageState='missing',bodyReadFailed=false;
     try{
       const result=await request(binary,home,path,{payload,signal,sessionId,protocolHeaders,accept:'application/json',onPhase,beforeDispatch,stage,timing,onDispatch:()=>{dispatched=true;onDispatch();}});
       upstreamRequestId=safeUpstreamRequestId(result.headers.get('x-request-id'));
       onPhase('streaming');
-      const response=await jsonResponse(result,output);
+      const response=await jsonResponse(result,output,()=>{bodyReadFailed=true;});
       if(!response||typeof response!=='object'||Array.isArray(response))throw new AppError(502,'上游工具响应无效','upstream_protocol');
-      usage=responseUsage(response);
+      terminal='json';({usage,state:usageState}=responseUsageState(response));
       actualModel=typeof response.model==='string'?response.model:undefined;
       if(!Array.isArray(response.data)||!response.data.length||response.data.some(image=>typeof image?.b64_json!=='string'||!image.b64_json))throw new AppError(502,'上游图片响应缺少图片数据','upstream_protocol');
-      return {input:0,output:0,cached:0,...usage,usageKnown:!!usage,...(actualModel?{actualModel}:{}),...(upstreamRequestId?{upstreamRequestId}:{}),response};
+      return {input:0,output:0,cached:0,...usage,usageKnown:!!usage,meteringDiagnostic:transportMeteringDiagnostic({usageKnown:!!usage,usageState,terminal,dispatched}),...(actualModel?{actualModel}:{}),...(upstreamRequestId?{upstreamRequestId}:{}),response};
     }catch(error){
       upstreamRequestId??=safeUpstreamRequestId(error.upstreamRequestId);
+      const rejected=error.meteringUpstreamRejected===true,interruption=signal?.aborted?(signal.reason?.code==='service_shutdown'?'gateway_shutdown':'client_cancelled'):bodyReadFailed||error.code==='upstream_connection'?'upstream':'none';
       if(signal?.aborted)error=new AppError(499,'客户端已取消或服务停止','request_cancelled');
       if(!(error instanceof AppError))error=new AppError(502,'上游工具连接中断','upstream_connection');
-      throw Object.assign(error,usage||{},{actualModel,...(upstreamRequestId?{upstreamRequestId}:{}),usageKnown:!!usage||error.usageKnown===true||!dispatched});
+      throw Object.assign(error,usage||{},{actualModel,...(upstreamRequestId?{upstreamRequestId}:{}),usageKnown:!!usage||error.usageKnown===true||!dispatched,meteringDiagnostic:transportMeteringDiagnostic({usageKnown:!!usage||error.usageKnown===true||!dispatched,usageState,terminal,dispatched,rejected,interruption})});
     }finally{observeTiming(timing,'transportEnd');stage.emit('transport-end');}
   }
   async function models({binary,home,signal,force=false}){
@@ -209,7 +208,7 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
   }
   async function run({binary,home,payload,sessionId,signal,protocolHeaders,collectOutput=true,output,onEvent=async()=>{},onPhase=()=>{},beforeDispatch,onDispatch=()=>{},timing}){
     const stage=stages.capture(),controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
-    let completed=null,knownUsage=null,dispatched=false,actualModel,upstreamRequestId,timingTerminalObserved=false,timingTerminalToken,deliveryFailed=false,receivedTail='',recoveryDecoder;
+    let completed=null,knownUsage=null,dispatched=false,actualModel,upstreamRequestId,timingTerminalObserved=false,timingTerminalToken,deliveryFailed=false,receivedTail='',recoveryDecoder,terminal='none',usageState='missing',readingBody=false,meteringUncertain=false;
     const finishedItems=new Map();let retainedItems=0;
     try{
       const response=await request(binary,home,'/responses',{payload,sessionId,protocolHeaders,signal:controller.signal,onPhase,beforeDispatch,stage,timing,onDispatch:()=>{dispatched=true;onDispatch();}});
@@ -231,39 +230,41 @@ export function createResponsesTransport({fetchImpl=fetch,credentials=accountCre
         stage.content(event);
         if(event.type==='response.completed'){
           if(completed)throw new AppError(502,'上游重复结束事件','upstream_protocol');
-          knownUsage=responseUsage(event.response);
+          terminal='completed';({usage:knownUsage,state:usageState}=responseUsageState(event.response));
           completed=event;output?.move('sse:event','sse:terminal');output?.resize('sse:parse',0);return;
         }
         if(['response.failed','response.incomplete','error'].includes(event.type)){
-          knownUsage=responseUsage(event.response);throw structuredFailure(event.response?.error||event.error||event)||new AppError(502,'上游响应失败或未完整结束','upstream_incomplete');
+          terminal=event.type==='response.incomplete'?'incomplete':'failed';({usage:knownUsage,state:usageState}=responseUsageState(event.response));throw structuredFailure(event.response?.error||event.error||event)||new AppError(502,'上游响应失败或未完整结束','upstream_incomplete');
         }
         if(completed)throw new AppError(502,'上游结束后仍返回事件','upstream_protocol');
         if(collectOutput&&event.type==='response.output_item.done'&&Number.isSafeInteger(event.output_index)&&event.output_index>=0&&event.item){const previous=finishedItems.get(event.output_index)?.bytes||0;const next=retainedItems-previous+eventBytes;output?.resize('sse:items',next);retainedItems=next;finishedItems.set(event.output_index,{item:event.item,bytes:eventBytes});}
         try{await onEvent(event,controller.signal);}catch(error){deliveryFailed=true;throw error;}output?.resize('sse:event',0);output?.resize('sse:parse',0);
       };
       let receiving=false;
-      for await(const chunk of response.body){
+      readingBody=true;for await(const chunk of response.body){
+        readingBody=false;
         observeTiming(timing,'rawChunk',chunk.byteLength);
         if(!receiving){receiving=true;onPhase('streaming');}
         output?.resize('sse:chunk',chunk.byteLength);output?.resize('sse:scratch',chunk.byteLength*2+(buffer.length+chunk.byteLength)*4);buffer=(buffer+decoder.decode(chunk,{stream:true})).replaceAll('\r\n','\n');output?.resize('sse:buffer',buffer.length*2);output?.resize('sse:scratch',0);
-        let at;while((at=buffer.indexOf('\n\n'))!==-1){receivedTail=buffer.slice(at+2);await consume(buffer.slice(0,at));output?.resize('sse:scratch',(buffer.length-at-2)*2);buffer=receivedTail;receivedTail='';output?.resize('sse:buffer',buffer.length*2);output?.resize('sse:scratch',0);}output?.resize('sse:chunk',0);
-      }
+        let at;while((at=buffer.indexOf('\n\n'))!==-1){receivedTail=buffer.slice(at+2);await consume(buffer.slice(0,at));output?.resize('sse:scratch',(buffer.length-at-2)*2);buffer=receivedTail;receivedTail='';output?.resize('sse:buffer',buffer.length*2);output?.resize('sse:scratch',0);}output?.resize('sse:chunk',0);readingBody=true;
+      }readingBody=false;
       output?.resize('sse:scratch',buffer.length*2+8);buffer+=decoder.decode();output?.resize('sse:buffer',buffer.length*2);output?.resize('sse:scratch',0);if(buffer.trim())await consume(buffer);buffer='';output?.resize('sse:buffer',0);
       if(!completed)throw new AppError(502,'上游连接提前结束，本次用量可能未计入累计','upstream_incomplete');
       // Keep streamed events intact; non-streaming clients also need items from done events.
       const responseBody=(!completed.response?.output?.length&&finishedItems.size)
         ?{...completed.response,output:[...finishedItems].sort(([a],[b])=>a-b).map(([,entry])=>entry.item)}:completed.response;
       if(completed.response?.output?.length){finishedItems.clear();output?.resize('sse:items',0);}
-      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,...(actualModel?{actualModel}:{}),...(upstreamRequestId?{upstreamRequestId}:{}),terminal:completed,response:responseBody,...(timingTerminalObserved?{timingTerminalObserved:true,timingTerminalToken}: {})};
+      return {input:0,output:0,cached:0,...knownUsage,usageKnown:!!knownUsage,meteringDiagnostic:transportMeteringDiagnostic({usageKnown:!!knownUsage,usageState,terminal,dispatched}),...(actualModel?{actualModel}:{}),...(upstreamRequestId?{upstreamRequestId}:{}),terminal:completed,response:responseBody,...(timingTerminalObserved?{timingTerminalObserved:true,timingTerminalToken}: {})};
     }catch(error){
       if(deliveryFailed&&!knownUsage&&bufferedUsageMaxBytes){
-        const recovered=receivedTerminalUsage(receivedTail+recoveryDecoder.decode(),{output,maxBytes:Math.min(bufferedUsageMaxBytes,maxJsonResponseBytes),maxFrames:bufferedUsageMaxFrames});
-        if(recovered){knownUsage=recovered.usage;actualModel=recovered.actualModel??actualModel;}
+        const recovered=receivedTerminalFacts(receivedTail+recoveryDecoder.decode(),{output,maxBytes:Math.min(bufferedUsageMaxBytes,maxJsonResponseBytes),maxFrames:bufferedUsageMaxFrames});
+        if(recovered){terminal=recovered.terminal;usageState=recovered.usageState;meteringUncertain=usageState==='valid'&&!recovered.usage;if(recovered.usage){knownUsage=recovered.usage;actualModel=recovered.actualModel??actualModel;}}
       }
       upstreamRequestId??=safeUpstreamRequestId(error.upstreamRequestId);
+      const rejected=error.meteringUpstreamRejected===true,interruption=signal?.aborted?(signal.reason?.code==='service_shutdown'?'gateway_shutdown':'client_cancelled'):error.code==='request_cancelled'?'client_cancelled':readingBody||['upstream_connection','upstream_incomplete'].includes(error.code)&&terminal==='none'?'upstream':'none';
       if(controller.signal.aborted)error=signal?.aborted?new AppError(499,'客户端已取消或服务停止','request_cancelled'):controller.signal.reason;
       if(!(error instanceof AppError))error=new AppError(502,'上游连接中断','upstream_connection');
-      throw Object.assign(error,knownUsage||{},{actualModel,...(upstreamRequestId?{upstreamRequestId}:{}),usageKnown:!!knownUsage||error.usageKnown===true||!dispatched});
+      throw Object.assign(error,knownUsage||{},{actualModel,...(upstreamRequestId?{upstreamRequestId}:{}),usageKnown:!!knownUsage||error.usageKnown===true||!dispatched,meteringDiagnostic:{...transportMeteringDiagnostic({usageKnown:!!knownUsage||error.usageKnown===true||!dispatched,usageState,terminal,dispatched,rejected,interruption}),...(meteringUncertain?{reason:'settlement_uncertain'}:{})}});
     }finally{observeTiming(timing,'transportEnd');stage.emit('transport-end');signal?.removeEventListener('abort',abort);}
   }
   const transport={run,runJson,models,supportsDispatchAuthorization:true,stageObserverStatus:stages.status};dispatchSources.set(transport,{run,runJson});return transport;

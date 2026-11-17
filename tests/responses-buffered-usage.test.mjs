@@ -40,3 +40,16 @@ test('buffered usage recovery budgets accept explicit disable and reject invalid
  assert.doesNotThrow(()=>createResponsesTransport({bufferedUsageMaxBytes:0}));
  for(const configuration of [{bufferedUsageMaxBytes:-1},{bufferedUsageMaxBytes:1.5},{bufferedUsageMaxBytes:512*1024*1024+1},{bufferedUsageMaxFrames:0},{bufferedUsageMaxFrames:1.5},{bufferedUsageMaxFrames:65537}])assert.throws(()=>createResponsesTransport(configuration),{code:'upstream_configuration'});
 });
+
+test('buffered terminals retain missing or invalid usage diagnostics after cancellation without inventing counts',async()=>{
+ for(const type of ['completed','failed','incomplete'])for(const [usage,reason] of [[undefined,'terminal_usage_missing'],[{input_tokens:-1,output_tokens:2},'terminal_usage_invalid'],[{input_tokens:1,output_tokens:2,input_tokens_details:{cached_tokens:2}},'terminal_usage_invalid']]){
+  const response={status:type,...(usage===undefined?{}:{usage})};const {error}=await scenario({abort:true,tail:frame({type:'response.'+type,response})});
+  assert.equal(error.usageKnown,false);assert.equal(error.input,undefined);assert.equal(error.meteringDiagnostic.reason,reason);assert.equal(error.meteringDiagnostic.terminal,type);assert.equal(error.meteringDiagnostic.interruption,'client_cancelled');assert.equal(error.meteringDiagnostic.usage_known,false);
+ }
+});
+test('observing a buffered non-completed terminal does not expand billing recovery',async()=>{
+ for(const type of ['failed','incomplete']){
+  const {error}=await scenario({abort:true,tail:frame({type:'response.'+type,response:{status:type,usage:terminal.response.usage}})});
+  assert.equal(error.usageKnown,false);assert.equal(error.input,undefined);assert.equal(error.output??0,0);assert.equal(error.meteringDiagnostic.reason,'settlement_uncertain');assert.equal(error.meteringDiagnostic.terminal,type);assert.equal(error.meteringDiagnostic.usage_known,false);
+ }
+});

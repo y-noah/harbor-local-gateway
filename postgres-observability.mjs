@@ -1,4 +1,5 @@
 import {canonicalStreamTiming} from './request-stream-timing-facts.mjs';
+import {canonicalMeteringDiagnostic} from './request-metering-diagnostic.mjs';
 import {AppError,requestPhases,usageWindow} from './store.mjs';
 import seed from './pricing-data.mjs';
 import {modelReleaseRegistry,modelReleaseSetting} from './model-release-dates.mjs';
@@ -22,7 +23,7 @@ export async function postgresRequestObservation(store,id,at=Date.now(),{scope}=
     const timeline=(Array.isArray(phases)?phases:[]).filter(p=>p&&requestPhases.has(p.phase)&&Number.isSafeInteger(p.at)).map(({phase,at})=>({phase,at}));
     const value=decorateReferenceRequest(row,publicUsage(await store.quote(row)),window.start);
     return {...value,...await quotaConfirmationView(store,row,{canManage:authorization===null||authorization.view==='department'}),error:row.error?sanitizeRecord(row.error,{maxBytes:2048}):null,phase_history:undefined,observedAt:at,streamTiming:canonicalStreamTiming(Array.isArray(phases)?phases.at(-1)?.stream_timing:undefined)??null,
-      timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??row.ended??at)-p.at)}))};
+      meteringDiagnostic:canonicalMeteringDiagnostic(Array.isArray(phases)?phases.at(-1)?.metering:undefined),timeline:timeline.map((p,i)=>({...p,duration:Math.max(0,(timeline[i+1]?.at??row.ended??at)-p.at)}))};
   },{level:'REPEATABLE READ',readOnly:true});
 }
 

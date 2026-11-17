@@ -16,14 +16,14 @@ export function createOutputBudget({maxBufferedBytes=512*1024*1024,maxBytesPerOw
   return {open,status:()=>({bufferedBytes:bytes,scopes,owners:owners.size,peakBufferedBytes:peak,rejected,maxBufferedBytes,maxBytesPerOwner,maxScopes,maxScopesPerOwner})};
 }
 
-export async function readOutputText(response,{maxBytes,output,prefix='body'}={}){
+export async function readOutputText(response,{maxBytes,output,prefix='body',onReadFailure}={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<1||maxBytes>8*1024**3)throw new AppError(503,'上游读取预算无效','output_configuration');
   const tooLarge=()=>new AppError(502,'上游响应超过读取上限，未重发请求','upstream_response_too_large');
   if(Number(response.headers.get('content-length'))>maxBytes){await response.body?.cancel().catch(()=>{});throw tooLarge();}
   if(!response.body)return {text:'',bytes:0};
   const reader=response.body.getReader();let bytes=0,chunks=[];
   try{
-    for(;;){const item=await reader.read();if(item.done)break;const next=bytes+item.value.byteLength;if(next>maxBytes)throw tooLarge();output?.resize(prefix+':raw',next);bytes=next;chunks.push(item.value);}
+    for(;;){let item;try{item=await reader.read();}catch(error){try{onReadFailure?.();}catch{}throw error;}if(item.done)break;const next=bytes+item.value.byteLength;if(next>maxBytes)throw tooLarge();output?.resize(prefix+':raw',next);bytes=next;chunks.push(item.value);}
     output?.resize(prefix+':concat',bytes);const joined=Buffer.concat(chunks,bytes);chunks=[];output?.resize(prefix+':raw',0);output?.resize(prefix+':text',bytes*2);const text=joined.toString('utf8');output?.resize(prefix+':text',text.length*2);output?.resize(prefix+':concat',0);return {text,bytes};
   }catch(error){await reader.cancel().catch(()=>{});throw error;}
   finally{chunks=[];output?.resize(prefix+':raw',0);output?.resize(prefix+':concat',0);reader.releaseLock();}
