@@ -10,13 +10,17 @@ export function createPostgresPricingAdmin(store,{adminAuthenticated,adminContex
  const runtime=createPostgresPricingRuntime(store,options);
  async function handle(req,res,{signal}={}){
   beginAdminRequestTiming(req,res);
-  const path=new URL(req.url,'http://localhost').pathname;
+  const url=new URL(req.url,'http://localhost'),path=url.pathname;
   if(path!=='/api/admin/pricing'&&path!=='/api/admin/pricing/refresh')return false;
   const scope=adminContext?await adminContext(req):undefined;
   if(scope){const trusted=requireDepartmentScope(scope,{allowGlobal:true,roles:['super_admin']});if(trusted.view!=='global')throw new AppError(403,'费率仅允许在超管全局视图管理','department_forbidden');}
   else if(!await adminAuthenticated(req))throw new AppError(401,'请先输入管理密码登录','admin_required');
   let result;
-  if(path==='/api/admin/pricing'&&req.method==='GET')result=await runtime.status({signal});
+  if(path==='/api/admin/pricing'&&req.method==='GET'){
+   const views=url.searchParams.getAll('view'),view=views[0]??'full';
+   if(views.length>1||!['full','catalog','unpriced'].includes(view))throw new AppError(400,'费率查询视图无效','invalid_query');
+   result=await runtime.status({signal,view});
+  }
   else if(path==='/api/admin/pricing'&&req.method==='PATCH')result=await runtime.configure(await readBody(req,{signal}),{scope});
   else if(path==='/api/admin/pricing/refresh'&&req.method==='POST')result=await runtime.refresh({force:true});
   else throw new AppError(405,'费率管理不支持此请求方法','method_not_allowed');

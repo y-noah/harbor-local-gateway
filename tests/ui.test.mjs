@@ -704,12 +704,12 @@ test('account entry separates subscription and Key types and preserves independe
 const pricingState=()=>({seedCaptured:'2026-10-29',settings:{enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[]},state:{active:'a'.repeat(64)},unpricedModels:[{model:'new-model',requests:2}],rates:[{model:'gpt-6.1-sol',input:'2',cached:'0.1',output:'10',manual:false}]});
 test('late fee settings cannot replace a newer dialog and the settings view identifies missing prices without raw usage',async()=>{
  let release;const page=await ui(()=>new Promise(r=>release=()=>r(response(pricingState()))));page.run('admin=true;');const pending=page.click('pricing-settings');await page.click('close');page.run("modal('<h2>other</h2>')");release();await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>other</h2>');
- const html=page.run('pricingOverview('+JSON.stringify(pricingState())+')');assert.match(html,/new-model：2条/);assert.match(html,/<details class="pricing-status"><summary>自动同步已开启 · 1个待计价模型/);assert.doesNotMatch(html,/<details class="pricing-status" open/);assert.match(html,/USD \/ 100万Token/);assert.doesNotMatch(html,/亿 Token/);assert.match(html,/\$2\.00/);assert.match(html,/\$0\.10/);
+ const html=page.run('pricingOverview('+JSON.stringify(pricingState())+')');assert.match(html,/new-model：2条/);assert.match(html,/<details[^>]*class="pricing-status"[^>]*><summary[^>]*>自动同步已开启 · 1个待计价模型/);assert.doesNotMatch(html,/<details class="pricing-status" open/);assert.match(html,/USD \/ 100万Token/);assert.doesNotMatch(html,/亿 Token/);assert.match(html,/\$2\.00/);assert.match(html,/\$0\.10/);
 });
 test('fee alias removal identifies the exact mapping even after the server has reordered the list',async()=>{
  const a={name:'alias-a',target:'gpt-6.1-sol',from:1,to:null,source:'fixture A'},b={name:'alias-b',target:'gpt-6.1-sol',from:1,to:null,source:'fixture B'},calls=[];
  const state=pricingState();state.settings.aliases=[b,a];state.settings.version=1;
- const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?state:snapshot());});page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='accounts';modal('<h2>pricing</h2>')");
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing?view=catalog'?state:snapshot());});page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='accounts';modal('<h2>pricing</h2>')");
  await page.click('pricing-alias-remove',JSON.stringify([a.name,a.target,a.from,a.to]));const sent=calls.find(([p,o])=>p==='/api/admin/pricing'&&o.method==='PATCH');assert.deepEqual(JSON.parse(sent[1].body),{expectedVersion:1,aliases:[b]});
 });
 test('every rendered reference amount comes from Standard data rather than legacy counters',async()=>{
@@ -727,7 +727,7 @@ test('session management shows its own reference amount and coverage without bor
 
 test('Key model selection preserves exact names, saved versions and ignores stale async dialogs',async()=>{
  const calls=[],state={...snapshot(),keys:[{id:'k',member_id:'m',allowed_models:['sol'],model_policy_version:7}]};
- const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?pricingState():state);});
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing?view=catalog'?pricingState():state);});
  page.run('admin=true;state='+JSON.stringify(state)+';globalThis.FormData=class{get(k){return formValues[k]??null;}};');
  await page.click('key-models','k');assert.match(page.node('#modal-content').innerHTML,/只允许指定模型/);assert.match(page.node('#modal-content').innerHTML,/gpt-6.1-sol/);
  page.node('[name="allowed_models"]').value='sol';page.node('#key-model-suggestion').onchange({target:{value:'gpt-6.1-sol'}});assert.equal(page.node('[name="allowed_models"]').value,'sol\ngpt-6.1-sol');assert.equal(page.node('[name="model_policy_mode"]').value,'limited');
@@ -738,18 +738,18 @@ test('Key model selection preserves exact names, saved versions and ignores stal
 
 test('member model limits use an employee-scoped endpoint, retain disabled rules and guard stale dialogs',async()=>{
  const limits={enabled:false,version:2,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'20.00'}],usage:[]},calls=[];
- const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing'?pricingState():path.endsWith('usage-limits')?limits:snapshot());});
+ const page=await ui((path,options)=>{calls.push([path,options]);return response(path==='/api/admin/pricing?view=catalog'?pricingState():path.endsWith('usage-limits')?limits:snapshot());});
  page.run('admin=true;globalThis.FormData=class{get(k){return values[k]??null;}getAll(k){return values[k]||[];}};');await page.click('member-limits','member-id');assert.match(page.node('#modal-content').innerHTML,/北京时间00:00重置/);assert.match(page.node('#modal-content').innerHTML,/20.00/);
  page.node('#member-limit-enabled').onchange({target:{value:'on'}});assert.equal(page.run('memberLimitEditor.enabled'),true);
  page.run('globalThis.values={limits_enabled:"on",limit_model:["gpt-6.1-sol"],limit_hours:["168"],limit_usd:["30.00"]};');await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
  const saved=calls.find(([p,o])=>p==='/api/admin/members/member-id/usage-limits'&&o.method==='PATCH');assert.deepEqual(JSON.parse(saved[1].body),{expected_version:2,enabled:true,rules:[{model:'gpt-6.1-sol',hours:168,limit_usd:'30.00'}]});
- let release;const delayed=await ui(path=>path==='/api/admin/pricing'?response(pricingState()):new Promise(r=>release=()=>r(response(limits))));delayed.run('admin=true;');const pending=delayed.click('member-limits','member-id');await delayed.click('close');delayed.run("modal('<h2>other</h2>')");release();await pending;assert.equal(delayed.node('#modal-content').innerHTML,'<h2>other</h2>');
+ let release;const delayed=await ui(path=>path==='/api/admin/pricing?view=catalog'?response(pricingState()):new Promise(r=>release=()=>r(response(limits))));delayed.run('admin=true;');const pending=delayed.click('member-limits','member-id');await delayed.click('close');delayed.run("modal('<h2>other</h2>')");release();await pending;assert.equal(delayed.node('#modal-content').innerHTML,'<h2>other</h2>');
 });
 test('R2 member limit loading shows retry/close for network and HTTP errors and ignores late failures',async()=>{
  for(const network of [true,false]){
   const page=await ui(()=>{if(network)throw Error('synthetic offline');return response({error:{message:'synthetic unavailable'}},503);});page.run('admin=true;');await page.click('member-limits','member-id');const html=page.node('#modal-content').innerHTML;assert.match(html,/synthetic/);assert.match(html,/重试/);assert.match(html,/关闭/);assert.doesNotMatch(html,/正在读取/);
  }
- let reject;const page=await ui(path=>path==='/api/admin/pricing'?response(pricingState()):new Promise((_,r)=>reject=r));page.run('admin=true;');const pending=page.click('member-limits','member-id');await page.click('close');page.run("modal('<h2>new dialog</h2>')");reject(Error('late failure'));await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
+ let reject;const page=await ui(path=>path==='/api/admin/pricing?view=catalog'?response(pricingState()):new Promise((_,r)=>reject=r));page.run('admin=true;');const pending=page.click('member-limits','member-id');await page.click('close');page.run("modal('<h2>new dialog</h2>')");reject(Error('late failure'));await pending;assert.equal(page.node('#modal-content').innerHTML,'<h2>new dialog</h2>');
 });
 
 
@@ -1458,7 +1458,7 @@ test('类型名称和归档保存的迟到结果不关闭新弹窗或覆盖其�
 
 
 test('自定义类型名称说明在模型与限额编辑器中按纯文本显示',async()=>{
- const type={id:'usage-a',code:'A',name:'<b>研发</b>',description:'<i>说明</i>',enabled:1,version:1,default_version:null,configured:false,defaults:null};const page=await ui(path=>response(path==='/api/admin/pricing'?{rates:[]}:{types:[type]}));page.run('admin=true;state='+JSON.stringify(typeSnapshot()));await page.click('edit-member-type','usage-a');const html=page.node('#modal-content').innerHTML;assert.match(html,/&lt;b&gt;研发&lt;\/b&gt;/);assert.match(html,/&lt;i&gt;说明&lt;\/i&gt;/);assert.doesNotMatch(html,/<b>研发<\/b>|<i>说明<\/i>/);
+ const type={id:'usage-a',code:'A',name:'<b>研发</b>',description:'<i>说明</i>',enabled:1,version:1,default_version:null,configured:false,defaults:null};const page=await ui(path=>response(path==='/api/admin/pricing?view=catalog'?{rates:[]}:{types:[type]}));page.run('admin=true;state='+JSON.stringify(typeSnapshot()));await page.click('edit-member-type','usage-a');const html=page.node('#modal-content').innerHTML;assert.match(html,/&lt;b&gt;研发&lt;\/b&gt;/);assert.match(html,/&lt;i&gt;说明&lt;\/i&gt;/);assert.doesNotMatch(html,/<b>研发<\/b>|<i>说明<\/i>/);
 });
 
 test('员工到期列显示北京时间，混合Key注明最近到期、永久和已过期而不混为同一期限',async()=>{
@@ -1471,7 +1471,7 @@ test('员工到期列显示北京时间，混合Key注明最近到期、永久�
 
 test('创建员工和新增类型各自打开正确表单，不复用同一个创建模式',async()=>{
  const type={id:'usage-a',code:'A',name:'合成类型',description:'',enabled:1,configured:true,version:1,default_version:1,defaults:{allowed_models:null,usage_limits:{enabled:false,rules:[]}}};
- const page=await ui(path=>response(path==='/api/admin/pricing'?{rates:[]}:{types:[type]}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot()));
+ const page=await ui(path=>response(path==='/api/admin/pricing?view=catalog'?{rates:[]}:{types:[type]}));page.run('admin=true;state='+JSON.stringify(pagedSnapshot()));
  await page.click('create-member');assert.match(page.node('#modal-content').innerHTML,/<h2>创建员工 Key<\/h2>/);assert.match(page.node('#modal-content').innerHTML,/name="type_id"/);assert.match(page.node('#modal-content').innerHTML,/<details id="typed-member-custom"><summary>自定义权限与限额<\/summary>/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/name="type_name"/);
  await page.click('close');await page.click('create-member-type');assert.match(page.node('#modal-content').innerHTML,/<h2>新增使用类型<\/h2>/);assert.match(page.node('#modal-content').innerHTML,/name="type_name"/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/name="type_id"/);
  await page.click('close');await page.click('create-member');assert.match(page.node('#modal-content').innerHTML,/<h2>创建员工 Key<\/h2>/);
@@ -1506,7 +1506,7 @@ test('原生关闭也失效旧请求并清空二级状态，重新打开不会�
 });
 
 test('创建员工成功后刷新尚未返回时原生close事件不丢失新Key结果',async()=>{
- let release;const catalog=typeCatalog();Object.assign(catalog.types[0],{version:1,default_version:1,configured:true,defaults:{allowed_models:null,usage_limits:{enabled:false,rules:[]}}});const state=pagedSnapshot(),page=await ui((path,options)=>{if(path==='/api/admin/members'&&options.method==='POST')return response({memberId:'member-created',keyId:'key-created',secret:'synthetic-created'});if(path==='/api/admin/member-types')return response(catalog);if(path==='/api/admin/pricing')return response({rates:[]});if(path.startsWith('/api/admin/state'))return new Promise(resolve=>release=()=>resolve(response(state)));return response(state);});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview"');await page.click('create-member');useSyntheticForm(page,{name:'合成关闭时序',type_id:'usage-a',days:'0',models_mode:'template',limits_mode:'template'});const submitted=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false}}}});await new Promise(setImmediate);assert.equal(typeof release,'function');assert.equal(page.node('#modal').open,false);const version=page.run('dialogVersion');page.node('#modal').onclose();assert.equal(page.run('dialogVersion'),version);release();await submitted;assert.match(page.node('#modal-content').innerHTML,/Key 已生成/);assert.equal(page.node('#new-secret').textContent,'synthetic-created');page.node('#modal').onclose();assert.equal(page.node('#modal').open,true);
+ let release;const catalog=typeCatalog();Object.assign(catalog.types[0],{version:1,default_version:1,configured:true,defaults:{allowed_models:null,usage_limits:{enabled:false,rules:[]}}});const state=pagedSnapshot(),page=await ui((path,options)=>{if(path==='/api/admin/members'&&options.method==='POST')return response({memberId:'member-created',keyId:'key-created',secret:'synthetic-created'});if(path==='/api/admin/member-types')return response(catalog);if(path==='/api/admin/pricing?view=catalog')return response({rates:[]});if(path.startsWith('/api/admin/state'))return new Promise(resolve=>release=()=>resolve(response(state)));return response(state);});page.run('admin=true;state='+JSON.stringify(state)+';tab="overview"');await page.click('create-member');useSyntheticForm(page,{name:'合成关闭时序',type_id:'usage-a',days:'0',models_mode:'template',limits_mode:'template'});const submitted=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false}}}});await new Promise(setImmediate);assert.equal(typeof release,'function');assert.equal(page.node('#modal').open,false);const version=page.run('dialogVersion');page.node('#modal').onclose();assert.equal(page.run('dialogVersion'),version);release();await submitted;assert.match(page.node('#modal-content').innerHTML,/Key 已生成/);assert.equal(page.node('#new-secret').textContent,'synthetic-created');page.node('#modal').onclose();assert.equal(page.node('#modal').open,true);
 });
 
 test('弹窗内视图复用同一个原生窗口，关闭后重新打开才再次调用showModal',async()=>{
@@ -1529,7 +1529,7 @@ test('关闭管理弹窗后迟到的启停删除操作不能关闭或重开其�
 
 test('关闭编辑表单后迟到的名称模型和负载设置保存不关闭新弹窗',async()=>{
  for(const [action,id] of [['edit-member','member-one'],['key-models','key-one'],['balancing-settings','']]){
-  let release;const state={...snapshot(),accounts:[],members:[{id:'member-one',name:'合成保存员工',enabled:1}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1,allowed_models:null,model_policy_version:0}],balancing:{settings:{weighted:false,failover:false,nightly:false,quietMinutes:30}}},page=await ui((path,options)=>options.method==='PATCH'?new Promise(resolve=>release=()=>resolve(response({ok:true}))):response(path==='/api/admin/pricing'?{rates:[]}:state));page.run('admin=true;state='+JSON.stringify(state)+';modal("原管理")');await page.click(action,id);useSyntheticForm(page,{name:'更新名称',model_policy_mode:'all',weighted:'false',failover:'false',nightly:'false',quietMinutes:'30'});const pending=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false}}}});await new Promise(setImmediate);await page.click('close');page.run('modal("另一个编辑")');release();await pending;assert.equal(page.node('#modal').open,true,action);assert.equal(page.node('#modal-content').innerHTML,'另一个编辑',action);
+  let release;const state={...snapshot(),accounts:[],members:[{id:'member-one',name:'合成保存员工',enabled:1}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1,allowed_models:null,model_policy_version:0}],balancing:{settings:{weighted:false,failover:false,nightly:false,quietMinutes:30}}},page=await ui((path,options)=>options.method==='PATCH'?new Promise(resolve=>release=()=>resolve(response({ok:true}))):response(path==='/api/admin/pricing?view=catalog'?{rates:[]}:state));page.run('admin=true;state='+JSON.stringify(state)+';modal("原管理")');await page.click(action,id);useSyntheticForm(page,{name:'更新名称',model_policy_mode:'all',weighted:'false',failover:'false',nightly:'false',quietMinutes:'30'});const pending=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false}}}});await new Promise(setImmediate);await page.click('close');page.run('modal("另一个编辑")');release();await pending;assert.equal(page.node('#modal').open,true,action);assert.equal(page.node('#modal-content').innerHTML,'另一个编辑',action);
  }
 });
 
@@ -1631,7 +1631,7 @@ test('轻量刷新后请求测试的模型选项与实际选中值一致',async(
 
 test('员工与Key二级编辑取消返回所属员工管理而非退出弹窗',async()=>{
  for(const action of ['edit-member','key-models','renew-key','new-key']){
-  const state={...snapshot(),members:[{id:'member-one',name:'合成上下文员工',enabled:1,usage_limits:{enabled:false,rules:[]}}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1,allowed_models:null,model_policy_version:1}]};const page=await ui(path=>response(path==='/api/admin/pricing'?{rates:[]}:state));page.run('admin=true;state='+JSON.stringify(state)+';tab="members";renderMemberDetail("member-one")');await page.click(action,['edit-member','new-key'].includes(action)?'member-one':'key-one');assert.match(page.node('#modal-content').innerHTML,/data-action="member-detail" data-id="member-one">取消/);await page.click('member-detail','member-one');assert.equal(page.node('#modal').open,true,action);assert.match(page.node('#modal-content').innerHTML,/合成上下文员工/);assert.match(page.node('#modal-content').innerHTML,/访问 Key/);
+  const state={...snapshot(),members:[{id:'member-one',name:'合成上下文员工',enabled:1,usage_limits:{enabled:false,rules:[]}}],keys:[{id:'key-one',member_id:'member-one',prefix:'synthetic',enabled:1,allowed_models:null,model_policy_version:1}]};const page=await ui(path=>response(path==='/api/admin/pricing?view=catalog'?{rates:[]}:state));page.run('admin=true;state='+JSON.stringify(state)+';tab="members";renderMemberDetail("member-one")');await page.click(action,['edit-member','new-key'].includes(action)?'member-one':'key-one');assert.match(page.node('#modal-content').innerHTML,/data-action="member-detail" data-id="member-one">取消/);await page.click('member-detail','member-one');assert.equal(page.node('#modal').open,true,action);assert.match(page.node('#modal-content').innerHTML,/合成上下文员工/);assert.match(page.node('#modal-content').innerHTML,/访问 Key/);
  }
 });
 
@@ -1703,6 +1703,24 @@ test('pricing uses release dates descending, unknown dates last and consistent l
  await page.run('changePageSize("pricing",100)');assert.equal((page.node('#modal-content').innerHTML.match(/<tr><td>/g)||[]).length,55);assert.equal(reads,1);await page.click('close');await page.click('pricing-page','1');assert.equal(page.node('#modal-content').innerHTML,'');assert.equal(page.run('pricingView'),null);
 });
 
+test('费率先显示轻目录，展开才读取待计价统计且保持分页',async()=>{
+ const data={...pricingState(),unpricedModels:null,unpricedStatus:'not_loaded'},calls=[];let release;
+ data.rates=Array.from({length:25},(_,i)=>({model:'synthetic-'+i,input:'1',cached:null,output:'2'}));
+ const page=await ui(path=>{calls.push(path);return path.endsWith('view=catalog')?response(data):new Promise(resolve=>release=()=>resolve(response({unpricedStatus:'loaded',unpricedModels:[{model:'synthetic-missing',requests:3}]})));});
+ page.run('admin=true;state='+JSON.stringify(snapshot()));await page.click('pricing-settings');
+ assert.deepEqual(calls,['/api/admin/pricing?view=catalog']);assert.match(page.node('#modal-content').innerHTML,/synthetic-0/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/暂无待计价|0个待计价/);
+ await page.click('pricing-page','2');page.node('#pricing-status').open=true;page.node('#pricing-status').ontoggle();await new Promise(setImmediate);
+ assert.equal(calls.length,2);assert.match(page.node('#pricing-missing').innerHTML,/正在核对待计价/);assert.match(page.node('#modal-content').innerHTML,/第 2 \/ 2 页/);
+ page.node('#pricing-status').ontoggle();assert.equal(calls.length,2);release();await new Promise(setImmediate);
+ assert.match(page.node('#pricing-missing').innerHTML,/synthetic-missing：3条/);assert.match(page.node('#modal-content').innerHTML,/第 2 \/ 2 页/);assert.equal(page.run('pricingStatusOpen'),true);
+});
+test('费率缺费率统计失败可重试，关闭后迟到结果不覆盖新弹窗',async()=>{
+ const data={...pricingState(),unpricedModels:null,unpricedStatus:'not_loaded'};let release,reads=0;
+ const page=await ui(path=>path.endsWith('view=catalog')?response(data):++reads===1?response({error:{message:'合成统计失败'}},503):new Promise(resolve=>release=()=>resolve(response({unpricedStatus:'loaded',unpricedModels:[]}))));
+ page.run('admin=true;state='+JSON.stringify(snapshot()));await page.click('pricing-settings');page.node('#pricing-status').open=true;page.node('#pricing-status').ontoggle();await new Promise(setImmediate);
+ assert.match(page.node('#pricing-missing').innerHTML,/合成统计失败/);assert.doesNotMatch(page.node('#modal-content').innerHTML,/暂无待计价/);
+ const pending=page.click('pricing-unpriced');await new Promise(setImmediate);assert.equal(reads,2);await page.click('close');page.run('modal("new dialog")');release();await pending;assert.equal(page.node('#modal-content').innerHTML,'new dialog');
+});
 test('refresh preserves request DOM and updates busy protection in place',async()=>{
  let release;const data={summary:{requests:1,success:1,active:0,average_ms:1,standard:{}},pagination:{page:1,pageSize:20,total:1,totalPages:1},rows:[{id:'preserved-row',started:1,ended:2,status:'ok'}],models:[],members:[],byModel:[],byMember:[]};
  const page=await ui(()=>new Promise(resolve=>{release=()=>resolve(response({...data,summary:{...data.summary,requests:2}}));}));page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="requests";recordView="requests";requestsData='+JSON.stringify(data)+';render()');

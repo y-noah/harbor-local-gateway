@@ -26,15 +26,19 @@ export async function postgresRequestObservation(store,id,at=Date.now(),{scope}=
   },{level:'REPEATABLE READ',readOnly:true});
 }
 
-export async function postgresPricingStatus(store,at=Date.now()){
+export async function postgresPricingStatus(store,at=Date.now(),{view='full'}={}){
+  if(!['full','catalog','unpriced'].includes(view))throw new AppError(400,'费率查询视图无效','invalid_query');
   return store.transaction(async()=>{
+    const window=usageWindow(at);
+    const readMissing=()=>store.all(`SELECT COALESCE(r.billing_model,r.model,'未记录') model,COUNT(*) requests FROM harbor.requests r${joins}
+      WHERE r.usage_at>=$1 AND r.usage_at<$2 AND (NOT COALESCE(${validPrice},false) OR p.state='unpriced') GROUP BY COALESCE(r.billing_model,r.model,'未记录') ORDER BY model`,window.start,window.end);
+    if(view==='unpriced')return {unpricedModels:await readMissing(),unpricedStatus:'loaded',window};
     const settingsRows=await store.all("SELECT name,value FROM harbor.gateway_settings WHERE name IN ('pricing.state','pricing.settings','model.release_dates')"),saved=Object.fromEntries(settingsRows.map(r=>[r.name,JSON.parse(r.value)]));
     const state=saved['pricing.state'],settings={enabled:true,refreshHours:24,version:0,manualRates:{},aliases:[],...saved['pricing.settings']};
     const book=state?.active&&await store.pricingBook(state.active);if(!book?.rates)throw new AppError(503,'计价版本尚未准备好','pricing_unavailable');
-    const window=usageWindow(at),missing=await store.all(`SELECT COALESCE(r.billing_model,r.model,'未记录') model,COUNT(*) requests FROM harbor.requests r${joins}
-      WHERE r.usage_at>=$1 AND r.usage_at<$2 AND (NOT COALESCE(${validPrice},false) OR p.state='unpriced') GROUP BY COALESCE(r.billing_model,r.model,'未记录') ORDER BY model`,window.start,window.end);
+    const missing=view==='catalog'?null:await readMissing();
     const releases=saved[modelReleaseSetting],dates=modelReleaseRegistry(releases,at);
     return {metric:referenceMetric,currency:'USD',basis:seed.basis,source:seed.source,seedCaptured:seed.captured,state,settings,modelReleaseState:releases?{checkedAt:releases.checkedAt,lastSuccess:releases.lastSuccess,error:releases.error}:null,
-      rates:Object.entries(book.rates).map(([model,rate])=>({model,...rate,manual:Object.hasOwn(settings.manualRates,model),release_date:dates[model]?.date??null,release_date_source:dates[model]?.source??null})),unpricedModels:missing};
+      rates:Object.entries(book.rates).map(([model,rate])=>({model,...rate,manual:Object.hasOwn(settings.manualRates,model),release_date:dates[model]?.date??null,release_date_source:dates[model]?.source??null})),unpricedModels:missing,...(view==='catalog'?{unpricedStatus:'not_loaded'}:{})};
   },{level:'REPEATABLE READ',readOnly:true});
 }

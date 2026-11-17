@@ -32,7 +32,7 @@ export function createPostgresPricingRuntime(store,{clock=Date.now,fetchImpl=fet
  }
  // Keep seven-day aggregates off the dispatch pool and within its existing
  // bounded admin query queue. The caller retains ownership of both resources.
- const readStatus=({signal}={})=>queryQueue?queryQueue.run(()=>postgresPricingStatus(readStore,clock()),{signal}):postgresPricingStatus(readStore,clock());
+ const readStatus=({signal,view='full'}={})=>queryQueue?queryQueue.run(()=>postgresPricingStatus(readStore,clock(),{view}),{signal}):postgresPricingStatus(readStore,clock(),{view});
  const status=options=>track(()=>readStatus(options));
  function configure(value,{scope}={}){return track(async()=>{
   await locked(async current=>{

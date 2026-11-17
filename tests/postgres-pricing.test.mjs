@@ -95,7 +95,7 @@ test('PG关闭取消官方请求并等待清理，关闭后不再发布',integra
  const before=(await runtime.status()).state,pending=worker.refresh({force:true});await started;await worker.close();await pending;assert.deepEqual((await runtime.status()).state,before);assert.throws(()=>worker.backfill(),{code:'service_stopping'});
 }));
 
-test('PG管理适配器鉴权、读取body和GET/PATCH/refresh入口',integration,()=>fixture(async({store})=>{
+test('PG管理适配器鉴权、读取body和GET/PATCH/refresh入口',integration,()=>fixture(async({store,record})=>{
  let authenticated=false;const admin=createPostgresPricingAdmin(store,{clock:()=>at,adminAuthenticated:async()=>authenticated,fetchImpl:async()=>new Response(page('admin-model'))});
  const send=async(path,method='GET',payload)=>{
   const req=Readable.from(payload?[Buffer.from(JSON.stringify(payload))]:[]);req.url=path;req.method=method;req.headers={'content-type':'application/json'};
@@ -103,6 +103,21 @@ test('PG管理适配器鉴权、读取body和GET/PATCH/refresh入口',integratio
  };
  try{assert.equal((await send('/other')).handled,false);await assert.rejects(send('/api/admin/pricing'),{status:401});authenticated=true;
   const initial=await send('/api/admin/pricing');assert.equal(initial.status,200);assert.equal(initial.headers['Cache-Control'],'no-store');assert.match(initial.headers['Server-Timing'],/^app;dur=\d+\.\d{2}$/);
+  await record({model:'synthetic-unpriced'});
+  await record({model:'synthetic-retained',started:usageWindow(at).start-2000,ended:usageWindow(at).start-1000});
+  const all=store.all.bind(store);let requestReads=0;
+  store.all=async(sql,...args)=>{if(sql.includes('FROM harbor.requests'))requestReads++;return all(sql,...args);};
+  try{
+   const catalog=await send('/api/admin/pricing?view=catalog');
+   assert.deepEqual(catalog.value.rates,initial.value.rates);assert.deepEqual(catalog.value.settings,initial.value.settings);
+   assert.equal(catalog.value.unpricedModels,null);assert.equal(catalog.value.unpricedStatus,'not_loaded');assert.equal(requestReads,0);
+   const missing=await send('/api/admin/pricing?view=unpriced');
+   assert.equal(missing.value.unpricedStatus,'loaded');assert.equal(requestReads,1);
+   assert.deepEqual(missing.value.unpricedModels,[{model:'synthetic-unpriced',requests:1}]);assert.deepEqual(missing.value.window,usageWindow(at));
+   assert.deepEqual((await send('/api/admin/pricing')).value.unpricedModels,missing.value.unpricedModels);
+   for(const query of ['view=bad','view=','view=catalog&view=unpriced'])await assert.rejects(send('/api/admin/pricing?'+query),{status:400,code:'invalid_query'});
+   authenticated=false;await assert.rejects(send('/api/admin/pricing?view=catalog'),{status:401});await assert.rejects(send('/api/admin/pricing?view=unpriced'),{status:401});authenticated=true;
+  }finally{store.all=all;}
   const configured=await send('/api/admin/pricing','PATCH',{expectedVersion:0,enabled:false});assert.equal(configured.value.settings.enabled,false);assert.equal(configured.headers['Server-Timing'],undefined);
   const refreshed=await send('/api/admin/pricing/refresh','POST');assert.ok(refreshed.value.rates.some(r=>r.model==='admin-model'));assert.equal(refreshed.headers['Server-Timing'],undefined);await assert.rejects(send('/api/admin/pricing','DELETE'),{status:405});
  }finally{await admin.close();}
