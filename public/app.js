@@ -33,7 +33,9 @@ function pageDataReady(){
  return true;
 }
 function updatePageReadFeedback(pending=false){
- const note=$('#page-read-feedback');if(!note)return;note.hidden=!pageReadError;note.innerHTML=pageReadError?`<span role="alert">${esc(pageReadError)}</span>${button('retry-workspace','重试','secondary')}`:'<span role="status">正在加载…</span>';
+ const note=$('#page-read-feedback');if(!note)return;
+ if(admin&&sessionVerificationState?.epoch===authEpoch){connectionState('登录待核验',true);const checking=sessionVerificationState.status==='checking';note.hidden=false;note.innerHTML=`<span role="${checking?'status':'alert'}">${checking?'登录状态待核验，正在确认…':'登录状态暂无法核验，当前显示上次数据'}</span>${button('session-verify','重试核验','secondary','',checking)}${button('session-relogin','重新登录','secondary')}`;return;}
+ note.hidden=!pageReadError;note.innerHTML=pageReadError?`<span role="alert">${esc(pageReadError)}</span>${button('retry-workspace','重试','secondary')}`:'<span role="status">正在加载…</span>';
 }
 function preservePageWhileReading(){
  const content=$('#content');if(!content)return;content.inert=false;content.setAttribute?.('aria-busy',String(!pageReadError));
@@ -327,13 +329,32 @@ async function departmentAction(action,id){
  if(action==='department-key-revoke'){const row=view?.rows.find(row=>row.id===id),departmentId=view?.id;if(!row||view.kind!=='keys')return;return formModal('撤销管理 Key',`确认撤销「${esc(row.label)}」？相关管理会话将失效。`,'',async(_f,current)=>{await api('/api/admin/departments/'+encodeURIComponent(departmentId)+'/management-keys/'+encodeURIComponent(id)+'/revoke','POST',{expected_version:row.version});if(current()){if(departmentPageActive())void loadDepartmentPage();await openDepartmentKeys(departmentId);}});}
 }
 
-let sessionVerification=null;
-async function verifyUnauthorizedSession(epoch){
- if(epoch!==authEpoch)return;
- if(!sessionVerification||sessionVerification.epoch!==epoch){const check={epoch};check.promise=(async()=>{try{const value=await api('/api/auth/session');if(epoch===authEpoch&&value.authenticated===false){admin=false;authEpoch++;state=null;showLogin();}}catch{}finally{if(sessionVerification===check)sessionVerification=null;}})();sessionVerification=check;}
- await sessionVerification.promise;
+let sessionVerification=null,sessionVerificationState=null;
+function endUnverifiedSession(){authEpoch++;admin=false;state=null;for(const controller of adminReads)controller.abort();adminReads.clear();showLogin();}
+async function verifyUnauthorizedSession(epoch,{retry=false}={}){
+ if(epoch!==authEpoch||!admin)return false;
+ if(sessionVerification?.epoch===epoch)return sessionVerification.promise;
+ if(sessionVerificationState?.epoch===epoch&&!retry)return null;
+ const check={epoch};sessionVerification=check;sessionVerificationState={epoch,status:'checking'};updatePageReadFeedback();
+ check.promise=(async()=>{try{
+  const value=await api('/api/auth/session');if(epoch!==authEpoch||sessionVerification!==check)return null;
+  if(typeof value.authenticated!=='boolean')throw Error('登录状态响应无效');
+  if(!value.authenticated){endUnverifiedSession();return false;}
+  sessionVerificationState=null;syncPageReadFeedback();updatePageReadFeedback();return true;
+ }catch(error){
+  if(epoch!==authEpoch||sessionVerification!==check)return null;
+  if(error.status===401){endUnverifiedSession();return false;}
+  sessionVerificationState={epoch,status:'failed'};updatePageReadFeedback();return null;
+ }finally{if(sessionVerification===check)sessionVerification=null;}})();
+ return check.promise;
+}
+async function retrySessionVerification(){
+ const epoch=authEpoch;if(!admin||sessionVerificationState?.epoch!==epoch)return;
+ if(sessionVerification?.epoch===epoch)return sessionVerification.promise;
+ if(await verifyUnauthorizedSession(epoch,{retry:true})===true&&admin&&epoch===authEpoch)await refresh();
 }
 async function api(path,method='GET',data,credential='',signal,selectedDepartment){
+ if(path.startsWith('/api/admin/')&&method!=='GET'&&sessionVerificationState?.epoch===authEpoch)throw Error('登录状态待核验，请重试核验后操作');
  if(managementIdentity?.business_available===false&&path.startsWith('/api/admin/')&&!/^\/api\/admin\/departments(?:\/|\?|$)/.test(path))throw Error('当前团队已停用，请先在团队管理中恢复');
  if(globalDepartmentView()&&path.startsWith('/api/admin/')&&method!=='GET'&&!/^\/api\/admin\/(?:departments(?:\/|$)|pricing(?:\/|$)|recordings(?:\/|$)|backup$)/.test(path))throw Error('请先选择业务所属部门，再进行此操作');
   const epoch=authEpoch,requestNavigation=navigationVersion,requestDialog=dialogVersion,isAdmin=path.startsWith('/api/admin/'),scopeHeaders=isAdmin?(/^\/api\/admin\/departments(?:\/|\?|$)/.test(path)&&managementIdentity?.role==='super_admin'?{'X-Harbor-Department':'global'}:departmentHeaders()):path==='/api/auth/session'&&managementIdentity?{'X-Harbor-Department':selectedDepartment??departmentView}:{};
@@ -432,7 +453,7 @@ async function waitForOfficialQuotaRefresh(epoch){
  }finally{clearTimeout(timer);}
 }
 function foregroundButton(node,busy){node?.classList?.toggle('action-loading',busy);node?.setAttribute?.('aria-busy',String(busy));}
-function connectionState(message,failed=false){const node=$('#connection');if(!node)return;node.textContent=message;node.title=message;node.classList?.toggle('connection-error',failed);node.classList?.toggle('connection-online',!failed);}
+function connectionState(message,failed=false){if(admin&&sessionVerificationState?.epoch===authEpoch){message='登录待核验';failed=true;}const node=$('#connection');if(!node)return;node.textContent=message;node.title=message;node.classList?.toggle('connection-error',failed);node.classList?.toggle('connection-online',!failed);}
 
 
 function fixedSessionCommand(identifier){return `codex -c 'model_providers.harbor.http_headers.X-Harbor-Session="${identifier}"'`;}
@@ -526,7 +547,7 @@ async function refresh(renderPage=true,automaticScope='',{preserveRequestsPage=f
     failPageRead(e,'state',scope);if(renderPage)render();else if(!automaticScope)toast(e.message);return false;
   }finally{if(foregroundRefreshVersion===version){foregroundRefreshVersion=0;foregroundRefreshScope='';syncLoadingRegions();}}
 }
-function showLogin({display=true}={}){stopOfficialLoginWatch();stopAccountDetails();accountDetailsError='';manualRefreshPending=false;const feedback=$('#page-read-feedback');if(feedback){feedback.hidden=true;feedback.innerHTML='';}stateReadController?.abort();stateReadController=null;$('#login-cancel').hidden=true;$('#department-context').innerHTML='';pageStateCache.clear();pageReadErrors.clear();renderedPageScope='';pageReadError='';overviewCostController?.abort();overviewCostController=null;overviewCostData=null;overviewCostKey='';overviewCostError='';for(const scope of Object.keys(dialogPageSizes))delete dialogPageSizes[scope];requestGroupPageSizes={model:20,member_name:20};recordingQueryPageSize=20;recordingExportPageSize=20;keyUsagePageSize=20;initialLoadError='';sidebarToolsMarkup=null;const tools=$('#admin-tools');if(tools)tools.innerHTML='';resetExtraState();packageCatalogController?.abort();packageCatalogVersion++;packageCatalog=null;accountPoolFilters={q:'',platform:'',package:'',status:'',quota:'',issue:'',page:1,pageSize:20};stopRecordingPage();recordingAdminFilters={q:'',source:'current',session:'',member:'',memberLabel:'',type:'',model:'',outcome:'',device:'',range:'7'};recordingAdminData=null;recordingAdminStatus=null;recordingAdminQuery=null;recordingExportList=null;recordingAdminTab='query';stopTypeStatistics();typeStatisticsResolvedQuery='';typeStatisticsPendingQuery='';typeCatalogController?.abort();typeStatisticsData=null;typeCatalog=[];overviewType='';typeStatisticsFilters={type:'',member:'',model:'',status:'',groupBy:'type',page:1,pageSize:20};overviewStatisticsFilters={...typeStatisticsFilters};keyRenewalSelection.clear();stopPeople();membersData=null;membersRefreshStale=false;keyUsageData=null;keyUsageDataScope='';requestsResolvedQuery='';requestsPendingQuery='';memberDetailData=null;memberSelection.clear();memberFilters={q:'',typeId:'',status:'',page:1,pageSize:20};requestsAbort?.abort();requestsPageSnapshot='';requestsCursors=new Map([[1,'']]);requestsVersion++;requestsData=null;requestsLoading=false;requestStatisticsTab='list';requestGroupPages={model:1,member_name:1};requestsFilters={member:'',model:'',status:'',device:'',page:1,pageSize:20};connectionView='test';historyController?.abort();historyVersion++;historyData=null;historyResolvedFilters=null;historyLoading=false;recordView='usage';historyFilters={kind:'audit',page:1,pageSize:20,action:'',account:'',session:'',start:'',end:''};if(dialogOpen())close();sessionsPage=1;sessionsPageSize=20;sessionsLoading=false;sessionsFilters=emptySessionFilters();sessionsConfirmedFilters=emptySessionFilters();sessionsConfirmedSnapshot=null;sessionsLoadError='';testKey='';platformModels=[];chatModel='codex';chat=[];chatSession='';chatOwner='';draft='';$('#modal-content').innerHTML='';$('#content').innerHTML='';if(display){$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}}
+function showLogin({display=true}={}){sessionVerification=null;sessionVerificationState=null;stopOfficialLoginWatch();stopAccountDetails();accountDetailsError='';manualRefreshPending=false;const feedback=$('#page-read-feedback');if(feedback){feedback.hidden=true;feedback.innerHTML='';}stateReadController?.abort();stateReadController=null;$('#login-cancel').hidden=true;$('#department-context').innerHTML='';pageStateCache.clear();pageReadErrors.clear();renderedPageScope='';pageReadError='';overviewCostController?.abort();overviewCostController=null;overviewCostData=null;overviewCostKey='';overviewCostError='';for(const scope of Object.keys(dialogPageSizes))delete dialogPageSizes[scope];requestGroupPageSizes={model:20,member_name:20};recordingQueryPageSize=20;recordingExportPageSize=20;keyUsagePageSize=20;initialLoadError='';sidebarToolsMarkup=null;const tools=$('#admin-tools');if(tools)tools.innerHTML='';resetExtraState();packageCatalogController?.abort();packageCatalogVersion++;packageCatalog=null;accountPoolFilters={q:'',platform:'',package:'',status:'',quota:'',issue:'',page:1,pageSize:20};stopRecordingPage();recordingAdminFilters={q:'',source:'current',session:'',member:'',memberLabel:'',type:'',model:'',outcome:'',device:'',range:'7'};recordingAdminData=null;recordingAdminStatus=null;recordingAdminQuery=null;recordingExportList=null;recordingAdminTab='query';stopTypeStatistics();typeStatisticsResolvedQuery='';typeStatisticsPendingQuery='';typeCatalogController?.abort();typeStatisticsData=null;typeCatalog=[];overviewType='';typeStatisticsFilters={type:'',member:'',model:'',status:'',groupBy:'type',page:1,pageSize:20};overviewStatisticsFilters={...typeStatisticsFilters};keyRenewalSelection.clear();stopPeople();membersData=null;membersRefreshStale=false;keyUsageData=null;keyUsageDataScope='';requestsResolvedQuery='';requestsPendingQuery='';memberDetailData=null;memberSelection.clear();memberFilters={q:'',typeId:'',status:'',page:1,pageSize:20};requestsAbort?.abort();requestsPageSnapshot='';requestsCursors=new Map([[1,'']]);requestsVersion++;requestsData=null;requestsLoading=false;requestStatisticsTab='list';requestGroupPages={model:1,member_name:1};requestsFilters={member:'',model:'',status:'',device:'',page:1,pageSize:20};connectionView='test';historyController?.abort();historyVersion++;historyData=null;historyResolvedFilters=null;historyLoading=false;recordView='usage';historyFilters={kind:'audit',page:1,pageSize:20,action:'',account:'',session:'',start:'',end:''};if(dialogOpen())close();sessionsPage=1;sessionsPageSize=20;sessionsLoading=false;sessionsFilters=emptySessionFilters();sessionsConfirmedFilters=emptySessionFilters();sessionsConfirmedSnapshot=null;sessionsLoadError='';testKey='';platformModels=[];chatModel='codex';chat=[];chatSession='';chatOwner='';draft='';$('#modal-content').innerHTML='';$('#content').innerHTML='';if(display){$('#login').classList.remove('hidden');$('#shell').classList.add('hidden');}}
 function webBackupAvailable(){return state?.mode==='本机 · 订阅测试';}
 function managementSettings(){const globalTools=!managementIdentity||departmentView==='global';return !admin?'':`<details class="management-settings"><summary aria-label="管理设置" title="管理设置"><svg class="sidebar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m9.2 3-.7 2.3-2.3 1.3L3.9 6l-2 3.5 1.6 1.8v2.7l-1.6 1.7 2 3.5 2.3-.6 2.3 1.3.7 2.3h4l.7-2.3 2.3-1.3 2.3.6 2-3.5-1.6-1.7v-2.7l1.6-1.8-2-3.5-2.3.6-2.3-1.3-.7-2.3z"/><circle cx="11.2" cy="12.5" r="3"/></svg><span class="sidebar-tool-label">管理设置</span><svg class="sidebar-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m5 10 3-3 3 3"/></svg></summary><div class="management-menu">${button('download-platform-guide','下载平台文档','text-button')}${globalTools?button('pricing-settings','模型费率','text-button'):''}${state?.capabilities?.recordingHistory?button('recording-retention-settings','正文保留期','text-button'):''}${globalTools&&webBackupAvailable()?button('backup','创建数据库备份','text-button'):'<span class="hint">备份由运维命令管理</span>'}</div></details>`;}
 function showShell(){
@@ -733,7 +754,7 @@ function renderRequestStatistics(){
 }
 function flushRequestStatistics(){if(requestsRenderPending&&canRenderRequestStatistics())renderRequestStatistics();}
 document.addEventListener('focusout',()=>setTimeout(flushRequestStatistics,0));
-document.addEventListener('visibilitychange',()=>{flushRequestStatistics();expireRecordingSearchResults();if(recordingDocumentView?.expires&&recordingDocumentView.expires<=Date.now())renderRecordingDocument(recordingDocumentView);if(recordingAdminVisible()&&recordingAdminData&&!document.hidden&&recordingAdminTab==='query'&&!['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)){const target=$('#recording-query-results');if(target)target.innerHTML=recordingAdminResults();}if(recordingDetail?.expiresAt&&recordingDetail.expiresAt<=Date.now()){expireRecording(recordingDetail);renderRecording();}});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&admin&&sessionVerificationState?.epoch===authEpoch&&sessionVerificationState.status==='failed')void retrySessionVerification();flushRequestStatistics();expireRecordingSearchResults();if(recordingDocumentView?.expires&&recordingDocumentView.expires<=Date.now())renderRecordingDocument(recordingDocumentView);if(recordingAdminVisible()&&recordingAdminData&&!document.hidden&&recordingAdminTab==='query'&&!['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)){const target=$('#recording-query-results');if(target)target.innerHTML=recordingAdminResults();}if(recordingDetail?.expiresAt&&recordingDetail.expiresAt<=Date.now()){expireRecording(recordingDetail);renderRecording();}});
 function clearRemovedRequestMember(members){
   if(!requestsFilters.member||!Array.isArray(members)||!members.some(member=>member.id===requestsFilters.member&&member.removed_at))return false;
   requestsFilters.member='';delete requestsFilters.member_missing;requestsData=null;return true;
@@ -2107,6 +2128,8 @@ document.addEventListener('click',async e=>{
   const nav=e.target.closest('[data-tab]');if(nav)return setTab(nav.dataset.tab);
   const el=e.target.closest('[data-action]');if(!el)return;const action=el.dataset.action,identifier=el.dataset.id,actionEpoch=authEpoch,actionDialog=dialogVersion,actionFromDialog=dialogOpen(),actionCurrent=()=>admin&&actionEpoch===authEpoch&&actionDialog===dialogVersion&&(!actionFromDialog||dialogOpen());const operation={epoch:actionEpoch,navigation:navigationVersion,dialog:actionDialog,ownsDialog:false};activeActionContext=operation;Promise.resolve().then(()=>{if(activeActionContext===operation)activeActionContext=null;});const settings=el.closest?.('.management-settings');if(settings)settings.open=false;if(action!=='close')foregroundButton(el,true);
   try{
+    if(action==='session-verify')return retrySessionVerification();
+    if(action==='session-relogin'){endUnverifiedSession();return;}
     if(managementSecretPending&&(action==='close'||action.startsWith('department-')))return toast('请等待管理 Key 生成完成');
     if(action.startsWith('department-'))return await departmentAction(action,identifier);
     if(globalDepartmentView()&&departmentBusinessActions.has(action))return await chooseBusinessDepartment(action,identifier);
