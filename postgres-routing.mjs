@@ -1,3 +1,4 @@
+import {routeAdmissionBusy} from './postgres-route-wait.mjs';
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {createPostgresAudit} from './postgres-audit.mjs';
 import {codexQuotaDenials} from './codex-entitlements.mjs';
@@ -67,7 +68,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
     };
     return {settings,packagePolicy,effectiveWeighted,accounts,distribution,extraView,select,schedule:saved.get(scheduleName)||{}};
   }
-  async function resolve(member,payload,headers={},{preparing:requestPreparing,protocol='responses',consumptionScope,scope:departmentScope}={}){
+  async function resolve(member,payload,headers={},{preparing:requestPreparing,protocol='responses',consumptionScope,scope:departmentScope,routeWait}={}){
     const scope=consumptionScope===undefined?null:consumptionScopes.get(consumptionScope);if(consumptionScope!==undefined&&!scope)failure(503,'来源路由约束未经认证','consumption_scope_invalid');
     if(!['responses','images'].includes(protocol))failure(503,'推理通道配置无效','routing_configuration');
     const department=await access.resolve(departmentScope,{member,write:true,employeeOnly:true});
@@ -81,7 +82,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
     const routing=await state(at,{scope:departmentScope,protocol,model:payload.model,...(scope?{accountIds:scope.accountIds,persistAuto:false,scheduleName:'routing_schedule.consumption_'+scope.source}:{})});let account=session?routing.accounts.find(a=>a.id===session.account_id):null;
     if(scope&&session&&!account){
       if(fixed||!scope.rebind)failure(409,'固定会话或上下文不允许改变消耗来源','consumption_source_conflict');
-      if(preparing.has(member.id)||requestPreparing?.has(member.id)||await store.get("SELECT id FROM harbor.requests WHERE session_id=$1 AND status IN ('queued','running') AND ($2::text IS NULL OR id<>$2) LIMIT 1",session.id,scope.excludeRequestId))failure(409,'会话仍有请求处理中，暂不能切换','session_busy');
+      const busy=routeWait?.capture();const pending=await store.get("SELECT id FROM harbor.requests WHERE session_id=$1 AND status IN ('queued','running') AND ($2::text IS NULL OR id<>$2) LIMIT 1",session.id,scope.excludeRequestId);if(pending)throw busy?busy(pending.id):routeAdmissionBusy(pending.id);
       const target=await routing.select(),from=session.account_id;
       const changed=await store.get('UPDATE harbor.sessions SET account_id=$1,upstream_thread=$2,route_version=route_version+1,handoff_requires_replay=1 WHERE id=$3 AND route_version=$4 RETURNING *',target.id,id(),session.id,session.route_version);
       if(!changed)failure(409,'会话绑定已变化','session_route_conflict');session=changed;account=target;
@@ -98,7 +99,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
       const uncertain=routing.packagePolicy.enabled&&routing.distribution.subscriptionMode!=='manual'&&routing.distribution.system.packages?.items.find(item=>item.id===account.id),insufficient=uncertain&&!uncertain.exhausted&&uncertain.reason!=='quota_exhausted'&&(!uncertain.eligible||routing.distribution.system.reason);
       const exhausted=routing.packagePolicy.enabled&&packageScope?.exhausted&&!authorizedExtra;
       if(!pinnedApi&&(blocked||exhausted||extraDenied||routing.effectiveWeighted&&!positive&&!insufficient)){
-        if(preparing.has(member.id)||requestPreparing?.has(member.id)||await store.get("SELECT id FROM harbor.requests WHERE session_id=$1 AND status IN ('queued','running') LIMIT 1",session.id))failure(409,'会话仍有请求处理中，暂不能切换','session_busy');
+        const busy=routeWait?.capture();const pending=await store.get("SELECT id FROM harbor.requests WHERE session_id=$1 AND status IN ('queued','running') LIMIT 1",session.id);if(pending)throw busy?busy(pending.id):routeAdmissionBusy(pending.id);
         let destination=routing;
         if(routing.packagePolicy.enabled&&!api&&routing.distribution.subscriptionMode!=='manual'){
           const items=new Map(routing.distribution.system.packages.items.map(item=>[item.id,item])),source=items.get(account.id),legacy=account.package_selection?.mode==='legacy',legacyGroup=routing.distribution.system.snapshots.get(account.id)?.group;

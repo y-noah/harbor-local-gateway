@@ -1,3 +1,4 @@
+import {createRouteAdmissionWait} from './postgres-route-wait.mjs';
 import {createPostgresPricingAdmin} from './postgres-pricing-admin.mjs';
 import {requireDepartmentScope} from './department-access.mjs';
 import {beginAdminRequestTiming,finishAdminRequestTiming,registerAdminRequestTimingSignal,wrapAdminQueryTimingQueue} from './admin-request-timing.mjs';
@@ -88,6 +89,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
   const consumptionPolicies=createPostgresConsumptionPolicy(store,{clock});
   const stages=createStreamingStageObserver(stageObserver);
   const timingPersistence={queued:0,rejected:0};
+  const routeAdmissionWait=createRouteAdmissionWait();
   const active=new Set(),members=new Map(),preparing=new Map(),accounts=new Map();let stopping=false;
   const execution=createInferenceBudget({...executionOptions,maxConcurrent,maxPerMember:Math.min(maxPerMember,maxConcurrent)});
   const preparation=createRoutingPreparation({maxWaiting:maxConcurrent,stageObserver});
@@ -239,7 +241,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
     if(active.size>=maxConcurrent||(members.get(member.id)||0)>=maxPerMember)throw new AppError(429,'请求并发已满，请稍后重试','gateway_busy');
     const controller=new AbortController();active.add(controller);members.set(member.id,(members.get(member.id)||0)+1);stage.emit('lease',{lease:'member',action:'acquire'});const observeCancel=()=>stage.emit('cancel');controller.signal.addEventListener('abort',observeCancel,{once:true});
     const close=()=>{if(!res.writableEnded)controller.abort();};res.on('close',close);
-    let output,ticket,releasePreparation,releaseExecution,requestId,routedAccount,contextReplayable=false,contextComplete=false,contextSaved=false,accountTracked=false,capture,requestContext,batch=[],batchBytes=0,flushTimer,recordFailed=false,recordFailureReason=null,recordStarted=false,settlementAttempted=false,dispatched=false,extraBoundary,consumption,attemptIndex=-1,attemptPersistence=Promise.resolve(),upstreamEventSeen=false,currentDispatched=false,actualConsumptionSource=null,actualFallback=false,currentReliable=false,consumptionSelection;
+    let output,ticket,releasePreparation,releaseExecution,releaseRouteOwner,requestId,routedAccount,contextReplayable=false,contextComplete=false,contextSaved=false,accountTracked=false,capture,requestContext,batch=[],batchBytes=0,flushTimer,recordFailed=false,recordFailureReason=null,recordStarted=false,settlementAttempted=false,dispatched=false,extraBoundary,consumption,attemptIndex=-1,attemptPersistence=Promise.resolve(),upstreamEventSeen=false,currentDispatched=false,actualConsumptionSource=null,actualFallback=false,currentReliable=false,consumptionSelection;
     const consumptionAttempts=[];
     const record=operation=>{try{return operation();}catch{capture=undefined;recordFailed=true;recordFailureReason??='capture_failed';return undefined;}};
     const writeRecording=(method,...args)=>record(()=>{const result=recordingBufferWrite(buffer,method,...args);if(!result.accepted){recordFailed=true;recordFailureReason??=result.reason;}return result.accepted;});
@@ -310,11 +312,11 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       // A released savepoint is not proof that its outer transaction committed.
       // This receipt changes observation only; routing and settlement stay intact.
       try{receipt.nested=!!store.context?.getStore?.();}catch{receipt.nested=true;}
-      let route=await store.transaction(async()=>{
+      let route=await routeAdmissionWait.run(()=>store.transaction(async()=>{
         await lockPostgresRouting(store);
         const current=await store.authenticate(secret,{at:clock(),lock:true}),scope=authenticatedScope(current),device=await deviceAccess.authorize(current,req,{phase:'admission'});await store.checkModel(current,payload.model,payload.tools);
         await checkLimits(current,payload,{at:clock()});
-        const route=await (consumptionRouting?consumptionRouting.resolve(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope}):resolveRoute(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope}));
+        const route=await (consumptionRouting?consumptionRouting.resolve(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope,routeWait:routeAdmissionWait}):resolveRoute(current,payload,req.headers,{preparing,protocol:jsonPath?'images':'responses',scope,routeWait:routeAdmissionWait}));
         if(!route?.session?.id||!route?.account?.id)throw new AppError(503,'会话路由未准备好','session_account_unavailable');
         if(identified.session&&identified.session.id!==route.session.id)throw new AppError(409,'会话关联已变化，请稍后重试','session_route_conflict');
         // Recheck trusted ownership/state, even when an adapter returns stale data.
@@ -326,13 +328,14 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
         if(jsonPath&&account.auth_mode==='openai_api')throw new AppError(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');
         stage.emit('admission-attempt');releaseExecution=execution.acquire({memberId:current.id,accountId:account.id});if(releaseExecution){stage.emit('lease',{lease:'execution',action:'acquire'});stage.emit('admission-granted');}if(!releaseExecution)throw new AppError(503,'账号执行容量已满，请稍后重试','inference_capacity_busy');
         const requestId=await store.observe(current,req.socket.remoteAddress||'unknown',String(req.headers['user-agent']||'').slice(0,200),payload.model,{at:clock(),channel:jsonPath?jsonPath.slice(1):'responses',device,parameters:payload,scope});
+        releaseRouteOwner=routeAdmissionWait.own(requestId);
         await store.run('UPDATE harbor.requests SET account_id=$1,session_id=$2,route_version=$3,recording_state=$4,handoff_input=$5,recording_reason=$7 WHERE id=$6',account.id,session.id,session.route_version,captureEnabled?'pending':'disabled',contextReplayable?'replayable':'opaque',requestId,captureDecision.reason);
         if(route.consumption?.schemaAvailable)await consumptionPolicies.recordAdmission(requestId,current.key_id,route.consumption);
         await store.run('UPDATE harbor.accounts SET last_used=$1 WHERE id=$2',clock(),account.id);
         const extraAdmission={...await extraRuntime.admit({requestId,account,model:payload.model,protocol:jsonPath?'images':'responses',scope}),fixed:!!identified.fixed};
         await quotaSubjects.admit(requestId,account,{mode:extraAdmission.mode});
         receipt.callbackCompleted=true;return {requestId,account,session,extraAdmission,scope,...(route.consumption?{consumption:route.consumption}:{})};
-      });
+      }),{signal:controller.signal,inTransaction:()=>!!store.context.getStore()});
       receipt.timing?.preDispatch('admissionEnd');
       requestId=route.requestId;consumption=route.consumption;if(consumption?.schemaAvailable)sourceHeaders();if(receipt.nested)receipt.publish('source-unavailable');else receipt.publish('accepted',{accepted:true,recordingExpected:captureEnabled});routedAccount=route.account;accounts.set(routedAccount.id,(accounts.get(routedAccount.id)||0)+1);accountTracked=true;
       const createBoundary=()=>extraRuntime.boundary({requestId,scope:route.scope,protocol:jsonPath?'images':'responses',admittedExtra:route.extraAdmission.extraReserved,fixed:route.extraAdmission.fixed,packagePreference:route.scope?adminRouter.dispatchPreferenceFor(route.scope):adminRouter.dispatchPreference,
@@ -440,6 +443,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       }
       throw controller.signal.reason?.code==='service_shutdown'?controller.signal.reason:error;
     }finally{
+     try{
       await extraBoundary?.releaseUnused();
       releasePreparation?.();
       if(flushTimer)clearInterval(flushTimer);
@@ -447,6 +451,7 @@ export function createPostgresResponsesHandler({store,queryStore=store,recording
       if(requestId&&captureEnabled&&(!recordStarted||recordFailed))await store.run("UPDATE harbor.requests SET recording_state='partial',recording_reason=$2 WHERE id=$1 AND recording_state IN ('disabled','pending','complete')",requestId,recordFailureReason??'capture_failed').catch(()=>{});
       if(accountTracked){const n=accounts.get(routedAccount.id)-1;if(n)accounts.set(routedAccount.id,n);else accounts.delete(routedAccount.id);void chat?.wake();}
       if(releaseExecution){releaseExecution();stage.emit('lease',{lease:'execution',action:'release'});}else stage.emit('lease',{lease:'execution',action:'not-acquired'});output?.close();if(output)stage.emit('lease',{lease:'output',action:'release'});res.off('close',close);controller.signal.removeEventListener('abort',observeCancel);active.delete(controller);const count=members.get(member.id)-1;if(count)members.set(member.id,count);else members.delete(member.id);stage.emit('lease',{lease:'member',action:'release'});ticket?.close();
+     }finally{releaseRouteOwner?.();}
     }
   }
   const handle=async(req,res)=>{

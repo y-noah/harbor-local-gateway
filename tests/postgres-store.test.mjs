@@ -164,7 +164,7 @@ test('HTTP Responses uses the original Key, PostgreSQL ownership, shared model p
   handler.drain();response=await send({model:'gpt-6.1-sol',input:'draining'});assert.equal(response.status,503);assert.equal(dispatched,acceptedCalls+1);
 });
 
-test('R21 slow uploads protect routing until every same-member body completes or disconnects',integration,async t=>{
+test('R21 unadmitted slow uploads do not block automatic routing and later use the latest binding',integration,async t=>{
   const {store}=await fixture(t);await store.migrate();await store.initializePricing();const {member}=await legacyMember(t,store),root=mkdtempSync(join(tmpdir(),'harbor-pg-upload-'));
   for(const aid of ['a','b'])await store.run("INSERT INTO harbor.accounts(id,name,home,state) VALUES($1,$1,$1,'ready')",aid);
   const put=(name,value)=>store.run('INSERT INTO harbor.gateway_settings VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value',name,JSON.stringify(value));
@@ -182,14 +182,14 @@ test('R21 slow uploads protect routing until every same-member body completes or
   await put('routing_weights',{mode:'manual',weights:{a:0,b:100},expires:nextWeightReset(Date.now()),version:2});
   for(let i=0;i<2;i++){const request=http.request(origin+'/v1/responses',{method:'POST',headers});request.on('error',()=>{});request.on('response',res=>res.resume());uploads.push(request);request.write('{"model":"gpt-6.1-sol","input":"');}
   await wait(()=>handler.status().preparing===2);
-  response=await send();assert.equal(response.status,409);assert.equal((await response.json()).error.code,'session_busy');assert.equal(calls,1);
+  response=await send();assert.equal(response.status,200);await response.json();assert.equal(calls,2);
   // Finishing one body must not clear the other upload's reference count.
-  // Body-read completion precedes async routing; wait for its actual rejection before releasing the sibling.
+  // Each upload resolves the latest binding only after its body is complete.
   const completedUpload=eventOnce(uploads[0],'response',{signal:AbortSignal.timeout(5000)});
-  uploads[0].end('synthetic","stream":false}');const [uploadResult]=await completedUpload;assert.equal(uploadResult.statusCode,409);assert.equal(calls,1);await wait(()=>handler.status().preparing===1);
-  response=await send();assert.equal(response.status,409);await response.json();assert.equal((await store.get('SELECT route_version FROM harbor.sessions WHERE id=$1',before.id)).route_version,0);
+  uploads[0].end('synthetic","stream":false}');const [uploadResult]=await completedUpload;assert.equal(uploadResult.statusCode,200);assert.equal(calls,3);await wait(()=>handler.status().preparing===1);
+  response=await send();assert.equal(response.status,200);await response.json();assert.equal((await store.get('SELECT route_version FROM harbor.sessions WHERE id=$1',before.id)).route_version,1);
   uploads[1].destroy();await wait(()=>handler.status().preparing===0);
-  response=await send();assert.equal(response.status,200);await response.json();const after=await store.get('SELECT * FROM harbor.sessions WHERE id=$1',before.id);assert.equal(after.account_id,'b');assert.equal(after.route_version,1);assert.equal(calls,2);
+  response=await send();assert.equal(response.status,200);await response.json();const after=await store.get('SELECT * FROM harbor.sessions WHERE id=$1',before.id);assert.equal(after.account_id,'b');assert.equal(after.route_version,1);assert.equal(calls,5);
 });
 
 test('request input previews are page bounded, encrypted, expiration aware and isolated from damaged ciphertext',integration,async t=>{
