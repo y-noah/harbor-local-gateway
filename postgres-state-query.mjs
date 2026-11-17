@@ -6,7 +6,7 @@ import {referenceMetric} from './pricing.mjs';
 import {postgresMemberLimitConfiguration} from './postgres-member-limits.mjs';
 import {fields,validPrice,joins,decorate,aggregate,aggregateSql,referencePartialAggregateSql,referenceRollupAggregateSql} from './postgres-reference-query.mjs';
 import {createPostgresQueryQueue} from './postgres-query-queue.mjs';
-import {verifyUsageRollupAvailability,usageRollupsReady,usageRollupMoneySql} from './postgres-usage-rollups.mjs';
+import {createUsageRollupReadInitializer,usageRollupsReady,usageRollupMoneySql} from './postgres-usage-rollups.mjs';
 import {createQueryDepartments,departmentPredicate} from './postgres-query-departments.mjs';
 import {createAdminDepartments} from './postgres-admin-departments.mjs';
 import {assertPostgresAuditScopes} from './postgres-audit.mjs';
@@ -87,7 +87,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
   const queue=queryQueue||createPostgresQueryQueue();
   const departments=createQueryDepartments(store);
   if(!Number.isSafeInteger(maxPeople)||maxPeople<1||maxPeople>10000)throw new AppError(503,'兼容员工状态容量无效','state_configuration');
-  let rollupInitialization;
+  const initializeUsage=createUsageRollupReadInitializer(store);
   async function loadSessionPage({window,sessionPage,sessionPageSize,sessionQ,sessionType,sessionAccount,sessionStatus},authorization,signal){
       checkCancelled(signal);
       const sessionArgs=[window.start,window.end],conditions=['s.updated>=$1','s.updated<$2'];
@@ -286,5 +286,5 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
         requests:requests.map(row=>decorate(row,window.start)),totals:totals||{requests:0,success:0,standard:empty},daily:daily.sort((a,b)=>a.day.localeCompare(b.day)),audit};
     },{level:'REPEATABLE READ',readOnly:true});
   }
-  return {read:(query,{signal,scope}={})=>{const input={...query};return queue.run(async()=>{checkCancelled(signal);const authorization=await departments.resolve(scope);checkCancelled(signal);if(['accounts','overview-cost'].includes(input.view)){const initializationError=await (rollupInitialization??=verifyUsageRollupAvailability(store).then(()=>null,error=>error));checkCancelled(signal);if(initializationError)throw initializationError;}return execute(input,authorization,signal);},{signal});},close:()=>queue.close(),status:()=>queue.status()};
+  return {read:(query,{signal,scope}={})=>{const input={...query};return queue.run(async()=>{checkCancelled(signal);const authorization=await departments.resolve(scope);checkCancelled(signal);if(['accounts','overview-cost'].includes(input.view)){await initializeUsage();checkCancelled(signal);}return execute(input,authorization,signal);},{signal});},close:()=>queue.close(),status:()=>queue.status()};
 }

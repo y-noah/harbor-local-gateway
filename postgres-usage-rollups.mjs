@@ -50,6 +50,20 @@ export async function verifyUsageRollupAvailability(store){
  if(value.version!==1||value.checksum!==bundle.checksum)throw conflict();
  await verifyUsageRollups(store);verifiedStores.add(store);return true;
 }
+// A transient read failure must not poison all later management reads. Schema
+// conflicts remain rejected; only another request retries transient failures.
+export function createUsageRollupReadInitializer(store){
+ let pending;
+ return async()=>{
+  const current=pending??=verifyUsageRollupAvailability(store);
+  try{await current;}
+  catch(error){
+   const retryable=typeof error?.code==='string'&&(/^(08|53)[0-9A-Z]{3}$/.test(error.code)||['57014','57P01','57P02','57P03','ECONNRESET','ECONNREFUSED','ETIMEDOUT','EPIPE'].includes(error.code));
+   if(pending===current&&retryable)pending=undefined;
+   throw error;
+  }
+ };
+}
 export async function migrateUsageRollups(store,{apply=false,runtimeRole}={}){
  if(typeof apply!=='boolean')throw new TypeError('usage_rollup_apply_invalid');
  if(!apply){await verifyUsageRollupAvailability(store);return false;}
