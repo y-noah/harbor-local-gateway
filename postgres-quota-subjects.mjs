@@ -2,7 +2,7 @@ import {readFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {AppError} from './store.mjs';
 import {accountCapacity} from './rates.mjs';
-import {retainCodexQuotaDenials} from './codex-entitlements.mjs';
+import {codexQuotaDenials,retainCodexQuotaDenials} from './codex-entitlements.mjs';
 import {apiCredentialQuotaSubject} from './quota-subject.mjs';
 
 export const quotaSubjectContract='quota-subject-coordination-v1';
@@ -112,6 +112,21 @@ function ordinarySnapshot(snapshot){
   return {checked:snapshot.checked,windows:snapshot.windows,remaining:snapshot.remaining,ordinaryUsageAllowed:snapshot.ordinaryUsageAllowed,limitReached:snapshot.limitReachedType==='rate_limit_reached',limitReachedType:snapshot.limitReachedType==='rate_limit_reached'?'rate_limit_reached':null};
 }
 
+function sharedOrdinaryState(account,subject,at){
+ if(!subject?.shared||subject.scope!=='account_metered_bucket'||!subject.snapshot)return 'unknown';
+ const denial=codexQuotaDenials(subject.snapshot);if(denial.spend_control||denial.workspace)return 'hard_denied';
+ const capacity=accountCapacity({...account,quota_json:JSON.stringify(subject.snapshot),token_budget:null,budget_used:0,since_check_tokens:0},0,0,at);
+ return !capacity.eligible&&(capacity.source==='official_denied'||capacity.source==='official'&&capacity.remaining===0)?'exhausted':'unknown';
+}
+// Only bound current identities are considered; no supplier identifiers leave this helper.
+// Admission callers retain the existing shared-state lock through final authorization.
+export async function sharedOrdinaryQuotaStates(store,accounts,at=Date.now()){
+ const states=new Map();if(!accounts.length||!await installed(store))return states;
+ if(store.context.getStore())await lock(store);
+ const rows=await store.all('SELECT b.account_id,s.scope,s.shared,s.snapshot FROM harbor.quota_subject_accounts b JOIN harbor.accounts a ON a.id=b.account_id AND a.quota_identity_epoch=b.identity_epoch JOIN harbor.quota_subjects s ON s.ref=b.subject_ref WHERE b.account_id=ANY($1::text[])',accounts.map(account=>account.id));
+ const owners=new Map(accounts.map(account=>[account.id,account]));for(const row of rows)states.set(row.account_id,sharedOrdinaryState(owners.get(row.account_id),row,at));return states;
+}
+
 export function createPostgresQuotaSubjects(store,{identity,clock=Date.now}={}){
   async function transaction(){if(!store.context.getStore())fail('quota_subject_transaction_required');await lock(store);}
   async function bind(account,facts){
@@ -166,10 +181,7 @@ export function createPostgresQuotaSubjects(store,{identity,clock=Date.now}={}){
     // Shared identity is accounting evidence, not a local execution semaphore.
     // Missing/stale snapshots, in-flight/unknown usage and token estimates cannot
     // prove provider exhaustion. Preserve those facts and let the provider decide.
-    if(subject.scope==='account_metered_bucket'&&subject.snapshot){
-      const capacity=accountCapacity({...account,quota_json:JSON.stringify(subject.snapshot),token_budget:null,budget_used:0,since_check_tokens:0},0,0,clock());
-      if(!capacity.eligible&&(capacity.source==='official_denied'||capacity.source==='official'&&capacity.remaining===0))fail('shared_supplier_quota_unavailable',429);
-    }
+    if(['exhausted','hard_denied'].includes(sharedOrdinaryState(account,subject,clock())))fail('shared_supplier_quota_unavailable',429);
   }
 
   async function admit(requestId,account,{mode,replaceConfirmedUnused=false}={}){

@@ -1,3 +1,4 @@
+import {sharedOrdinaryQuotaStates} from './postgres-quota-subjects.mjs';
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {codexQuotaDenials} from './codex-entitlements.mjs';
@@ -42,15 +43,18 @@ export function createPostgresExtraRuntime(store,{clock=Date.now,service=createP
  const access=createRoutingDepartments(store,{clock});
  // Manual positive weights authorize an upstream attempt, not a fabricated
  // balance or a local extra-use reservation. Upstream remains the authority.
- function classifyManual(account,options,manualPositive){
+ function classifyManual(account,options,manualPositive,sharedState){
   const value=classifyExtraPackage(account,options);
+  if(manualPositive&&sharedState==='hard_denied')return {mode:'blocked',packageAvailable:null,reason:'official_spending_denied'};
+  if(manualPositive&&sharedState==='exhausted'&&account.kind==='codex'&&account.auth_mode==='subscription'&&['package','package_compatibility'].includes(value.mode))return {...value,mode:'manual_extra',packageAvailable:false,reason:null};
   if(manualPositive&&account.kind==='codex'&&account.auth_mode==='subscription'&&(value.mode==='extra'||value.reason==='package_availability_unknown'))return {...value,mode:'manual_extra',packageAvailable:false,reason:null};
   return value.mode==='extra'?{...value,mode:'blocked',reason:'manual_positive_weight_required'}:value;
  }
  async function classifyAccounts(accounts,{model,protocol,scope}={}){
   const department=await access.resolve(scope);if(department){const owners=new Map((await store.all('SELECT id,department_id FROM harbor.accounts WHERE id=ANY($1::text[])',accounts.map(account=>account.id))).map(row=>[row.id,row]));for(const account of accounts)access.same(department,owners.get(account.id));}
   const saved=await readExtraDispatchSettings(store,()=>access.settings(department,['balancing','routing_strategy','routing_weights','routing_auto','routing_schedule','account_package_policy']),access.identity(department)),policy=saved.get('account_package_policy')??{enabled:false},weights=saved.get('routing_weights'),legacy=saved.get('balancing')??{},settings=balanceSettings({...legacy,weighted:saved.get('routing_strategy')?.weighted??legacy.weighted??false}),manualActive=weights?.mode==='manual'&&(settings.weighted||policy.enabled),decorated=await decorateExtraDispatchPackages(store,packages,accounts);
-  return new Map(decorated.map(account=>[account.id,{...classifyManual(account,{at:clock(),model,protocol,packagePolicy:policy},manualActive&&weights.weights?.[account.id]>0),protocol}]));
+  const sharedStates=await sharedOrdinaryQuotaStates(store,manualActive?decorated.filter(account=>account.kind==='codex'&&account.auth_mode==='subscription'&&weights.weights?.[account.id]>0):[],clock());
+  return new Map(decorated.map(account=>[account.id,{...classifyManual(account,{at:clock(),model,protocol,packagePolicy:policy},manualActive&&weights.weights?.[account.id]>0,sharedStates.get(account.id)),protocol}]));
  }
  async function classify(account,options){return (await classifyAccounts([account],options)).get(account.id);}
  async function routingView(accounts,{model,protocol,packagePolicy,distribution}={}){
