@@ -78,10 +78,12 @@ test('全局同码类型筛选显示服务端团队，不按code合并不同类�
  page.run("departmentView='department-a'");assert.doesNotMatch(page.run('typeOptions()'),/真实团队/);
 });
 test('剩余额度区分确定金额、计价缺失、首次加载与旧值更新，不把未知变为满额',async()=>{
- const page=await ui();page.run("globalThis.limitRow={usage_limits:{enabled:true},limit_usage:[{model:'gpt-6.1-sol',hours:24,limit_usd:'100',remaining_usd:'73.21',unresolved:0}]}");
+ const page=await ui();page.run("globalThis.limitRow={usage_limits:{enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'100'}]},limit_usage:[{model:'gpt-6.1-sol',hours:24,limit_usd:'100',remaining_usd:'73.21',unresolved:0}]}");
  assert.match(page.run('memberLimitSummary(limitRow,{})'),/剩余 \$73\.21/);
  assert.match(page.run('memberLimitSummary(limitRow,{usagePending:true})'),/\$73\.21.*更新中/);
- page.run('limitRow.limit_usage[0].unresolved=2;limitRow.limit_usage[0].remaining_usd="100"');const unknown=page.run('memberLimitSummary(limitRow,{})');assert.match(unknown,/2条请求未完成计价，剩余额度暂不可算/);assert.doesNotMatch(unknown,/剩余 \$100/);
+ assert.match(page.run('memberLimitSummary(limitRow,{usageError:true})'),/\$73\.21.*更新失败，保留上次结果/);
+ page.run('limitRow.limit_usage[0].unresolved=2;limitRow.limit_usage[0].remaining_usd="100"');const partial=page.run('memberLimitSummary(limitRow,{})');assert.match(partial,/剩余 \$100\.00.*2条未计价/);assert.doesNotMatch(partial,/请求受限|暂不可算/);
+ for(const missing of ['null','undefined']){page.run('limitRow.limit_usage[0].remaining_usd='+missing);const unknown=page.run('memberLimitSummary(limitRow,{})');assert.match(unknown,/剩余额度获取失败.*2条未计价/);assert.doesNotMatch(unknown,/剩余 \$100|剩余 \$0/);}
  page.run('limitRow.limit_usage=[]');assert.match(page.run('memberLimitSummary(limitRow,{usagePending:true})'),/剩余额度加载中/);assert.match(page.run('memberLimitSummary(limitRow,{usageError:true})'),/剩余额度获取失败/);
 });
 test('团队分配设置主动读取该团队权重，缺失时可重试而非要求无效的全局刷新',async()=>{

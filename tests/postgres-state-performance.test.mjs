@@ -77,7 +77,8 @@ test('people=none preserves complete overview DTO across usage boundaries, sessi
           }
           assert.equal(compact.totals.requests,5);assert.equal(compact.totals.standard.unpriced,1);assert.equal(compact.totals.standard.total_exact,'36028.797018963972');
           assert.equal(compact.sessionsPagination.total,27);assert.equal(compact.sessionsPagination.page,page===1?1:2);
-          assert.equal(compact.sessions.length,page===1?25:2);
+          assert.equal(compact.sessionsPagination.pageSize,20);assert.equal(compact.sessionsPagination.totalPages,2);
+          assert.equal(compact.sessions.length,page===1?20:7);
           if(page!==1)assert.equal(compact.sessions.find(row=>row.id===sessions[26]).request_count,2);
           assert.equal(compact.accounts.find(row=>row.id===accounts[1]).standard.requests,0);
         }else{assert.equal(compact.totals.requests,0);assert.deepEqual(compact.daily,[]);assert.equal(compact.sessionsPagination.total,0);assert.deepEqual(compact.requests,[]);}

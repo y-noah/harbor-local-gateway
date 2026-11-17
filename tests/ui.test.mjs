@@ -2057,7 +2057,7 @@ test('平台离线指南分两部分覆盖按角色上手与模型demo，不带�
  assert.match(html,/npm\.cmd --version[\s\S]*npm\.cmd install -g @openai\/codex[\s\S]*codex\.cmd --version/);assert.ok(html.includes('无需放宽系统执行策略'));assert.match(html,/cd harbor-codex-demo\ncodex\.cmd/);
  for(const text of ['Node.js 官方下载页','24.x LTS','.msi','重新打开一个PowerShell','uname -m','x86_64','aarch64','Linux安装步骤','Codex 官方下载与安装入口','桌面安装不等于WSL已安装CLI','npm --version'])assert.ok(html.includes(text),text);
  assert.ok(html.indexOf('使用前告知')<html.indexOf('第一部分：从登录到完成首次使用'));assert.ok(html.indexOf('第一部分：从登录到完成首次使用')<html.indexOf('第二部分：模型选择与初始化 demo'));
- assert.match(html,/<td>429／达到模型共享限额<\/td><td>[^<]*重置窗口/);assert.match(html,/<td>409／剩余额度暂不可算<\/td><td>[^<]*缺计量或缺费率/);
+ assert.match(html,/<td>429／达到模型共享限额<\/td><td>[^<]*重置窗口/);assert.match(html,/<td>未计量／缺费率／未计价<\/td><td>[^<]*只累计已计价金额[^<]*不因此拒绝新请求/);assert.doesNotMatch(html,/409／剩余额度暂不可算/);
  assert.match(html,/default-src 'none'/);assert.doesNotMatch(html,/<script|<iframe|<img|<link|gitlab|resources\/company|sk-synthetic-private-upstream|hg_synthetic_private_employee|173\.208|sichuang/i);assert.doesNotMatch(html,/<(?:form|input|button)\b/);assert.match(html,/C:&#92;Users&#92;YOUR_USER&#92;\.codex&#92;harbor-models\.json/);
  for(const link of html.matchAll(/href="([^"]+)"/g))assert.ok(link[1].startsWith('#')||link[1].startsWith('https://developers.openai.com/')||link[1]==='https://nodejs.org/en/download'||link[1]==='https://openai.com/codex/',link[1]);
  await page.click('download-platform-guide');assert.equal(page.downloads.at(-1),'Harbor-平台说明.html');assert.equal(page.node('#modal').open,false);
