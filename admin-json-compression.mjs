@@ -45,3 +45,5 @@ export function createAdminJsonCompression({maxInputBytes=2097152,gzipImpl=gzip}
  async function close(){closed=true;if(active)await new Promise(resolve=>idle.push(resolve));}
  return {send,close,status:()=>({active,closed})};
 }
+
+export {accepted as acceptedContentEncodings,vary as varyAcceptEncoding};
