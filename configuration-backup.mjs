@@ -26,7 +26,7 @@ export const configurationTables=Object.freeze({
  employee_devices:fields('id member_id name system state pending_renewal hardware_state fingerprint installation_fingerprint fingerprint_source review_fingerprint review_installation_fingerprint allowed_key_ids version credential_generation public_key_sha256 csr created approved_at replaces_device_id enrollment_digest enrollment_expires department_id'),
  device_credentials:fields('fingerprint device_id generation certificate issued expires revoked department_id'),
 });
-const settingNames=['pricing.state','pricing.settings','pricing.official','device.instance_scope','balancing','routing_strategy','routing_weights','transfer_schedule','account_package_policy','extra_usage_policy','handoff_policy'];
+const settingNames=['pricing.state','pricing.settings','pricing.official','device.instance_scope','balancing','routing_strategy','routing_weights','api_account_scope','transfer_schedule','account_package_policy','extra_usage_policy','handoff_policy'];
 const allowedSetting=name=>settingNames.includes(name)||/^subscription_monthly_usd:[a-zA-Z0-9-]{1,100}$/.test(name);
 const materialRole=role=>['application_key','admin_settings','device_ca_certificate','device_ca_key','device_server_certificate','device_server_key'].includes(role)||/^codex_auth:[a-zA-Z0-9-]{1,100}$/.test(role);
 const primary={extra_usage_policy:['singleton'],account_extra_usage:['account_id'],gateway_settings:['name'],department_settings:['department_id','name'],member_type_templates:['type_id','version'],department_admin_key_secrets:['department_id','key_id'],account_package_versions:['template_id','version'],account_package_selections:['account_id'],device_credentials:['fingerprint']};

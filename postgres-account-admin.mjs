@@ -7,7 +7,8 @@ import {createPostgresSubscriptionPrices,subscriptionMonthlyUsd} from './postgre
 import {mkdir,rmdir} from 'node:fs/promises';
 import {join,resolve} from 'node:path';
 import {AppError,id,hash,encryptStoredKey} from './store.mjs';
-import {name,bool,integer,apiKeyValue,apiWeightValue} from './admin-input.mjs';
+import {name,bool,integer,apiKeyValue} from './admin-input.mjs';
+import {createPostgresApiAccountScope} from './postgres-api-account-scope.mjs';
 import {lockPostgresRouting} from './postgres-routing.mjs';
 import {createPostgresAccountQuotas} from './postgres-account-quotas.mjs';
 import {createPostgresAccountLogin} from './postgres-account-login.mjs';
@@ -22,13 +23,13 @@ export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,c
   const queue=createPostgresQueryQueue(checks),readContext=new AsyncLocalStorage(),readQueue={...queue,run:(operation,options)=>readContext.getStore()?operation():queue.run(()=>readContext.run(true,operation),options)},pending=new Map(),controllers=new Set();let stopping=false;
   const packages=createPostgresAccountPackages(store,{clock,queryQueue:readQueue,onChange:(_reason,options)=>router.syncWeights('package',clock(),options)});
   const subscriptionPrices=createPostgresSubscriptionPrices(store,{clock});
+  const apiScopes=createPostgresApiAccountScope(store,{clock});
   const subjectIdentity=Buffer.isBuffer(encryptionKey)&&encryptionKey.length===32?createCodexQuotaSubjectIdentity(encryptionKey,{schemaVersion:'0.167.2'}):undefined;
   const quotas=readQuota?createPostgresAccountQuotas(store,{router,packages,queue,readQuota,clock,subjectIdentity,parallelism:checks.maxConcurrent??2}):null;
   const login=startLogin?createPostgresAccountLogin(store,{startLogin,reserveLogin,clock,local,onReady:(account,options)=>quotas?.refresh(account,{force:true,...options}),checkSubscription:(account,options)=>queue.run(()=>checkSubscription(account,options))}):null;
   const running=()=>{if(stopping)throw new AppError(503,'账号管理正在关闭','service_stopping');};
   const auditWriter=createPostgresAudit(store,{clock}),audit=(action,detail,scope,accountId=typeof detail==='string'?detail:detail.account)=>auditWriter.write(scope,{action,detail,subject:{kind:'account',id:accountId}});
   const account=async(accountId,lock=false,scope=null)=>{await departments.current(scope,{lock});const row=await store.get('SELECT * FROM harbor.accounts WHERE id=$1 AND removed_at IS NULL'+(scope?.view==='department'?' AND department_id=$2':'')+(lock?' FOR UPDATE':''),accountId,...(scope?.view==='department'?[scope.department_id]:[]));if(!row)throw new AppError(404,'账号不存在或已移除','department_object_not_found');departments.same(scope,row);if(lock)running();return row;};
-  const weight=async(accountId,value,scope=null)=>apiWeightValue(value,(await store.get("SELECT COALESCE(SUM(api_weight),0) n FROM harbor.accounts WHERE auth_mode='openai_api' AND removed_at IS NULL AND id<>$1"+(scope?' AND department_id=$2':''),accountId,...(scope?[scope.department_id]:[]))).n);
   function cipher(secret,accountId){if(!Buffer.isBuffer(encryptionKey)||encryptionKey.length!==32)throw new AppError(503,'上游凭据加密尚未配置','upstream_configuration');return encryptStoredKey(encryptionKey,secret,'upstream:'+accountId);}
   const mutate=(fn,{scope=null}={})=>store.transaction(async()=>{if(scope)await departments.current(scope,{lock:true,write:true});await lockPostgresRouting(store);if(stopping)throw new AppError(503,'账号管理正在关闭','service_stopping');return fn();});
   const platform=platformTransport?createPostgresPlatformAdmin(store,{runtime,encryptionKey,transport:platformTransport,queue,mutate,cipher,clock,packages}):null;
@@ -83,39 +84,45 @@ export function createPostgresAccountAdmin(store,{runtime,encryptionKey,router,c
     if(path==='/api/admin/accounts'&&method==='POST'){
       const kind=payload.kind||'codex',mode=payload.auth_mode||'subscription',accountId=id(),accountName=name(payload.name);
       if(!['codex','claude'].includes(kind)||!['subscription','openai_api'].includes(mode)||mode==='openai_api'&&kind!=='codex')throw new AppError(400,'不支持的账号类型');
+      if(mode!=='openai_api'&&(payload.api_usage_scope!==undefined||payload.expected_api_scope_version!==undefined))throw new AppError(400,'仅API账号可设置API使用范围');
       if(payload.subscription_monthly_usd!==undefined){if(kind!=='codex'||mode!=='subscription')throw new AppError(400,'仅Codex官方订阅可设置订阅月费');subscriptionMonthlyUsd(payload.subscription_monthly_usd);}
       const secret=mode==='openai_api'?apiKeyValue(payload.api_key):null,encrypted=secret?cipher(secret,accountId):null,home=join(resolve(runtime),'accounts',accountId);let created=false;
       try{
         await mkdir(join(resolve(runtime),'accounts'),{recursive:true,mode:0o700});await mkdir(home,{mode:0o700});created=true;
         await mutate(async()=>{
-          await departments.current(trusted,{lock:true});const share=mode==='openai_api'?await weight(accountId,payload.api_weight??0,trusted):0;
-          await store.run("INSERT INTO harbor.accounts(id,name,home,kind,auth_mode,api_weight,state,api_secret_cipher,api_secret_digest"+(trusted?',department_id':'')+") VALUES($1,$2,$3,$4,$5,$6,'offline',$7,$8"+(trusted?',$9':'')+")",accountId,accountName,home,kind,mode,share,encrypted,secret?hash(secret):null,...(trusted?[trusted.department_id]:[]));if(mode!=='openai_api')await packages.attach(accountId,payload.package??{template_id:null},{scope:trusted??undefined});else if(payload.package!==undefined)throw new AppError(400,'API账号使用人工预算，不适用订阅套餐');await audit('account.create',accountId,trusted);
+          await departments.current(trusted,{lock:true});
+          await store.run("INSERT INTO harbor.accounts(id,name,home,kind,auth_mode,api_weight,state,api_secret_cipher,api_secret_digest"+(trusted?',department_id':'')+") VALUES($1,$2,$3,$4,$5,0,'offline',$6,$7"+(trusted?',$8':'')+")",accountId,accountName,home,kind,mode,encrypted,secret?hash(secret):null,...(trusted?[trusted.department_id]:[]));if(mode!=='openai_api')await packages.attach(accountId,payload.package??{template_id:null},{scope:trusted??undefined});else if(payload.package!==undefined)throw new AppError(400,'API账号使用人工预算，不适用订阅套餐');
+          if(mode==='openai_api'){const saved=await apiScopes.read({scope:trusted??undefined,lock:true});await apiScopes.save(accountId,{api_usage_scope:payload.api_usage_scope===undefined?'shared':payload.api_usage_scope,api_weight:payload.api_weight??0,expected_api_scope_version:payload.expected_api_scope_version===undefined?saved.version:payload.expected_api_scope_version},{scope:trusted??undefined});}
+          await audit('account.create',accountId,trusted);
           if(payload.subscription_monthly_usd!==undefined)await subscriptionPrices.save(accountId,{monthly_usd:payload.subscription_monthly_usd,expected_version:0},{scope:trusted??undefined});
         },{scope:trusted});return {status:201,value:{id:accountId}};
       }catch(error){if(created)await rmdir(home).catch(()=>{});throw error;}
     }
     const match=path.match(/^\/api\/admin\/accounts\/([a-zA-Z0-9-]+)(?:\/(check|quota|login|login\/cancel))?$/);if(!match)return null;
     if(trusted)await account(match[1],false,trusted);
-    if(method==='GET'&&!match[2]){const row=await account(match[1],false,trusted);const {id:accountId,name,kind,auth_mode,enabled,state,created,api_weight,token_budget}=row;return {status:200,value:{id:accountId,name,kind,auth_mode,enabled,state,created,api_weight,token_budget,...(trusted?{department_id:row.department_id}:{})}};}
+    if(method==='GET'&&!match[2]){const row=await account(match[1],false,trusted),configured=row.auth_mode==='openai_api'?apiScopes.decorate([row],{configuration:await apiScopes.read({scope:trusted??undefined})})[0]:row;const {id:accountId,name,kind,auth_mode,enabled,state,created,token_budget}=row;return {status:200,value:{id:accountId,name,kind,auth_mode,enabled,state,created,api_weight:configured.api_scope_weight??row.api_weight,token_budget,...(row.auth_mode==='openai_api'?{api_usage_scope:configured.api_usage_scope,api_scope_version:configured.api_scope_version}:{}),...(trusted?{department_id:row.department_id}:{})}};}
     if(login&&match[2]?.startsWith('login')){if(trusted&&(await account(match[1],false,trusted)).kind!=='codex')departments.unsupported();return login.handle(match[1],match[2],method,options);}
     if(quotas&&method==='POST'&&match[2]==='quota')return {status:200,value:{ok:true,...await quotas.refresh(await account(match[1],false,trusted),{force:true,...options})}};
     if(method==='POST'&&match[2]==='check')return {status:200,value:await check(await account(match[1],false,trusted),options)};
     if(match[2])return null;
     if(method==='PATCH'){const value=await mutate(async()=>{
       const current=await account(match[1],true,trusted),api=current.auth_mode==='openai_api';
-      if((payload.api_key!==undefined||payload.api_weight!==undefined)&&!api)throw new AppError(400,'订阅账号不能写入API Key或人工API占比');
+      if((payload.api_key!==undefined||payload.api_weight!==undefined||payload.api_usage_scope!==undefined||payload.expected_api_scope_version!==undefined)&&!api)throw new AppError(400,'订阅账号不能写入API配置');
       const secret=payload.api_key===undefined?null:apiKeyValue(payload.api_key),encrypted=secret?cipher(secret,current.id):null;
-      const share=payload.api_weight===undefined?current.api_weight:await weight(current.id,payload.api_weight,trusted),enabled=payload.enabled===undefined?current.enabled:bool(payload.enabled);
+      let share=current.api_weight;
+      if(api&&(payload.api_weight!==undefined||payload.api_usage_scope!==undefined||payload.expected_api_scope_version!==undefined)){const saved=await apiScopes.read({scope:trusted??undefined,lock:true});share=(await apiScopes.save(current.id,{...(payload.api_usage_scope===undefined?{}:{api_usage_scope:payload.api_usage_scope}),...(payload.api_weight===undefined?{}:{api_weight:payload.api_weight}),expected_api_scope_version:payload.expected_api_scope_version===undefined?saved.version:payload.expected_api_scope_version},{scope:trusted??undefined})).stored_api_weight;}
+      const enabled=payload.enabled===undefined?current.enabled:bool(payload.enabled);
       const budget=payload.token_budget===undefined?current.token_budget:integer(payload.token_budget,'本地预算',{nullable:true}),perPercent=payload.tokens_per_percent===undefined?current.tokens_per_percent:integer(payload.tokens_per_percent,'容量换算',{min:100,max:1e7});
       const migration=payload.enabled===false?await router.disableAccount(current.id,{scope:trusted??undefined}):{moved:0,resetTextSessions:0};
       if(payload.enabled===false&&current.state==='login')await store.run("UPDATE harbor.accounts SET state='offline',last_error='登录已取消' WHERE id=$1",current.id);
       await store.run('UPDATE harbor.accounts SET enabled=$1,token_budget=$2,tokens_per_percent=$3,api_weight=$4 WHERE id=$5',enabled,budget,perPercent,share,current.id);
       if(secret){await invalidateQuotaSubjectIdentity(store,current.id);await store.run("UPDATE harbor.accounts SET api_secret_cipher=$1,api_secret_digest=$2,route_epoch=route_epoch+1,state='offline',route_block=NULL,last_error=NULL WHERE id=$3",encrypted,hash(secret),current.id);await audit('account.api.key',current.id,trusted);}
-      if(api&&share!==current.api_weight)await audit('account.api.weight',{account:current.id,from:current.api_weight,to:share},trusted);await audit('account.update',current.id,trusted);return {ok:true,...migration};
+      await audit('account.update',current.id,trusted);return {ok:true,...migration};
     },{scope:trusted});if(payload.enabled===false){login?.cancel(match[1]);platform?.cancel(match[1]);}return {status:200,value};}
     if(method==='DELETE'){const value=await mutate(async()=>{
       const current=await account(match[1],true,trusted);
       if(await store.get("SELECT id FROM harbor.requests WHERE account_id=$1 AND status IN ('queued','running') LIMIT 1",current.id))throw new AppError(409,'账号有请求正在处理或排队，请完成后再移除');
+      if(current.auth_mode==='openai_api')await apiScopes.remove(current.id,{scope:trusted??undefined});
       await store.run("UPDATE harbor.accounts SET enabled=0,state='removed',api_secret_cipher=NULL,api_secret_digest=NULL,removed_at=$1,route_epoch=route_epoch+1 WHERE id=$2",clock(),current.id);
       await store.run("UPDATE harbor.sessions SET state='uncertain',route_version=route_version+1 WHERE account_id=$1",current.id);await audit('account.remove',current.id,trusted);return {ok:true};
     },{scope:trusted});login?.cancel(match[1]);platform?.cancel(match[1]);return {status:200,value};}

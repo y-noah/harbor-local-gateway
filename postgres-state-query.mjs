@@ -12,6 +12,7 @@ import {createAdminDepartments} from './postgres-admin-departments.mjs';
 import {assertPostgresAuditScopes} from './postgres-audit.mjs';
 import {quotaSubjectScopeHints} from './postgres-quota-subjects.mjs';
 import {subscriptionMonthlyUsd} from './postgres-subscription-price.mjs';
+import {createPostgresApiAccountScope} from './postgres-api-account-scope.mjs';
 
 const checkCancelled=signal=>{if(signal?.aborted)throw signal.reason??new AppError(499,'管理查询已取消','request_cancelled');};
 
@@ -86,6 +87,7 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
   const adminDepartments=createAdminDepartments(store);
   const queue=queryQueue||createPostgresQueryQueue();
   const departments=createQueryDepartments(store);
+  const apiScopes=createPostgresApiAccountScope(store,{clock});
   if(!Number.isSafeInteger(maxPeople)||maxPeople<1||maxPeople>10000)throw new AppError(503,'兼容员工状态容量无效','state_configuration');
   const initializeUsage=createUsageRollupReadInitializer(store);
   async function loadSessionPage({window,sessionPage,sessionPageSize,sessionQ,sessionType,sessionAccount,sessionStatus},authorization,signal){
@@ -185,10 +187,13 @@ export function createPostgresStateQueries(store,{clock=Date.now,encryptionKey,q
       }
       const accountArgs=[],accountDepartment=departmentPredicate(authorization,'accounts',accountArgs);
       const packages=createPostgresAccountPackages(store,{clock}),packagePolicy=await packages.policy(store,{scope:authorization??undefined}),accounts=await packages.decorate(await store.all('SELECT id,name,kind,auth_mode,route_epoch,platform_config,platform_models,api_weight,api_secret_digest,enabled,state,last_used,last_error,route_block,quota_json,quota_error FROM harbor.accounts WHERE removed_at IS NULL AND '+accountDepartment+' ORDER BY id',...accountArgs));
+      checkCancelled(signal);
+      const rawApis=accounts.filter(row=>row.auth_mode==='openai_api'),apiSettings=rawApis.length?await apiScopes.read({scope:authorization??undefined}):undefined,apiMetadata=new Map(apiScopes.decorate(rawApis,{configuration:apiSettings}).map(row=>[row.id,{api_usage_scope:row.api_usage_scope,api_scope_version:row.api_scope_version,api_weight:row.api_scope_weight}]));
+      checkCancelled(signal);
       const supplierScopes=await quotaSubjectScopeHints(store,accounts.map(row=>row.id));
       const priceNames=accounts.filter(row=>row.kind==='codex'&&row.auth_mode==='subscription').map(row=>'subscription_monthly_usd:'+row.id);
       const subscriptionPrices=new Map((priceNames.length?await store.all('SELECT name,value FROM harbor.gateway_settings WHERE name=ANY($1::text[])',priceNames):[]).map(row=>[row.name,subscriptionMonthlyUsd(JSON.parse(row.value).monthly_usd)]));
-      const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,subscription_monthly_usd:subscriptionPrices.get('subscription_monthly_usd:'+row.id)??null,supplier_quota:supplierScopes.get(row.id),package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,...(usage?{standard:usage(row.id)}:{})}));
+      const accountData=usage=>accounts.map(({api_secret_digest,...row})=>({...row,...apiMetadata.get(row.id),subscription_monthly_usd:subscriptionPrices.get('subscription_monthly_usd:'+row.id)??null,supplier_quota:supplierScopes.get(row.id),package:accountPackageBudget(row,{at,enabled:packagePolicy.enabled}),last_error:row.last_error?sanitizeRecord(row.last_error,{maxBytes:2048}):null,quota_error:row.quota_error?sanitizeRecord(row.quota_error,{maxBytes:2048}):null,api_key_configured:!!api_secret_digest,api_key_fingerprint:api_secret_digest?.slice(0,8)||null,...(usage?{standard:usage(row.id)}:{})}));
       // Metadata remains useful while historical usage and routing aggregates
       // are pending. Omit those fields rather than publishing invented zeros.
       if(view==='accounts-meta')return {view,usageMetric:referenceMetric,usageWindow:window,observedAt:at,peopleLoaded:false,

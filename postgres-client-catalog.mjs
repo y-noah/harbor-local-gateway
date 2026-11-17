@@ -1,3 +1,4 @@
+import {createPostgresApiAccountScope,apiAccountScopeAllowed} from './postgres-api-account-scope.mjs';
 import {resolveCodexModelMetadata} from './codex-model-metadata.mjs';
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {openSync,readSync,closeSync} from 'node:fs';
@@ -10,7 +11,7 @@ import {consumptionSource,consumptionCandidateGroups,assertConsumptionSource} fr
 import {createPostgresConsumptionPolicy,verifyConsumptionPolicyAvailability} from './postgres-consumption-policy.mjs';
 const routes=new Set(['/v1/models','/v1/codex/models','/v1/codex/image-mcp.mjs']);
 const fail=(status,message,code)=>{throw new AppError(status,message,code);};
-const columns='id,home,kind,auth_mode,route_epoch,state,enabled,removed_at,route_block';
+const columns='id,home,kind,auth_mode,api_weight,route_epoch,state,enabled,removed_at,route_block';
 const waitAbort=(promise,signal)=>new Promise((resolve,reject)=>{const aborted=()=>reject(signal.reason??new AppError(499,'客户端已断开','request_cancelled'));signal.addEventListener('abort',aborted,{once:true});promise.then(resolve,reject).finally(()=>signal.removeEventListener('abort',aborted));if(signal.aborted)aborted();});
 const send=(res,headers,body,signal)=>new Promise((resolve,reject)=>{
  let settled=false;const clean=()=>{res.off('finish',finished);res.off('close',closed);res.off('error',failed);signal.removeEventListener('abort',aborted);},done=error=>{if(settled)return;settled=true;clean();error?reject(error):resolve();},finished=()=>done(),closed=()=>done(new AppError(499,'客户端已断开','request_cancelled')),failed=error=>done(error),aborted=()=>{res.destroy();done(signal.reason??new AppError(499,'客户端已断开','request_cancelled'));};
@@ -23,6 +24,7 @@ export function createPostgresClientCatalog(store,{deviceAccess,transportForAcco
  if(!store||typeof deviceAccess?.authorize!=='function'||typeof transportForAccount!=='function'||typeof clock!=='function'||!Number.isInteger(maxSources)||maxSources<1||maxSources>256||!Number.isInteger(maxModels)||maxModels<1||maxModels>100000||!Number.isInteger(maxResponseBytes)||maxResponseBytes<1024||maxResponseBytes>16777216||!Number.isInteger(maxScriptBytes)||maxScriptBytes<1024||maxScriptBytes>1048576||!Number.isInteger(timeoutMs)||timeoutMs<100||timeoutMs>60000)fail(503,'客户端目录资源配置无效','client_catalog_configuration');
  if(sourceAccounts!==undefined&&typeof sourceAccounts!=='function')fail(503,'客户端目录来源依赖无效','client_catalog_configuration');
  const requests=createPostgresQueryQueue({maxConcurrent,maxQueued,queueTimeoutMs:timeoutMs}),providers=createPostgresQueryQueue({maxConcurrent:providerConcurrency,maxQueued:64,queueTimeoutMs:timeoutMs}),controllers=new Set(),deadlines=new WeakMap();let stopping=false;
+ const apiScopes=createPostgresApiAccountScope(store,{clock});
  const access=createRoutingDepartments(store,{clock}),consumption=createPostgresConsumptionPolicy(store,{clock});let consumptionInitialization,consumptionAvailable=false;
  async function initializeConsumption(){const initialized=await (consumptionInitialization??=verifyConsumptionPolicyAvailability(store).then(available=>({available}),error=>{consumptionInitialization=undefined;throw error;}));consumptionAvailable=initialized.available;}
  async function explicitSources(policy,signal,fixedIds,scope){
@@ -47,6 +49,7 @@ export function createPostgresClientCatalog(store,{deviceAccess,transportForAcco
    const scope=store.departmentScope?.(current),department=await access.resolve(scope,{member:current,write:true,employeeOnly:true});
    if(initialScope&&['department_id','member_id','credential_id','credential_version','member_version','department_version'].some(field=>initialScope[field]!==scope?.[field]))fail(409,'员工或部门授权已变化，请重新读取目录','client_catalog_policy_changed');
    if(!key)fail(401,'Key无效','invalid_api_key');const policy=consumptionAvailable?await consumption.read(current.key_id,{memberId:current.id,lock:true}):null;
+   const apiConfiguration=await apiScopes.read({scope});
    let pinned=null,sessionVersion=null;
    if(new URL(req.url,'http://localhost').pathname!=='/v1/codex/image-mcp.mjs'&&req.headers['x-harbor-session']!==undefined){
     // Serialize only the local snapshot with routing writers; release before upstream IO.
@@ -55,6 +58,8 @@ export function createPostgresClientCatalog(store,{deviceAccess,transportForAcco
     if(!session.enabled)fail(403,'该会话已被禁止访问','session_disabled');
     pinned=await store.get('SELECT '+columns+(department?',department_id':'')+' FROM harbor.accounts WHERE id=$1 FOR SHARE',session.account_id);
     if(!pinned)fail(503,'会话绑定账号不可用','session_account_unavailable');access.same(department,pinned);
+    pinned=apiScopes.decorate([pinned],{configuration:apiConfiguration,policy:policy?.consumption_policy??'inherit'})[0];
+    if(!apiAccountScopeAllowed(pinned,policy?.consumption_policy??'inherit'))fail(409,'当前Key来源不能访问此API账号','api_account_scope_conflict');
     assertConsumptionSource(policy?.consumption_policy??'inherit',pinned);
     if(pinned.enabled!==1||pinned.removed_at!==null||!(usablePinnedApiAccount(pinned)||pinned.auth_mode==='subscription'&&sourceValid(pinned)&&!pinned.route_block))fail(503,'会话绑定账号不可用','session_account_unavailable');
     // Only a healthy pinned API bypasses automatic allocation weight. Subscription
@@ -63,12 +68,19 @@ export function createPostgresClientCatalog(store,{deviceAccess,transportForAcco
     sessionVersion={id:session.id,account_id:session.account_id,route_version:session.route_version,enabled:session.enabled,client_key:session.client_key};
    }
    let sourceRows=fixed.length?await store.all('SELECT '+columns+(department?',department_id':'')+' FROM harbor.accounts WHERE id=ANY($1::text[])'+(department?' AND department_id=$2':'')+' ORDER BY id FOR SHARE',fixed.map(row=>row.id),...(department?[department.department_id]:[])):[];
+   sourceRows=apiScopes.decorate(sourceRows,{configuration:apiConfiguration,policy:policy?.consumption_policy??'inherit'}).filter(account=>apiAccountScopeAllowed(account,policy?.consumption_policy??'inherit'));
    if(pinned)sourceRows=sourceRows.filter(row=>row.id===pinned.id);
    if(!pinned&&fixed.length&&policy&&policy.consumption_policy!=='inherit'){const eligible=new Set((await explicitSources(policy.consumption_policy,signal,new Set(fixed.map(row=>row.id)),scope)).map(row=>row.id));sourceRows=sourceRows.filter(row=>eligible.has(row.id));}
-   alive(signal);return {sourceRows,policy,scope,pinned,allowed:storedModelAllowlist(key.allowed_models),versions:{session:sessionVersion,department:department?.department_id??null,department_version:department?.department_version??null,member:current.id,key:current.key_id,member_access:current.access_version??null,member_device:current.device_policy_version,key_access:key.access_version,key_model:key.model_policy_version,key_device:key.device_policy_version,key_device_ids:key.device_ids,key_enabled:key.enabled,key_expires:key.expires,device,physical,...(policy??{})}};
+   alive(signal);return {sourceRows,policy,scope,pinned,allowed:storedModelAllowlist(key.allowed_models),versions:{api_scope:apiConfiguration,session:sessionVersion,department:department?.department_id??null,department_version:department?.department_version??null,member:current.id,key:current.key_id,member_access:current.access_version??null,member_device:current.device_policy_version,key_access:key.access_version,key_model:key.model_policy_version,key_device:key.device_policy_version,key_device_ids:key.device_ids,key_enabled:key.enabled,key_expires:key.expires,device,physical,...(policy??{})}};
   });
  }
- async function sources(scope){await access.resolve(scope,{employeeOnly:true});const subscription=await store.get("SELECT "+columns+(scope?",department_id":"")+" FROM harbor.accounts WHERE kind='codex' AND auth_mode='subscription' AND enabled=1 AND state IN ('ready','degraded') AND removed_at IS NULL"+(scope?" AND department_id=$1":"")+" ORDER BY last_used DESC,id LIMIT 1",...(scope?[scope.department_id]:[])),apis=await store.all("SELECT "+columns+(scope?",department_id":"")+" FROM harbor.accounts WHERE auth_mode='openai_api' AND enabled=1 AND state='ready' AND route_block IS NULL AND removed_at IS NULL"+(scope?" AND department_id=$2":"")+" ORDER BY id LIMIT $1",maxSources+1,...(scope?[scope.department_id]:[])),rows=[...(subscription?[subscription]:[]),...apis];if(rows.length>maxSources)fail(503,'目录来源超过服务端预算，请管理员调整配置','client_catalog_capacity');return rows;}
+ async function sources(scope){
+  await access.resolve(scope,{employeeOnly:true});const configuration=await apiScopes.read({scope}),excluded=Object.keys(configuration.accounts);
+  const subscription=await store.get("SELECT "+columns+(scope?",department_id":"")+" FROM harbor.accounts WHERE kind='codex' AND auth_mode='subscription' AND enabled=1 AND state IN ('ready','degraded') AND removed_at IS NULL"+(scope?" AND department_id=$1":"")+" ORDER BY last_used DESC,id LIMIT 1",...(scope?[scope.department_id]:[]));
+  const apis=await store.all("SELECT "+columns+(scope?",department_id":"")+" FROM harbor.accounts WHERE auth_mode='openai_api' AND enabled=1 AND state='ready' AND route_block IS NULL AND removed_at IS NULL AND NOT(id=ANY($2::text[]))"+(scope?" AND department_id=$3":"")+" ORDER BY id LIMIT $1",maxSources+1,excluded,...(scope?[scope.department_id]:[]));
+  const rows=apiScopes.decorate([...(subscription?[subscription]:[]),...apis],{configuration}).filter(account=>apiAccountScopeAllowed(account,'inherit'));if(rows.length>maxSources)fail(503,'目录来源超过服务端预算，请管理员调整配置','client_catalog_capacity');return rows;
+ }
+
  async function catalogs(rows,signal){const result=new Array(rows.length);let next=0,retainedBytes=0,capacity=false;const settled=await Promise.allSettled(Array.from({length:Math.min(rows.length,2)},async()=>{for(;;){alive(signal);if(capacity)return;const index=next++;if(index>=rows.length)return;const account=rows[index];try{result[index]={status:'fulfilled',value:await providers.run(async()=>{alive(signal);const transport=await transportForAccount(account,{signal});alive(signal);if(typeof transport?.models!=='function')fail(502,'账号不支持模型目录','client_catalog_upstream');const value=await transport.models({binary:codexBinary,home:account.auth_mode==='openai_api'?account.id:account.home,signal});alive(signal);if(!Array.isArray(value))fail(502,'上游模型目录协议无效','client_catalog_upstream');if(value.length>maxModels){capacity=true;fail(503,'来源目录超过模型数量预算','client_catalog_capacity');}if(value.some(m=>!m||typeof m!=='object'||Array.isArray(m)||typeof m.slug!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/.test(m.slug)))fail(502,'上游模型目录协议无效','client_catalog_upstream');const bytes=Buffer.byteLength(JSON.stringify(value));if(value.length>maxModels||bytes>maxResponseBytes||retainedBytes+bytes>maxResponseBytes){capacity=true;fail(503,'全部来源目录超过合并预算','client_catalog_capacity');}retainedBytes+=bytes;return value;})};}catch(error){if(['client_catalog_capacity','upstream_response_too_large','upstream_buffer_busy'].includes(error.code))capacity=true;result[index]={status:'rejected',reason:error};}}}));if(capacity)fail(503,'全部来源目录超过合并预算','client_catalog_capacity');const rejected=settled.find(item=>item.status==='rejected');if(rejected)throw rejected.reason;alive(signal);return result;}
  async function handle(req,res){const url=new URL(req.url,'http://localhost');if(!routes.has(url.pathname)||req.method!=='GET')return false;if(stopping)fail(503,'客户端目录正在关闭','service_stopping');
   const controller=new AbortController(),deadline=performance.now()+timeoutMs,timer=setTimeout(()=>controller.abort(new AppError(504,'客户端目录读取超时','client_catalog_timeout')),timeoutMs),closed=()=>{if(!res.writableEnded)controller.abort(new AppError(499,'客户端已断开','request_cancelled'));};timer.unref();controllers.add(controller);req.once('aborted',closed);res.once('close',closed);const {signal}=controller;deadlines.set(signal,{at:deadline,controller});

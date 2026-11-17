@@ -146,7 +146,7 @@ export async function assertDepartmentIsolationReadiness(store,initialAvailabili
  return true;
 }
 
-export const departmentSettingNames=Object.freeze(['balancing','routing_strategy','routing_weights','routing_auto','routing_schedule','routing_schedule.consumption_api','routing_schedule.consumption_subscription','transfer_schedule','request_handoff_policy','account_package_policy','extra_usage_policy','recording.retention']);
+export const departmentSettingNames=Object.freeze(['balancing','routing_strategy','routing_weights','routing_auto','routing_schedule','routing_schedule.consumption_api','routing_schedule.consumption_subscription','transfer_schedule','request_handoff_policy','account_package_policy','api_account_scope','extra_usage_policy','recording.retention']);
 
 export async function migrateDepartmentIsolation(store,{apply=false,runtimeRole}={}){
  if(typeof apply!=='boolean'||runtimeRole!==undefined&&(typeof runtimeRole!=='string'||!/^[a-z_][a-z0-9_]{0,62}$/.test(runtimeRole)))throw new AppError(400,'部门迁移参数无效','department_migration_configuration');

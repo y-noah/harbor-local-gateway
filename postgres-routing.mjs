@@ -1,3 +1,4 @@
+import {decorateApiAccountScope,apiAccountScopeAllowed,createPostgresApiAccountScope} from './postgres-api-account-scope.mjs';
 import {routeAdmissionBusy} from './postgres-route-wait.mjs';
 import {createRoutingDepartments} from './postgres-routing-departments.mjs';
 import {createPostgresAudit} from './postgres-audit.mjs';
@@ -38,19 +39,19 @@ export async function lockPostgresRouting(store){
 const consumptionScopes=new WeakMap();
 // Minted only by the authenticated consumption adapter, never from payload or
 // headers. Copy the candidate set so later callers cannot broaden the scope.
-export function createPostgresConsumptionRoutingScope({accountIds,source,rebind=false,expectedSession=null,excludeRequestId=null,resumeSession=false}={}){
-  if(!['api','subscription'].includes(source)||!(accountIds instanceof Set)||[...accountIds].some(value=>typeof value!=='string'||!value.length)||typeof rebind!=='boolean'||typeof resumeSession!=='boolean'||resumeSession&&!expectedSession||excludeRequestId!==null&&typeof excludeRequestId!=='string'||expectedSession!==null&&(!expectedSession.id||!expectedSession.account_id||!Number.isSafeInteger(expectedSession.route_version)))failure(503,'来源路由约束无效','consumption_scope_invalid');
-  const token=Object.freeze({});consumptionScopes.set(token,{accountIds:new Set(accountIds),source,rebind,resumeSession,expectedSession:expectedSession&&{id:expectedSession.id,account_id:expectedSession.account_id,route_version:expectedSession.route_version},excludeRequestId});return token;
+export function createPostgresConsumptionRoutingScope({accountIds,source,rebind=false,expectedSession=null,excludeRequestId=null,resumeSession=false,apiPolicy='inherit'}={}){
+  if(!['inherit','api_only','api_first','subscription_only'].includes(apiPolicy)||!['api','subscription'].includes(source)||!(accountIds instanceof Set)||[...accountIds].some(value=>typeof value!=='string'||!value.length)||typeof rebind!=='boolean'||typeof resumeSession!=='boolean'||resumeSession&&!expectedSession||excludeRequestId!==null&&typeof excludeRequestId!=='string'||expectedSession!==null&&(!expectedSession.id||!expectedSession.account_id||!Number.isSafeInteger(expectedSession.route_version)))failure(503,'来源路由约束无效','consumption_scope_invalid');
+  const token=Object.freeze({});consumptionScopes.set(token,{accountIds:new Set(accountIds),source,rebind,resumeSession,apiPolicy,expectedSession:expectedSession&&{id:expectedSession.id,account_id:expectedSession.account_id,route_version:expectedSession.route_version},excludeRequestId});return token;
 }
 export const usablePinnedApiAccount=account=>account?.auth_mode==='openai_api'&&['ready','degraded'].includes(account.state)&&!account.route_block;
 export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),isStopping=()=>false,extraRuntime=createPostgresExtraRuntime(store,{clock})}={}){
   const access=createRoutingDepartments(store,{clock}),packages=createPostgresAccountPackages(store,{clock});
   const write=(name,value,scope)=>access.write(scope,name,value);
   const audit=(scope,action,detail,at,subject)=>createPostgresAudit(store,{clock}).write(scope,{action,detail,at,subject});
-  async function state(at,{protocol='responses',model,force=false,persist=true,persistAuto=true,accountIds,packagePolicyOverride,scheduleName='routing_schedule',scope}={}){
+  async function state(at,{protocol='responses',model,force=false,persist=true,persistAuto=true,accountIds,packagePolicyOverride,scheduleName='routing_schedule',scope,apiPolicy='inherit'}={}){
     const department=await access.resolve(scope,{write:persist}),saved=await readExtraDispatchSettings(store,()=>access.settings(department,['balancing','routing_strategy','routing_weights','routing_auto','routing_schedule','routing_schedule.consumption_api','routing_schedule.consumption_subscription','account_package_policy'],{lock:persist}),access.identity(department));
     const legacy=saved.get('balancing')||{},settings=balanceSettings({...legacy,weighted:(saved.get('routing_strategy')||{}).weighted??legacy.weighted??false});
-    let accounts=await packages.routingAccounts({protocol,persist,scope:department});if(accountIds)accounts=accounts.filter(account=>accountIds.has(account.id));
+    let accounts=decorateApiAccountScope(await packages.routingAccounts({protocol,persist,scope:department}),{configuration:await access.setting(department,'api_account_scope',{lock:persist}),policy:apiPolicy,allocation:true}).filter(account=>apiAccountScopeAllowed(account,apiPolicy));if(accountIds)accounts=accounts.filter(account=>accountIds.has(account.id));
     const packagePolicy=packagePolicyOverride??saved.get('account_package_policy')??{enabled:false,smoothing_hours:24,version:0},options={packagePolicy,protocol,model};
     let system;
     if(settings.weighted||packagePolicy.enabled||force){
@@ -79,7 +80,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
     if(session&&!session.enabled)failure(403,'该会话已被禁止访问','session_disabled');
     if(protocol==='images'&&session&&(await store.get('SELECT auth_mode FROM harbor.accounts WHERE id=$1',session.account_id))?.auth_mode==='openai_api')failure(400,'官方Key接入暂仅支持Responses会话','unsupported_api_route');
     if(scope?.expectedSession&&(!session||['id','account_id','route_version'].some(field=>session[field]!==scope.expectedSession[field])))failure(409,'会话绑定已变化','session_route_conflict');
-    const routing=await state(at,{scope:departmentScope,protocol,model:payload.model,...(scope?{accountIds:scope.accountIds,persistAuto:false,scheduleName:'routing_schedule.consumption_'+scope.source}:{})});let account=session?routing.accounts.find(a=>a.id===session.account_id):null;
+    const routing=await state(at,{scope:departmentScope,protocol,model:payload.model,...(scope?{accountIds:scope.accountIds,persistAuto:false,scheduleName:'routing_schedule.consumption_'+scope.source,apiPolicy:scope.apiPolicy}:{})});let account=session?routing.accounts.find(a=>a.id===session.account_id):null;
     if(scope&&session&&!account){
       if(fixed||!scope.rebind)failure(409,'固定会话或上下文不允许改变消耗来源','consumption_source_conflict');
       const busy=routeWait?.capture();const pending=await store.get("SELECT id FROM harbor.requests WHERE session_id=$1 AND status IN ('queued','running') AND ($2::text IS NULL OR id<>$2) LIMIT 1",session.id,scope.excludeRequestId);if(pending)throw busy?busy(pending.id):routeAdmissionBusy(pending.id);
@@ -89,6 +90,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
       await audit(department,'session.route',{session:session.id,from,to:target.id,reason:'consumption_source'},at,{kind:'session',id:session.id});
     }
     if(session){
+      if(!account){const original=await store.get('SELECT * FROM harbor.accounts WHERE id=$1 AND removed_at IS NULL',session.account_id);if(original)await createPostgresApiAccountScope(store,{clock}).assertAccount(original,{scope:department,policy:scope?.apiPolicy??'inherit'});}
       if(!account||!account.enabled||!['ready','degraded'].includes(account.state)&&!account.route_block)failure(503,'会话绑定账号不可用，请新建客户端任务','session_account_unavailable');
       const api=account.auth_mode==='openai_api',blocked=account.route_block&&(api||account.route_block!=='quota_exhausted');
       if(blocked&&!routing.settings.failover)failure(503,'绑定账号已阻断，自动切换未开启','session_account_blocked');
@@ -104,7 +106,7 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
         if(routing.packagePolicy.enabled&&!api&&routing.distribution.subscriptionMode!=='manual'){
           const items=new Map(routing.distribution.system.packages.items.map(item=>[item.id,item])),source=items.get(account.id),legacy=account.package_selection?.mode==='legacy',legacyGroup=routing.distribution.system.snapshots.get(account.id)?.group;
           const compatible=new Set(routing.accounts.filter(candidate=>candidate.auth_mode==='openai_api'||routing.extraView.decisions.get(candidate.id)?.decision.mode==='extra'&&routing.extraView.decisions.get(candidate.id)?.decision.allowed||source?.comparison_key&&items.get(candidate.id)?.comparison_key===source.comparison_key||legacy&&legacyGroup&&candidate.package_selection?.mode==='legacy'&&routing.distribution.system.snapshots.get(candidate.id)?.group===legacyGroup).map(candidate=>candidate.id));
-          destination=await state(at,{scope:departmentScope,protocol,model:payload.model,accountIds:scope?new Set([...compatible].filter(accountId=>scope.accountIds.has(accountId))):compatible,persistAuto:false,...(scope?{scheduleName:'routing_schedule.consumption_'+scope.source}:{})});
+          destination=await state(at,{scope:departmentScope,protocol,model:payload.model,accountIds:scope?new Set([...compatible].filter(accountId=>scope.accountIds.has(accountId))):compatible,persistAuto:false,...(scope?{scheduleName:'routing_schedule.consumption_'+scope.source,apiPolicy:scope.apiPolicy}:{})});
         }
         const target=await destination.select();
         if(target.id!==account.id){
@@ -249,9 +251,9 @@ export function createPostgresRouter(store,{clock=Date.now,preparing=new Set(),i
   async function catalogCandidates({at=clock(),policy='inherit',model,protocol='responses',scope}={}){
     normalizeConsumptionPolicy(policy,{defaultValue:null});if(!['responses','images'].includes(protocol))failure(503,'推理通道配置无效','routing_configuration');
     const read=async()=>{
-      const whole=await state(at,{scope,protocol,model,persist:false,persistAuto:false}),groups=consumptionCandidateGroups(policy,whole.accounts),candidates=[],sources={};
+      const whole=await state(at,{scope,protocol,model,persist:false,persistAuto:false,apiPolicy:policy}),groups=consumptionCandidateGroups(policy,whole.accounts),candidates=[],sources={};
       for(const group of groups){
-        const accountIds=new Set(group.candidates.map(account=>account.id)),view=group.source===null?whole:await state(at,{scope,protocol,model,persist:false,persistAuto:false,accountIds});
+        const accountIds=new Set(group.candidates.map(account=>account.id)),view=group.source===null?whole:await state(at,{scope,protocol,model,persist:false,persistAuto:false,accountIds,apiPolicy:policy});
         for(const account of view.distribution.eligible){if(!(view.distribution.weights.get(account.id)>0))continue;candidates.push({account,source:consumptionSource(account),eligible:true,support:'unknown',reason:model?'model_support_unverified':'model_not_selected'});}
       }
       for(const source of ['api','subscription']){

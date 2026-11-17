@@ -61,7 +61,7 @@ export function createPostgresConsumptionRouting(store,{router,clock=Date.now,sc
     }
     const accountIds=new Set(view.sources[source].accountIds),bound=session&&await store.get('SELECT kind,auth_mode FROM harbor.accounts WHERE id=$1',session.account_id),changing=!!session&&consumptionSource(bound)!==source;
     if(changing){if(identity.fixed)fail('consumption_source_conflict','固定会话来源与当前Key配置冲突');await context(session,payload,{excludeRequestId});}
-    const scope=createPostgresConsumptionRoutingScope({accountIds,source,rebind:changing,expectedSession:expectedSession??session,excludeRequestId,resumeSession:!!expectedSession});
+    const scope=createPostgresConsumptionRoutingScope({accountIds,source,rebind:changing,expectedSession:expectedSession??session,excludeRequestId,resumeSession:!!expectedSession,apiPolicy:snapshot.consumption_policy});
     const route=await router.resolve(member,payload,headers,{...options,consumptionScope:scope});assertConsumptionSource(snapshot.consumption_policy,route.account);
     if(consumptionSource(route.account)!==source)fail('consumption_source_conflict','返回账号不符合已选消耗来源');return route;
   }
