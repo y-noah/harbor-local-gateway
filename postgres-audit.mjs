@@ -6,8 +6,12 @@ import {verifyDepartmentIsolationAvailability,assertDepartmentIsolationReadiness
 const subjects={account:'accounts',member:'members',key:'keys',session:'sessions',request:'requests',type:'member_types',department:'departments',export:'recording_export_jobs'};
 const denied=()=>{throw new AppError(403,'审计缺少可信身份或对象归属不符','department_forbidden');};
 const instances=new WeakMap();
-export async function assertPostgresAuditScopes(store){
- if(await store.get('SELECT 1 FROM harbor.audit a LEFT JOIN harbor.audit_scopes o ON o.audit_id=a.id WHERE o.audit_id IS NULL LIMIT 1'))throw new AppError(503,'存在缺少可信归属的审计记录，请完成审计写入适配','audit_scope_required');
+export async function assertPostgresAuditScopes(store,window=null){
+ if(window!==null&&(!Number.isSafeInteger(window.start)||!Number.isSafeInteger(window.end)||window.start<0||window.end<=window.start))throw new AppError(503,'审计校验时间范围无效','audit_scope_configuration');
+ // Page reads verify the complete visible window, not unrelated retained history.
+ // Explicit integrity checks retain the unbounded default.
+ const args=window===null?[]:[window.start,window.end],range=window===null?'':' AND a.at>=$1 AND a.at<$2';
+ if(await store.get('SELECT 1 FROM harbor.audit a LEFT JOIN harbor.audit_scopes o ON o.audit_id=a.id WHERE o.audit_id IS NULL'+range+' LIMIT 1',...args))throw new AppError(503,'存在缺少可信归属的审计记录，请完成审计写入适配','audit_scope_required');
 }
 const systemActions={
  'routing.nightly':/^(session\.(route|handoff\.(requested|completed|cancelled|failed|superseded))|balancing\.weights\.auto)$/,

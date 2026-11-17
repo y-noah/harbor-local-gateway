@@ -4,9 +4,10 @@ import {randomUUID} from 'node:crypto';
 import {PostgresStore} from '../postgres-store.mjs';
 import {migrateDepartmentIsolation,createPostgresDepartments} from '../postgres-departments.mjs';
 import {createDepartmentScopeIssuer} from '../department-access.mjs';
-import {createPostgresAudit} from '../postgres-audit.mjs';
+import {createPostgresAudit,assertPostgresAuditScopes} from '../postgres-audit.mjs';
 import {createPostgresHistoryQueries} from '../postgres-history-query.mjs';
 import {historyQuery} from '../observability.mjs';
+import {usageWindow} from '../store.mjs';
 import {referenceMetric} from '../pricing.mjs';
 const url=process.env.HARBOR_TEST_DATABASE_URL;
 const integration={skip:!url?'需隔离真实PostgreSQL':false,timeout:60000};
@@ -111,5 +112,19 @@ test('审计归属独立持久化且历史所有读取按范围查询，同日�
   await assert.rejects(reader.list(query({}),{scope:sa}),{status:403});
   await assert.rejects(store.run('INSERT INTO harbor.audit VALUES($1,$2,$3,$4)','unowned-new',now,'synthetic.missing.owner',JSON.stringify({department_id:b.id})),{code:'23514'});
   await assert.rejects(store.transaction(async()=>{await store.query('ALTER TABLE harbor.audit_scopes DISABLE TRIGGER audit_scope_immutable');await store.run('DELETE FROM harbor.audit_scopes WHERE audit_id=$1',event);await assert.rejects(reader.list(query({}),{scope:sb}),{code:'audit_scope_required'});throw Error('synthetic rollback');}),/synthetic rollback/);
+  // A retained orphan outside the visible window belongs to full integrity
+  // diagnosis; it must not make every seven-day page scan all retained history.
+  const visible=usageWindow(now);
+  await assert.rejects(store.transaction(async()=>{
+   await store.query('ALTER TABLE harbor.audit DISABLE TRIGGER audit_scope_required');
+   await store.run("INSERT INTO harbor.audit VALUES('synthetic-old-orphan',$1,'synthetic.missing.owner','{}')",visible.start-1);
+   const original=store.get.bind(store),checks=[];store.get=async(sql,...args)=>{if(sql.includes('o.audit_id IS NULL'))checks.push({sql,args});return original(sql,...args);};
+   try{await reader.list(query({}),{scope:sb});assert.equal(checks.length,1);assert.match(checks[0].sql,/a.at>=\$1 AND a.at<\$2/);assert.deepEqual(checks[0].args,[visible.start,visible.end]);}finally{store.get=original;}
+   await assert.rejects(assertPostgresAuditScopes(store),{code:'audit_scope_required'});
+   await store.run("INSERT INTO harbor.audit VALUES('synthetic-boundary-orphan',$1,'synthetic.missing.owner','{}')",visible.start);
+   await assert.rejects(reader.list(query({}),{scope:sb}),{code:'audit_scope_required'});
+   throw Error('synthetic old orphan rollback');
+  }),/synthetic old orphan rollback/);
+
  }finally{await store?.close();await admin.query('DROP DATABASE '+database);await admin.close();}
 });

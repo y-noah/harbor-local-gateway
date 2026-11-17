@@ -58,8 +58,9 @@ export function createPostgresHistoryQueries(store,{clock=Date.now,pageBytes=131
   async function list(query,{scope}={}){
     if(![20,50,100].includes(query.pageSize))throw new AppError(400,'历史每页条数仅支持20、50、100');
     return snapshot(scope,async authorization=>{
-      if(authorization!==null)await assertPostgresAuditScopes(store);
-      const at=clock(),window=usageWindow(at),accounts=await catalog(authorization),known=new Set(accounts.map(a=>a.id)),nightly=query.kind==='nightly',args=[Math.max(query.start??window.start,window.start),Math.min(query.end??window.end,window.end)];
+      const at=clock(),window=usageWindow(at);
+      if(authorization!==null)await assertPostgresAuditScopes(store,window);
+      const accounts=await catalog(authorization),known=new Set(accounts.map(a=>a.id)),nightly=query.kind==='nightly',args=[Math.max(query.start??window.start,window.start),Math.min(query.end??window.end,window.end)];
       const parameter=value=>{args.push(value);return '$'+args.length;},time=nightly?'a.started':'a.at',conditions=[time+'>=$1',time+'<$2'];let from;
       if(nightly){
         if(authorization?.view==='department')conditions.push('a.department_id='+parameter(authorization.department_id));
