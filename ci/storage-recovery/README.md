@@ -396,3 +396,14 @@ Host 在暂停前持久化原入口 epoch、进程代次、三容器、原数据
 员工列表显式使用 `usage_profile=list` 时只计算列表需要的 `last_seen` 与原口径参考消耗，不计算或返回 `ips`、`used_devices`、`unverified_requests`；未指定或指定 `full` 维持原完整契约，员工详情及 Key 查询不变。`last_seen` 仍为近7天 `usage_at` 范围内的最大非空 `started`，不把开始时间当成计量窗口，不跳过迟到请求。不安装索引仍结果正确，但可能较慢。
 
 回退前端调用即可恢复默认完整响应，或回滚本次查询代码；保留索引不会改变业务结果。需要撤销索引时，核对其定义、有效性和非约束属性，并确认无其他维护占用，再单独执行 `DROP INDEX CONCURRENTLY harbor.request_member_last_seen_cover`，不删除其他索引或业务数据。
+
+
+### 部门会话用量覆盖索引
+
+`session-department-usage-index.sql` 为部门会话查询增加 `request_session_department_usage_cover`，定义为 `(session_id, usage_at) INCLUDE(id, price_version, department_id)`。原 `session-usage-index.sql` 的索引没有覆盖部门过滤列，特定长寿命会话与跨部门流量分布下，优化器仍可能选择按时间扫描大量无关请求。新索引不改七天范围、权限、分页、金额或查询结果，不强制查询计划；旧索引保留至目标环境验收后另行决定。
+
+这是用户维护窗口内执行的显式数据库维护，普通镜像发布不会安装或启用该索引。沿本节既有增量索引入口，在核对 Harbor 实例、数据库身份、维护占用、空间与备份条件后，以表所有者在同一连接的 autocommit 模式执行三个 `-- statement-boundary` 片段。按维护窗口设置连接局部 `lock_timeout` 和 `statement_timeout`，不要包在事务或业务启动路径中。前后检查精确列顺序、索引类型及 `indisvalid/indisready/indislive`；同名异构、无效或未完成索引明确失败，不能将 `IF NOT EXISTS` 的跳过视为安装成功。失败保留现场，查明原因后再处理，不自动删除或重试。
+
+本地合成验证包含同一会话十万条旧记录、其他部门十万条近窗记录及本部门两百条近窗记录。已安装旧索引时仍读取大量无关候选，新增部门覆盖后结果逐字段一致、候选限定为两百条；刚更新未 VACUUM 的记录也保持正确。二十万条量级的候选索引约 26.66 MiB；每批五百条插入的有限样本显示额外写入和 WAL 开销。上述是合成环境证据，缓存、页分裂与执行顺序会影响耗时，不能外推线上提速或容量比例。
+
+安装后核对实际 SQL 的计划、读取页数与页面加载时间，同时观察请求写入。索引存在不等于线上超时已解决，仍须区分查价读取、排队与锁等待。需要回退时，先核对该索引与脚本定义一致、不属于约束且无其他维护占用，再在 autocommit 模式单独执行 `DROP INDEX CONCURRENTLY harbor.request_session_department_usage_cover`；保留旧索引和所有业务数据。未安装或回退后查询结果不变，性能可能回到原水平。
