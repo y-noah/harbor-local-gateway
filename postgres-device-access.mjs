@@ -6,6 +6,7 @@ import {deviceTransportProof} from './device-transport.mjs';
 import {deviceDigest,deviceEnrollmentMessage,verifyDeviceEnrollment} from './device-proof.mjs';
 
 const fail=(status,message,code='device_invalid')=>{throw new AppError(status,message,code);};
+const checkCancelled=signal=>{if(signal?.aborted)throw signal.reason??new AppError(499,'管理查询已取消','request_cancelled');};
 const object=(value,keys)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(key=>keys.includes(key));
 const identifier=value=>typeof value==='string'&&/^[a-f0-9-]{36}$/.test(value);
 const identityIdentifier=value=>typeof value==='string'&&/^[a-zA-Z0-9-]{1,80}$/.test(value);
@@ -137,26 +138,34 @@ export function createPostgresDeviceAccess(store,{issuer,clock=Date.now,queryQue
     return store.transaction(async()=>{await member(initial.member_id,{lock:true});const value=await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1 FOR UPDATE',deviceId);if(value.version!==payload.expected_version)fail(409,'设备已变化','device_conflict');let state=value.state;if(payload.enabled!==undefined){if(!['approved','disabled'].includes(state))fail(409,'此设备不能直接恢复，需重新核验','device_state_invalid');state=payload.enabled?'approved':'disabled';}await store.run('UPDATE harbor.employee_devices SET name=$1,state=$2,version=version+1 WHERE id=$3',payload.name===undefined?value.name:text(payload.name,80),state,deviceId);await audit('device.update',{device:deviceId,member:value.member_id,state});return dto(await store.get('SELECT * FROM harbor.employee_devices WHERE id=$1',deviceId));});
   }
   async function list(params,{signal}={}){
+    checkCancelled(signal);
     if([...params.keys()].some(key=>!['member_id','key_id','state','page','page_size'].includes(key)||params.getAll(key).length!==1))fail(400,'设备查询参数无效');const page=Number(params.get('page')??1),pageSize=Number(params.get('page_size')??20),memberId=params.get('member_id'),keyId=params.get('key_id'),state=params.get('state');if(!Number.isSafeInteger(page)||page<1||!Number.isSafeInteger(pageSize)||![20,50,100].includes(pageSize)||memberId&&!identityIdentifier(memberId)||keyId&&!identityIdentifier(keyId)||state&&!['pending','approved','disabled','needs_review','replaced'].includes(state))fail(400,'设备查询参数无效');
     return read(async()=>{
-      await departments.revalidate({target:readStore});
+      checkCancelled(signal);
+      await departments.revalidate({target:readStore,signal});
+      checkCancelled(signal);
       const at=clock(),window=usageWindow(at),values=[],where=['m.removed_at IS NULL'],actor=departments.current();
       if(actor?.view==='department'){values.push(actor.department_id);where.push('m.department_id=$'+values.length);}
       const add=(sql,value)=>{values.push(value);where.push(sql.replaceAll('?',String(values.length)));};
-      const owner=memberId?await member(memberId,{target:readStore}):null;
+      const owner=memberId?await member(memberId,{target:readStore,signal}):null;
+      checkCancelled(signal);
       if(memberId)add('d.member_id=$?',memberId);
-      if(keyId){const key=await readStore.get('SELECT member_id,device_ids FROM harbor.keys WHERE id=$1 AND removed_at IS NULL',keyId);if(!key)fail(404,'Key不存在');await member(key.member_id,{target:readStore});add('d.member_id=$?',key.member_id);values.push(keyId);where.push('(d.allowed_key_ids IS NULL OR d.allowed_key_ids ? $'+values.length+')');if(key.device_ids!==null)add('d.id=ANY($?::text[])',key.device_ids);}
+      if(keyId){const key=await readStore.get('SELECT member_id,device_ids FROM harbor.keys WHERE id=$1 AND removed_at IS NULL',keyId);checkCancelled(signal);if(!key)fail(404,'Key不存在');await member(key.member_id,{target:readStore,signal});checkCancelled(signal);add('d.member_id=$?',key.member_id);values.push(keyId);where.push('(d.allowed_key_ids IS NULL OR d.allowed_key_ids ? $'+values.length+')');if(key.device_ids!==null)add('d.id=ANY($?::text[])',key.device_ids);}
       if(state)add('d.state=$?',state);
-      const from=' FROM harbor.employee_devices d JOIN harbor.members m ON m.id=d.member_id WHERE '+where.join(' AND '),total=(await readStore.get('SELECT COUNT(*) n'+from,...values)).n,totalPages=Math.max(1,Math.ceil(total/pageSize)),current=Math.min(page,totalPages),n=values.length;
+      const from=' FROM harbor.employee_devices d JOIN harbor.members m ON m.id=d.member_id WHERE '+where.join(' AND '),total=(await readStore.get('SELECT COUNT(*) n'+from,...values)).n;
+      checkCancelled(signal);
+      const totalPages=Math.max(1,Math.ceil(total/pageSize)),current=Math.min(page,totalPages),n=values.length;
       const rows=await readStore.all(`SELECT d.*,m.name member_name,c.expires certificate_expires,(c.expires>$${n+3} AND c.revoked IS NULL AND d.state='approved') certificate_valid,
         (SELECT COUNT(*) FROM harbor.requests r WHERE r.device_id=d.id AND r.member_id=d.member_id${actor?' AND r.department_id=m.department_id':''} AND r.usage_at>=$${n+1} AND r.usage_at<$${n+2}${keyId?' AND r.key_id=$'+(n+4):''}) request_count
         ${from.replace(' WHERE ',' LEFT JOIN harbor.device_credentials c ON c.device_id=d.id AND c.generation=d.credential_generation WHERE ')} ORDER BY d.created DESC,d.id DESC LIMIT $${n+(keyId?5:4)} OFFSET $${n+(keyId?6:5)}`,...values,window.start,window.end,at,...(keyId?[keyId]:[]),pageSize,(current-1)*pageSize);
+      checkCancelled(signal);
       const requestValues=[window.start,window.end],requestWhere=['r.usage_at>=$1','r.usage_at<$2','rm.removed_at IS NULL'];
       if(memberId){requestValues.push(memberId);requestWhere.push('r.member_id=$'+requestValues.length);}
       if(keyId){requestValues.push(keyId);requestWhere.push('r.key_id=$'+requestValues.length);}
       if(state){requestValues.push(state);requestWhere.push('EXISTS(SELECT 1 FROM harbor.employee_devices sd WHERE sd.id=r.device_id AND sd.state=$'+requestValues.length+')');}
       if(actor?.view==='department'){requestValues.push(actor.department_id);requestWhere.push('r.department_id=$'+requestValues.length);}
       const summary=await readStore.get(`SELECT COUNT(DISTINCT r.device_id) used_devices,COUNT(*) FILTER(WHERE r.device_auth_state IN ('compatible_unverified','historical_unknown')) unverified_requests FROM harbor.requests r JOIN harbor.members rm ON rm.id=r.member_id WHERE ${requestWhere.join(' AND ')}`,...requestValues);
+      checkCancelled(signal);
       return {rows:rows.map(row=>({...dto(row),fingerprint:hex(row.fingerprint)?row.fingerprint:null,member_name:row.member_name,request_count:row.request_count})),summary:{registered_devices:total,...summary},...(owner?{member:{id:owner.id,device_mode:owner.device_mode,device_policy_version:owner.device_policy_version}}:{}),pagination:{page:current,pageSize,total,totalPages},observedAt:at};
     },{signal});
   }
