@@ -33,16 +33,18 @@ function pageDataReady(){
  return true;
 }
 function updatePageReadFeedback(pending=false){
- const note=$('#page-read-feedback');if(!note)return;note.hidden=!pending&&!pageReadError;note.innerHTML=pageReadError?`<span role="alert">${esc(pageReadError)}</span>${button('retry-workspace','重试','secondary')}`:'<span role="status">正在加载…</span>';
+ const note=$('#page-read-feedback');if(!note)return;note.hidden=!pageReadError;note.innerHTML=pageReadError?`<span role="alert">${esc(pageReadError)}</span>${button('retry-workspace','重试','secondary')}`:'<span role="status">正在加载…</span>';
 }
 function preservePageWhileReading(){
  const content=$('#content');if(!content)return;content.inert=false;content.setAttribute?.('aria-busy',String(!pageReadError));
- const changedPage=!!renderedPageScope&&renderedPageScope!==pageScope();
- if(changedPage){const navigation=['sessions','requests'].includes(tab)?recordTabs():['history','playground'].includes(tab)?connectionTabs():'';content.innerHTML=navigation+'<div class="page-loading-placeholder" aria-hidden="true"></div>';}
+ const usage=['sessions','requests'].includes(tab),changedPage=!!renderedPageScope&&renderedPageScope!==pageScope();
+ if(changedPage||usage&&!content.innerHTML){const navigation=usage?recordTabs():['history','playground'].includes(tab)?connectionTabs():'';content.innerHTML=navigation+(usage?loadingRegion('',workspacePagePending(),'','usage-initial-results'):'<div class="page-loading-placeholder" aria-hidden="true"></div>');}
  else if(['sessions','requests'].includes(tab)&&content.querySelector){const navigation=content.querySelector('.record-navigation');if(!navigation)content.insertAdjacentHTML('afterbegin',recordTabs());else if(navigation.dataset.pageScope!==pageScope()){navigation.dataset.pageScope=pageScope();for(const child of navigation.children)if(!child.classList.contains('record-tabs'))child.remove();}}
  for(const node of document.querySelectorAll('#content [data-action="record-view"]')){const selected=node.dataset.id===(tab==='sessions'?'sessions':recordView);node.classList.toggle('primary',selected);node.classList.toggle('secondary',!selected);}
  for(const node of document.querySelectorAll('#content > :not(.record-navigation):not(.connection-tabs)'))node.inert=renderedPageScope!==pageScope();
+ regionBusy('usage-initial-results',workspacePagePending());
  updatePageReadFeedback(!pageReadError&&!content.querySelector?.('.data-refresh-region[aria-busy="true"]'));
+ syncWorkspaceLoadingMask();
 }
 function pageReadKey(source,scope=pageScope()){return scope+'\0'+source;}
 function syncPageReadFeedback(){
@@ -52,7 +54,7 @@ function syncPageReadFeedback(){
 }
 function failPageRead(error,source,scope=pageScope()){
  if(error?.name==='AbortError')return;pageReadErrors.set(pageReadKey(source,scope),{scope,source,message:error.message});syncPageReadFeedback();
- const content=$('#content');if(content&&scope===pageScope()){content.inert=false;content.setAttribute?.('aria-busy','false');updatePageReadFeedback(false);}
+ const content=$('#content');if(content&&scope===pageScope()){content.inert=false;content.setAttribute?.('aria-busy','false');regionBusy('usage-initial-results',false);updatePageReadFeedback(false);}
 }
 function retirePageReadSource(source,scope=pageScope()){const removed=pageReadErrors.delete(pageReadKey(source,scope));syncPageReadFeedback();if(removed&&scope===pageScope())updatePageReadFeedback(false);}
 function pageReadSucceeded(source,scope=pageScope()){retirePageReadSource(source,scope);}
@@ -209,13 +211,13 @@ function departmentPageActive(){return admin&&managementIdentity?.role==='super_
 function departmentManagementContext(){
  if(managementIdentity?.role!=='super_admin')return '';
  const view=departmentPage?.epoch===authEpoch?departmentPage:null,rows=view?.rows||[],busy=!!view?.loading;
- const table=`<div class="table-wrap"><table><thead><tr><th>团队名称</th><th>状态</th><th>有效管理 Key</th><th>操作</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${esc(row.name)}</td><td>${row.enabled?'已启用':'已停用'}</td><td>${fmt(row.management_keys??0)}</td><td><div class="actions">${button('department-enter',row.id===departmentView?'当前团队':'进入团队','secondary',row.id,busy||!row.enabled||row.id===departmentView)}${button('department-edit','编辑','secondary',row.id,busy)}${button('department-keys','管理 Key','secondary',row.id,busy)}</div></td></tr>`).join('')||`<tr><td colspan="4">${view?.loaded?'暂无团队':'—'}</td></tr>`}</tbody></table></div>`;
- return `<div class="page-toolbar">${button('department-create','新建团队','primary','',busy)}</div><section class="panel">${loadingRegion(table,busy,'','department-results')}${view?.error?`<div role="alert" class="notice warn">${esc(view.error)} ${button('department-page-retry','重试')}</div>`:''}<div class="pager">${button('department-page-prev','上一页','secondary','',busy||!(view?.cursors.length>1))}<span>第 ${view?.cursors.length||1} 页</span>${button('department-page-next','下一页','secondary','',busy||!view?.next)}<label>每页<select id="department-page-size" ${busy?'disabled':''}>${[20,50,100].map(size=>`<option value="${size}" ${size===(view?.size||20)?'selected':''}>${size}</option>`).join('')}</select>条</label></div></section>`;
+ const table=`<div class="table-wrap"><table><thead><tr><th>团队名称</th><th>状态</th><th>有效管理 Key</th><th>操作</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${esc(row.name)}</td><td>${row.enabled?'已启用':'已停用'}</td><td>${fmt(row.management_keys??0)}</td><td><div class="actions">${row.id===departmentView?'<span class="department-current">当前团队</span>':button('department-enter','进入团队','secondary',row.id,busy||!row.enabled)}${button('department-edit','编辑','secondary',row.id,busy)}${button('department-keys','管理 Key','secondary',row.id,busy)}</div></td></tr>`).join('')||`<tr><td colspan="4">${view?.loaded?'暂无团队':'—'}</td></tr>`}</tbody></table></div>`;
+ return `<section class="panel">${loadingRegion(table,busy,'','department-results')}${view?.error?`<div role="alert" class="notice warn">${esc(view.error)} ${button('department-page-retry','重试')}</div>`:''}<div class="pager">${button('department-page-prev','上一页','secondary','',busy||!(view?.cursors.length>1))}<span>第 ${view?.cursors.length||1} 页</span>${button('department-page-next','下一页','secondary','',busy||!view?.next)}<label class="page-size-control">每页<select id="department-page-size" ${busy?'disabled':''}>${[20,50,100].map(size=>`<option value="${size}" ${size===(view?.size||20)?'selected':''}>${size}</option>`).join('')}</select>条</label></div></section>`;
 }
 function renderDepartmentPage(){
  if(!departmentPageActive())return;
  showShell();document.querySelectorAll('[data-tab]').forEach(el=>el.classList.toggle('active',el.dataset.tab===navigationTab()));$('.page')?.classList.toggle('overview-page',false);
- $('#content').inert=false;$('#content').innerHTML=connectionTabs()+departmentManagementContext();
+ $('#content').inert=false;$('#content').innerHTML=connectionTabs()+departmentManagementContext();syncWorkspaceLoadingMask();
  $('#department-page-size').onchange=event=>{const size=Number(event.target.value);if(![20,50,100].includes(size)||departmentPage?.loading)return;void loadDepartmentPage({size,reset:true});};
 }
 async function loadDepartmentPage({size=departmentPage?.size||20,reset=false,cursors=null}={}){
@@ -388,7 +390,24 @@ function pageScope(){return tab+':'+(tab==='requests'?recordView:'');}
 function pageRefreshing(){return foregroundRefreshVersion===refreshVersion&&foregroundRefreshScope===pageScope();}
 function quietDataLoading(){return true;}
 function loadingRegion(content,busy,label='',id=''){return `<div ${id?'id="'+id+'" ':''}class="loading-region data-refresh-region" aria-busy="${busy?'true':'false'}"><div class="loading-region-content" ${busy?'inert':''}>${content||''}</div><div class="data-loading-mask" role="status">正在加载…</div></div>`;}
-function regionBusy(id,busy){const region=$('#'+id);region?.setAttribute?.('aria-busy',String(busy));region?.querySelector?.('.loading-region')?.setAttribute?.('aria-busy',String(busy));region?.querySelector?.('.loading-region-content')?.toggleAttribute?.('inert',busy);}
+function workspacePagePending(){
+ if(!admin)return false;
+ if(tab==='requests'&&recordView==='recordings')return recordingAdminTab==='exports'?recordingExportListLoading:recordingAdminLoading;
+ if(departmentPageActive())return !!departmentPage?.loading;
+ if(!state)return !initialLoadError&&!pageReadError;
+ if(pageRefreshing())return true;
+ if(tab==='members')return membersLoading;if(tab==='sessions')return sessionsLoading;if(tab==='history')return historyLoading;if(tab==='overview')return !!overviewType&&typeStatisticsLoading;
+ return tab==='requests'&&(recordView==='usage'?keyUsageLoading:recordView==='requests'?requestsLoading:recordView==='types'?typeStatisticsLoading:false);
+}
+function syncWorkspaceLoadingMask(){
+ const content=$('#content');if(!content)return;const usage=admin;content.classList?.toggle('workspace-page',usage);
+ if(!content.querySelector)return;
+ let mask=content.querySelector(':scope > .workspace-loading-mask');
+ const busy=usage&&workspacePagePending();
+ if(busy&&!mask){content.insertAdjacentHTML('beforeend','<div class="data-loading-mask workspace-loading-mask" role="status" aria-live="polite"><span>正在加载…</span></div>');mask=content.querySelector(':scope > .workspace-loading-mask');}
+ if(mask)mask.hidden=!busy;
+}
+function regionBusy(id,busy){const region=$('#'+id);region?.setAttribute?.('aria-busy',String(busy));region?.querySelector?.('.loading-region')?.setAttribute?.('aria-busy',String(busy));region?.querySelector?.('.loading-region-content')?.toggleAttribute?.('inert',busy);syncWorkspaceLoadingMask();}
 function syncLoadingRegions(){const pending=pageRefreshing();regionBusy('state-page-results',pending);regionBusy('members-results',membersLoading);regionBusy('key-usage-results',keyUsageLoading||!pagedPeople()&&pending);regionBusy('sessions-results',sessionsLoading||pending);regionBusy('account-pool-results',pending);regionBusy('history-results',historyLoading||pending);regionBusy('type-statistics-results',typeStatisticsLoading);const note=$('#page-refresh-note');if(note)note.hidden=true;const refresh=$('#refresh');if(refresh){const busy=pending||manualRefreshPending;refresh.disabled=!!busy;refresh.classList?.toggle('is-loading',!!busy);refresh.setAttribute?.('aria-busy',String(!!busy));}}
 function coverageMarkup(value){const text=referenceCoverage(value);return text?'<small>'+esc(text)+'</small>':'';}
 async function waitForOfficialQuotaRefresh(epoch){
@@ -774,7 +793,7 @@ function requestsSection(){
   const summary=t?`<div class="stats request-stats">${[['请求 / 成功',fmt(t.requests)+' / '+fmt(t.success),'处理中 '+fmt(t.active)],['参考消耗（USD）',referenceTotal(t.standard),referenceCoverage(t.standard)],['未计量 / 缺费率',fmt(t.standard?.unmetered)+' / '+fmt(t.standard?.unpriced),''],['完成平均耗时',(t.average_ms/1000).toFixed(2)+'s','']].map(([label,value,hint])=>`<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value}</div>${hint?'<small>'+hint+'</small>':''}</div>`).join('')}</div>`:`<p class="hint">${esc(data.statisticsError||'汇总独立加载中，明细可先查看。')}</p>`;
   const grouped=(title,rows,name)=>{const size=requestGroupPageSizes[name],totalPages=Math.max(1,Math.ceil(rows.length/size)),page=Math.min(requestGroupPages[name],totalPages);requestGroupPages[name]=page;return rows.length?`<div class="table-wrap"><table><thead><tr><th>${name==='model'?'模型':'用户'}</th><th>请求 / 成功</th><th>参考合计（USD）</th><th>输入 / 输出（USD）</th><th>未计量 / 缺费率</th></tr></thead><tbody>${rows.slice((page-1)*size,page*size).map(x=>`<tr><td>${esc(x[name]||'未记录')}</td><td>${fmt(x.requests)} / ${fmt(x.success)}</td><td>${referenceTotal(x.standard)}<small>人工核对 ${referenceMoney(x.standard?.adjustment)}</small></td><td>${referenceMoney(x.standard?.input)} / ${referenceMoney(x.standard?.output)}<small>其中缓存 ${referenceMoney(x.standard?.cached)}</small></td><td>${fmt(x.standard?.unmetered)} / ${fmt(x.standard?.unpriced)}</td></tr>`).join('')}</tbody></table></div>`+`<div class="pager">${button('request-group-page','上一页','secondary',name+':'+(page-1),page<=1)}<span>第 ${page} / ${totalPages} 页 · 共 ${fmt(rows.length)} 组</span>${button('request-group-page','下一页','secondary',name+':'+(page+1),page>=totalPages)}${pageSizeControl('request-group:'+name,size)}</div>`:empty('当前筛选无数据。');};
   const hasNext=p.nextCursor===undefined?p.page<p.totalPages:!!p.nextCursor;
-  const pager=`<div class="session-pager"><span>${p.cursorMode?'第 '+p.page+' 页 · 当前匹配 '+fmt(p.total)+' 条':'第 '+p.page+' / '+p.totalPages+' 页 · 共 '+fmt(p.total)+' 条'}</span><label>每页<select id="requests-page-size">${PAGE_SIZES.map(n=>`<option value="${n}" ${p.pageSize===n?'selected':''}>${n}</option>`).join('')}</select>条</label><div class="actions">${button('requests-page','上一页','secondary',p.page-1,p.page<=1)}${button('requests-page','下一页','secondary',p.page+1,!hasNext)}</div></div>`;
+  const pager=`<div class="session-pager"><span>${p.cursorMode?'第 '+p.page+' 页 · 当前匹配 '+fmt(p.total)+' 条':'第 '+p.page+' / '+p.totalPages+' 页 · 共 '+fmt(p.total)+' 条'}</span><label class="page-size-control">每页<select id="requests-page-size">${PAGE_SIZES.map(n=>`<option value="${n}" ${p.pageSize===n?'selected':''}>${n}</option>`).join('')}</select>条</label><div class="actions">${button('requests-page','上一页','secondary',p.page-1,p.page<=1)}${button('requests-page','下一页','secondary',p.page+1,!hasNext)}</div></div>`;
   const timing=data.statisticsAt?`统计时间 ${beijingDate(data.statisticsAt)}${data.statisticsWatermark!==data.watermark?data.statisticsWatermarkKind==='postgres_visibility'?' · 列表与汇总来自不同读取快照，分组与合计使用同一统计水位':' · 列表加载后数据已有变化，分组与合计使用同一统计水位':''}`:'';
 
   const content=requestStatisticsTab==='list'?requestTable(data.rows)+pager:t?grouped(requestStatisticsTab==='model'?'按模型统计':'按用户统计',requestStatisticsTab==='model'?data.byModel||[]:data.byMember||[],requestStatisticsTab):`<p class="hint">${esc(data.statisticsError||'正在加载统计…')}</p>`;
@@ -785,7 +804,7 @@ function bindRequestFilters(){
   for(const field of requestFilterFields())$(`#requests-${field}`).onchange=e=>{requestsFilters[field]=e.target.value;if(field==='outcome')requestsFilters.status='';if(field==='member')delete requestsFilters.member_missing;if(field==='model')delete requestsFilters.model_missing;requestsFilters.page=1;void loadRequests();};
   if($('#requests-page-size'))$('#requests-page-size').onchange=e=>{requestsFilters.pageSize=Number(e.target.value);requestsFilters.page=1;void loadRequests();};
 }
-function connectionTabs(){return `<div class="actions record-tabs connection-tabs" aria-label="系统管理分类">${[['guide','接入说明'],['test','请求测试'],['history','系统操作历史'],...(managementIdentity?.role==='super_admin'?[['departments','部门管理']]:[])].map(([value,label])=>button('connection-view',label,(tab==='history'?value==='history':connectionView===value)?'primary':'secondary',value,sending)).join('')}${admin&&tab==='playground'&&connectionView==='guide'?button('download-access-guide','下载接入文档','secondary'):''}</div>`;}
+function connectionTabs(){return `<div class="actions record-tabs connection-tabs" aria-label="系统管理分类">${[['guide','接入说明'],['test','请求测试'],['history','系统操作历史'],...(managementIdentity?.role==='super_admin'?[['departments','部门管理']]:[])].map(([value,label])=>button('connection-view',label,(tab==='history'?value==='history':connectionView===value)?'primary':'secondary',value,sending)).join('')}${admin&&tab==='playground'&&connectionView==='guide'?button('download-access-guide','下载接入文档','secondary'):''}${departmentPageActive()?button('department-create','新建团队','primary department-create-action','',!!departmentPage?.loading):''}</div>`;}
 function historyName(id){return historyData?.accounts?.find(a=>a.id===id)?.name||state?.accounts?.find(a=>a.id===id)?.name||id||'—';}
 function weightsText(weights){return weights?Object.entries(weights).map(([id,n])=>historyName(id)+' '+weightPercent(n)).join('；')||'自动模式':'此前值未记录';}
 function historyText(r){
@@ -1016,7 +1035,7 @@ function sessionFiltersBar(){
 function sessionPager(){
   const p=state.sessionsPagination||{page:sessionsPage,pageSize:sessionsPageSize,total:state.sessions.length,totalPages:1};
   const control=(label,page,disabled)=>`<button type="button" class="secondary" data-action="sessions-page" data-id="${page}" ${disabled||sessionsLoading?'disabled':''}>${label}</button>`;
-  return `<div class="session-pager" aria-label="会话分页"><span class="hint">共 ${fmt(p.total)} 个会话 · 第 ${fmt(p.page)} / ${fmt(p.totalPages)} 页</span><div class="actions"><label>每页<select id="session-page-size" aria-label="每页会话数" ${sessionsLoading?'disabled':''}>${PAGE_SIZES.map(n=>`<option value="${n}" ${n===p.pageSize?'selected':''}>${n} 条</option>`).join('')}</select></label>${control('首页',1,p.page<=1)}${control('上一页',p.page-1,p.page<=1)}${control('下一页',p.page+1,p.page>=p.totalPages)}${control('末页',p.totalPages,p.page>=p.totalPages)}</div></div>`;
+  return `<div class="session-pager" aria-label="会话分页"><span class="hint">共 ${fmt(p.total)} 个会话 · 第 ${fmt(p.page)} / ${fmt(p.totalPages)} 页</span><div class="actions"><label class="page-size-control">每页<select id="session-page-size" aria-label="每页会话数" ${sessionsLoading?'disabled':''}>${PAGE_SIZES.map(n=>`<option value="${n}" ${n===p.pageSize?'selected':''}>${n} 条</option>`).join('')}</select></label>${control('首页',1,p.page<=1)}${control('上一页',p.page-1,p.page<=1)}${control('下一页',p.page+1,p.page>=p.totalPages)}${control('末页',p.totalPages,p.page>=p.totalPages)}</div></div>`;
 }
 function overviewCostScope(){return `${authEpoch}:${overviewCostRevision}:${state?.usageWindow?.start}:${state?.usageWindow?.end}:${state?.totals?.requests}`;}
 function overviewCostWindowScope(){return `${authEpoch}:${state?.usageWindow?.start}:${state?.usageWindow?.end}`;}
@@ -1039,6 +1058,7 @@ async function loadOverviewCost(){
  finally{if(overviewCostController===controller){overviewCostController=null;const target=$('#overview-cost-chart');if(!target&&admin&&tab==='overview'&&!overviewType&&windowScope===overviewCostWindowScope())render();if(target&&admin&&tab==='overview'&&!overviewType&&windowScope===overviewCostWindowScope()){target.innerHTML=overviewCostChart();for(const bar of target.querySelectorAll?.('[data-height]')||[])bar.style.height=bar.dataset.height+'%';}}}
 }
 function render(){
+  syncWorkspaceLoadingMask();
   if(departmentPageActive()){renderDepartmentPage();if(departmentPage?.epoch!==authEpoch)void loadDepartmentPage({reset:true});return;}
   if(admin&&managementIdentity?.business_available===false){showShell();$('#content').inert=false;$('#content').innerHTML='<section class="panel"><p>当前团队已停用</p>'+button('department-picker','团队管理','primary')+'</section>';return;}
   if(admin)syncPageReadFeedback();

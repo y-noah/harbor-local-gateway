@@ -258,3 +258,13 @@ body{font-size:17.6px}
 .department-scope{display:block;padding:0 12px 14px;color:var(--muted);font-size:12px;line-height:1.5;overflow-wrap:anywhere}
 
 .scope-notice{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px;padding:10px 14px;border:1px solid var(--line);border-radius:8px;font-size:13px;color:var(--muted)}
+
+/* 各工作区共用主内容遮罩，侧栏保持可导航；各查询沿用原有 busy 状态。 */
+#content.workspace-page{position:relative;min-height:calc(100dvh - 100px)}
+.workspace-page .data-refresh-region>.data-loading-mask{display:none}
+.workspace-page>.workspace-loading-mask:not([hidden]){display:flex;align-items:flex-start;justify-content:center;min-height:260px}
+.workspace-loading-mask>span{position:sticky;top:40dvh}
+.workspace-loading-mask[hidden]{display:none}
+.connection-tabs>.department-create-action{margin-left:auto}
+.department-current{display:inline-flex;align-items:center;padding:8px 12px;color:var(--green);background:var(--soft);border-radius:8px;white-space:nowrap;cursor:default}
+#department-results td .actions{flex-wrap:nowrap;white-space:nowrap}

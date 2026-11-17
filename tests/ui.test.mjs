@@ -77,7 +77,7 @@ test('轻总览切到会话页立即补全状态，迟到响应不能覆盖其�
   const page=await ui(path=>{paths.push(path);return new Promise(resolve=>pending.push(()=>resolve(response(path.includes('view=overview')?compact:full))));});
   page.run('admin=true;state='+JSON.stringify(compact)+';tab="overview";render();globalThis.previousContent=document.querySelector("#content").innerHTML;setTab("sessions");');
   assert.ok(paths.some(path=>path.startsWith('/api/admin/state?')&&!path.includes('view=overview')));
-  assert.notEqual(page.node('#content').innerHTML,page.run('previousContent'));assert.match(page.node('#content').innerHTML,/page-loading-placeholder/);assert.doesNotMatch(page.node('#content').innerHTML,/overview-controls|loading-mask/);
+  assert.notEqual(page.node('#content').innerHTML,page.run('previousContent'));assert.match(page.node('#content').innerHTML,/usage-initial-results/);assert.doesNotMatch(page.node('#content').innerHTML,/overview-controls/);
   page.run('setTab("overview")');pending.shift()();pending.shift()();await new Promise(setImmediate);
   assert.equal(page.run('state.view'),'overview');
   page.run('setTab("sessions")');pending.shift()();await new Promise(setImmediate);
@@ -89,7 +89,7 @@ test('首屏轻状态到达前切页只补读一次完整状态，失败后可�
   let release,reads=0;
   const page=await ui(path=>{if(!path.startsWith('/api/admin/state'))return response({});reads++;if(reads===1)return new Promise(resolve=>release=()=>resolve(response(compact)));return reads===2?response({error:{message:'合成临时失败'}},503):response(full);});
   page.run('admin=true;state=null;tab="overview";');const first=page.run('refresh()');page.run('setTab("sessions")');assert.equal(reads,1);release();await first;
-  assert.equal(reads,2);assert.match(page.node('#content').innerHTML,/重新读取/);assert.equal(page.run('pageRefreshing()'),false);
+  assert.equal(reads,2);assert.match(page.node('#page-read-feedback').innerHTML,/合成临时失败/);assert.match(page.node('#page-read-feedback').innerHTML,/重试/);assert.equal(page.run('pageRefreshing()'),false);
   await page.click('retry-workspace');assert.equal(reads,3);assert.equal(page.run('state.view'),undefined);assert.match(page.node('#content').innerHTML,/近7天活动会话/);
 });
 
@@ -606,7 +606,7 @@ test('request list combines filters with complete totals and discards stale or l
  const result={summary:{requests:251,success:250,input:100,output:20,cached:5,unmetered:1,active:0,average_ms:1000},pagination:{page:1,pageSize:25,total:251,totalPages:11},rows:[],models:['alpha','beta'],members:[{id:'m1',name:'同名'},{id:'m2',name:'同名'}],byModel:[],byMember:[]};
  const pending=[];const page=await ui((path)=>path.startsWith('/api/admin/requests?')?new Promise(r=>pending.push({path,release:body=>r(response(body))})):response({ok:true}));
  page.run('admin=true;state='+JSON.stringify(snapshot())+";tab='requests';recordView='requests';");
- const first=page.run('loadRequests()');assert.equal(page.node('#content').innerHTML,'');assert.doesNotMatch(page.node('#content').innerHTML,/loading-mask/);pending[0].release(result);await first;assert.match(page.node('#content').innerHTML,/251/);
+ const first=page.run('loadRequests()');assert.match(page.node('#content').innerHTML,/usage-initial-results/);assert.equal(page.node('#page-read-feedback').hidden,true);pending[0].release(result);await first;assert.match(page.node('#content').innerHTML,/251/);
  const older=page.run("requestsFilters.model='alpha';loadRequests()");const newer=page.run("requestsFilters.member='m1';loadRequests()");assert.match(pending[2].path,/member=m1&model=alpha/);pending[2].release({...result,summary:{...result.summary,requests:4}});await newer;pending[1].release(result);await older;assert.equal(page.run('requestsData.summary.requests'),4);
  const last=page.run('loadRequests()');await page.node('#logout').onclick();pending[3].release(result);await last;assert.equal(page.run('requestsData'),null);assert.equal(page.node('#content').innerHTML,'');
 });
@@ -1185,7 +1185,7 @@ test('请求明细与汇总先于慢全局状态完成且不重复读取',async(
 
 test('鉴权成功立即进入工作空间并显示等待反馈，不滞留取消登录卡',async()=>{
  let release;const page=await ui(path=>path==='/api/auth/login'?response({ok:true}):new Promise(resolve=>release=resolve));page.node('#admin-input').value='synthetic';const submit={disabled:false};const pending=page.node('#login-form').onsubmit({preventDefault(){},submitter:submit});await new Promise(setImmediate);
- assert.equal(page.run('admin'),true);assert.equal(page.node('#shell').classList.values.has('hidden'),false);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.equal(page.run('state'),null);assert.equal(page.node('#content').innerHTML,'');assert.equal(page.node('#page-read-feedback').hidden,false);assert.match(page.node('#page-read-feedback').innerHTML,/正在加载/);assert.equal(page.node('#admin-input').value,'');
+ assert.equal(page.run('admin'),true);assert.equal(page.node('#shell').classList.values.has('hidden'),false);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.equal(page.run('state'),null);assert.equal(page.node('#content').innerHTML,'');assert.equal(page.node('#page-read-feedback').hidden,true);assert.equal(page.run('workspacePagePending()'),true);assert.equal(page.node('#admin-input').value,'');
  release(response(snapshot()));await pending;assert.equal(submit.disabled,false);assert.match(page.node('#content').innerHTML,/最近 7 天请求/);assert.equal(page.run('tab'),'overview');
 });
 test('登录成功附带总览时直接使用同份数据，避免重复状态请求',async()=>{
@@ -2024,7 +2024,7 @@ test('员工列表独立用量使用list profile，元数据和缓存筛选范�
 
 test('跨工作区待加载立即移除旧账号表，仅保留新页导航和一处加载反馈，失败不恢复旧表',async()=>{
  const page=await ui(()=>response({})),base={...snapshot(),view:'accounts',capabilities:{sessionStateView:true},accounts:[{id:'old-account',name:'旧账号标识',kind:'codex',enabled:1,state:'ready'}]};page.run('admin=true;state='+JSON.stringify(base)+';tab="accounts";render()');assert.match(page.node('#content').innerHTML,/account-pool-results|旧账号标识/);
- page.run('tab="sessions";render()');assert.doesNotMatch(page.node('#content').innerHTML,/account-pool-results|旧账号标识|account-pool-filters|data-loading-mask/);assert.match(page.node('#content').innerHTML,/data-action="record-view"/);assert.match(page.node('#content').innerHTML,/page-loading-placeholder/);assert.match(page.node('#page-read-feedback').innerHTML,/正在加载/);assert.equal(page.node('#content').inert,false);
+ page.run('tab="sessions";render()');assert.doesNotMatch(page.node('#content').innerHTML,/account-pool-results|旧账号标识|account-pool-filters/);assert.match(page.node('#content').innerHTML,/data-action="record-view"/);assert.match(page.node('#content').innerHTML,/usage-initial-results/);assert.equal(page.node('#page-read-feedback').hidden,true);assert.equal(page.node('#content').inert,false);
  page.run('failPageRead(Error("合成会话读取失败"),"state");render()');assert.doesNotMatch(page.node('#content').innerHTML,/account-pool-results|旧账号标识/);assert.match(page.node('#page-read-feedback').innerHTML,/合成会话读取失败|重试/);assert.match(page.node('#content').innerHTML,/data-action="record-view"/);
 });
 test('同页面等待仍保留旧表，已有局部遮罩时不重复显示顶部加载提示',async()=>{
@@ -2213,4 +2213,23 @@ test('新Key列表未同步时分页模式读取真实Key权限，旧模式明�
   const calls=[],policy={allowed_models:['gpt-6.1-sol'],usage_limits:{enabled:false,rules:[]}},page=await ui(path=>{calls.push(path);assert.equal(path,'/api/admin/keys/synthetic-new-id/policy');return response(policy);});const data={...snapshot(),keys:[],capabilities:{pagedMembers:paged}};page.run('admin=true;state='+JSON.stringify(data)+';showSecret("synthetic-new-secret",{keyId:"synthetic-new-id"})');await page.click('copy-secret');
   if(paged){assert.equal(calls.length,1);assert.match(page.copied[0],/synthetic-new-secret\n可用模型：gpt-6.1-sol/);}else{assert.equal(calls.length,0);assert.equal(page.copied.length,0);assert.match(page.node('#toast').textContent,/未加载/);page.run('state.keys=[{id:"synthetic-new-id",member_id:"synthetic-member",allowed_models:["gpt-6.1-sol"]}];state.members=[{id:"synthetic-member",usage_limits:{enabled:false,rules:[]}}]');await page.click('copy-secret');assert.match(page.copied[0],/synthetic-new-secret\n可用模型：gpt-6.1-sol/);}
  }
+});
+
+test('部门页新建入口并入分类栏，当前团队为状态且分页控件统一间距',async()=>{
+ const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(snapshot())+';managementIdentity={role:"super_admin"};departmentView="team-current";tab="playground";connectionView="departments";departmentPage={epoch:authEpoch,rows:[{id:"team-current",name:"当前合成团队",enabled:true},{id:"team-other",name:"其他合成团队",enabled:true}],cursors:[null],loaded:true,size:20};');
+ const navigation=page.run('connectionTabs()'),table=page.run('departmentManagementContext()');assert.equal((navigation.match(/data-action="department-create"/g)||[]).length,1);assert.doesNotMatch(table,/data-action="department-create"/);assert.match(table,/<span class="department-current">当前团队<\/span>/);assert.doesNotMatch(table,/data-action="department-enter" data-id="team-current"/);assert.match(table,/data-action="department-enter" data-id="team-other"/);assert.match(table,/<label class="page-size-control">每页<select id="department-page-size"/);
+});
+
+test('使用数据共享一个主内容遮罩，仅实际读取时显示，正文默认不查询',async()=>{
+ const page=await ui(()=>response({}));let mask=null,added=0;const content=page.node('#content');content.querySelector=selector=>selector===':scope > .workspace-loading-mask'?mask:null;content.insertAdjacentHTML=()=>{added++;mask={hidden:false};};content.innerHTML='保留已有结果';page.run('admin=true;state='+JSON.stringify(snapshot())+';tab="sessions";sessionsLoading=true;syncWorkspaceLoadingMask()');assert.equal(mask.hidden,false);assert.equal(added,1);assert.equal(content.innerHTML,'保留已有结果');page.run('syncWorkspaceLoadingMask()');assert.equal(added,1);
+ for(const [setup,clear] of [['sessionsLoading=true','sessionsLoading=false'],['tab="requests";recordView="usage";keyUsageLoading=true','keyUsageLoading=false'],['recordView="requests";requestsLoading=true','requestsLoading=false'],['recordView="types";typeStatisticsLoading=true','typeStatisticsLoading=false'],['recordView="recordings";recordingAdminLoading=true','recordingAdminLoading=false'],['recordingAdminTab="exports";recordingExportListLoading=true','recordingExportListLoading=false']]){page.run(setup+';syncWorkspaceLoadingMask()');assert.equal(mask.hidden,false,setup);page.run(clear+';syncWorkspaceLoadingMask()');assert.equal(mask.hidden,true,clear);}
+ page.run('recordingAdminTab="query";recordingAdminLoading=false;foregroundRefreshVersion=refreshVersion;foregroundRefreshScope=pageScope();syncWorkspaceLoadingMask()');assert.equal(mask.hidden,true);page.run('foregroundRefreshVersion=0;foregroundRefreshScope="";tab="accounts";syncWorkspaceLoadingMask()');assert.equal(mask.hidden,true);assert.equal(added,1);
+});
+
+test('首页员工账号和系统读取统一主内容遮罩，错误仅显示重试且不显示顶部加载条',async()=>{
+ const page=await ui(()=>response({}));let mask=null,added=0;const content=page.node('#content');content.querySelector=selector=>selector===':scope > .workspace-loading-mask'?mask:null;content.insertAdjacentHTML=()=>{added++;mask={hidden:false};};
+ page.run('admin=true;state=null;tab="overview";render()');assert.equal(mask.hidden,false);assert.equal(page.node('#page-read-feedback').hidden,true);page.run('failPageRead(Error("合成首屏失败"),"state");render()');assert.equal(mask.hidden,true);assert.match(page.node('#page-read-feedback').innerHTML,/合成首屏失败|重试/);
+ page.run('pageReadErrors.clear();pageReadError="";initialLoadError="";state='+JSON.stringify(snapshot())+';renderedPageScope=pageScope();');content.innerHTML='保留成功数据';
+ for(const [setup,clear] of [['tab="overview";foregroundRefreshVersion=refreshVersion;foregroundRefreshScope=pageScope()','foregroundRefreshScope=""'],['tab="members";membersLoading=true','membersLoading=false'],['tab="accounts";foregroundRefreshVersion=refreshVersion;foregroundRefreshScope=pageScope()','foregroundRefreshScope=""'],['tab="history";historyLoading=true','historyLoading=false'],['tab="playground";connectionView="departments";managementIdentity={role:"super_admin"};departmentPage={loading:true}','departmentPage.loading=false']]){page.run(setup+';syncWorkspaceLoadingMask()');assert.equal(mask.hidden,false,setup);assert.equal(content.innerHTML,'保留成功数据');page.run(clear+';syncWorkspaceLoadingMask()');assert.equal(mask.hidden,true,clear);}
+ assert.equal(added,1);page.run('admin=false;syncWorkspaceLoadingMask()');assert.equal(mask.hidden,true);
 });
