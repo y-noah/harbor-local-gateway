@@ -21,6 +21,11 @@ async function setup(t){
  return {...a,base,member,key2,call,configure,send,seed,calls,now:()=>at,advance:ms=>at+=ms,hold:fn=>hold=fn,known:value=>known=value};
 }
 const rule=(model=sol,hours=24,limit_usd='2.00')=>({model,hours,limit_usd});
+test('限额PATCH不依赖统计查询，统计故障时关闭仍明确提交且保留冲突保护',{timeout:10000},async t=>{
+ const a=await setup(t),path='/api/admin/members/'+a.member.memberId+'/usage-limits';await a.configure([rule()]);a.store.memberLimits.status=()=>{throw Error('synthetic statistics timeout');};
+ const saved=await a.call(path,'PATCH',{enabled:false,expected_version:1});assert.equal(saved.status,200);assert.equal(saved.body.enabled,false);assert.equal(saved.body.version,2);assert.equal(saved.body.usage_pending,true);assert.equal(Object.hasOwn(saved.body,'usage'),false);assert.equal(a.store.memberLimits.configuration(a.member.memberId).enabled,false);
+ assert.equal((await a.call(path)).status,500);assert.equal((await a.call(path,'PATCH',{enabled:true,expected_version:1})).status,409);assert.equal(a.store.memberLimits.configuration(a.member.memberId).enabled,false);
+});
 test('administrators configure a per-member switch with exact amounts, strict rules and optimistic conflicts', {timeout:10000},async t=>{
  const a=await setup(t),path='/api/admin/members/'+a.member.memberId+'/usage-limits';assert.equal((await a.call(path)).body.enabled,false);
  assert.equal((await a.call(path,'PATCH',{enabled:true,rules:[rule()],expected_version:0},a.member.secret)).status,401);
@@ -50,11 +55,16 @@ test('limits use immutable unrounded amounts, cached prices and manual reconcili
  await a.configure([rule(sol,24,'3')]);a.store.run('UPDATE requests SET manual_cost_atoms=NULL,input=1000000 WHERE id=?',id);
  const pricing=(await a.call('/api/admin/pricing')).body;await a.call('/api/admin/pricing','PATCH',{expectedVersion:pricing.settings.version,manualRates:{[sol]:{input:'100',cached:'10',output:'100',source:'synthetic rate change'}}});assert.equal(a.store.memberLimits.status(a.member.memberId).usage[0].used_usd,'2');
 });
-test('unknown usage blocks relevant models until reconciled; unknown aliases and implicit tool models cannot bypass limits',{timeout:10000},async t=>{
- const a=await setup(t);await a.configure([rule()]);const id=a.seed(sol,a.now(),0,{unknown:true});assert.equal((await a.send()).body.error.type,'member_model_usage_unknown');assert.equal(a.calls.length,0);
- assert.equal((await a.call('/api/admin/requests/'+id+'/settle','POST',{standard_usd:'1.00'})).status,200);assert.equal(a.store.memberLimits.status(a.member.memberId).usage[0].used_usd,'1');
+test('unknown usage stays visible without blocking; known costs and later reconciliation still enforce limits',{timeout:10000},async t=>{
+ const a=await setup(t);await a.configure([rule(sol,24,'3')]);const id=a.seed(sol,a.now(),0,{unknown:true});
+ let status=a.store.memberLimits.status(a.member.memberId).usage[0];assert.equal(status.unresolved,1);assert.equal(status.used_usd,'0');assert.equal(status.blocked,false);
+ assert.equal((await a.send(sol,a.key2)).status,200);assert.equal(a.calls.length,1);
+ status=a.store.memberLimits.status(a.member.memberId).usage[0];assert.equal(status.used_usd,'2');assert.equal(status.unresolved,1);assert.equal(status.blocked,false);
  for(const [model,extra] of [['unknown-alias',{}],[sol,{tools:[{type:'image_generation'}]}],[sol,{tools:[{type:'namespace',tools:[{type:'image_generation'}]}]}]])assert.ok([403,409].includes((await a.send(model,a.member,extra)).status));
- a.seed('unknown-alias',a.now(),1,{unknown:true});assert.equal((await a.send()).status,409);assert.equal((await a.send(astra)).status,200);
+ assert.equal((await a.call('/api/admin/requests/'+id+'/settle','POST',{standard_usd:'1.00'})).status,200);
+ status=a.store.memberLimits.status(a.member.memberId).usage[0];assert.equal(status.used_usd,'3');assert.equal(status.unresolved,0);assert.equal(status.blocked,true);
+ assert.equal((await a.send()).status,429);assert.equal(a.calls.length,1);
+ a.seed('unknown-alias',a.now(),1,{unknown:true});assert.equal((await a.send()).status,429);assert.equal((await a.send(astra)).status,200);
 });
 test('concurrent requests admitted below a limit complete, then subsequent requests are rejected',{timeout:10000},async t=>{
  const a=await setup(t);await a.configure([rule()]);let release;const held=new Promise(r=>release=r);a.hold(()=>held);const first=a.send(),second=a.send(sol,a.key2);
@@ -81,10 +91,10 @@ test('R1 alias rules cannot be newly saved and existing rules enforce the same c
  assert.equal((await a.call(path,'PATCH',{enabled:false,expected_version:0})).status,200);assert.equal((await a.send(sol)).status,200);
  assert.equal((await a.configure([rule(sol,24,'0')])).status,200);assert.equal((await a.send(sol)).status,429);
 });
-test('unattributed manual amounts pause configured model limits without charging the same amount to every model',{timeout:10000},async t=>{
+test('unattributed manual amounts remain unresolved without blocking or charging every model',{timeout:10000},async t=>{
  const a=await setup(t);await a.configure([rule(sol,24,'20'),rule(astra,24,'20')]);const id=a.seed('unknown-alias',a.now(),0,{unknown:true});
  await a.call('/api/admin/requests/'+id+'/settle','POST',{standard_usd:'0.50'});
- const status=a.store.memberLimits.status(a.member.memberId);assert.ok(status.usage.every(row=>row.used_usd==='0'&&row.unresolved===1&&row.blocked));assert.equal((await a.send(sol)).status,409);assert.equal((await a.send(astra)).status,409);
+ const status=a.store.memberLimits.status(a.member.memberId);assert.ok(status.usage.every(row=>row.used_usd==='0'&&row.unresolved===1&&!row.blocked));assert.equal((await a.send(sol)).status,200);assert.equal((await a.send(astra)).status,200);
  a.store.run("UPDATE requests SET manual_cost_atoms='0' WHERE id=?",id);assert.ok(a.store.memberLimits.status(a.member.memberId).usage.every(row=>row.unresolved===0));
 });
 

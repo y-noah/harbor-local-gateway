@@ -137,13 +137,13 @@ test('R1 official normalized Qoder counters preserve exact USD and do not reject
   const first=await app.chat({model});assert.equal(first.status,200);assert.equal(first.body.usage.prompt_tokens,1000000);assert.equal(first.body.harbor_standard_usage.total_exact,'0.85001');assert.equal(app.store.get('SELECT input FROM requests').input,1000000);
   assert.equal(app.store.memberLimits.status(app.member.memberId).usage[0].blocked,false);assert.equal((await app.chat({model})).status,200);assert.equal((await app.chat({model})).status,429);
 });
-test('R1 a Qoder result with masked zero usage cannot bypass a configured USD ceiling',async t=>{
+test('Qoder masked zero usage remains unknown without blocking subsequent requests',async t=>{
   const root=mkdtempSync(join(tmpdir(),'harbor-qoder-masked-'));t.after(()=>rmSync(root,{recursive:true,force:true}));const binary=join(root,'qoder');
   writeFileSync(binary,`#!/usr/bin/env node\nif(process.argv.includes('--list-models')){console.log('MODEL\\nPerformance');process.exit(0);}process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'合成有输出但计量隐藏',usage:{input_tokens:0,output_tokens:0,cache_read_input_tokens:0,cache_creation_input_tokens:0}})));\n`,{mode:0o700});
   const app=await fixture(t,{transport:createPlatformTransport({qoderBinary:binary})}),id=await app.create('qoder');await app.check(id);const model='qoder/'+JSON.parse(app.store.get('SELECT platform_models FROM accounts WHERE id=?',id).platform_models)[0];
   app.store.pricing.configure({expectedVersion:app.store.pricing.status().settings.version,manualRates:{[model]:{input:'1',cached:'1',output:'1',source:'合成验收费率'}}});app.store.memberLimits.save(app.member.memberId,{expected_version:0,enabled:true,rules:[{model,hours:24,limit_usd:'1.00'}]});
   const result=await app.chat({model});assert.equal(result.status,200);assert.equal(result.body.usage,null);assert.equal(app.store.get('SELECT usage_unknown FROM requests').usage_unknown,1);assert.notEqual(result.body.harbor_standard_usage.state,'priced');
-  const denied=await app.chat({model});assert.equal(denied.status,409);assert.equal(denied.body.error.type,'member_model_usage_unknown');
+  const next=await app.chat({model});assert.equal(next.status,200);assert.equal(next.body.usage,null);const status=app.store.memberLimits.status(app.member.memberId).usage[0];assert.equal(status.unresolved,2);assert.equal(status.blocked,false);assert.equal(status.used_usd,'0');
 });
 test('R3 unsupported Qoder arguments do not create unknown usage or block the next request',async t=>{
   let runs=0;const app=await fixture(t,{transport:{models:async()=>['example-model'],run:async()=>{runs++;return {text:'done',input:1,output:1,cached:0,usageKnown:true};}}}),id=await app.create('qoder');await app.check(id);

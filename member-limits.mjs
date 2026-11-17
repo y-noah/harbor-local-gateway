@@ -67,7 +67,7 @@ export function createMemberLimits(store,{clock=Date.now}={}){
       for(const row of measured){if(row.ended<window.start||!window.inclusive&&row.ended===window.start||row.model!==model&&row.model!==null)continue;if(row.model===null){if(row.atoms!==0n)unresolved++;continue;}if(row.atoms===null)unresolved++;else used+=row.atoms;}
       const ceiling=amount(rule.limit_usd),exceeded=used>=ceiling;
       const inFlight=pending.filter(row=>(referenceModel(row.billing_model||row.model,row.started,store.pricing.book(row.price_version))||row.billing_model||row.model)===model).length;
-      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved,in_flight:inFlight,exceeded,blocked:config.enabled&&(exceeded||unresolved>0||rule.invalid_model),window:{start:window.start,end:window.end}};
+      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved,in_flight:inFlight,exceeded,blocked:config.enabled&&(exceeded||rule.invalid_model),window:{start:window.start,end:window.end}};
     });
     return {...config,currency:'USD',observed_at:at,usage};
   }
@@ -89,7 +89,6 @@ export function createMemberLimits(store,{clock=Date.now}={}){
     for(const row of status(memberId,at).usage){
       if(!requested.has(row.effective_model))continue;
       if(row.exceeded)failure(429,memberLimitExceededMessage(row),'member_model_limit_exceeded');
-      if(row.unresolved)failure(409,row.model+'窗口内存在无法计价的记录，请管理员核对后重试','member_model_usage_unknown');
     }
   }
   return {configuration,save,status,check};

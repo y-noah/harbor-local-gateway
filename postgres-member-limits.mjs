@@ -56,7 +56,7 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
     if(!targets.length)return {...config,currency:'USD',observed_at:at,usage:[]};
     const start=Math.min(...targets.map(rule=>memberLimitWindow(rule.hours,at).start));
     // Resolve historical aliases before narrowing the price lookup. Unknown
-    // models stay in the set because they can block every configured rule.
+    // models stay in the set so unresolved coverage remains visible for every rule.
     const rows=await store.all(`WITH rules AS (
       SELECT * FROM jsonb_to_recordset($4::jsonb) AS x(position INTEGER,model TEXT,start_at BIGINT,inclusive BOOLEAN)
     ), source AS MATERIALIZED (
@@ -101,7 +101,7 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
       JSON.stringify(targets.map((r,position)=>({position,model:r.effective_model||r.model,start_at:memberLimitWindow(r.hours,at).start,inclusive:r.hours===24}))),JSON.stringify(book));
     const usage=targets.map((rule,i)=>{
       const row=rows[i],used=BigInt(row.used),ceiling=memberLimitAtoms(rule.limit_usd),exceeded=used>=ceiling;
-      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved:row.unresolved,in_flight:row.in_flight,exceeded,blocked:config.enabled&&(exceeded||row.unresolved>0||rule.invalid_model),window:{start:memberLimitWindow(rule.hours,at).start,end:at}};
+      return {...rule,used_usd:exactUsd(used),remaining_usd:exactUsd(used>=ceiling?0n:ceiling-used),unresolved:row.unresolved,in_flight:row.in_flight,exceeded,blocked:config.enabled&&(exceeded||rule.invalid_model),window:{start:memberLimitWindow(rule.hours,at).start,end:at}};
     });
     return {...config,currency:'USD',observed_at:at,usage};
   }
@@ -140,7 +140,6 @@ export function createPostgresMemberLimits(store,{clock=Date.now}={}){
       for(const row of (await calculate(memberId,at,config,current)).usage){
         if(!requested.has(row.effective_model))continue;
         if(row.exceeded)fail(429,memberLimitExceededMessage(row),'member_model_limit_exceeded');
-        if(row.unresolved)fail(409,row.model+'窗口内存在无法计价的记录，请管理员核对后重试','member_model_usage_unknown');
       }
     },{level:'REPEATABLE READ',readOnly:true});
   }

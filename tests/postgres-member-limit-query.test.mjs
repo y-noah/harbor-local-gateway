@@ -11,7 +11,7 @@ import {createMemberLimits} from '../member-limits.mjs';
 const url=process.env.HARBOR_TEST_DATABASE_URL,integration={skip:!url?'需独立PG测试库':false,timeout:20000};
 const options=(database='postgres')=>{const value=new URL(url);value.pathname='/'+database;return {connectionString:value.href,allowPlaintextLocalNetwork:true,poolSize:2};};
 
-test('PG限额先按历史模型和规则窗口筛选，未知模型仍保守阻断且与SQLite一致',integration,async()=>{
+test('PG限额先按历史模型和规则窗口筛选，未计价记录不阻断且与SQLite一致',integration,async()=>{
  const admin=new PostgresStore(options()),database='harbor_limit_query_'+randomUUID().replaceAll('-',''),directory=await mkdtemp(join(tmpdir(),'harbor-limit-query-'));let store,legacy;
  try{
   await admin.query('CREATE DATABASE '+database);store=new PostgresStore(options(database));await store.migrate();await store.initializePricing();
@@ -26,10 +26,19 @@ test('PG限额先按历史模型和规则窗口筛选，未知模型仍保守阻
   for(let i=0;i<50;i++)await seed(astra,at);
   await seed(astra,null);await seed(sol,at);await seed('historical-sol',at);await seed(sol,null);await seed(sol,at-168*3600000);
   const unknown=await seed('unknown-model',at,{manual_cost_atoms:'1000000000000',status:'reconciled'});await seed('unknown-zero',at,{input:0,output:0,cached:0,price_version:'missing-synthetic'});
+  const unmetered=await seed(sol,at,{usage_unknown:1}),missingVersion=await seed(sol,at,{price_version:'missing-synthetic'});
+  assert.equal((await store.get('SELECT state,total_atoms FROM harbor.request_prices WHERE request_id=$1',unmetered)).state,'unmetered');
   let captured;const query=store.query.bind(store);store.query=(sql,args)=>{if(sql.startsWith('WITH rules AS'))captured={sql,args};return query(sql,args);};
-  const actual=await limits.status(member.memberId,at);assert.deepEqual(actual,original.status(member.memberId,at));assert.ok(actual.usage.every(r=>r.unresolved===1));await assert.rejects(limits.check(member.memberId,sol,{at}),{code:'member_model_usage_unknown'});
+  const actual=await limits.status(member.memberId,at);assert.deepEqual(actual,original.status(member.memberId,at));assert.ok(actual.usage.every(r=>r.unresolved===3&&!r.blocked));await limits.check(member.memberId,sol,{at});
   const plan=(await query('EXPLAIN (ANALYZE,FORMAT JSON) '+captured.sql,captured.args)).rows[0]['QUERY PLAN'][0],counts={};
   const visit=node=>{if(['CTE source','CTE relevant'].includes(node['Subplan Name']))counts[node['Subplan Name']]=node['Actual Rows'];for(const child of node.Plans??[])visit(child);};visit(plan.Plan);assert.ok(counts['CTE source']>50);assert.ok(counts['CTE relevant']<10);
+  const known=await seed(sol,at,{manual_cost_atoms:'20000000000000',status:'reconciled'});const exceeded=await limits.status(member.memberId,at);assert.deepEqual(exceeded,original.status(member.memberId,at));assert.equal(exceeded.usage[0].unresolved,3);assert.equal(exceeded.usage[0].blocked,true);await assert.rejects(limits.check(member.memberId,sol,{at}),{code:'member_model_limit_exceeded'});legacy.run("UPDATE requests SET manual_cost_atoms='0' WHERE id=?",known);await sync(known);
   legacy.run("UPDATE requests SET manual_cost_atoms='0' WHERE id=?",unknown);await sync(unknown);assert.deepEqual(await limits.status(member.memberId,at),original.status(member.memberId,at));await limits.check(member.memberId,sol,{at});
+  // Reconciliation changes only the known total; unresolved rows keep their original facts.
+  legacy.run("UPDATE requests SET manual_cost_atoms='20000000000000',status='reconciled' WHERE id=?",unmetered);await sync(unmetered);
+  const reconciled=await limits.status(member.memberId,at);assert.deepEqual(reconciled,original.status(member.memberId,at));assert.equal(reconciled.usage[0].unresolved,1);assert.equal(reconciled.usage[0].blocked,true);await assert.rejects(limits.check(member.memberId,sol,{at}),{code:'member_model_limit_exceeded'});
+  assert.equal((await store.get('SELECT price_version FROM harbor.requests WHERE id=$1',missingVersion)).price_version,'missing-synthetic');
+  await limits.save(member.memberId,{enabled:false,expected_version:1});original.save(member.memberId,{enabled:false,expected_version:1});await limits.check(member.memberId,sol,{at});assert.deepEqual(await limits.status(member.memberId,at),original.status(member.memberId,at));assert.equal((await limits.configuration(member.memberId)).rules.length,2);
+
  }finally{await store?.close();legacy?.close();await admin.query('DROP DATABASE IF EXISTS '+database);await admin.close();await rm(directory,{recursive:true,force:true});}
 });

@@ -96,7 +96,7 @@ export function createPostgresMemberAdmin(store,{encryptionKey,readStore=store,c
     if(typeMatch&&method==='PATCH')return {status:200,value:await store.transaction(async()=>types.changeType(await activeMember(typeMatch[1],trusted),payload,{scope:trusted??undefined}))};
     const limitMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/usage-limits$/);
     if(limitMatch&&['GET','PATCH'].includes(method)){
-      return {status:200,value:await queryQueue.run(async()=>{await store.transaction(async()=>{await activeMember(limitMatch[1],trusted??null,{write:method!=='GET'});if(method==='PATCH')await limits.save(limitMatch[1],payload,{scope:trusted??undefined});});return readLimits.status(limitMatch[1]);},method==='GET'?{signal}:{})};
+      return {status:200,value:await queryQueue.run(async()=>{const saved=await store.transaction(async()=>{await activeMember(limitMatch[1],trusted??null,{write:method!=='GET'});if(method==='PATCH')return limits.save(limitMatch[1],payload,{scope:trusted??undefined});});return method==='PATCH'?{...saved,currency:'USD',usage_pending:true}:readLimits.status(limitMatch[1]);},method==='GET'?{signal}:{})};
     }
     const memberMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
     if(memberMatch&&['PATCH','DELETE'].includes(method))return {status:200,value:await store.transaction(async()=>{

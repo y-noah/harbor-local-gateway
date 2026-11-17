@@ -459,7 +459,7 @@ test('login shows a usable official link and code and opens the browser from the
   page.run("admin=true;state={accounts:[{id:'one',name:'Test',kind:'codex'}]};tab='accounts';");
   await page.click('login-account','one');assert.equal(page.node('#modal').open,true);assert.equal(page.node('#device-code').textContent,'TEST-ONLY');assert.equal(page.node('#device-link').href,'https://auth.openai.com/codex/device');assert.equal(page.popups[0].url,'https://auth.openai.com/codex/device');assert.equal(page.popups[0].opener,null);
   assert.equal(calls[0][0],'/api/admin/accounts/one/login');assert.ok(page.timers.some(x=>x.delay===2000&&x.active));
-  page.run('close()');assert.ok(!page.timers.some(x=>x.delay===2000&&x.active));assert.equal(page.node('#modal-content').innerHTML,'');
+  page.run('close()');assert.ok(page.timers.some(x=>x.delay===2000&&x.active));assert.equal(page.node('#modal-content').innerHTML,'');page.run('stopOfficialLoginWatch()');
 });
 test('login failures close the blank popup and show the actual failure instead of a success toast',async()=>{
   const page=await ui(()=>response({error:{message:'设备授权不可用'}},502));page.run("admin=true;state={accounts:[{id:'one',name:'Test',kind:'codex'}]};");
@@ -915,11 +915,11 @@ test('访问批次刷新失败禁用执行，迟到结果不能污染新弹窗',
  let reads=0,writes=0;const page=await ui((_path,options)=>{if(options.method==='POST'){writes++;return response({});}return ++reads===1?response(accessBatchRecord()):response({error:{message:'合成查询失败'}},503);});page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));await page.click('access-batch-open','access-one');await page.click('access-batch-refresh');await page.click('access-batch-execute');assert.equal(writes,0);assert.match(page.node('#access-batch-content').innerHTML,/上次快照/);let release;const other=await ui(()=>new Promise(resolve=>{release=()=>resolve(response(accessBatchRecord()));}));other.run('admin=true;state='+JSON.stringify(deviceSnapshot()));const pending=other.click('access-batch-open','access-one');await new Promise(setImmediate);await other.click('close');other.run('modal("其他内容")');release();await pending;assert.equal(other.node('#modal-content').innerHTML,'其他内容');
 });
 test('请求设备列与详情只读当时快照，不将来源IP推断为设备',async()=>{
- const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));const html=page.run('requestTable([{id:"request",started:1,ended:2,ip:"sensitive-network",device_name:"当时设备",device_system:"合成系统",device_auth_state:"authenticated",device_id:"11111111-1111-1111-1111-111111111111",standard:{}}])');assert.match(html,/当时设备/);assert.match(html,/11111111-1111-1111-1111-111111111111/);assert.doesNotMatch(html,/设备已认证|设备认证/);assert.ok(!html.includes('sensitive-network'));const unknown=page.run('phaseDetail({id:"r",ip:"sensitive-network",timeline:[]})');assert.match(unknown,/未获取设备标识/);assert.ok(!unknown.includes('sensitive-network'));
+ const page=await ui(()=>response({}));page.run('admin=true;state='+JSON.stringify(deviceSnapshot()));const html=page.run('requestTable([{id:"request",started:1,ended:2,ip:"sensitive-network",device_name:"当时设备",device_system:"合成系统",device_auth_state:"authenticated",device_id:"11111111-1111-1111-1111-111111111111",standard:{}}])');assert.match(html,/当时设备/);assert.match(html,/11111111-1111-1111-1111-111111111111/);assert.doesNotMatch(html,/设备已认证|设备认证/);assert.ok(!html.includes('sensitive-network'));const unknown=page.run('phaseDetail({id:"r",ip:"sensitive-network",timeline:[]})');assert.match(unknown,/—/);assert.ok(!unknown.includes('sensitive-network'));
 });
 test('请求身份直接显示已有设备标识，缺失时不推断设备或展示认证提示',async()=>{
  const page=await ui(()=>response({}));
- for(const [row,expected] of [[{status:'rejected',device_auth_state:'compatible_unverified'},['未记录账号','未获取设备标识']],[{},['未记录账号','未获取设备标识']],[{account_id:'account',device_id:'registered-device',device_auth_state:'authenticated'},['账号名称未记录','registered-device']],[{device_id:'registered-compatible',device_auth_state:'compatible_unverified'},['未记录账号','registered-compatible']],[{device_id:'credentials-device',device_auth_state:'unverified_hardware'},['未记录账号','credentials-device']],[{device_id:'   '},['未记录账号','未获取设备标识']]]){
+ for(const [row,expected] of [[{status:'rejected',device_auth_state:'compatible_unverified'},['未记录账号','—']],[{},['未记录账号','—']],[{account_id:'account',device_id:'registered-device',device_auth_state:'authenticated'},['账号名称未记录','registered-device']],[{device_id:'registered-compatible',device_auth_state:'compatible_unverified'},['未记录账号','registered-compatible']],[{device_id:'credentials-device',device_auth_state:'unverified_hardware'},['未记录账号','credentials-device']],[{device_id:'   '},['未记录账号','—']]]){
   page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,standard:{},ip:'never-display-network',...row}));
   const list=page.run('requestTable([record])'),detail=page.run('phaseDetail(record)');
   for(const value of expected){assert.ok(list.includes(value));assert.ok(detail.includes(value));}
@@ -928,7 +928,26 @@ test('请求身份直接显示已有设备标识，缺失时不推断设备或�
   assert.ok(!list.includes('<small> ·'));assert.ok(!detail.includes('Key：—…'));assert.ok(!list.includes('never-display-network'));assert.ok(!detail.includes('never-display-network'));
   assert.match(detail,/Key：未记录 Key/);assert.match(detail,/客户端：未记录客户端/);
  }
- const compatible=page.run('phaseDetail({device_auth_state:"compatible_unverified"})');assert.match(compatible,/设备系统：系统未记录/);assert.match(compatible,/设备标识：未获取设备标识/);assert.match(compatible,/凭据代次：未记录/);
+ const compatible=page.run('phaseDetail({device_auth_state:"compatible_unverified"})');assert.match(compatible,/设备系统：系统未记录/);assert.match(compatible,/标识：—/);assert.match(compatible,/凭据代次：未记录/);
+});
+test('请求标识按设备、会话、客户端逐级显示，回退不生成设备筛选或虚构身份',async()=>{
+ const page=await ui(()=>response({}));
+ for(const [row,value,source] of [
+  [{device_id:'device-one',session_id:'session-one',agent:'Codex/1'},'device-one','设备'],
+  [{session_id:'session-one',agent:'Codex/1'},'session-one','会话'],
+  [{agent:'Codex/1'},'Codex/1','客户端'],
+  [{device_id:{value:'fake'},session_id:'session-safe'},'session-safe','会话'],
+  [{device_id:'x'.repeat(201),session_id:'session-safe'},'session-safe','会话'],
+  [{device_id:'bad\nvalue',session_id:['fake'],agent:'Codex/1'},'Codex/1','客户端'],
+  [{session_id:'session<script>'},'session&lt;script&gt;','会话'],
+  [{device_id:null,session_id:null,agent:{}},'—',''],
+ ]){
+  page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,standard:{},...row}));
+  const list=page.run('requestTable([record])'),detail=page.run('phaseDetail(record)');assert.ok(list.includes(value));assert.ok(detail.includes(value));assert.match(list,/设备 \/ 会话/);
+  if(source==='设备')assert.match(list,/data-action="requests-device"/);else assert.doesNotMatch(list,/data-action="requests-device"/);
+  if(source)assert.ok(detail.includes(source+'标识：'));if(source==='会话'||source==='客户端')assert.match(detail,/不代表设备唯一/);if(!source)assert.match(detail,/未保存设备、会话或客户端标识/);
+  assert.ok(!list.includes('<script>'));assert.ok(!detail.includes('<script>'));
+ }
 });
 test('请求身份保留已有历史字段和零代次，全部文本继续转义',async()=>{
  const page=await ui(()=>response({}));page.run('globalThis.record='+JSON.stringify({id:'request',started:1,ended:2,member_name:'员工<one>',account_name:'账号<one>',model:'模型<one>',device_id:'device<one>',device_name:'设备<one>',device_system:'系统<one>',device_auth_state:'authenticated',device_generation:0,key_prefix:'key<one>',key_removed_at:1,agent:'客户端<one>',standard:{}}));
@@ -2232,4 +2251,83 @@ test('首页员工账号和系统读取统一主内容遮罩，错误仅显示�
  page.run('pageReadErrors.clear();pageReadError="";initialLoadError="";state='+JSON.stringify(snapshot())+';renderedPageScope=pageScope();');content.innerHTML='保留成功数据';
  for(const [setup,clear] of [['tab="overview";foregroundRefreshVersion=refreshVersion;foregroundRefreshScope=pageScope()','foregroundRefreshScope=""'],['tab="members";membersLoading=true','membersLoading=false'],['tab="accounts";foregroundRefreshVersion=refreshVersion;foregroundRefreshScope=pageScope()','foregroundRefreshScope=""'],['tab="history";historyLoading=true','historyLoading=false'],['tab="playground";connectionView="departments";managementIdentity={role:"super_admin"};departmentPage={loading:true}','departmentPage.loading=false']]){page.run(setup+';syncWorkspaceLoadingMask()');assert.equal(mask.hidden,false,setup);assert.equal(content.innerHTML,'保留成功数据');page.run(clear+';syncWorkspaceLoadingMask()');assert.equal(mask.hidden,true,clear);}
  assert.equal(added,1);page.run('admin=false;syncWorkspaceLoadingMask()');assert.equal(mask.hidden,true);
+});
+
+const officialLoginFixture=page=>{page.node('#device-link').removeAttribute=function(name){delete this[name];};return page.run('admin=true;state='+JSON.stringify({...snapshot(),accounts:[{id:'synthetic-account',name:'合成订阅',kind:'codex',state:'login'}]})+';tab="accounts";loginDialog(state.accounts[0],{userCode:"TEST-ONLY",verificationUrl:"https://auth.openai.com/codex/device",expiresAt:Date.now()+600000})');};
+const pollOfficial=page=>{const timer=page.run('officialLoginWatch.timer');timer.active=false;return timer.fn();};
+test('关闭官方登录弹窗后继续核对，成功立即更新账号且不关闭后来打开的弹窗',async()=>{
+ let reads=0;const page=await ui(path=>{assert.equal(path,'/api/admin/accounts/synthetic-account/login');reads++;return response({state:'ready'});});officialLoginFixture(page);page.run('globalThis.synced=0;refresh=async()=>{synced++;return true};close();modal("另一个管理弹窗")');await pollOfficial(page);assert.equal(reads,1);assert.equal(page.run('state.accounts[0].state'),'ready');assert.equal(page.run('synced'),1);assert.equal(page.run('officialLoginWatch'),null);assert.equal(page.node('#modal-content').innerHTML,'另一个管理弹窗');
+});
+test('官方登录瞬时错误保留验证码并在官方截止内继续，明确拒绝和过期停止',async()=>{
+ for(const status of [503,429,403]){let reads=0;const page=await ui(()=>{reads++;return response({error:{message:'合成读取错误'}},status);});officialLoginFixture(page);await pollOfficial(page);assert.equal(page.node('#device-code').textContent,'TEST-ONLY');if(status===403){assert.equal(page.run('officialLoginWatch'),null);continue;}assert.match(page.node('#login-status').textContent,/重新核对/);assert.ok(page.run('officialLoginWatch'));page.run('officialLoginWatch.expiresAt=Date.now()-1');await pollOfficial(page);assert.equal(reads,1);assert.equal(page.run('officialLoginWatch'),null);assert.equal(page.node('#device-code').textContent,'验证码已过期');}
+});
+test('官方登录取消或身份变化丢弃在途结果，切页成功不导航或刷新其他页面',async()=>{
+ for(const action of ['cancel','identity','navigation']){let release,posts=0;const page=await ui((path,options)=>{if(options.method==='POST'){posts++;return response({ok:true});}return new Promise(resolve=>release=()=>resolve(response({state:'ready'})));});officialLoginFixture(page);page.run('globalThis.synced=0;refresh=async()=>{synced++;return true}');const pending=pollOfficial(page);await new Promise(setImmediate);if(action==='cancel')await page.click('cancel-login','synthetic-account');else if(action==='identity')page.run('authEpoch++;admin=false;state=null;showLogin()');else page.run('tab="overview";navigationVersion++;close();modal("其他页面弹窗")');const before=page.run('synced');release();await pending;assert.equal(page.run('synced'),before);assert.equal(page.run('officialLoginWatch'),null);if(action==='navigation'){assert.equal(page.run('tab'),'overview');assert.equal(page.node('#modal-content').innerHTML,'其他页面弹窗');assert.equal(page.run('state.accounts[0].state'),'ready');}else assert.notEqual(page.run('state?.accounts[0].state'),'ready');assert.equal(posts,action==='cancel'?1:0);}
+});
+
+test('第二个官方登录启动失败或取消失败不丢失原授权观察',async()=>{
+ for(const action of ['start','cancel']){let reads=0;const page=await ui((path,options)=>options.method==='POST'?response({error:{message:'合成写入失败'}},action==='start'?409:503):(reads++,response({state:'ready'})));officialLoginFixture(page);page.run('globalThis.previousWatch=officialLoginWatch;refresh=async()=>true;state.accounts.push({id:"second",name:"合成第二账号",kind:"codex",state:"offline"})');if(action==='start')await page.click('login-account','second');else await page.click('cancel-login','synthetic-account');assert.equal(page.run('officialLoginWatch===previousWatch'),true);await pollOfficial(page);assert.equal(reads,1);assert.equal(page.run('state.accounts[0].state'),'ready');assert.equal(page.run('officialLoginWatch'),null);}
+});
+
+
+test('新限额元数据不被失败用量回退，剩余额度保持未知并可重试恢复',async()=>{
+ const {page,pending}=await memberRefreshFixture();page.run('membersData.rows[0].usage_limits={enabled:false,rules:[],version:1};');
+ const work=page.run('loadMembers()'),pair=memberRefreshPair(pending),metadata=memberRefreshPage('member-one','0',{usagePending:true});metadata.rows[0].usage_limits={enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'50.00'}],version:2};pair.meta.release(metadata);await new Promise(setImmediate);
+ assert.equal(page.run('membersData.rows[0].usage_limits.version'),2);assert.match(page.run('memberLimitSummary(membersData.rows[0],membersData)'),/50.00/);assert.doesNotMatch(page.run('memberLimitSummary(membersData.rows[0],membersData)'),/未开启限额|剩余 \$0/);
+ pair.usage.release({error:{message:'合成统计失败'}},503);assert.equal(await work,false);assert.equal(page.run('membersData.rows[0].usage_limits.enabled'),true);assert.match(page.run('memberLimitSummary(membersData.rows[0],membersData)'),/50.00.*剩余额度获取失败/);
+ const retry=page.run('loadMembers()'),next=memberRefreshPair(pending.slice(2));next.meta.release(metadata);const complete=structuredClone(metadata);delete complete.usagePending;complete.rows[0].limit_usage=[{model:'gpt-6.1-sol',hours:24,limit_usd:'50.00',remaining_usd:'45.00'}];next.usage.release(complete);await retry;await new Promise(setImmediate);assert.match(page.run('memberLimitSummary(membersData.rows[0],membersData)'),/剩余 \$45.00/);
+});
+test('旧配置用量迟到不覆盖新元数据限额或套用旧剩余',async()=>{
+ const {page,pending}=await memberRefreshFixture();page.run('membersData.rows[0].usage_limits={enabled:true,rules:[{model:"gpt-6.1-sol",hours:24,limit_usd:"100.00"}],version:1};membersData.rows[0].limit_usage=[{model:"gpt-6.1-sol",hours:24,limit_usd:"100.00",remaining_usd:"90.00"}];');
+ const work=page.run('loadMembers()'),pair=memberRefreshPair(pending),meta=memberRefreshPage('member-one','0',{usagePending:true});meta.rows[0].usage_limits={enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'50.00'}],version:2};pair.meta.release(meta);await new Promise(setImmediate);assert.equal(page.run('membersData.rows[0].limit_usage?.length??0'),0);
+ const old=memberRefreshPage();old.rows[0].usage_limits={enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'100.00'}],version:1};old.rows[0].limit_usage=[{model:'gpt-6.1-sol',hours:24,limit_usd:'100.00',remaining_usd:'90.00'}];pair.usage.release(old);await work;assert.equal(page.run('membersData.rows[0].usage_limits.version'),2);assert.match(page.run('memberLimitSummary(membersData.rows[0],membersData)'),/50.00/);assert.doesNotMatch(page.run('memberLimitSummary(membersData.rows[0],membersData)'),/90.00|100.00/);
+});
+
+test('未计价仅显示数量且兼容旧接口未知剩余，不伪造余额或阻断',async()=>{
+ const page=await ui(()=>response({}));page.run('globalThis.limitRow={usage_limits:{enabled:true,rules:[{model:"gpt-6.1-sol",hours:24,limit_usd:"50.00"}]},limit_usage:[{model:"gpt-6.1-sol",hours:24,limit_usd:"50.00",remaining_usd:null,unresolved:2}]};');
+ assert.match(page.run('memberLimitSummary(limitRow,{})'),/剩余额度获取失败.*2条未计价/);assert.doesNotMatch(page.run('memberLimitSummary(limitRow,{})'),/请求受限|剩余 \$0/);page.run('limitRow.limit_usage[0].remaining_usd="40.00"');assert.match(page.run('memberLimitSummary(limitRow,{})'),/剩余 \$40.00.*2条未计价/);
+});
+
+test('关闭员工限额成功立即使用保存回执，不等待统计刷新且旧详情不保留开启状态',async()=>{
+ const previous={enabled:true,version:2,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'50'}]},saved={...previous,enabled:false,version:3,usage_pending:true};let payload;const page=await ui((path,options)=>{if(options.method==='PATCH'){payload=JSON.parse(options.body);return response(saved);}return response(path.includes('pricing')?pricingState():{...previous,usage:[]});});page.run('admin=true;state='+JSON.stringify({...snapshot(),members:[{id:'member-id',name:'合成限额',usage_limits:previous}],keys:[]})+';globalThis.refreshPending=false;refresh=()=>{refreshPending=true;return new Promise(resolve=>globalThis.finishRefresh=resolve)};');await page.click('member-limits','member-id');page.run('globalThis.FormData=class{get(name){return name==="limits_enabled"?"off":null;}getAll(){return [];}}');page.node('#member-limit-enabled').onchange({target:{value:'off'}});await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});assert.deepEqual(payload,{expected_version:2,enabled:false});assert.equal(page.run('state.members[0].usage_limits.enabled'),false);assert.equal(page.run('state.members[0].usage_limits.version'),3);assert.equal(page.run('state.members[0].limit_usage'),null);assert.equal(page.node('#toast').textContent,'员工模型限额已保存');assert.match(page.node('#modal-content').innerHTML,/未开启/);assert.equal(page.run('refreshPending'),true);page.run('finishRefresh(false)');await new Promise(setImmediate);assert.equal(page.run('state.members[0].usage_limits.enabled'),false);
+});
+
+test('限额保存迟到不覆盖新弹窗或新身份，较新配置不被旧回执回退',async()=>{
+ for(const action of ['close','identity','newer']){let release;const previous={enabled:true,version:2,rules:[]},page=await ui((_path,options)=>options.method==='PATCH'?new Promise(resolve=>release=()=>resolve(response({enabled:false,version:3,rules:[],usage:[]}))):response({rates:[],...previous,usage:[]}));page.run('admin=true;state='+JSON.stringify({...snapshot(),members:[{id:'member-id',name:'合成限额',usage_limits:previous}],keys:[]})+';refresh=async()=>false;');await page.click('member-limits','member-id');useSyntheticForm(page,{limits_enabled:'off'});const pending=page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});await new Promise(setImmediate);if(action==='close')page.run('close();modal("新弹窗")');if(action==='identity')page.run('authEpoch++;admin=false;state=null;showLogin()');if(action==='newer')page.run('state.members[0].usage_limits={enabled:true,version:4,rules:[]}');release();await pending;if(action==='close'){assert.equal(page.node('#modal-content').innerHTML,'新弹窗');assert.equal(page.run('state.members[0].usage_limits.version'),2);}if(action==='identity')assert.equal(page.run('state'),null);if(action==='newer')assert.equal(page.run('state.members[0].usage_limits.version'),4);}
+});
+
+test('分页员工保存限额立即同步列表和详情，统计待查不伪造零用量',async()=>{
+ const previous={enabled:true,version:2,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'50.00'}]},member={id:'member-id',name:'合成分页员工',enabled:1,usage_limits:previous};const paths=[];
+ const page=await ui((path,options)=>{paths.push(path);return response(options.method==='PATCH'?{...previous,enabled:false,version:3,usage_pending:true}:path.includes('pricing')?pricingState():{...previous,usage:[]});});
+ page.run('admin=true;state='+JSON.stringify({...snapshot(),capabilities:{pagedMembers:true},members:[]})+';membersData='+JSON.stringify({rows:[member]})+';memberDetailData='+JSON.stringify({member,rows:[],pagination:{total:0,pageSize:20}})+';refresh=()=>new Promise(()=>{});');await page.click('member-limits','member-id');useSyntheticForm(page,{limits_enabled:'off'});await page.node('#dialog-form').onsubmit({preventDefault(){},target:{querySelector(){return {disabled:false};}}});
+ assert.equal(page.run('membersData.rows[0].usage_limits.enabled'),false);assert.equal(page.run('memberDetailData.member.usage_limits.version'),3);assert.equal(page.run('membersData.rows[0].limit_usage'),null);assert.equal(page.run('memberDetailData.member.limit_usage'),null);assert.match(page.node('#modal-content').innerHTML,/未开启/);assert.equal(paths.some(path=>path==='/api/admin/members/member-id'),false);
+});
+
+test('保存成功的新限额不被此前发出的元数据和用量响应降级',async()=>{
+ const {page,pending}=await memberRefreshFixture(),work=page.run('loadMembers()'),pair=memberRefreshPair(pending);
+ page.run('membersData.rows[0].usage_limits={enabled:false,rules:[],version:3};membersData.rows[0].defaults_version=8;');
+ const stale=memberRefreshPage('member-one','0',{usagePending:true});stale.rows[0].usage_limits={enabled:true,rules:[{model:'gpt-6.1-sol',hours:24,limit_usd:'50.00'}],version:2};pair.meta.release(stale);await new Promise(setImmediate);assert.equal(page.run('membersData.rows[0].usage_limits.enabled'),false);
+ const usage=structuredClone(stale);delete usage.usagePending;pair.usage.release(usage);await work;assert.equal(page.run('membersData.rows[0].usage_limits.version'),3);assert.equal(page.run('membersData.rows[0].usage_limits.enabled'),false);
+});
+
+
+test('刷新会话恢复临时失败保留重试状态而非显示登录表单',async()=>{
+ const page=await ui(()=>response({error:{message:'synthetic unavailable'}},503),{restore:true});assert.equal(page.run('admin'),false);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.match(page.node('#auth-restore-message').textContent,/未能恢复登录状态/);
+});
+
+test('会话恢复失败可重试成功，仅服务器确认后显示后台',async()=>{
+ let calls=0;const page=await ui(path=>path==='/api/auth/session'?++calls===1?response({error:{message:'temporary'}},500):response({authenticated:true}):response(snapshot()),{restore:true});assert.equal(page.run('admin'),false);await page.node('#auth-restore-retry').onclick();assert.equal(page.run('admin'),true);assert.equal(page.node('#auth-restore').classList.values.has('hidden'),true);assert.equal(page.node('#login').classList.values.has('hidden'),true);
+});
+test('会话恢复仅明确未认证或401显示登录，网络失败不作未认证',async()=>{
+ for(const result of ['false','401','network']){const page=await ui(()=>result==='network'?Promise.reject(Error('network')):response(result==='false'?{authenticated:false}:{error:{message:'expired'}},result==='401'?401:200),{restore:true});assert.equal(page.run('admin'),false);assert.equal(page.node('#login').classList.values.has('hidden'),result==='network');}
+});
+test('恢复中的迟到成功不覆盖用户重新登录选择',async()=>{
+ let release;const page=await ui(()=>new Promise(resolve=>release=()=>resolve(response({authenticated:true}))),{restore:true});assert.equal(page.node('#login').classList.values.has('hidden'),true);page.node('#auth-restore-login').onclick();release();await new Promise(setImmediate);assert.equal(page.run('admin'),false);assert.equal(page.node('#login').classList.values.has('hidden'),false);
+});
+test('登录HTML初始禁止原生提交且不使用GET携带密码',()=>{
+ const html=readFileSync(new URL('../public/index.html',import.meta.url),'utf8');assert.match(html,/<form id="login-form"[^>]*method="post"/);assert.match(html,/<button id="login-submit"[^>]*disabled/);assert.match(html,/<div id="login" class="login-wrap hidden"/);
+});
+
+test('会话恢复超时呈现可重试错误，不显示登录或授权后台',async()=>{
+ const page=await ui((_path,options)=>new Promise((_resolve,reject)=>options.signal.addEventListener('abort',()=>reject(Object.assign(Error('aborted'),{name:'AbortError'})))),{restore:true});const timeout=page.timers.find(timer=>timer.delay===30000&&timer.active);assert.ok(timeout);timeout.fn();await new Promise(setImmediate);assert.equal(page.run('admin'),false);assert.equal(page.node('#login').classList.values.has('hidden'),true);assert.match(page.node('#auth-restore-message').textContent,/未能恢复登录状态/);assert.equal(page.node('#auth-restore-retry').hidden,false);
 });

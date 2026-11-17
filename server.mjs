@@ -368,7 +368,7 @@ export function createGateway(options={}) {
         }
         const limitsMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/usage-limits$/);
         if(limitsMatch&&method==='GET')return json(res,200,store.memberLimits.status(limitsMatch[1]));
-        if(limitsMatch&&method==='PATCH'){store.memberLimits.save(limitsMatch[1],await body(req));return json(res,200,store.memberLimits.status(limitsMatch[1]));}
+        if(limitsMatch&&method==='PATCH'){const saved=store.memberLimits.save(limitsMatch[1],await body(req));return json(res,200,{...saved,currency:'USD',usage_pending:true});}
         const memberMatch=path.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
         if(memberMatch&&method==='DELETE'){
           const m=store.get('SELECT * FROM members WHERE id=? AND removed_at IS NULL',memberMatch[1]);if(!m)throw new AppError(404,'员工不存在或已移除');
