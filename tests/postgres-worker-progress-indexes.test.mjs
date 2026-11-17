@@ -20,7 +20,7 @@ async function insert(store,{kind='recording.index',status='completed',created=s
  await store.query('INSERT INTO harbor.background_jobs(id,kind,payload,available_at,created,claimed_at,updated,status,result) VALUES($1,$2,\'{}\',$3,$3,$4,$5,$6,$7::jsonb)',[randomUUID(),kind,created,claimed,updated,status,result===null?null:JSON.stringify(result)]);
 }
 const nodes=plan=>[plan,...(plan.Plans||[]).flatMap(nodes)];
-test('显式并发索引保持原进度全部分支语义，实际自选计划覆盖完整OR且generic语义一致',integration,()=>fixture(async store=>{
+test('进度CASE保留全部分支语义，启动证明短路历史查询且generic语义一致',integration,()=>fixture(async store=>{
  await store.query("INSERT INTO harbor.background_jobs(id,kind,payload,available_at,created,claimed_at,updated,status,result) SELECT 'old-'||n,(ARRAY['worker.startup','recording.context.index','recording.index','routing.expiry','recording.purge','recording.export'])[1+n%6],'{}',1,1,1,1,CASE WHEN n%7=0 THEN 'running' ELSE 'completed' END,'{}' FROM generate_series(1,250000) n");
  await store.query('ANALYZE harbor.background_jobs');
  const variants=[];
@@ -40,6 +40,7 @@ test('显式并发索引保持原进度全部分支语义，实际自选计划�
   await store.query('DELETE FROM harbor.background_jobs WHERE created>1');await insert(store,variant);await probe();const plan=await explain();plans.push(plan);
   const scans=nodes(plan.Plan);assert.ok(!scans.some(n=>n['Node Type']==='Seq Scan'&&n['Relation Name']==='background_jobs'),JSON.stringify(scans));
   assert.ok(scans.some(n=>n['Index Name']==='background_job_progress_claim'),JSON.stringify(scans));assert.ok(scans.some(n=>n['Index Name']==='background_job_progress_update'));
+  if(variant.kind==='worker.startup'&&variant.result===workerStartupResult){const branches=plan.Plan.Plans;assert.equal(branches.length,3);assert.equal(branches[0]['Actual Loops'],1);assert.equal(branches[1]['Actual Loops'],0);assert.equal(branches[2]['Actual Loops'],0);}
  }
  // Generic estimates may choose a sequential scan for an unknown cutoff.
  // Verify its actual plan and all results without forcing planner settings.
@@ -49,6 +50,7 @@ test('显式并发索引保持原进度全部分支语义，实际自选计划�
  const genericNodes=nodes(generic.Plan),genericOutcomes=[];
  for(const variant of variants){await store.query('DELETE FROM harbor.background_jobs WHERE created>1');await insert(store,variant);genericOutcomes.push((await store.get(`EXECUTE harbor_progress(${since},'worker.startup','{"contract":"harbor-worker-startup-v1"}'::jsonb)`)).progress);}
  assert.deepEqual(genericOutcomes,before);
+ await store.query('DELETE FROM harbor.background_jobs WHERE created>1');await insert(store,{kind:'worker.startup',result:workerStartupResult});const genericStartup=(await store.get(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) EXECUTE harbor_progress(${since},'worker.startup','{"contract":"harbor-worker-startup-v1"}'::jsonb)`))['QUERY PLAN'][0];assert.equal(genericStartup.Plan.Plans.length,3);assert.equal(genericStartup.Plan.Plans[0]['Actual Loops'],1);assert.equal(genericStartup.Plan.Plans[1]['Actual Loops'],0);assert.equal(genericStartup.Plan.Plans[2]['Actual Loops'],0);
  console.log(JSON.stringify({module:'worker-progress-indexes',syntheticRows:250000,branchCases:variants.length,baselineMs:baseline['Execution Time'],indexedMs:plans.map(p=>p['Execution Time']),genericMs:generic['Execution Time'],genericNodes:genericNodes.map(n=>({type:n['Node Type'],index:n['Index Name']}))}));
 }));
 test('同名错误索引拒绝且不删改，完成态复核拒绝缺失索引',integration,()=>fixture(async store=>{

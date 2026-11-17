@@ -18,6 +18,6 @@ export function createWorkerStartupProbe(jobs){
 
 export async function hasWorkerProgress(store,since){
  if(!Number.isSafeInteger(since)||since<0)throw TypeError('Progress timestamp invalid');
- const row=await store.get("SELECT EXISTS(SELECT 1 FROM harbor.background_jobs WHERE ((status='running' AND claimed_at>=$1 OR status='completed' AND updated>=$1) AND kind IN ('recording.purge','routing.expiry','recording.index','recording.export')) OR (kind=$2 AND status='completed' AND created>=$1 AND claimed_at>=$1 AND updated>=$1 AND result=$3::jsonb)) progress",since,workerStartupKind,JSON.stringify(workerStartupResult));
+ const row=await store.get("SELECT CASE WHEN EXISTS(SELECT 1 FROM harbor.background_jobs WHERE kind=$2 AND status='completed' AND created>=$1 AND claimed_at>=$1 AND updated>=$1 AND result=$3::jsonb) THEN true WHEN EXISTS(SELECT 1 FROM harbor.background_jobs WHERE status='running' AND claimed_at>=$1 AND kind IN ('recording.purge','routing.expiry','recording.index','recording.export')) THEN true ELSE EXISTS(SELECT 1 FROM harbor.background_jobs WHERE status='completed' AND updated>=$1 AND kind IN ('recording.purge','routing.expiry','recording.index','recording.export')) END progress",since,workerStartupKind,JSON.stringify(workerStartupResult));
  return row.progress===true;
 }
