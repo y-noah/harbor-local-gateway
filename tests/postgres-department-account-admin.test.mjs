@@ -81,3 +81,11 @@ test('登录挑战后旧Cookie注销，新Cookie轮询立即清理旧登录',int
 test('账号审计真实归属与停用部门启动登录收尾',integration,async t=>{
  const f=await fixture(t,{startLogin:()=>loginFlow()}),a=await create(f,'a');await f.store.run("UPDATE harbor.accounts SET state='login' WHERE id=$1",a);await f.store.run('UPDATE harbor.departments SET enabled=false WHERE id=$1',f.rows.a.id);await f.admin.recover();assert.equal((await f.store.get('SELECT state FROM harbor.accounts WHERE id=$1',a)).state,'offline');const rows=await f.store.all('SELECT s.*,a.action FROM harbor.audit_scopes s JOIN harbor.audit a ON a.id=s.audit_id WHERE s.subject_id=$1',a);assert.ok(rows.length>=2);assert.ok(rows.every(row=>row.department_id===f.rows.a.id));assert.ok(rows.some(row=>row.actor_kind==='system'&&row.action==='account.login.failed'));
 });
+
+test('订阅检查故障保留已有ready状态，授权后检查故障不伪报授权未完成',integration,async t=>{
+ let flow;const f=await fixture(t,{startLogin:()=>flow=loginFlow(),checkSubscription:async()=>{throw new AppError(504,'订阅状态检查超时，请重新检查','subscription_check_timeout');}}),a=await create(f,'a');
+ await f.store.run("UPDATE harbor.accounts SET state='ready' WHERE id=$1",a);
+ const checked=await f.call('a','/api/admin/accounts/'+a+'/check','POST',{});assert.equal(checked.status,504);assert.equal((await f.store.get('SELECT state FROM harbor.accounts WHERE id=$1',a)).state,'ready');
+ const started=f.call('a','/api/admin/accounts/'+a+'/login','POST',{});await wait(()=>!!flow);flow.authorize({type:'device',verificationUrl:'https://auth.openai.com/codex/device',userCode:'TEST-ONLY'});assert.equal((await started).status,200);flow.complete({success:true});await wait(()=>f.admin.status().login.pending===0);
+ const row=await f.store.get('SELECT state,last_error FROM harbor.accounts WHERE id=$1',a);assert.equal(row.state,'offline');assert.match(row.last_error,/授权已完成.*检查暂不可用/);assert.doesNotMatch(row.last_error,/官方登录未完成/);
+});

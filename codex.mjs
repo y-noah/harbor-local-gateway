@@ -21,15 +21,27 @@ export function argsFor(workspace,model,sessionId) {
   if(sessionId)args.push('resume',sessionId);
   args.push('-'); return args;
 }
-export function checkLogin(binary,home,{spawnProcess=spawn,maxOutputBytes=2*1024*1024}={}) {
-  if(!Number.isSafeInteger(maxOutputBytes)||maxOutputBytes<256||maxOutputBytes>128*1024*1024)throw new AppError(503,'订阅状态响应上限无效','upstream_configuration');
+export function checkLogin(binary,home,{spawnProcess=spawn,maxOutputBytes=2*1024*1024,signal,timeoutMs=10000}={}) {
+  if(!Number.isSafeInteger(maxOutputBytes)||maxOutputBytes<256||maxOutputBytes>128*1024*1024||!Number.isSafeInteger(timeoutMs)||timeoutMs<1||timeoutMs>60000)throw new AppError(503,'订阅状态检查配置无效','upstream_configuration');
   return new Promise((resolve,reject)=>{
-    const child=spawnProcess(binary,['login','status',...codexAuthArgs()],{env:runnerEnv(home),windowsHide:true});
-    let out='',bytes=0,overflow,ended=false;const timer=setTimeout(()=>child.kill(),10000);
-    const read=chunk=>{if(ended||overflow)return;bytes+=chunk.length;if(bytes>maxOutputBytes){out='';overflow=new AppError(502,'订阅状态响应超过读取上限','upstream_response_too_large');child.kill();return;}out+=chunk;};
+    let child,timer,out='',bytes=0,failure,ended=false;
+    const cleanup=()=>{clearTimeout(timer);signal?.removeEventListener('abort',abort);};
+    const abort=()=>{failure??=new AppError(503,'订阅状态检查已取消，请重新检查','subscription_check_cancelled');child?.kill();};
+    if(signal?.aborted)return reject(new AppError(503,'订阅状态检查已取消，请重新检查','subscription_check_cancelled'));
+    try{child=spawnProcess(binary,['login','status',...codexAuthArgs()],{env:runnerEnv(home),windowsHide:true});}
+    catch(error){return reject(['cli_capacity_busy','service_stopping','request_cancelled'].includes(error.code)?error:new AppError(503,'无法启动订阅状态检查，请检查CLI配置','subscription_check_unavailable'));}
+    timer=setTimeout(()=>{failure??=new AppError(504,'订阅状态检查超时，请重新检查','subscription_check_timeout');child.kill();},timeoutMs);
+    const read=chunk=>{if(ended||failure)return;bytes+=chunk.length;if(bytes>maxOutputBytes){out='';failure=new AppError(502,'订阅状态响应超过读取上限','upstream_response_too_large');child.kill();return;}out+=chunk;};
     child.stdout.on('data',read);child.stderr.on('data',read);
-    child.on('error',()=>{ended=true;clearTimeout(timer);resolve(false);});
-    child.on('close',code=>{if(ended)return;ended=true;clearTimeout(timer);if(overflow)reject(overflow);else resolve(code===0 && /ChatGPT/i.test(out));});
+    child.on('error',()=>{if(ended)return;ended=true;cleanup();reject(new AppError(503,'无法启动订阅状态检查，请检查CLI配置','subscription_check_unavailable'));});
+    child.on('close',code=>{
+      if(ended)return;ended=true;cleanup();
+      if(failure)return reject(failure);
+      if(code===0&&/ChatGPT/i.test(out))return resolve(true);
+      if(code===1&&/(?:^|\n)Not logged in(?:\r?\n|$)/i.test(out)||code===0&&/Logged in using an API key/i.test(out))return resolve(false);
+      reject(new AppError(502,'订阅状态检查未返回有效结果，请重新检查','subscription_check_failed'));
+    });
+    signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
   });
 }
 export function usageDelta(usage,previous={input:0,output:0,cached:0}){

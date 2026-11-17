@@ -40,12 +40,12 @@ export function createPostgresAccountLogin(store,{startLogin,reserveLogin,checkS
     const task=(async()=>{
       let verified=null;
       try{
-        const result=await completed;let ready=false;
-        if(result?.success&&!stopping&&pending.get(entry.account.id)===entry)try{await validate(entry);ready=await checkSubscription(entry.account,{signal:entry.controller.signal})===true;}catch{}
+        const result=await completed;let ready=false,checkFailed=false;
+        if(result?.success&&!stopping&&pending.get(entry.account.id)===entry)try{await validate(entry);ready=await checkSubscription(entry.account,{signal:entry.controller.signal})===true;}catch{checkFailed=true;}
         if(stopping||pending.get(entry.account.id)!==entry)return;
         await mutate(async()=>{
           const current=await validate(entry,{lock:true});if(current.route_epoch!==entry.account.route_epoch||current.state!=='login')return;
-          await store.run("UPDATE harbor.accounts SET state=$1,last_error=$2 WHERE id=$3",ready?'ready':'offline',ready?null:'官方登录未完成，请检查授权后重试',current.id);
+          await store.run("UPDATE harbor.accounts SET state=$1,last_error=$2 WHERE id=$3",ready?'ready':'offline',ready?null:checkFailed?'官方授权已完成，但订阅状态检查暂不可用，请重新检查账号':result?.success?'授权已完成，但未检测到订阅登录，请检查授权账号':'官方登录未完成，请检查授权后重试',current.id);
           await audit(ready?'account.login.success':'account.login.failed',current.id,entry.options.scope);if(ready)verified={...current,state:'ready'};
         });
       }catch{/* Failed persistence leaves login state visible and recoverable. */}
