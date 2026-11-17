@@ -18,7 +18,7 @@
 /* The fixed toolbar and scrollable body occupy separate rows. */
 #modal[open]{display:flex;flex-direction:column}
 .modal-toolbar{display:flex;justify-content:flex-end;align-items:center;flex:0 0 auto;padding:8px 12px;background:#fff;border-bottom:1px solid var(--line)}
-#modal-content{min-height:0;max-height:calc(85vh - 55px);overflow:auto;padding:16px 24px 24px;overscroll-behavior:contain;scrollbar-gutter:stable}
+#modal-content,#modal-waiting{min-height:0;max-height:calc(85vh - 55px);overflow:auto;padding:16px 24px 24px;overscroll-behavior:contain;scrollbar-gutter:stable}
 #modal-content h2{overflow-wrap:anywhere}
 .modal-close{display:grid;place-items:center;flex-shrink:0;width:36px;height:36px;padding:0;border:1px solid var(--line);border-radius:9px;background:#fff;color:#526659;font-size:27.5px;line-height:1}
 .modal-close:hover{background:#f1f6ef}.modal-close:focus-visible{outline:2px solid var(--green);outline-offset:2px}
@@ -30,7 +30,7 @@
 .member-model-row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:12px 0}.member-model-row p{min-width:0;margin:0;font-size:14.3px;line-height:1.6;overflow-wrap:anywhere}.member-model-row>button{flex-shrink:0}
 .member-key-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px}.member-key-actions .actions{gap:18px}.member-dialog .danger{color:#a54f3d}
 .member-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:20px}
-@media(max-width:600px){#modal-content{padding:14px 16px 18px}.member-budget-row{padding:12px}.member-key-card{padding:12px}.member-model-row{align-items:flex-start}.member-key-actions{align-items:flex-start}.member-heading{gap:8px}.member-identity-heading{gap:8px}}
+@media(max-width:600px){#modal-content,#modal-waiting{padding:14px 16px 18px}.member-budget-row{padding:12px}.member-key-card{padding:12px}.member-model-row{align-items:flex-start}.member-key-actions{align-items:flex-start}.member-heading{gap:8px}.member-identity-heading{gap:8px}}
 
 .planning-items .mini-row>span:first-child{min-width:0;overflow-wrap:anywhere}
 .planning-items .mini-row small{display:block;margin-top:4px}
