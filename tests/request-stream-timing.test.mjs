@@ -46,3 +46,39 @@ test('write tokens cannot masquerade as content or retire incomplete writes',()=
 test('unobserved raw and decode boundaries remain missing with null counts',()=>{const {timing}=fixture();timing.bodyEnd();timing.dispatch();timing.transportEnd();timing.responseEnd();const summary=timing.finish({outcome:'ok'});assert.equal(summary.complete,false);assert.equal(summary.counts.rawChunks,null);assert.equal(summary.counts.rawBytes,null);assert.equal(summary.counts.decodedEvents,null);for(const name of ['headers','firstRawChunk','firstDecodedEvent'])assert.ok(summary.missing.includes('missing_'+name));assert.equal(summary.durationsMs.response,0);});
 
 test('finish before actual response end is incomplete and cannot invent the missing endpoint',()=>{const {timing}=fixture();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(10);timing.decodedEvent();timing.transportEnd();const result=timing.finish({outcome:'ok'});assert.equal(result.complete,false);assert.ok(result.missing.includes('missing_responseEnd'));assert.equal(result.durationsMs.response,null);timing.responseEnd();assert.equal(timing.finish({outcome:'ok'}),result);});
+
+test('non-streaming buffers over 64 real deltas in one bounded receipt and preserves first arrival',async()=>{
+ const {canonicalRequestStreamTiming}=await import('../request-stream-timing-facts.mjs');
+ const {timing,advance}=fixture();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(1000);timing.decodedEvent();
+ for(let n=0;n<200;n++){advance(1);assert.equal(timing.bufferContent(timing.upstreamEvent(delta('x'))),true);}
+ assert.equal(timing.upstreamEvent({type:'response.completed',response:{status:'completed',output:[]}}),null);
+ advance(10);const token=timing.bufferedContentToken({status:'completed',output:[{type:'message',content:[{type:'output_text',text:'final synthetic'}]}]}),write=timing.writeStart({bytes:500,contentToken:token});advance(3);timing.writeEnd(write);timing.transportEnd();timing.responseEnd();
+ const summary=timing.finish({outcome:'ok'});assert.equal(summary.complete,true);assert.deepEqual(summary.missing,[]);assert.equal(summary.counts.contentChunks,200);assert.equal(summary.counts.bufferedContentChunks,200);assert.equal(summary.counts.bufferedContentWrites,1);assert.equal(summary.counts.deliveredBufferedContentChunks,200);assert.equal(summary.counts.completedBufferedContentWrites,1);assert.equal(summary.counts.writes,1);assert.equal(summary.counts.contentWrites,1);assert.equal(summary.offsetsMs.firstUpstreamContent,1);assert.equal(summary.durationsMs.firstContentRelay,209);assert.equal(summary.durationsMs.firstContentWrite,3);assert.deepEqual(canonicalRequestStreamTiming(JSON.parse(JSON.stringify(summary))),summary);assert.equal(timing.bufferContent(token),false);assert.equal(timing.bufferedContentToken({status:'completed',output:[{type:'message',content:[{type:'output_text',text:'final synthetic'}]}]}),null);
+});
+test('buffered response duplicate claims, discarded segments, failed writes and cancellation never become complete',()=>{
+ for(const scenario of ['duplicate-claim','duplicate-write','discard','failed','cancel','no-write']){
+  const {timing}=fixture();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(10);timing.decodedEvent();
+  const first=timing.upstreamEvent(delta('first'));if(scenario==='discard')timing.retireContent(first);else timing.bufferContent(first);
+  timing.bufferContent(timing.upstreamEvent(delta('second')));const token=timing.bufferedContentToken({status:'completed',output:[{type:'message',content:[{type:'output_text',text:'final synthetic'}]}]});if(scenario==='duplicate-claim')assert.equal(timing.bufferedContentToken({status:'completed',output:[{type:'message',content:[{type:'output_text',text:'final synthetic'}]}]}),null);
+  if(scenario!=='no-write'){
+   const write=timing.writeStart({bytes:20,contentToken:token});timing.writeEnd(write,{ok:scenario!=='failed'&&scenario!=='cancel'});
+   if(scenario==='duplicate-write'){const duplicate=timing.writeStart({bytes:20,contentToken:token});timing.writeEnd(duplicate);}
+  }
+  timing.transportEnd();timing.responseEnd();const summary=timing.finish({outcome:scenario==='cancel'?'cancelled':scenario==='failed'?'failed':'ok'});
+  assert.equal(summary.complete,false,scenario);assert.ok(summary.missing.length,scenario);assert.equal(summary.counts.bufferedContentWrites<=1,true,scenario);if(['failed','cancel','no-write'].includes(scenario))assert.equal(summary.counts.deliveredBufferedContentChunks,0,scenario);
+ }
+});
+
+test('cancelled buffered request cannot claim complete even after its JSON socket callback succeeds',async()=>{
+ const {canonicalRequestStreamTiming}=await import('../request-stream-timing-facts.mjs'),{timing}=fixture();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(10);timing.decodedEvent();timing.bufferContent(timing.upstreamEvent(delta('x')));const write=timing.writeStart({bytes:20,contentToken:timing.bufferedContentToken({status:'completed',output:[{type:'message',content:[{type:'output_text',text:'final synthetic'}]}]})});timing.writeEnd(write);timing.transportEnd();timing.responseEnd();const summary=timing.finish({outcome:'cancelled'});assert.equal(summary.complete,false);assert.ok(summary.missing.includes('buffered_outcome_not_ok'));assert.deepEqual(canonicalRequestStreamTiming(JSON.parse(JSON.stringify(summary))),summary);
+});
+
+test('buffered JSON receipt requires visible terminal content without pretending delta-byte identity',async()=>{
+ const {canonicalRequestStreamTiming}=await import('../request-stream-timing-facts.mjs');
+ for(const finalText of [null,'权威终态改写🧪']){
+  const {timing}=fixture();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(100);timing.decodedEvent();
+  for(const text of ['初','稿😀'])timing.bufferContent(timing.upstreamEvent(delta(text)));
+  const response={status:'completed',output:finalText===null?[]:[{type:'message',content:[{type:'output_text',text:finalText}]}]},token=timing.bufferedContentToken(response),write=timing.writeStart({bytes:100,contentToken:token});timing.writeEnd(write);timing.transportEnd();timing.responseEnd();const summary=timing.finish({outcome:'ok'});
+  assert.equal(summary.counts.contentChunks,2);assert.equal(summary.counts.contentBytes,Buffer.byteLength('初稿😀'));assert.equal(summary.complete,finalText!==null);assert.deepEqual(canonicalRequestStreamTiming(JSON.parse(JSON.stringify(summary))),summary);if(finalText===null){assert.ok(summary.missing.includes('content_pair_invalid'));assert.ok(summary.missing.includes('unpaired_events'));assert.equal(summary.counts.deliveredBufferedContentChunks,0);}else assert.equal(summary.counts.deliveredBufferedContentChunks,2);
+ }
+});

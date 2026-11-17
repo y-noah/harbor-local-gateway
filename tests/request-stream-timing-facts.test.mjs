@@ -37,3 +37,15 @@ test('all real content and non-content write completions must balance before rec
  const {canonicalStreamTiming}=await import('../request-stream-timing-facts.mjs');
  for(const completeFirst of [false,true]){const timing=createRequestStreamTiming();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(5);timing.decodedEvent();if(completeFirst){const done=timing.writeStart({bytes:10});timing.writeEnd(done);}timing.writeStart({bytes:5});timing.transportEnd();timing.responseEnd();const original=timing.finish({outcome:'ok'});assert.deepEqual(canonicalRequestStreamTiming(JSON.parse(JSON.stringify(original))),original);assert.ok(original.missing.includes('unpaired_events'));const forged={...original,complete:true,missing:[]};assert.throws(()=>canonicalRequestStreamTiming(forged));assert.equal(canonicalStreamTiming(forged),undefined);}
 });
+
+test('buffered counters are all-or-none, conserved, bounded and cannot forge completion',()=>{
+ const timing=createRequestStreamTiming();timing.bodyEnd();timing.dispatch();timing.headers();timing.rawChunk(10);timing.decodedEvent();
+ for(let i=0;i<3;i++)timing.bufferContent(timing.upstreamEvent({type:'response.output_text.delta',delta:'x'}));
+ const write=timing.writeStart({bytes:20,contentToken:timing.bufferedContentToken({status:'completed',output:[{type:'message',content:[{type:'output_text',text:'final synthetic'}]}]})});timing.writeEnd(write);timing.transportEnd();timing.responseEnd();const valid=JSON.parse(JSON.stringify(timing.finish({outcome:'ok'})));assert.deepEqual(canonicalRequestStreamTiming(valid),valid);
+ for(const name of ['bufferedContentChunks','bufferedContentWrites','completedBufferedContentWrites','deliveredBufferedContentChunks']){
+  const partial=structuredClone(valid);delete partial.counts[name];assert.throws(()=>canonicalRequestStreamTiming(partial));
+  for(const value of [-1,0.5,Number.MAX_SAFE_INTEGER+1,null]){const changed=structuredClone(valid);changed.counts[name]=value;assert.throws(()=>canonicalRequestStreamTiming(changed));}
+ }
+ for(const patch of [{bufferedContentWrites:2},{deliveredBufferedContentChunks:2},{completedBufferedContentWrites:0},{bufferedContentChunks:4},{contentChunks:4}]){const changed=structuredClone(valid);Object.assign(changed.counts,patch);assert.throws(()=>canonicalRequestStreamTiming(changed));}
+ const legacy=sample();assert.equal(Object.hasOwn(canonicalRequestStreamTiming(legacy).counts,'bufferedContentChunks'),false);
+});

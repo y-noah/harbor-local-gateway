@@ -5,7 +5,8 @@ const keys=Object.freeze({
   durations:['bodyRead','beforeDispatch','upstreamHeaders','upstreamFirstRawChunk','firstRawToDecoded','upstreamFirstEvent','upstreamFirstContent','firstContentRelay','firstContentWrite','upstream','response','total','maxContentGap','maxRelay','maxWriteWait','totalWriteWait'],
   counts:['rawChunks','rawBytes','decodedEvents','upstreamEvents','contentChunks','contentBytes','writes','completedWrites','contentWrites','completedContentWrites','retiredContentChunks','wireBytes','backpressuredWrites','failedWrites'],
 });
-const reasons=new Set(['clock_invalid','duration_budget','clock_unavailable','content_classification','content_budget','inflight_budget','write_bytes_invalid','content_pair_invalid','content_pair_missing','write_pair_invalid','write_failed','outcome_invalid','missing_content_write','stage_order','unpaired_events','outcome_unknown','raw_bytes_invalid','content_not_relayed',...['started','bodyEnd','dispatch','headers','firstRawChunk','firstDecodedEvent','transportEnd','responseEnd'].map(name=>'missing_'+name)]);
+const bufferedKeys=Object.freeze(['bufferedContentChunks','bufferedContentWrites','completedBufferedContentWrites','deliveredBufferedContentChunks']);
+const reasons=new Set(['buffered_outcome_not_ok','clock_invalid','duration_budget','clock_unavailable','content_classification','content_budget','inflight_budget','write_bytes_invalid','content_pair_invalid','content_pair_missing','write_pair_invalid','write_failed','outcome_invalid','missing_content_write','stage_order','unpaired_events','outcome_unknown','raw_bytes_invalid','content_not_relayed',...['started','bodyEnd','dispatch','headers','firstRawChunk','firstDecodedEvent','transportEnd','responseEnd'].map(name=>'missing_'+name)]);
 const outcomes=new Set(['ok','failed','cancelled','interrupted','unknown']),maxMs=30*86400000;
 const invalid=()=>{throw TypeError('request_stream_timing_invalid');};
 function object(value,allowed,{optional=false}={}){
@@ -23,7 +24,10 @@ const count=value=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=
 export function canonicalRequestStreamTiming(value){
   const root=object(value,[...keys.root,'preDispatchOffsetsMs'],{optional:true});if(keys.root.some(name=>!Object.hasOwn(root,name)))invalid();
   if(root.version!==1||root.clock!=='process-monotonic'||root.upstreamBoundary!=='decoded-response-event'||root.rawReadBoundary!=='fetch-response-body-chunk'||root.writeBoundary!=='node-socket-write-callback'||root.clientReceiptVerified!==false||!outcomes.has(root.outcome)||typeof root.complete!=='boolean')invalid();
-  const offsets=object(root.offsetsMs,keys.offsets,{optional:true}),durations=object(root.durationsMs,keys.durations),counts=object(root.counts,keys.counts);
+  const offsets=object(root.offsetsMs,keys.offsets,{optional:true}),durations=object(root.durationsMs,keys.durations),counts=object(root.counts,[...keys.counts,...bufferedKeys],{optional:true});
+  if(keys.counts.some(name=>!Object.hasOwn(counts,name)))invalid();
+  const hasBuffered=bufferedKeys.some(name=>Object.hasOwn(counts,name));if(hasBuffered&&bufferedKeys.some(name=>!Object.hasOwn(counts,name)))invalid();
+  const buffered=Object.fromEntries(bufferedKeys.map(name=>[name,counts[name]??0]));
   let preparation;
   if(Object.hasOwn(root,'preDispatchOffsetsMs')){
     preparation=object(root.preDispatchOffsetsMs,preDispatchTimingStages,{optional:true});let previous=offsets.bodyEnd??offsets.started??0;
@@ -48,7 +52,13 @@ export function canonicalRequestStreamTiming(value){
   if(counts.completedWrites+counts.failedWrites>counts.writes||counts.contentWrites+counts.retiredContentChunks>counts.contentChunks||counts.completedContentWrites>counts.contentWrites||counts.completedContentWrites>counts.completedWrites)invalid();
   if((counts.completedWrites>0)!==Object.hasOwn(offsets,'firstWriteComplete')||(counts.completedWrites>0)!==Object.hasOwn(offsets,'lastWriteComplete')||(counts.completedContentWrites>0)!==Object.hasOwn(offsets,'firstContentWriteComplete'))invalid();
   if(counts.completedWrites>0&&offsets.firstWriteComplete>offsets.lastWriteComplete)invalid();
-  if(root.complete&&(counts.completedWrites!==counts.writes||counts.failedWrites!==0||counts.contentWrites!==counts.contentChunks||counts.completedContentWrites!==counts.contentChunks||counts.retiredContentChunks!==0))invalid();
+  if(hasBuffered){
+    if(root.outcome!=='ok'&&!missing.includes('buffered_outcome_not_ok'))invalid();
+    if(bufferedKeys.some(name=>!count(buffered[name]))||buffered.bufferedContentChunks<1||buffered.bufferedContentChunks>counts.contentChunks||buffered.bufferedContentWrites>1||buffered.completedBufferedContentWrites>buffered.bufferedContentWrites||buffered.bufferedContentWrites>counts.contentWrites||buffered.completedBufferedContentWrites>counts.completedContentWrites)invalid();
+    if(buffered.deliveredBufferedContentChunks!==(buffered.completedBufferedContentWrites===1?buffered.bufferedContentChunks:0)||counts.contentWrites-buffered.bufferedContentWrites+buffered.bufferedContentChunks+counts.retiredContentChunks>counts.contentChunks||counts.completedContentWrites-buffered.completedBufferedContentWrites+buffered.deliveredBufferedContentChunks>counts.contentChunks)invalid();
+    if(buffered.deliveredBufferedContentChunks<buffered.bufferedContentChunks&&!missing.includes('unpaired_events'))invalid();
+  }
+  if(root.complete&&(counts.completedWrites!==counts.writes||counts.failedWrites!==0||counts.contentWrites-buffered.bufferedContentWrites+buffered.bufferedContentChunks!==counts.contentChunks||counts.completedContentWrites-buffered.completedBufferedContentWrites+buffered.deliveredBufferedContentChunks!==counts.contentChunks||counts.retiredContentChunks!==0))invalid();
   const spans={bodyRead:['started','bodyEnd'],beforeDispatch:['bodyEnd','dispatch'],upstreamHeaders:['dispatch','headers'],upstreamFirstRawChunk:['dispatch','firstRawChunk'],firstRawToDecoded:['firstRawChunk','firstDecodedEvent'],upstreamFirstEvent:['dispatch','firstUpstreamEvent'],upstreamFirstContent:['dispatch','firstUpstreamContent'],firstContentRelay:['firstUpstreamContent','firstContentWriteStart'],firstContentWrite:['firstContentWriteStart','firstContentWriteComplete'],upstream:['dispatch','transportEnd'],response:['started','responseEnd'],total:['started','finished']};
   for(const [name,[from,to]] of Object.entries(spans)){
     if(!Object.hasOwn(offsets,from)||!Object.hasOwn(offsets,to)){if(durations[name]!==null)invalid();continue;}
@@ -60,7 +70,7 @@ export function canonicalRequestStreamTiming(value){
   }
   const out={version:1,clock:root.clock,upstreamBoundary:root.upstreamBoundary,rawReadBoundary:root.rawReadBoundary,writeBoundary:root.writeBoundary,clientReceiptVerified:false,outcome:root.outcome,complete:root.complete,
     offsetsMs:Object.freeze(Object.fromEntries(keys.offsets.filter(name=>Object.hasOwn(offsets,name)).map(name=>[name,offsets[name]]))),
-    durationsMs:Object.freeze(Object.fromEntries(keys.durations.map(name=>[name,durations[name]]))),counts:Object.freeze(Object.fromEntries(keys.counts.map(name=>[name,counts[name]]))),missing:Object.freeze(missing.sort()),...(preparation?{preDispatchOffsetsMs:Object.freeze(Object.fromEntries(preDispatchTimingStages.filter(name=>Object.hasOwn(preparation,name)).map(name=>[name,preparation[name]])))}:{})};
+    durationsMs:Object.freeze(Object.fromEntries(keys.durations.map(name=>[name,durations[name]]))),counts:Object.freeze(Object.fromEntries([...keys.counts,...(hasBuffered?bufferedKeys:[])].map(name=>[name,counts[name]]))),missing:Object.freeze(missing.sort()),...(preparation?{preDispatchOffsetsMs:Object.freeze(Object.fromEntries(preDispatchTimingStages.filter(name=>Object.hasOwn(preparation,name)).map(name=>[name,preparation[name]])))}:{})};
   return Object.freeze(out);
 }
 
