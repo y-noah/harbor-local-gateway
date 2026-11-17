@@ -650,9 +650,9 @@ def verify_started_composition(api,image,config,started,approval):
     try:
         while time.monotonic()<end:
             observation['attempts']+=1;observation['containers']={};observation['checks']={'progress':{'attempted':False,'elapsedMs':0,'returncode':None}}
-            candidate=timed('gateway_inspection',lambda:container_inspection(api,name,[]))
+            candidate=timed('gateway_inspection',lambda:container_inspection(api,name,[],retry_deadline=end))
             observation['containers']['gateway']=composition(candidate)
-            background=timed('worker_inspection',lambda:container_inspection(api,worker,[]))
+            background=timed('worker_inspection',lambda:container_inspection(api,worker,[],retry_deadline=end))
             observation['containers']['worker']=composition(background)
             good=all(value and signed_candidate_image_id(value.get('Image'),approval) and value.get('Config',{}).get('Image')==image and value.get('State',{}).get('Running') and value['State'].get('Health',{}).get('Status')=='healthy' for value in [candidate,background])
             if good and timed('gateway_health_http',lambda:api['http_code'](port,'/health'))==200 and timed('gateway_ready_http',lambda:api['http_code'](port,'/ready'))==200 and timed('device_ready_http',lambda:device_http_code(stack,config,'/ready'))==200:

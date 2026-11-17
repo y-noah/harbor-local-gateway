@@ -58,4 +58,49 @@ class StartupDiagnosticTests(unittest.TestCase):
   for changes in [{'log':'secret'},{'returncode':True},{'elapsedMs':-1}]:
    bad=copy.deepcopy(result);bad['checks']['progress'].update(changes);self.assertIsNone(upgrade.startup_failure_observation(bad))
   clean=upgrade.startup_failure_observation(result);clean['checks'].clear();self.assertTrue(result['checks'])
+class StartupInspectionRetryTests(unittest.TestCase):
+ def setUp(self):
+  self.wrapper=load('startup_retry_wrapper','ci/deploy-wrapper.py');self.now=0;self.reads=[]
+  self.row={'Id':'synthetic-container','Image':'sha256:'+'a'*64,'Config':{'Image':'candidate'},'State':{'Running':True,'Health':{'Status':'healthy'}}}
+  self.api={'STACK':'/private/materials','NAME':'harbor','inspect_container':self.wrapper.inspect_container,'http_code':Mock(side_effect=lambda port,path,headers=None:403 if headers else 401 if path=='/api/admin/state' else 200),'docker':Mock(return_value=types.SimpleNamespace(returncode=0))}
+ def run_check(self,read):
+  def sleep(seconds):self.now+=seconds
+  device=Mock(side_effect=lambda stack,config,path,headers=None:403 if headers else 401 if path=='/api/admin/state' else 200)
+  with patch.object(pg.time,'monotonic',side_effect=lambda:self.now),patch.object(pg.time,'sleep',side_effect=sleep),patch.object(self.wrapper,'docker_container_read',side_effect=read),patch.object(pg,'record_shutdown_diagnostic') as diagnostic,patch.object(pg,'device_http_code',device):
+   self.diagnostic=diagnostic
+   return pg.verify_started_composition(self.api,'candidate',{'port':8092},123,{'configDigest':self.row['Image']})
+ def test_gateway_and_worker_retry_only_marked_transient_then_finish_full_checks(self):
+  def read(name):
+   self.reads.append(name)
+   if self.reads.count(name)==1:raise self.wrapper.ContainerInspectionUnavailable('synthetic timeout')
+   return 200,self.row
+  self.run_check(read)
+  self.assertEqual(self.reads,['harbor','harbor','harbor-worker','harbor-worker']);self.assertEqual(self.now,.5);self.diagnostic.assert_not_called();self.api['docker'].assert_called_once()
+ def test_persistent_gateway_transient_uses_original_deadline(self):
+  def read(name):self.reads.append(name);raise self.wrapper.ContainerInspectionUnavailable('synthetic timeout')
+  with self.assertRaises(pg.ShutdownUnconfirmed) as caught:self.run_check(read)
+  self.assertEqual(self.now,90);self.assertEqual(caught.exception.deployment_code,'preflight_observation_timeout');self.assertEqual(caught.exception.startup_observation['stage'],'gateway_inspection');self.assertEqual(set(self.reads),{'harbor'});self.api['docker'].assert_not_called();self.diagnostic.assert_called_once()
+ def test_worker_reuses_deadline_spent_by_gateway(self):
+  def read(name):
+   self.reads.append(name)
+   if name=='harbor':self.now=89;return 200,self.row
+   raise self.wrapper.ContainerInspectionUnavailable('synthetic timeout')
+  with self.assertRaises(pg.ShutdownUnconfirmed) as caught:self.run_check(read)
+  self.assertEqual(self.now,90);self.assertEqual(self.reads.count('harbor-worker'),4);self.assertEqual(caught.exception.startup_observation['stage'],'worker_inspection');self.assertTrue(caught.exception.startup_observation['containers']['gateway']['imageMatches'])
+ def test_identity_and_malformed_errors_reject_immediately(self):
+  for value in [RuntimeError('Docker inspection socket changed'),(200,{'Id':'synthetic','Config':'malformed','State':{'Running':True}}),(404,{'message':'unexpected absence'})]:
+   with self.subTest(value=type(value).__name__):
+    self.now=0;self.reads=[]
+    def read(name):
+     self.reads.append(name)
+     if isinstance(value,Exception):raise value
+     return value
+    with self.assertRaises(pg.ShutdownUnconfirmed):self.run_check(read)
+    self.assertEqual(self.now,0);self.assertEqual(self.reads,['harbor']);self.api['docker'].assert_not_called()
+ def test_shutdown_default_inspection_still_fails_once_without_retry(self):
+  read=Mock(side_effect=self.wrapper.ContainerInspectionUnavailable('synthetic timeout'));rows=[]
+  with patch.object(self.wrapper,'docker_container_read',read),patch.object(pg,'record_shutdown_diagnostic') as diagnostic,patch.object(pg.time,'sleep') as sleep:
+   with self.assertRaises(pg.ShutdownUnconfirmed):pg.container_inspection(self.api,'harbor',rows)
+  read.assert_called_once();sleep.assert_not_called();diagnostic.assert_called_once();self.assertEqual(rows[0]['reason'],'container_inspection_failed')
+
 if __name__=='__main__':unittest.main()
