@@ -901,3 +901,33 @@ PostgreSQL 费率接口支持轻目录：`GET /api/admin/pricing?view=catalog` �
 部门账号、模型权限、员工类型、共享限额、用量查询、正文与导出、额外额度及套餐配置均保留部门归属。订阅账号仍只需填写月费，API Key 独立添加。夜间任务按部门规划和换绑；管理 Key 撤销或部门停用后，旧任务不能启动新派发或迁移，已运行请求仍按原部门结算。停用后再启用不恢复旧管理会话或旧任务权限，员工与单个 Key 自身的启停状态保留。
 
 首次激活采用两阶段发布：普通票据省略 `activateDepartmentIsolation`（等同 `false`），仅上线兼容代码、不执行部门DDL；确认该兼容版本业务健康后，后续票据才明确设为 `true`。激活要求网关、Worker源镜像和目标都声明 `harbor-department-isolation-v1`，停源并排空运行角色连接后，由受控 owner 安装同校验和迁移。提交回执丢失须查询实际marker确认，结果未知不猜测成功；失败先回收候选并核验旧源兼容性再恢复，不通过删除部门结构回退。
+
+## 按需轻量配置备份
+
+`configuration-backup-cli.mjs` 是一次运行即退出的离线维护工具，不创建服务或定时任务。它保存账号、员工、访问 Key、模型权限、限额配置、团队/类型模板、设备凭据与必要关联，以及应用解密密钥、管理登录设置和 Codex `auth.json`。不导出请求、对话正文、Token/USD 历史、会话绑定或日志；恢复后历史消耗不继承，不能用此包恢复业务历史。旧全量备份和恢复工具仍保留，运行本 CLI 不会自动停止已有备份 timer、WAL 归档或清理旧包。
+
+使用 Node.js 24。将配置文件设为当前维护用户所有、`0600`，各目录为 `0700`；备份加密密钥是单独保管的 32 字节原始随机文件，不得复用 `key-encryption.key`，也不包含在备份包内。以下路径是示例，需替换为已核实的 Harbor 私有目录；备份包目录必须专用于本次导出，不覆盖已有 `configuration.enc`。
+
+```json
+{
+  "version": 1,
+  "directory": "/private/harbor/configuration-backup",
+  "dataDir": "/private/harbor/data",
+  "runtimeDir": "/private/harbor/runtime",
+  "journalDir": "/private/harbor/configuration-restore-journal",
+  "backupKeyFile": "/private/harbor/configuration-backup.key"
+}
+```
+
+数据库连接只从当前进程的 `HARBOR_CONFIGURATION_DATABASE_URL` 读取，不写入配置包或命令参数。使用有权读取配置表的维护连接导出；恢复连接须具有写入及离线校验权限。默认遵循既有数据库 TLS 要求，仅在已确认的本地隔离测试环境可显式设置 `allowPlaintextLocalNetwork: true`。
+
+```sh
+node configuration-backup-cli.mjs export /private/harbor/profile.json
+node configuration-backup-cli.mjs inspect /private/harbor/profile.json
+node configuration-backup-cli.mjs restore /private/harbor/restore-profile.json
+node configuration-backup-cli.mjs recover /private/harbor/restore-profile.json
+```
+
+`inspect` 不连接数据库，只显示各类配置数量。恢复前须用本版既有迁移初始化目标 schema，并确保目标实例离线、无其他数据库连接。恢复配置指向目标的 `dataDir/runtimeDir/journalDir`，保留原包与备份密钥。不同结构、同 ID 不同配置、目标同名但不同内容的凭据文件均拒绝覆盖；仅空目标中仍与迁移初始值一致的默认团队、未配置类型及策略允许替换。数据库配置写入使用单事务；凭据文件先准备并以加密 journal 记录。中断或提交回执不明时，保留材料，先执行 `recover` 核对实际提交标记，不自行删除 journal 或反复执行 `restore`。
+
+设备强制策略需同时提供 `deviceMaterials` 中的 `device_ca_certificate`、`device_ca_key`、`device_server_certificate`、`device_server_key` 四个绝对路径，导出时读取、恢复时写入目标路径。部署端还须沿用对应的设备 TLS 启用状态、端口和文件配置，CLI 不修改系统环境或启动服务。恢复后的账号统一为待检查；管理员应通过正常账号检查入口核实订阅登录有效性和 API 可用性，再验证原员工 Key、允许/拒绝的模型及限额。凭据字节完整并不代表供应方尚未撤销或过期。
